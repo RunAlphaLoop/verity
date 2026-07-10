@@ -1,0 +1,65 @@
+# The framework-churn tripwire (task #29): weekly, install the six frameworks
+# UNPINNED LATEST (ignoring our pyproject floors) and run the full e2e
+# conformance harness — adapter modules + interface pins — against a live
+# verity-server. When LlamaIndex/LangChain/LangGraph/CrewAI/ADK/OpenAI-Agents
+# move a plug point, THIS goes red (with the drifted versions named in the job
+# summary), not a user's integration.
+name: Framework canary
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC — catches weekend releases
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: paradedb/paradedb:latest-pg17
+        env:
+          POSTGRES_USER: verity
+          POSTGRES_PASSWORD: verity
+          POSTGRES_DB: verity
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U verity -d verity"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p verity-server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install adapters at their pinned floors (baseline)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest respx \
+            ./integrations/verity-llamaindex \
+            ./integrations/verity-langchain \
+            ./integrations/verity-langgraph \
+            ./integrations/verity-crewai \
+            ./integrations/verity-adk \
+            ./integrations/verity-openai-agents
+          python -m pip list --format=freeze > /tmp/pinned-freeze.txt
+      - name: Upgrade the six frameworks to unpinned latest
+        run: |
+          python -m pip install -U \
+            llama-index-core langchain-core langgraph-checkpoint \
+            crewai google-adk openai-agents
+          python -m pip list --format=freeze > /tmp/latest-freeze.txt
+      - name: Full e2e suite against latest frameworks
+        run: bash integrations/run_e2e.sh
+        env:
+          VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
+      - name: Drift summary (names moved versions, pass or fail)
+        if: always()
+        run: >-
+          python integrations/e2e/canary_summary.py
+          /tmp/pinned-freeze.txt /tmp/latest-freeze.txt
+          >> "$GITHUB_STEP_SUMMARY"

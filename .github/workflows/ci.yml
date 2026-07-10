@@ -36,3 +36,52 @@ jobs:
       - run: cargo test --workspace
         env:
           VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
+
+  # Framework conformance harness (task #29): the six adapter packages driven
+  # through REAL framework machinery (retrievers, BaseStore, unified Memory,
+  # BaseMemoryService, Session protocol) against a live verity-server + Parade
+  # DB. Framework churn is detected here and in framework-canary.yml — by CI,
+  # not by users. Runs standalone (no `needs:`) so it parallelizes with the
+  # rust job.
+  integrations-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: paradedb/paradedb:latest-pg17
+        env:
+          POSTGRES_USER: verity
+          POSTGRES_PASSWORD: verity
+          POSTGRES_DB: verity
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U verity -d verity"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p verity-server
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install adapter packages (pinned floors) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest respx \
+            ./integrations/verity-llamaindex \
+            ./integrations/verity-langchain \
+            ./integrations/verity-langgraph \
+            ./integrations/verity-crewai \
+            ./integrations/verity-adk \
+            ./integrations/verity-openai-agents
+      # The default run must stay mock-only: pytest.ini deselects `e2e`.
+      - name: Mock suites (e2e excluded by default)
+        run: python -m pytest -q
+        working-directory: integrations
+      - name: e2e conformance harness
+        run: bash integrations/run_e2e.sh
+        env:
+          VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
