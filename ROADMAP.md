@@ -62,18 +62,22 @@ into v0.2/v0.3.
 - [x] Load benchmark: ~170 QPS saturation (M3 Pro), queueing curve recorded; §4d cloud-shape run still owed before any public QPS claim
 - [x] Entity-bound + broad-visibility BM25: breach found (542ms) and fixed (12.6ms p50) via keyword-tokenized Tantivy pre-filter + materialized residual
 
-## 📦 v0.2 — the multiplier (~4–6 weeks)
+## 📦 v0.2 — the multiplier — ✅ SHIPPED 2026-07-10
 
-- [ ] Framework sinks: `VerityVectorStore` (LlamaIndex) + LangChain package — 400+ loaders inherited (2 wks)
-- [ ] LangGraph `BaseStore` adapter; others fast-follow (1 wk each)
-- [ ] Credential-lifecycle abstraction (4 shapes + expiry telemetry + webhook-health hooks) (1.5–2 wks)
-- [ ] Credential wizards: `verity connect slack` (Socket Mode), `verity connect github` (1 wk)
-- [ ] Salesforce connector (customer-created Connected App + CDC Pub/Sub; needs design partner) (3+ wks)
-- [ ] `subscriptions/listen` + webhook/SSE change notifications (1 wk)
-- [ ] Read-only scope-inspector web UI + freshness/backfill dashboards (2–3 wks)
-- [ ] Freshness SLO instrumentation (p50/p95 source-change-to-queryable per connector) (1 wk)
-- [ ] Compliance plane v0: envelope encryption/DEK plumbing, hard-purge pipeline, DSAR export CLI, `verity backup/restore` with §11b ordering (3 wks)
-- [ ] pg_net/Supabase trigger snippet + docs (1–2 days)
+Suites: 54 Rust + 66 ingest + 55 integrations tests green; fuzzer green; demo green.
+Two serving bugs found & fixed along the way: entity-bound BM25 breach (542→12.6ms p50)
+and BM25 query-syntax injection (user text now via paradedb.match). As-built deltas noted.
+
+- [x] Framework sinks: LlamaIndex + LangChain packages (real deps, 32 tests, live round-trips)
+- [x] LangGraph `BaseStore` adapter (23 tests). *Other adapters (CrewAI, ADK, OpenAI Sessions) still pending.*
+- [x] Credential lifecycle: 4 shapes, expiry telemetry, 401-invalidate-retry-once; HubSpot retrofitted. *Webhook-health hooks are seams, not yet wired to a scheduler.*
+- [x] `verity-cli connect slack` (manifest wizard) + `connect github` (PAT-used-once)
+- [x] Salesforce connector, fixture-verified slice: client_credentials + SOQL cursor polling + AccountShare metadata. *CDC Pub/Sub (gRPC) and live-org validation still need the design partner.*
+- [x] GET /v1/subscribe SSE (scoped, revocation-aware, capped). *MCP subscriptions/listen bridge pending.*
+- [x] /ui scope inspector: handle decode + live probes + quarantine/audit/freshness panels. *Backfill progress dashboard pending (needs backfill machinery).*
+- [x] Freshness samples on debezium+webhook ingest; /v1/slo/freshness percentiles
+- [x] Compliance v0: per-tenant DEKs (VERITY_KEK), L0 payload encryption at rest, /v1/admin/erasure hard purge with knowledge cascade, DSAR export, verity-cli backup/restore. *Uncovered surfaces listed in docs/OPERATIONS.md (SpiceDB tuples, media blobs, action/knowledge-publish episodes).*
+- [x] docs/snippets/pg-net-trigger.md
 
 ## 🏗 v0.3 — the scaling substrate (~6–8 weeks)
 
