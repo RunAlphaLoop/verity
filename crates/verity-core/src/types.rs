@@ -333,6 +333,18 @@ pub struct KnowledgeItem {
     pub published_at: Option<DateTime<Utc>>,
 }
 
+/// What `memory.forget` targets (roadmap task 5). Chunk = one retrieval unit;
+/// Episode = the L0 event and everything derived from it (chunks, facts, and
+/// the knowledge-support cascade). Forget is invalidate-don't-delete: rows get
+/// `valid_to`, never removal — hard purge stays with the §8 crypto-shredding
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ForgetRef {
+    Chunk(ChunkId),
+    Episode(EpisodeId),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]

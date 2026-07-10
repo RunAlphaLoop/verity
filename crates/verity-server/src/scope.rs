@@ -111,6 +111,33 @@ impl ScopeMinter {
         (handle, payload.expires_at)
     }
 
+    /// Signed media URI (roadmap task 9): HMAC over "media:<id>:<exp>" under
+    /// the same server key as scope handles. `expires_at` is unix seconds.
+    pub fn sign_media(&self, media_id: uuid::Uuid, expires_at: i64) -> String {
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("any key length works");
+        mac.update(format!("media:{media_id}:{expires_at}").as_bytes());
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    /// Verify a signed media URI: expiry first, then constant-time signature
+    /// check. Any malformation fails closed.
+    pub fn verify_media(
+        &self,
+        media_id: uuid::Uuid,
+        expires_at: i64,
+        sig: &str,
+    ) -> Result<(), ScopeError> {
+        if expires_at < Utc::now().timestamp() {
+            return Err(ScopeError::Expired);
+        }
+        let sig = URL_SAFE_NO_PAD
+            .decode(sig)
+            .map_err(|_| ScopeError::Malformed)?;
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("any key length works");
+        mac.update(format!("media:{media_id}:{expires_at}").as_bytes());
+        mac.verify_slice(&sig).map_err(|_| ScopeError::BadSignature)
+    }
+
     pub fn verify(&self, handle: &str) -> Result<ScopePayload, ScopeError> {
         let rest = handle.strip_prefix(PREFIX).ok_or(ScopeError::Malformed)?;
         let (body_b64, sig_b64) = rest.split_once('.').ok_or(ScopeError::Malformed)?;
@@ -195,6 +222,29 @@ mod tests {
             ScopeMinter::ephemeral().verify(&handle),
             Err(ScopeError::BadSignature)
         ));
+    }
+
+    #[test]
+    fn media_signatures_verify_and_fail_closed() {
+        let minter = ScopeMinter::ephemeral();
+        let id = uuid::Uuid::now_v7();
+        let exp = Utc::now().timestamp() + 60;
+        let sig = minter.sign_media(id, exp);
+        assert!(minter.verify_media(id, exp, &sig).is_ok());
+        // Wrong id, shifted expiry, expired stamp, foreign key: all rejected.
+        assert!(minter
+            .verify_media(uuid::Uuid::now_v7(), exp, &sig)
+            .is_err());
+        assert!(minter.verify_media(id, exp + 1, &sig).is_err());
+        let past = Utc::now().timestamp() - 1;
+        let stale = minter.sign_media(id, past);
+        assert!(matches!(
+            minter.verify_media(id, past, &stale),
+            Err(ScopeError::Expired)
+        ));
+        assert!(ScopeMinter::ephemeral()
+            .verify_media(id, exp, &sig)
+            .is_err());
     }
 
     #[test]

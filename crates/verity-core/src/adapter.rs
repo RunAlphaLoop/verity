@@ -92,6 +92,15 @@ pub trait StorageAdapter: Send + Sync {
         status: Option<KnowledgeStatus>,
     ) -> Result<Vec<KnowledgeItem>>;
 
+    /// `memory.forget` (roadmap task 5): retire a chunk, or an episode and
+    /// everything derived from it. Episode forget retires the episode's chunks
+    /// and facts (valid_to = now), then runs the knowledge retraction cascade:
+    /// its `knowledge_evidence` rows are deleted, distinct-entity support is
+    /// recounted, and any published item whose support drops below 3 becomes
+    /// `invalidated` (reason `support_withdrawn`) with its knowledge chunk
+    /// retired. Invalidate-don't-delete throughout. Returns rows retired.
+    async fn forget(&self, tenant: TenantId, ref_kind: ForgetRef, reason: &str) -> Result<u64>;
+
     /// Source hard-delete propagation (SPEC §8c, bi-temporal half): close all
     /// current facts for an entity at `deleted_at`. History stays queryable
     /// via `fact_as_of`; crypto-shred hard purge is a separate admin pipeline.

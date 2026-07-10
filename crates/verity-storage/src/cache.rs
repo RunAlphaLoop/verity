@@ -129,6 +129,18 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.list_knowledge(tenant, status).await
     }
 
+    async fn forget(&self, tenant: TenantId, ref_kind: ForgetRef, reason: &str) -> Result<u64> {
+        let retired = self.inner.forget(tenant, ref_kind, reason).await?;
+        // Episode forget may retire L1 facts; the count blends chunks and
+        // facts, so any non-zero episode forget flushes (same rationale as
+        // retire_entity: forgets are rare, correctness beats bookkeeping).
+        // Chunk forget never touches facts, so the cache stays warm.
+        if retired > 0 && matches!(ref_kind, ForgetRef::Episode(_)) {
+            self.facts.invalidate_all();
+        }
+        Ok(retired)
+    }
+
     async fn retire_entity(
         &self,
         tenant: TenantId,

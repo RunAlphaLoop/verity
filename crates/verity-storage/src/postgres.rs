@@ -790,6 +790,131 @@ impl StorageAdapter for PostgresAdapter {
         rows.iter().map(row_to_hit).collect()
     }
 
+    async fn forget(&self, tenant: TenantId, ref_kind: ForgetRef, reason: &str) -> Result<u64> {
+        match ref_kind {
+            ForgetRef::Chunk(chunk_id) => {
+                // Tenant-checked structural retire — the row stays for audit,
+                // it just stops being current (invalidate-don't-delete).
+                let result = sqlx::query(
+                    "UPDATE chunks SET valid_to = now()
+                     WHERE tenant_id = $1 AND id = $2 AND valid_to IS NULL",
+                )
+                .bind(tenant)
+                .bind(chunk_id)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+                tracing::info!(%chunk_id, reason, "forget: chunk retired");
+                Ok(result.rows_affected())
+            }
+            ForgetRef::Episode(episode_id) => {
+                let mut tx = self.pool.begin().await.map_err(db_err)?;
+                let chunks_retired = sqlx::query(
+                    "UPDATE chunks SET valid_to = now()
+                     WHERE tenant_id = $1 AND provenance = $2 AND valid_to IS NULL",
+                )
+                .bind(tenant)
+                .bind(episode_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                let facts_retired = sqlx::query(
+                    "UPDATE facts SET valid_to = now()
+                     WHERE tenant_id = $1 AND provenance = $2 AND valid_to IS NULL",
+                )
+                .bind(tenant)
+                .bind(episode_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+
+                // Knowledge retraction cascade: withdraw this episode's
+                // evidence, recount support, and pull published items whose
+                // k-support falls below the k=3 privacy floor.
+                let knowledge_ids: Vec<Uuid> = sqlx::query_scalar(
+                    "SELECT ke.knowledge_id FROM knowledge_evidence ke
+                     JOIN knowledge k ON k.id = ke.knowledge_id
+                     WHERE ke.episode_id = $1 AND k.tenant_id = $2
+                     FOR UPDATE OF k",
+                )
+                .bind(episode_id)
+                .bind(tenant)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+
+                for kid in knowledge_ids {
+                    sqlx::query(
+                        "DELETE FROM knowledge_evidence
+                         WHERE knowledge_id = $1 AND episode_id = $2",
+                    )
+                    .bind(kid)
+                    .bind(episode_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    let row = sqlx::query(
+                        "SELECT count(DISTINCT entity) AS entities, count(*) AS episodes
+                         FROM knowledge_evidence WHERE knowledge_id = $1",
+                    )
+                    .bind(kid)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    let distinct: i64 = row.try_get("entities").map_err(db_err)?;
+                    let episodes: i64 = row.try_get("episodes").map_err(db_err)?;
+                    sqlx::query(
+                        "UPDATE knowledge SET distinct_entities = $2, episode_count = $3
+                         WHERE id = $1",
+                    )
+                    .bind(kid)
+                    .bind(distinct as i32)
+                    .bind(episodes as i32)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                    if distinct < 3 {
+                        let invalidated = sqlx::query(
+                            "UPDATE knowledge
+                             SET status = 'invalidated', invalidated_at = now(),
+                                 invalidated_reason = 'support_withdrawn'
+                             WHERE id = $1 AND status = 'published'",
+                        )
+                        .bind(kid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                        if invalidated.rows_affected() > 0 {
+                            // Retire the §7g carve-out artifact so the
+                            // statement stops surfacing in recall.
+                            sqlx::query(
+                                "UPDATE chunks SET valid_to = now()
+                                 WHERE tenant_id = $1 AND document_id = $2
+                                   AND valid_to IS NULL",
+                            )
+                            .bind(tenant)
+                            .bind(format!("knowledge:{kid}"))
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db_err)?;
+                        }
+                    }
+                }
+                tx.commit().await.map_err(db_err)?;
+                tracing::info!(
+                    %episode_id,
+                    reason,
+                    chunks_retired,
+                    facts_retired,
+                    "forget: episode retired"
+                );
+                Ok(chunks_retired + facts_retired)
+            }
+        }
+    }
+
     async fn retire_entity(
         &self,
         tenant: TenantId,

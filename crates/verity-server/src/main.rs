@@ -5,26 +5,32 @@
 //! accepts caller-supplied principals until the identity/ReBAC planes land —
 //! that seam is documented in scope.rs and POST /v1/scopes.
 
+mod audit;
 mod ingest;
+mod media;
+mod purpose;
 mod scope;
+mod webhooks;
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::Deserialize;
 
+use audit::spawn_audit;
+use purpose::PurposePack;
 use scope::{ScopeMinter, ScopePayload};
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::{CachedAdapter, PostgresAdapter};
 
 /// `verity_core::types::Result` shadows std's; handlers need the two-arg form.
-type HandlerResult<T> = std::result::Result<T, (StatusCode, String)>;
+pub(crate) type HandlerResult<T> = std::result::Result<T, (StatusCode, String)>;
 
 #[derive(Parser)]
 #[command(
@@ -38,12 +44,67 @@ struct Cli {
     listen: String,
 }
 
-struct AppState {
-    storage: CachedAdapter<PostgresAdapter>,
+/// Admin/ingest-plane bearer auth (roadmap task 3). When `VERITY_ADMIN_TOKEN`
+/// is set, admin surfaces require `Authorization: Bearer <token>`; the check
+/// is constant-time (HMAC tags under a per-process random key compared via
+/// `Mac::verify_slice`). Unset = dev mode: warned once at startup, allowed.
+pub(crate) struct AdminAuth {
+    key: [u8; 32],
+    expected_tag: Option<Vec<u8>>,
+}
+
+impl AdminAuth {
+    fn from_env() -> Self {
+        let mut key = [0u8; 32];
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(&mut key);
+        let expected_tag = match std::env::var("VERITY_ADMIN_TOKEN") {
+            Ok(token) if !token.is_empty() => Some(Self::tag(&key, token.trim())),
+            _ => {
+                tracing::warn!("admin surfaces unauthenticated — dev mode (set VERITY_ADMIN_TOKEN to require bearer auth)");
+                None
+            }
+        };
+        Self { key, expected_tag }
+    }
+
+    fn tag(key: &[u8; 32], token: &str) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("any key length works");
+        mac.update(token.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    pub(crate) fn check(&self, headers: &HeaderMap) -> HandlerResult<()> {
+        let Some(expected) = &self.expected_tag else {
+            return Ok(()); // dev mode
+        };
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "admin surface requires Authorization: Bearer <token>".to_string(),
+            ))?;
+        use hmac::{Hmac, Mac};
+        let mut mac =
+            Hmac::<sha2::Sha256>::new_from_slice(&self.key).expect("any key length works");
+        mac.update(provided.trim().as_bytes());
+        // Constant-time comparison via the Mac trait.
+        mac.verify_slice(expected)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid admin token".to_string()))
+    }
+}
+
+pub(crate) struct AppState {
+    pub(crate) storage: CachedAdapter<PostgresAdapter>,
     /// Local query encoder (SPEC §4a). None = sparse-only recall; the server
     /// stays up if model download fails, it just loses the dense leg.
     encoder: Option<Arc<verity_encoder::QueryEncoder>>,
-    minter: ScopeMinter,
+    pub(crate) minter: ScopeMinter,
+    pub(crate) purposes: PurposePack,
+    pub(crate) admin: AdminAuth,
 }
 
 impl AppState {
@@ -53,7 +114,13 @@ impl AppState {
             .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
     }
 
-    async fn encode(&self, text: &str) -> HandlerResult<Option<Vec<f32>>> {
+    /// Direct pool access for server-plane tables (audit, webhooks, media,
+    /// principals) that live outside the StorageAdapter seam.
+    pub(crate) fn pool(&self) -> &sqlx::PgPool {
+        self.storage.inner().pool()
+    }
+
+    pub(crate) async fn encode(&self, text: &str) -> HandlerResult<Option<Vec<f32>>> {
         let Some(encoder) = &self.encoder else {
             return Ok(None);
         };
@@ -70,7 +137,10 @@ impl AppState {
 /// Entity tags an agent writes must stay inside its scope (SPEC §7c): in an
 /// entity-bound scope, requested ⊆ scope (empty = inherit the whole scope);
 /// in an unbound scope, tags pass through as given.
-fn resolve_entities(payload: &ScopePayload, requested: Vec<String>) -> HandlerResult<Vec<String>> {
+pub(crate) fn resolve_entities(
+    payload: &ScopePayload,
+    requested: Vec<String>,
+) -> HandlerResult<Vec<String>> {
     if payload.entity_scope.is_empty() {
         return Ok(requested);
     }
@@ -107,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
         storage: CachedAdapter::new(pg, 1_000_000),
         encoder,
         minter: ScopeMinter::from_env(),
+        purposes: PurposePack::from_env()?,
+        admin: AdminAuth::from_env(),
     });
 
     let app = Router::new()
@@ -117,11 +189,24 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/episodes", post(remember))
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
+        .route("/v1/forget", post(forget))
         .route("/v1/ingest/debezium", post(ingest_debezium))
+        .route("/v1/ingest/documents", post(ingest_documents))
         .route("/v1/briefs/{entity}", get(brief))
         .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/admin/audit", get(audit::admin_audit))
+        .route("/v1/admin/quarantine", get(webhooks::admin_quarantine))
+        .route("/v1/admin/principals", post(admin_principals))
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
+        .route("/v1/webhooks", post(webhooks::mint_webhook))
+        .route("/v1/webhooks/{id}", delete(webhooks::revoke_webhook))
+        .route("/wh/{token}", post(webhooks::webhook_post))
+        .route("/v1/files", post(media::upload_file))
+        .route("/v1/media/{id}", get(media::get_media))
+        .route("/v1/media/{id}/sign", post(media::sign_media))
+        // Media uploads need more than axum's 2MB default.
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -149,6 +234,11 @@ struct OpenScopeRequest {
     actor_azp: Option<String>,
     #[serde(default = "default_ttl")]
     ttl_seconds: i64,
+    /// Purpose binding (task 7): when present, the purpose pack CLAMPS the
+    /// requested confidentiality and may require an entity-bound scope.
+    /// Unknown purposes are rejected — fail closed, never fall through.
+    #[serde(default)]
+    purpose: Option<String>,
 }
 
 fn default_confidentiality() -> Confidentiality {
@@ -163,12 +253,28 @@ async fn open_scope(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenScopeRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    let mut max_confidentiality = req.max_confidentiality;
+    if let Some(purpose) = &req.purpose {
+        let rule = state.purposes.get(purpose).ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("unknown purpose {purpose:?}"),
+        ))?;
+        // Clamp, never raise: the effective ceiling is the min of what the
+        // caller asked for and what the purpose allows.
+        max_confidentiality = max_confidentiality.min(rule.max_confidentiality);
+        if rule.require_entity_scope && req.entity_scope.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("purpose {purpose:?} requires a non-empty entity_scope"),
+            ));
+        }
+    }
     let (handle, expires_at) = state.minter.mint(
         ScopePayload {
             tenant_id: req.tenant_id,
             principals: req.principals,
             entity_scope: req.entity_scope,
-            max_confidentiality: req.max_confidentiality,
+            max_confidentiality,
             actor_sub: req.actor_sub,
             actor_azp: req.actor_azp,
             expires_at: Utc::now(), // overwritten by mint
@@ -216,12 +322,16 @@ async fn recall(
         text: req.text,
         k: req.k.min(100),
     };
-    state
-        .storage
-        .recall(query)
-        .await
-        .map(Json)
-        .map_err(internal)
+    let summary = query.text.clone();
+    let hits = state.storage.recall(query).await.map_err(internal)?;
+    spawn_audit(
+        &state,
+        &payload,
+        "recall",
+        summary.as_deref(),
+        hits.iter().map(|h| h.chunk_id).collect(),
+    );
+    Ok(Json(hits))
 }
 
 // ---------- get ----------
@@ -254,14 +364,23 @@ async fn get_record(
         None => state.storage.current_fact(payload.tenant_id, &key).await,
     };
     match result {
-        Ok(Some(fact)) => Ok(Json(fact)),
+        Ok(Some(fact)) => {
+            spawn_audit(
+                &state,
+                &payload,
+                "get",
+                Some(&format!("{}/{}/{}", key.source, key.entity_id, key.field)),
+                vec![fact.id],
+            );
+            Ok(Json(fact))
+        }
         Ok(None) => Err((StatusCode::NOT_FOUND, "no value for that key/time".into())),
         Err(e) => Err(internal(e)),
     }
 }
 
-// ---------- ingest (trusted connector plane — not scope-handle gated;
-// authn for connectors arrives with the ingest-token work) ----------
+// ---------- ingest (trusted connector plane — admin-token gated, task 3;
+// not scope-handle gated) ----------
 
 #[derive(Deserialize)]
 struct IngestParams {
@@ -277,9 +396,11 @@ fn default_pk() -> String {
 
 async fn ingest_debezium(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<IngestParams>,
     Json(body): Json<serde_json::Value>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
     let envelopes: Vec<&serde_json::Value> = match &body {
         serde_json::Value::Array(items) => items.iter().collect(),
         one => vec![one],
@@ -351,6 +472,99 @@ async fn ingest_debezium(
     })))
 }
 
+// ---------- ingest: whole documents (connector contract, task 7 of v0.1) ----------
+
+#[derive(Deserialize)]
+struct IngestDocumentsRequest {
+    tenant_id: TenantId,
+    source: String,
+    document_id: String,
+    content: String,
+    #[serde(default)]
+    entities: Vec<String>,
+    /// Materialized principal tokens (see POST /v1/admin/principals).
+    visibility: Vec<PrincipalToken>,
+    /// mirrored | approximated | admin-assigned — the connector must label
+    /// how it derived the visibility set (SPEC §5e). Quarantined is not a
+    /// connector-assignable label.
+    acl_provenance: AclProvenance,
+    #[serde(default)]
+    valid_from: Option<DateTime<Utc>>,
+}
+
+/// POST /v1/ingest/documents (admin): one document version in → one L0
+/// episode + deterministic paragraph chunks out, under connector-supplied
+/// visibility and ACL provenance. The contract the Google Drive connector
+/// codes against.
+async fn ingest_documents(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<IngestDocumentsRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    if req.acl_provenance == AclProvenance::Quarantined {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "acl_provenance must be mirrored, approximated, or admin-assigned".into(),
+        ));
+    }
+    let valid_from = req.valid_from.unwrap_or_else(Utc::now);
+    let content_hash = format!("{:x}", md5ish(&req.content));
+    let episode_id = state
+        .storage
+        .append_episode(NewEpisode {
+            tenant_id: req.tenant_id,
+            source: req.source.clone(),
+            source_entity: Some(req.document_id.clone()),
+            kind: EpisodeKind::DocVersion,
+            payload: serde_json::json!({
+                "document_id": req.document_id,
+                "content_hash": content_hash,
+                "bytes": req.content.len(),
+            }),
+            content_hash: content_hash.clone(),
+            // Connector-mirrored documents track a system of record.
+            trust_tier: TrustTier::Authoritative,
+            writer_sub: None,
+            writer_azp: None,
+        })
+        .await
+        .map_err(internal)?;
+
+    let mut writes = Vec::new();
+    for (seq, content) in media::split_text(&req.content, media::CHUNK_CHARS)
+        .into_iter()
+        .enumerate()
+    {
+        let embedding = state.encode(&content).await.ok().flatten();
+        writes.push(ChunkWrite {
+            tenant_id: req.tenant_id,
+            source: req.source.clone(),
+            document_id: req.document_id.clone(),
+            seq: seq as i32,
+            content,
+            content_hash: format!("{content_hash}-{seq}"),
+            embedding,
+            visibility: req.visibility.clone(),
+            entity_tags: req.entities.clone(),
+            confidentiality: Confidentiality::Internal,
+            trust_tier: TrustTier::Authoritative,
+            valid_from,
+            provenance: episode_id,
+            acl_provenance: req.acl_provenance,
+        });
+    }
+    let chunks_indexed = state
+        .storage
+        .upsert_chunks(writes)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "episode_id": episode_id,
+        "chunks_indexed": chunks_indexed,
+    })))
+}
+
 // ---------- remember ----------
 
 #[derive(Deserialize)]
@@ -416,7 +630,7 @@ async fn remember(
 }
 
 /// Cheap content hash for L0 idempotency metadata (not security-relevant).
-fn md5ish(s: &str) -> u64 {
+pub(crate) fn md5ish(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
@@ -500,15 +714,57 @@ async fn activity(
         actors: vec![],
         limit: p.limit,
     };
-    state
-        .storage
-        .activity(query)
-        .await
-        .map(Json)
-        .map_err(internal)
+    let summary = query.entity.clone();
+    let actions = state.storage.activity(query).await.map_err(internal)?;
+    spawn_audit(
+        &state,
+        &payload,
+        "activity",
+        Some(&summary),
+        actions.iter().map(|a| a.id).collect(),
+    );
+    Ok(Json(actions))
 }
 
-// ---------- admin (trusted plane, same auth seam as ingest) ----------
+// ---------- forget ----------
+
+#[derive(Deserialize)]
+struct ForgetRequest {
+    scope_handle: String,
+    /// {"kind": "chunk"|"episode", "id": "<uuid>"}
+    #[serde(rename = "ref")]
+    reference: ForgetRef,
+    reason: String,
+}
+
+/// memory.forget (task 5): retire a chunk, or an episode plus its derived
+/// chunks/facts and the knowledge retraction cascade. Tenant comes from the
+/// verified scope handle, never the request body.
+async fn forget(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForgetRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let payload = state.verify_scope(&req.scope_handle)?;
+    let retired = state
+        .storage
+        .forget(payload.tenant_id, req.reference, &req.reason)
+        .await
+        .map_err(internal)?;
+    let (kind, id) = match req.reference {
+        ForgetRef::Chunk(id) => ("chunk", id),
+        ForgetRef::Episode(id) => ("episode", id),
+    };
+    spawn_audit(
+        &state,
+        &payload,
+        "forget",
+        Some(&format!("{kind}:{id} reason={}", req.reason)),
+        vec![id],
+    );
+    Ok(Json(serde_json::json!({ "retired": retired })))
+}
+
+// ---------- admin (trusted plane, bearer-token gated — task 3) ----------
 
 #[derive(Deserialize)]
 struct CreateTenantRequest {
@@ -517,14 +773,78 @@ struct CreateTenantRequest {
 
 async fn create_tenant(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CreateTenantRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
     let id = state
         .storage
         .create_tenant(&req.name)
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({ "tenant_id": id })))
+}
+
+#[derive(Deserialize)]
+struct PrincipalsRequest {
+    tenant_id: TenantId,
+    principals: Vec<String>,
+}
+
+/// POST /v1/admin/principals (admin): map source-native principal strings to
+/// materialized int tokens. Allocation is max(token)+1 per tenant inside one
+/// transaction (serialized by a per-tenant advisory lock); existing principals
+/// keep their token forever — connectors can call this idempotently.
+async fn admin_principals(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PrincipalsRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut tx = state.pool().begin().await.map_err(internal)?;
+    // Serialize concurrent allocators for the same tenant so max(token)+1
+    // can't race the UNIQUE (tenant_id, token) constraint into an error.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
+        .bind(req.tenant_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    let mut mappings = serde_json::Map::new();
+    for principal in &req.principals {
+        let existing: Option<i32> = sqlx::query_scalar(
+            "SELECT token FROM principals WHERE tenant_id = $1 AND principal = $2",
+        )
+        .bind(req.tenant_id)
+        .bind(principal)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let token = match existing {
+            Some(t) => t,
+            None => {
+                let next: i32 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(token), 0) + 1 FROM principals WHERE tenant_id = $1",
+                )
+                .bind(req.tenant_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal)?;
+                sqlx::query(
+                    "INSERT INTO principals (tenant_id, principal, token) VALUES ($1, $2, $3)",
+                )
+                .bind(req.tenant_id)
+                .bind(principal)
+                .bind(next)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+                next
+            }
+        };
+        mappings.insert(principal.clone(), serde_json::json!(token));
+    }
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "mappings": mappings })))
 }
 
 // ---------- brief ----------
@@ -559,6 +879,17 @@ async fn brief(
     );
     let memory = memory.map_err(internal)?;
     let actions = actions.map_err(internal)?;
+    spawn_audit(
+        &state,
+        &payload,
+        "brief",
+        Some(&entity),
+        memory
+            .iter()
+            .map(|h| h.chunk_id)
+            .chain(actions.iter().map(|a| a.id))
+            .collect(),
+    );
     Ok(Json(serde_json::json!({
         "entity": entity,
         "generated_at": Utc::now(),
@@ -609,11 +940,13 @@ struct ListKnowledgeParams {
     status: Option<KnowledgeStatus>,
 }
 
-/// Review queue (admin/audit plane — same auth seam as ingest).
+/// Review queue (admin/audit plane — bearer-token gated, task 3).
 async fn list_knowledge(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<ListKnowledgeParams>,
 ) -> HandlerResult<Json<Vec<KnowledgeItem>>> {
+    state.admin.check(&headers)?;
     state
         .storage
         .list_knowledge(p.tenant_id, p.status)
@@ -637,9 +970,11 @@ fn default_k_min() -> i32 {
 
 async fn publish_knowledge(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<uuid::Uuid>,
     Json(req): Json<PublishKnowledgeRequest>,
 ) -> HandlerResult<Json<KnowledgeItem>> {
+    state.admin.check(&headers)?;
     // k_min is clamped server-side: k=2 lets either supporting party infer
     // the other's interaction (SPEC v1.3 §2).
     let k_min = req.k_min.max(3);
@@ -668,6 +1003,6 @@ async fn publish_knowledge(
         })
 }
 
-fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
+pub(crate) fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
