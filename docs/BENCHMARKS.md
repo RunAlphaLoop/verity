@@ -155,3 +155,75 @@ identical, RRF unaffected; `entity_tags <@` subset filtering remains a heap filt
 (now small) pushed-down candidate set — add an entity-bound+broad-visibility bench case
 before claiming that combination; one bm25 index per table means the migration briefly
 drops search availability during rebuild (~1.6s at 1M).
+
+---
+
+## 2026-07-09 (later) — QPS under load, and the entity-bound BM25 breach
+
+**Setup:** 1,000,000 chunks, same machine/profile (Apple M3 Pro / 36 GB, ParadeDB pg17 in
+Docker). Two `verity-bench` additions: a `load` subcommand (the SPEC §4d follow-up flagged
+in finding 5 of the first entry) and the entity-bound BM25 case the 0004 entry said to add
+before claiming that combination. All numbers are **in-process adapter calls — no HTTP hop,
+no query encoder** (dense/hybrid end-to-end adds ~12ms p50 of client CPU per the encoder
+entry). One shared adapter, 16-connection pool.
+
+**New latency case** (`run --queries 200`, k=10): principals=[broad token] AND
+entity_scope=["account:0"] — broad visibility maximizes the Tantivy-pushed-down candidate
+set that the heap-side `entity_tags <@` filter must then chew through.
+
+| Case (1M chunks) | p50 | p95 | p99 |
+|---|---|---|---|
+| BM25 entity-bound + broad visibility | **542.7ms** | **724.5ms** | 955.4ms |
+
+Same run re-confirmed the existing cases (dense @1% 13.7/17.6ms p50/p95, BM25 @1%
+16.3/21.1ms, hybrid @1% 16.7/18.9ms, get 0.30/0.43ms — all consistent with prior entries).
+
+**Load** (`load --sweep --duration-secs 20`): closed loop, zero think time; N tokio tasks
+each looping a mixed workload — 70% hybrid recall (random 2-word text + random unit vector,
+1%-selectivity token), 20% `current_fact` point reads, 10% `activity()` timeline reads.
+Latencies are under-load and include waiting for one of the pool's 16 connections — at N=64
+that queueing is the measurement, not an artifact.
+
+| N | overall QPS | hybrid p50/p95/p99 | current_fact p50/p95/p99 | activity p50/p95/p99 |
+|---|---|---|---|---|
+| 4 | 166 | 32.7 / 48.9 / 60.6ms | 1.2 / 5.4 / 10.5ms | 1.3 / 4.9 / 7.9ms |
+| 16 | 167 | 115.1 / 170.4 / 212.4ms | 41.5 / 68.7 / 84.7ms | 42.7 / 68.1 / 84.9ms |
+| 64 | 170 | 388.4 / 513.3 / 582.1ms | 317.4 / 428.8 / 508.7ms | 311.0 / 410.1 / 500.7ms |
+
+(Per-type throughput is flat across the sweep: ~117 hybrid ops/s, ~34 get ops/s, ~16
+activity ops/s — the 70/20/10 mix at saturation.)
+
+**Findings:**
+
+1. **This box saturates at ~165–170 QPS for this mix, and it saturates by concurrency 4.**
+   Tripling and then 16x-ing the offered concurrency buys zero throughput — only queue
+   depth; p50 grows ~linearly with N (Little's law behavior, server-side bottleneck in
+   Postgres, not the client loop). The honest operating point is N=4: hybrid recall
+   48.9ms p95 *excluding* the encoder — with the ~12ms encode added, hybrid under load is
+   already outside the 50ms p95 envelope even at low concurrency.
+2. **SPEC §4d targets are not met on this setup, with caveats.** Target: ≥300 QPS hybrid
+   recall at p95 <50ms per 8-vCPU serving node; measured: ~117 hybrid ops/s inside a
+   166-QPS mix, on a laptop running Postgres under a Docker VM — not the reference shape,
+   and a recall-heavy 70/20/10 mix rather than §4d's 80/20 get/recall load model. The gap
+   (~2.5x) is real enough that it won't be closed by hardware relabeling alone; measuring
+   on the reference shape and a get-dominated mix is the required next pass.
+3. **Point reads queue behind recall under load:** `current_fact` p95 is 5.4ms at N=4
+   (vs 0.43ms idle) and hundreds of ms at N=64 — on a shared pool, 30ms hybrid queries
+   head-of-line-block sub-ms gets. The §4d get target (≥5k QPS at p95 <5ms) cannot be met
+   from the same undifferentiated pool; the planned L3 in-memory projection (or a
+   dedicated fast-path pool) is the designed fix, and a get-only load run should measure
+   the ceiling separately.
+4. **Entity-bound + broad-visibility BM25 is the worst number ever recorded here: 724ms
+   p95, ~14x the envelope.** The 0004 caveat is confirmed, not theoretical: visibility and
+   validity are pushed into Tantivy, but with the broad token the pushed-down candidate
+   set is essentially the whole text-match set, and `entity_tags <@` heap-filters all of
+   it. Dense recall is immune (the selectivity router sends tiny entity-bound subsets to
+   exact scan — account:0 covers ~100 chunks at 1M). Candidate fixes, in order: route the
+   sparse leg through the same selectivity router (entity-bound scopes are ~0.01%
+   selective — exact term matching over ~100 rows is microseconds), or push entity_tags
+   into the Tantivy boolean (term_set is exact for the single-tag chunks this corpus has,
+   but `<@` subset semantics for multi-tag chunks need care).
+5. Honesty notes: the bench tenant's activity timeline holds only 2 rows (~200 table-wide),
+   so the activity column measures the scoped timeline query at trivial table size — path
+   coverage, not a scale claim. No HTTP hop, no rate limiting, no encoder anywhere in the
+   load loop; a served deployment adds all three.

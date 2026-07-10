@@ -398,6 +398,163 @@ async fn run(adapter: &PostgresAdapter, n_queries: usize, k: usize) -> Result<()
     Ok(())
 }
 
+/// The mixed-workload op types, in workload-share order.
+const LOAD_OPS: &[&str] = &["hybrid recall @ 1%", "current_fact", "activity"];
+
+/// QPS-under-load (SPEC §4d): closed-loop, zero think time. Each of N tokio
+/// tasks loops the 70/20/10 mix until the deadline; latencies are recorded
+/// under load (they include any wait for one of the adapter pool's 16
+/// connections — at N > 16 that queueing is the point of the measurement).
+async fn load(
+    adapter: Arc<PostgresAdapter>,
+    levels: &[usize],
+    duration_secs: u64,
+    k: usize,
+) -> Result<()> {
+    let tenant = adapter.create_tenant("bench").await?;
+    let corpus: i64 = sqlx::query_scalar("SELECT count(*) FROM chunks WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(adapter.pool())
+        .await?;
+    println!(
+        "corpus: {corpus} chunks, k={k}, {duration_secs}s per level, mix: 70% hybrid recall @ 1% / 20% current_fact / 10% activity\n"
+    );
+
+    let mut report = Vec::new();
+    for &concurrency in levels {
+        report.push(load_at(&adapter, tenant, concurrency, duration_secs, k).await?);
+        println!();
+    }
+
+    std::fs::create_dir_all("bench-results")?;
+    let path = format!(
+        "bench-results/load-{}.json",
+        Utc::now().format("%Y%m%dT%H%M%S")
+    );
+    std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+    println!("results written to {path}");
+    println!("(corpus={corpus}; in-process adapter calls — no HTTP hop, no query encoder; closed loop, zero think time)");
+    Ok(())
+}
+
+async fn load_at(
+    adapter: &Arc<PostgresAdapter>,
+    tenant: TenantId,
+    concurrency: usize,
+    duration_secs: u64,
+    k: usize,
+) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let started = Instant::now();
+
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let adapter = Arc::clone(adapter);
+        handles.push(tokio::spawn(async move {
+            let mut rng = StdRng::from_os_rng();
+            let mut hists = [
+                Histogram::<u64>::new(3)?,
+                Histogram::<u64>::new(3)?,
+                Histogram::<u64>::new(3)?,
+            ];
+            while Instant::now() < deadline {
+                let roll: f64 = rng.random();
+                let (op, t) = if roll < 0.7 {
+                    let query = RecallQuery {
+                        scope: Scope {
+                            tenant_id: tenant,
+                            principals: vec![2], // the 1% selectivity token
+                            entity_scope: vec![],
+                            max_confidentiality: Confidentiality::Confidential,
+                        },
+                        embedding: Some(random_unit_vector(&mut rng)),
+                        text: Some(format!(
+                            "{} {}",
+                            WORDS.choose(&mut rng).expect("word pool"),
+                            WORDS.choose(&mut rng).expect("word pool")
+                        )),
+                        k,
+                    };
+                    let t = Instant::now();
+                    adapter.recall(query).await?;
+                    (0, t)
+                } else if roll < 0.9 {
+                    let key = FactKey {
+                        source: "bench".into(),
+                        entity_id: format!("account-{}", rng.random_range(0..1000)),
+                        field: "field-0".into(),
+                    };
+                    let t = Instant::now();
+                    adapter.current_fact(tenant, &key).await?;
+                    (1, t)
+                } else {
+                    let query = ActivityQuery {
+                        scope: Scope {
+                            tenant_id: tenant,
+                            principals: vec![BROAD_TOKEN],
+                            entity_scope: vec![],
+                            max_confidentiality: Confidentiality::Confidential,
+                        },
+                        entity: format!("account:{}", rng.random_range(0..1000)),
+                        since: None,
+                        action_types: vec![],
+                        actors: vec![],
+                        limit: 20,
+                    };
+                    let t = Instant::now();
+                    adapter.activity(query).await?;
+                    (2, t)
+                };
+                hists[op].record(t.elapsed().as_micros() as u64)?;
+            }
+            anyhow::Ok(hists)
+        }));
+    }
+
+    let mut merged = [
+        Histogram::<u64>::new(3)?,
+        Histogram::<u64>::new(3)?,
+        Histogram::<u64>::new(3)?,
+    ];
+    for handle in handles {
+        let hists = handle.await??;
+        for (m, h) in merged.iter_mut().zip(hists.iter()) {
+            m.add(h)?;
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let total_ops: u64 = merged.iter().map(|h| h.len()).sum();
+    println!(
+        "concurrency {concurrency:>3}: {total_ops} ops in {elapsed:.1}s = {:.0} QPS overall",
+        total_ops as f64 / elapsed
+    );
+    let mut per_op = Vec::new();
+    for (label, hist) in LOAD_OPS.iter().zip(merged.iter()) {
+        let (p50, p95, p99) = (
+            hist.value_at_quantile(0.50) as f64 / 1000.0,
+            hist.value_at_quantile(0.95) as f64 / 1000.0,
+            hist.value_at_quantile(0.99) as f64 / 1000.0,
+        );
+        let throughput = hist.len() as f64 / elapsed;
+        println!(
+            "  {label:<24} {:>8} ops  {throughput:>8.1} ops/s  p50 {p50:>7.2}ms  p95 {p95:>7.2}ms  p99 {p99:>7.2}ms",
+            hist.len()
+        );
+        per_op.push(serde_json::json!({
+            "op": label, "ops": hist.len(), "ops_per_sec": throughput,
+            "p50_ms": p50, "p95_ms": p95, "p99_ms": p99,
+        }));
+    }
+    Ok(serde_json::json!({
+        "concurrency": concurrency,
+        "duration_secs": elapsed,
+        "total_ops": total_ops,
+        "qps": total_ops as f64 / elapsed,
+        "ops": per_op,
+    }))
+}
+
 /// Local query-encoder latency (SPEC §4a): tokenizer + MiniLM-L6 ONNX forward
 /// pass + mean-pool + normalize, per short synthetic query. This is the cost
 /// every published dense/hybrid recall number must carry on cache misses.
