@@ -187,6 +187,40 @@ pub fn require_visibility(raw: Option<&str>, example: &str) -> Vec<i32> {
     tokens
 }
 
+// ---------- interactive prompts (the connect wizards) ----------
+
+/// Ask on stderr, read one trimmed line from stdin. stderr keeps prompts out
+/// of pipelines (`--dry-run` output stays clean when stdout is redirected).
+pub fn prompt_line(label: &str) -> Result<String> {
+    use std::io::{BufRead, Write};
+    eprint!("  {label}: ");
+    std::io::stderr().flush().ok();
+    let mut buf = String::new();
+    let n = std::io::stdin()
+        .lock()
+        .read_line(&mut buf)
+        .context("cannot read from stdin")?;
+    if n == 0 {
+        bail!("stdin closed while waiting for the {label}");
+    }
+    Ok(buf.trim().to_string())
+}
+
+/// Like `prompt_line`, but with echo disabled when stdin is a terminal —
+/// tokens should not linger on screen. Piped stdin (scripts, tests) has
+/// nothing to hide and falls back to a plain line read.
+pub fn prompt_secret(label: &str) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return prompt_line(label);
+    }
+    eprint!("  {label} {}: ", ui::dim("(input hidden)"));
+    std::io::stderr().flush().ok();
+    let secret = rpassword::read_password().context("cannot read the token from the terminal")?;
+    eprintln!(); // read_password suppresses the echo of Enter too
+    Ok(secret.trim().to_string())
+}
+
 // ---------- repo discovery ----------
 
 /// Find the verity checkout (the dir holding deploy/docker-compose.yml):

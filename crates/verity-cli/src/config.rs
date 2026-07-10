@@ -27,6 +27,27 @@ pub struct Config {
     /// re-minted without re-running `dev`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principals: Option<Vec<i32>>,
+    /// Source credentials written by the `connect` wizards (BYOT, SPEC §5e.2).
+    /// Last field on purpose: TOML wants tables after scalar values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors: Option<Connectors>,
+}
+
+/// `[connectors.*]` — one optional table per BYOT source wizard.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Connectors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slack: Option<SlackConnector>,
+}
+
+/// `[connectors.slack]` — the two tokens `verity-cli connect slack` collects.
+/// They live in this 0600 file only; the CLI never sends them anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackConnector {
+    /// App-level token (`xapp-…`): opens the Socket Mode WebSocket.
+    pub app_token: String,
+    /// Bot token (`xoxb-…`): Web API reads under the app's bot user.
+    pub bot_token: String,
 }
 
 pub fn default_path() -> Result<PathBuf> {

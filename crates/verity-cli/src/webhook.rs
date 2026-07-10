@@ -6,13 +6,18 @@ use anyhow::{bail, Context, Result};
 
 use crate::{ui, util, Ctx};
 
-pub async fn mint(ctx: &Ctx, name: &str, visibility: Option<&str>) -> Result<()> {
-    let tokens = util::require_visibility(
-        visibility,
-        &format!("verity-cli webhook mint {name} --visibility 1"),
-    );
-    let tenant = util::require_tenant(ctx)?;
+/// A freshly minted webhook: the server-relative ingest path (`/wh/<token>`,
+/// where the token IS the credential and only its hash persists) plus the id
+/// used for revocation (`DELETE /v1/webhooks/{id}`).
+pub struct Minted {
+    pub id: String,
+    pub path: String,
+}
 
+/// POST /v1/webhooks — shared by `webhook mint` and the `connect` wizards
+/// (SPEC §5e.1 entry point #4). Visibility is bound at mint time.
+pub async fn mint_raw(ctx: &Ctx, name: &str, tokens: &[i32], next_step: &str) -> Result<Minted> {
+    let tenant = util::require_tenant(ctx)?;
     let mut req = ctx
         .http
         .post(format!("{}/v1/webhooks", ctx.url))
@@ -32,14 +37,30 @@ pub async fn mint(ctx: &Ctx, name: &str, visibility: Option<&str>) -> Result<()>
             ctx.config_path.display()
         );
     }
-    let json = util::expect_json(
-        status,
-        &body,
+    let json = util::expect_json(status, &body, next_step)?;
+    Ok(Minted {
+        id: json["webhook_id"].as_str().unwrap_or("?").to_string(),
+        path: json["url"]
+            .as_str()
+            .context("mint response carries url")?
+            .to_string(),
+    })
+}
+
+pub async fn mint(ctx: &Ctx, name: &str, visibility: Option<&str>) -> Result<()> {
+    let tokens = util::require_visibility(
+        visibility,
+        &format!("verity-cli webhook mint {name} --visibility 1"),
+    );
+    let minted = mint_raw(
+        ctx,
+        name,
+        &tokens,
         "fix the request and re-run `verity-cli webhook mint`",
-    )?;
-    let path = json["url"].as_str().context("mint response carries url")?;
-    let full = format!("{}{path}", ctx.url);
-    let id = json["webhook_id"].as_str().unwrap_or("?");
+    )
+    .await?;
+    let full = format!("{}{}", ctx.url, minted.path);
+    let id = minted.id.as_str();
 
     ui::banner(&format!("webhook \"{name}\" minted"));
     println!();

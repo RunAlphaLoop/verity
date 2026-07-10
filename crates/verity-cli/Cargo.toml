@@ -21,3 +21,6 @@ clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }
+# No-echo token prompts for the `connect` credential wizards (tty only;
+# piped stdin falls back to plain line reads so scripts still work).
+rpassword = "7"

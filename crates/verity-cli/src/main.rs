@@ -11,6 +11,7 @@
 
 mod add;
 mod config;
+mod connect;
 mod dev;
 mod mcp;
 mod query;
@@ -98,6 +99,11 @@ tokens (POST /v1/scopes, actor cli:add) and uploads under that handle."
         #[command(subcommand)]
         command: WebhookCommand,
     },
+    /// BYOT source wizards: credentials created in YOUR tenant, never ours.
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommand,
+    },
     /// Watch the quarantine: payloads Verity refused to index permissively.
     Tail {
         /// Fetch and print once instead of polling every 2s.
@@ -124,6 +130,35 @@ enum WebhookCommand {
         /// readable by (payloads may narrow this set, never widen it).
         #[arg(long)]
         visibility: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectCommand {
+    /// Slack via app-from-manifest (~3 min): Socket Mode, no public URL;
+    /// tokens stay in the 0600 config file for the upcoming connector.
+    Slack {
+        /// Print only the bare manifest JSON on stdout (pipeable) and exit.
+        #[arg(long)]
+        print_manifest_only: bool,
+    },
+    /// GitHub repo webhook via a fine-grained PAT — pasted once, used for
+    /// one API call, never stored anywhere.
+    Github {
+        /// Repository as owner/name, e.g. acme/website (prompted if omitted).
+        repo: Option<String>,
+        /// REQUIRED. Comma-separated principal tokens every delivered payload
+        /// will be readable by — bound into the minted webhook URL.
+        #[arg(long)]
+        visibility: Option<String>,
+        /// REQUIRED. Public https base URL GitHub can reach this Verity
+        /// server at (GitHub delivers from its own cloud).
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Mint the Verity webhook, then print the GitHub API request that
+        /// WOULD be sent instead of sending it (no PAT asked for).
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -195,6 +230,26 @@ async fn run() -> Result<()> {
         Command::Webhook { command } => match command {
             WebhookCommand::Mint { name, visibility } => {
                 webhook::mint(&ctx, &name, visibility.as_deref()).await
+            }
+        },
+        Command::Connect { command } => match command {
+            ConnectCommand::Slack {
+                print_manifest_only,
+            } => connect::slack(&mut ctx, print_manifest_only).await,
+            ConnectCommand::Github {
+                repo,
+                visibility,
+                public_url,
+                dry_run,
+            } => {
+                connect::github(
+                    &ctx,
+                    repo.as_deref(),
+                    visibility.as_deref(),
+                    public_url.as_deref(),
+                    dry_run,
+                )
+                .await
             }
         },
         Command::Tail { once } => tail::run(&ctx, once).await,
