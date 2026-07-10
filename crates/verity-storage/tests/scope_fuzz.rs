@@ -241,7 +241,59 @@ async fn no_read_path_leaks_across_scopes() {
             }
         }
 
-        // Path 3: activity timeline, for a random entity.
+        // Path 3: latest_chunks (the brief's memory section), for a random entity.
+        let brief_entity = ENTITIES.choose(&mut rng).unwrap().to_string();
+        let latest = adapter
+            .latest_chunks(&scope, &brief_entity, 100)
+            .await
+            .unwrap();
+        probes += 1;
+        for hit in &latest {
+            assert!(
+                hit.entity_tags.contains(&brief_entity),
+                "LEAK via latest_chunks: {} returned for entity {brief_entity} it isn't tagged with",
+                hit.document_id
+            );
+            let entity_query_ok =
+                scope.entity_scope.is_empty() || scope.entity_scope.contains(&brief_entity);
+            if let Some(model) = chunk_by_doc(&hit.document_id) {
+                assert!(
+                    model
+                        .visibility
+                        .iter()
+                        .any(|t| scope.principals.contains(t))
+                        && model.confidentiality <= scope.max_confidentiality as i16
+                        && entity_query_ok,
+                    "LEAK via latest_chunks: scope {scope:?} got {} (vis {:?}, conf {})",
+                    hit.document_id,
+                    model.visibility,
+                    model.confidentiality
+                );
+                assert!(
+                    !model.superseded || hit.content.contains("current"),
+                    "STALE LEAK via latest_chunks: superseded {} returned",
+                    hit.document_id
+                );
+            } else {
+                // Action-derived chunk: check against the action model.
+                let id = hit.document_id.trim_start_matches("action:");
+                let model = action_models
+                    .iter()
+                    .find(|a| a.action_id == id)
+                    .expect("chunk maps to a seeded chunk or action");
+                assert!(
+                    model
+                        .visibility
+                        .iter()
+                        .any(|t| scope.principals.contains(t))
+                        && model.confidentiality <= scope.max_confidentiality as i16
+                        && entity_query_ok,
+                    "LEAK via latest_chunks: scope {scope:?} got action chunk {id}"
+                );
+            }
+        }
+
+        // Path 4: activity timeline, for a random entity.
         let entity = ENTITIES.choose(&mut rng).unwrap().to_string();
         let acts = adapter
             .activity(ActivityQuery {

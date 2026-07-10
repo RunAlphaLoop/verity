@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
         .route("/v1/ingest/debezium", post(ingest_debezium))
+        .route("/v1/briefs/{entity}", get(brief))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -497,6 +498,47 @@ async fn activity(
         .await
         .map(Json)
         .map_err(internal)
+}
+
+// ---------- brief ----------
+
+#[derive(Deserialize)]
+struct BriefQuery {
+    scope_handle: String,
+}
+
+/// The entity brief (SPEC §2 L3, v0.1 deterministic form): current state of an
+/// entity in one call — newest memory + recent agent activity. Assembled
+/// on-read under the CALLER's scope, so derived-visibility inheritance is
+/// trivially correct; precomputed briefs with lineage-intersection visibility
+/// arrive with the async L3 workers.
+async fn brief(
+    State(state): State<Arc<AppState>>,
+    Path(entity): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<BriefQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let payload = state.verify_scope(&q.scope_handle)?;
+    let scope = payload.to_scope();
+    let (memory, actions) = tokio::join!(
+        state.storage.latest_chunks(&scope, &entity, 10),
+        state.storage.activity(ActivityQuery {
+            scope: scope.clone(),
+            entity: entity.clone(),
+            since: None,
+            action_types: vec![],
+            actors: vec![],
+            limit: 10,
+        })
+    );
+    let memory = memory.map_err(internal)?;
+    let actions = actions.map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "entity": entity,
+        "generated_at": Utc::now(),
+        "recent_memory": memory,
+        "recent_activity": actions,
+        // L1 record linkage lands with cross-source entity resolution (§7f).
+    })))
 }
 
 fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {

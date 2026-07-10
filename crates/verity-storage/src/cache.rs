@@ -95,6 +95,15 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.record_action(action).await
     }
 
+    async fn latest_chunks(
+        &self,
+        scope: &Scope,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>> {
+        self.inner.latest_chunks(scope, entity, limit).await
+    }
+
     async fn retire_entity(
         &self,
         tenant: TenantId,

@@ -53,6 +53,16 @@ pub trait StorageAdapter: Send + Sync {
     /// entities it covers.
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>>;
 
+    /// Newest current chunks for an entity — the brief's memory section and a
+    /// timeline-style read. Same scope contract as `recall`; ordered by
+    /// valid_from descending.
+    async fn latest_chunks(
+        &self,
+        scope: &Scope,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>>;
+
     /// Source hard-delete propagation (SPEC §8c, bi-temporal half): close all
     /// current facts for an entity at `deleted_at`. History stays queryable
     /// via `fact_as_of`; crypto-shred hard purge is a separate admin pipeline.

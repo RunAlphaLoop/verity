@@ -158,6 +158,14 @@ struct ActivityParams {
     limit: Option<u32>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BriefParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// Entity to brief, e.g. "account:acme-corp".
+    entity: String,
+}
+
 // ---------- REST proxy plumbing ----------
 
 impl VerityMcp {
@@ -313,6 +321,21 @@ impl VerityMcp {
             query.push(("limit", limit.to_string()));
         }
         let req = self.http.get(self.endpoint("/v1/activity")).query(&query);
+        self.proxy(req).await
+    }
+
+    #[tool(
+        name = "memory_brief",
+        description = "One-call current state of an entity: its newest memory (observations, documents, actions) plus the recent agent activity timeline. Call this FIRST when starting work on an entity — it replaces several recall/activity round-trips."
+    )]
+    async fn memory_brief(
+        &self,
+        Parameters(p): Parameters<BriefParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let req = self
+            .http
+            .get(self.endpoint(&format!("/v1/briefs/{}", p.entity)))
+            .query(&[("scope_handle", p.scope_handle)]);
         self.proxy(req).await
     }
 

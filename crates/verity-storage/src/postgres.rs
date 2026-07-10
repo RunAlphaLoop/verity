@@ -482,6 +482,43 @@ impl StorageAdapter for PostgresAdapter {
         Ok(true)
     }
 
+    async fn latest_chunks(
+        &self,
+        scope: &Scope,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>> {
+        if scope.principals.is_empty() {
+            return Ok(Vec::new());
+        }
+        // An entity-bound scope may only read entities it covers (same rule
+        // as activity()).
+        if !scope.entity_scope.is_empty() && !scope.entity_scope.contains(&entity.to_string()) {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, document_id, seq, content, entity_tags, trust_tier, valid_from, provenance,
+                    0.0::float8 AS score
+             FROM chunks
+             WHERE tenant_id = $1
+               AND valid_to IS NULL
+               AND entity_tags @> ARRAY[$2]::text[]
+               AND visibility && $3
+               AND confidentiality <= $4
+             ORDER BY valid_from DESC
+             LIMIT $5",
+        )
+        .bind(scope.tenant_id)
+        .bind(entity)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
+        .bind(limit.clamp(1, 100) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_hit).collect()
+    }
+
     async fn retire_entity(
         &self,
         tenant: TenantId,
