@@ -8,6 +8,35 @@
 //! sub/azp come from process configuration (env/CLI), and tool schemas do not
 //! expose them. The only cross-call state an agent holds is the scope handle
 //! minted by `memory_open_scope`, which it passes back to every other verb.
+//!
+//! # Change notifications: a poll tool, not MCP resource subscriptions
+//!
+//! Verity's server pushes changes over SSE (`GET /v1/subscribe`), and rmcp
+//! 2.2 *can* forward pushes to the client: `Peer<RoleServer>` is cloneable
+//! into background tasks and exposes `notify_resource_updated`, and
+//! `ServerHandler::subscribe`/`unsubscribe` are overridable, so bridging the
+//! SSE feed to `notifications/resources/updated` is mechanically possible.
+//! It would not be useful over stdio today, and we deliberately do not do it:
+//!
+//! - Agent hosts drive **tools**, not resources — mainstream MCP clients
+//!   neither subscribe to resources nor deliver update notifications into
+//!   the model's context, and an agent cannot react mid-turn to a push in
+//!   any case (a notification has no delivery channel until the next turn).
+//! - `notifications/resources/updated` carries no payload — only the URI —
+//!   so the client must re-read to learn what changed; a pull surface would
+//!   be required even with the bridge in place.
+//! - The bridge would add durable per-subscription background tasks keyed to
+//!   scope handles that expire, in a proxy that is otherwise stateless.
+//!
+//! So the pull surface is exposed directly: [`memory_poll_changes`] — a
+//! cursor-disciplined one-shot poll built on the existing REST reads
+//! (`GET /v1/activity?since=` for actions, `GET /v1/briefs/{entity}` for new
+//! memory chunks, filtered client-side by `valid_from > since`). Agents call
+//! it between turns, which is the honest MCP delivery model. If hosts grow
+//! real subscription support, the SSE bridge can be added later without
+//! changing this tool.
+//!
+//! [`memory_poll_changes`]: VerityMcp::memory_poll_changes
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
@@ -243,6 +272,21 @@ struct ForgetParams {
     reason: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct PollChangesParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// Entities to watch, e.g. ["account:acme-corp"]. Each must be visible
+    /// to the scope; out-of-scope entities silently yield no changes
+    /// (fail closed).
+    entities: Vec<String>,
+    /// The cursor: only changes strictly after this instant are returned
+    /// (RFC 3339, e.g. "2026-07-09T17:41:02Z"). First call: use the moment
+    /// your task started. Every later call: pass back the previous result's
+    /// `next_since` verbatim.
+    since: DateTime<Utc>,
+}
+
 // ---------- REST proxy plumbing ----------
 
 impl VerityMcp {
@@ -291,6 +335,28 @@ impl VerityMcp {
     ) -> Result<CallToolResult, ErrorData> {
         self.proxy(self.http.post(self.endpoint(path)).json(body))
             .await
+    }
+
+    /// GET returning parsed JSON, for tools that combine several REST reads
+    /// (memory_poll_changes). Errors are tool-visible strings.
+    async fn get_json(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .get(self.endpoint(path))
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| format!("verity server unreachable at {}: {e}", self.config.url))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("verity REST error {status} on {path}: {body}"));
+        }
+        serde_json::from_str(&body).map_err(|e| format!("invalid JSON from {path}: {e}"))
     }
 
     /// Multipart POST /v1/files: fields `scope_handle`, `entities`
@@ -399,7 +465,61 @@ fn file_name_from_url(url: &reqwest::Url) -> String {
         .to_owned()
 }
 
-// ---------- the thirteen tools (SPEC §9a naming, snake_case) ----------
+// ---------- local helpers for memory_poll_changes ----------
+
+/// Parse an RFC 3339 timestamp field out of a server JSON record.
+fn record_timestamp(record: &serde_json::Value, field: &str) -> Option<DateTime<Utc>> {
+    record
+        .get(field)?
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// Fold one entity's REST reads into cursor-ordered changes: actions from
+/// `/v1/activity` keyed on `occurred_at` (the field the server's `since`
+/// filter compares against, inclusively — hence the strict `>` here so a
+/// re-poll at `next_since` doesn't repeat the boundary change), and brief
+/// `recent_memory` chunks keyed on `valid_from`. Action-derived chunks
+/// (document_id "action:…") are skipped — the action leg already reports
+/// them. Records without a parseable timestamp cannot be positioned on the
+/// cursor and are dropped.
+fn changes_for_entity(
+    since: DateTime<Utc>,
+    entity: &str,
+    actions: &[serde_json::Value],
+    memory: &[serde_json::Value],
+) -> Vec<(DateTime<Utc>, serde_json::Value)> {
+    let action_changes = actions.iter().filter_map(|record| {
+        let at = record_timestamp(record, "occurred_at").filter(|at| *at > since)?;
+        Some((at, "action", record))
+    });
+    let memory_changes = memory.iter().filter_map(|record| {
+        let from_action = record
+            .get("document_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id.starts_with("action:"));
+        if from_action {
+            return None;
+        }
+        let at = record_timestamp(record, "valid_from").filter(|at| *at > since)?;
+        Some((at, "memory", record))
+    });
+    action_changes
+        .chain(memory_changes)
+        .map(|(at, kind, record)| {
+            let change = serde_json::json!({
+                "entity": entity,
+                "kind": kind,
+                "at": at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                "record": record,
+            });
+            (at, change)
+        })
+        .collect()
+}
+
+// ---------- the fourteen tools (SPEC §9a naming, snake_case) ----------
 
 #[tool_router]
 impl VerityMcp {
@@ -504,6 +624,64 @@ impl VerityMcp {
         }
         let req = self.http.get(self.endpoint("/v1/activity")).query(&query);
         self.proxy(req).await
+    }
+
+    #[tool(
+        name = "memory_poll_changes",
+        description = "Poll for changes on watched entities since a cursor — the pull-based change feed. MCP delivers no pushes into a running turn, so call this periodically BETWEEN turns or task steps (e.g. before each new step on an entity) to learn what other agents did meanwhile. Returns, per watched entity, actions recorded by other agents and new memory (observations, ingested documents, webhook writes), oldest first, plus `next_since`. CURSOR DISCIPLINE: first call — pass `since` = the moment your task started; every later call — pass back the previous result's `next_since` VERBATIM (never invent, round, or reuse an older cursor; on a failed poll retry with the same cursor). Everything is scope-filtered: entities outside the scope yield nothing (fail closed). Note: the memory leg inspects each entity's 10 newest chunks, so poll more often than an entity gains 10 memories."
+    )]
+    async fn memory_poll_changes(
+        &self,
+        Parameters(p): Parameters<PollChangesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let since_str = p.since.to_rfc3339_opts(SecondsFormat::Micros, true);
+        let mut changes: Vec<(DateTime<Utc>, serde_json::Value)> = Vec::new();
+        for entity in &p.entities {
+            // Action leg: the server's `since` bounds the fetch (inclusive,
+            // on occurred_at); changes_for_entity re-filters strictly.
+            let activity = self
+                .get_json(
+                    "/v1/activity",
+                    &[
+                        ("scope_handle", p.scope_handle.clone()),
+                        ("entity", entity.clone()),
+                        ("since", since_str.clone()),
+                        ("limit", "500".to_owned()),
+                    ],
+                )
+                .await;
+            // Memory leg: the entity brief's newest chunks, filtered
+            // client-side by valid_from > since.
+            let brief = self
+                .get_json(
+                    &format!("/v1/briefs/{entity}"),
+                    &[("scope_handle", p.scope_handle.clone())],
+                )
+                .await;
+            // Any failed read fails the whole poll: a partial result with an
+            // advanced next_since would silently skip changes. The agent
+            // retries with the same cursor.
+            let (activity, brief) = match (activity, brief) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => return tool_error(e),
+            };
+            let actions = activity.as_array().cloned().unwrap_or_default();
+            let memory = brief
+                .get("recent_memory")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            changes.extend(changes_for_entity(p.since, entity, &actions, &memory));
+        }
+        changes.sort_by_key(|(at, _)| *at);
+        let next_since = changes.last().map_or(p.since, |(at, _)| *at);
+        let result = serde_json::json!({
+            "changes": changes.into_iter().map(|(_, c)| c).collect::<Vec<_>>(),
+            "next_since": next_since.to_rfc3339_opts(SecondsFormat::Micros, true),
+        });
+        let text = serde_json::to_string_pretty(&result)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -752,6 +930,8 @@ impl ServerHandler for VerityMcp {
                 "Verity: permission-aware shared memory for agents. Workflow: \
                  memory_open_scope once to get a scope_handle, then pass it to every \
                  other tool. Check memory_activity before side-effecting actions; \
+                 poll memory_poll_changes between turns to see what other agents \
+                 changed (pass each result's next_since back as the next cursor); \
                  record completed actions with memory_record_action; persist durable \
                  knowledge with memory_remember; ingest documents with \
                  memory_ingest_text / memory_ingest_file / memory_ingest_url; \
@@ -777,7 +957,67 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_name_from_url, html_to_text};
+    use super::{changes_for_entity, file_name_from_url, html_to_text};
+    use chrono::{DateTime, Utc};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn changes_are_strictly_after_the_cursor_and_carry_positions() {
+        let since = ts("2026-07-10T12:00:00Z");
+        let actions = vec![
+            // At the cursor exactly: the server's inclusive `since` returns
+            // it, the strict client filter must drop it (already reported).
+            serde_json::json!({"occurred_at": "2026-07-10T12:00:00Z", "summary": "old"}),
+            serde_json::json!({"occurred_at": "2026-07-10T12:00:05Z", "summary": "new"}),
+        ];
+        let memory = vec![
+            serde_json::json!({"valid_from": "2026-07-10T11:59:00Z", "content": "old chunk"}),
+            serde_json::json!({"valid_from": "2026-07-10T12:00:07.5Z", "content": "new chunk"}),
+        ];
+        let changes = changes_for_entity(since, "account:acme", &actions, &memory);
+        assert_eq!(changes.len(), 2);
+        let (at, change) = &changes[0];
+        assert_eq!(*at, ts("2026-07-10T12:00:05Z"));
+        assert_eq!(change["entity"], "account:acme");
+        assert_eq!(change["kind"], "action");
+        assert_eq!(change["at"], "2026-07-10T12:00:05.000000Z");
+        assert_eq!(change["record"]["summary"], "new");
+        let (at, change) = &changes[1];
+        assert_eq!(*at, ts("2026-07-10T12:00:07.5Z"));
+        assert_eq!(change["kind"], "memory");
+        assert_eq!(change["record"]["content"], "new chunk");
+    }
+
+    #[test]
+    fn action_derived_chunks_are_not_double_reported() {
+        let since = ts("2026-07-10T12:00:00Z");
+        let memory = vec![
+            serde_json::json!({
+                "valid_from": "2026-07-10T12:00:05Z",
+                "document_id": "action:quote-1",
+                "content": "quote.issued: sent quote"
+            }),
+            serde_json::json!({
+                "valid_from": "2026-07-10T12:00:06Z",
+                "document_id": "note.txt",
+                "content": "kept"
+            }),
+        ];
+        let changes = changes_for_entity(since, "account:acme", &[], &memory);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1["record"]["content"], "kept");
+    }
+
+    #[test]
+    fn unparseable_timestamps_never_position_a_change() {
+        let since = ts("2026-07-10T12:00:00Z");
+        let actions = vec![serde_json::json!({"occurred_at": "not-a-time"})];
+        let memory = vec![serde_json::json!({"content": "no valid_from at all"})];
+        assert!(changes_for_entity(since, "e", &actions, &memory).is_empty());
+    }
 
     #[test]
     fn html_to_text_strips_script_style_tags_and_entities() {
