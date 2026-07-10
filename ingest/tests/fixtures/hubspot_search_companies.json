@@ -1,0 +1,19 @@
+{
+  "total": 1,
+  "results": [
+    {
+      "id": "5001",
+      "properties": {
+        "createdate": "2026-05-20T14:00:00.000Z",
+        "domain": "acme.test",
+        "hs_lastmodifieddate": "2026-07-08T22:45:10.000Z",
+        "hs_object_id": "5001",
+        "industry": "COMPUTER_SOFTWARE",
+        "name": "Acme Corp"
+      },
+      "createdAt": "2026-05-20T14:00:00.000Z",
+      "updatedAt": "2026-07-08T22:45:10.000Z",
+      "archived": false
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "total": 3,
+  "results": [
+    {
+      "id": "301",
+      "properties": {
+        "createdate": "2026-06-01T09:00:00.000Z",
+        "email": "ada@acme.test",
+        "firstname": "Ada",
+        "hs_object_id": "301",
+        "lastmodifieddate": "2026-07-08T18:04:57.406Z",
+        "lastname": "Lovelace",
+        "lifecyclestage": null
+      },
+      "createdAt": "2026-06-01T09:00:00.000Z",
+      "updatedAt": "2026-07-08T18:04:57.406Z",
+      "archived": false
+    },
+    {
+      "id": "302",
+      "properties": {
+        "createdate": "2026-06-15T10:30:00.000Z",
+        "email": "grace@acme.test",
+        "firstname": "Grace",
+        "hs_object_id": "302",
+        "lastmodifieddate": "2026-07-09T01:12:03.000Z",
+        "lastname": "Hopper",
+        "lifecyclestage": "customer"
+      },
+      "createdAt": "2026-06-15T10:30:00.000Z",
+      "updatedAt": "2026-07-09T01:12:03.000Z",
+      "archived": false
+    }
+  ],
+  "paging": {
+    "next": {
+      "after": "2",
+      "link": "https://api.hubapi.com/crm/v3/objects/contacts/search?after=2"
+    }
+  }
+}

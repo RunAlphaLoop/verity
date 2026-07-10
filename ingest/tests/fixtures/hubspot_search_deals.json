@@ -1,0 +1,21 @@
+{
+  "total": 1,
+  "results": [
+    {
+      "id": "9843211",
+      "properties": {
+        "amount": "84000",
+        "closedate": "2026-09-30T00:00:00.000Z",
+        "createdate": "2026-04-02T11:00:00.000Z",
+        "dealname": "Acme expansion",
+        "dealstage": "negotiation",
+        "hs_lastmodifieddate": "2026-07-09T02:11:00.150Z",
+        "hs_object_id": "9843211",
+        "pipeline": "default"
+      },
+      "createdAt": "2026-04-02T11:00:00.000Z",
+      "updatedAt": "2026-07-09T02:11:00.150Z",
+      "archived": false
+    }
+  ]
+}
