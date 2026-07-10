@@ -225,14 +225,22 @@
     <div class="err" id="freshErr"></div>
     <div id="freshOut"></div>
   </section>
+
+  <!-- ============ 5. Connectors ============ -->
+  <section id="connectors">
+    <h2>Connectors <span class="sub">sink heartbeats, best-effort telemetry — GET /v1/admin/connector-status</span></h2>
+    <div class="row"><div class="tight"><button id="connBtn">Load</button></div></div>
+    <div class="err" id="connErr"></div>
+    <div id="connOut"></div>
+  </section>
 </div>
 
 <script>
 "use strict";
 /* Read-only inspector: the only verbs this page ever calls are
    POST /v1/recall (a scoped read), GET /v1/briefs, GET /v1/activity,
-   GET /v1/admin/quarantine, GET /v1/admin/audit, GET /v1/slo/freshness.
-   Nothing here mutates state. */
+   GET /v1/admin/quarantine, GET /v1/admin/audit, GET /v1/slo/freshness,
+   GET /v1/admin/connector-status. Nothing here mutates state. */
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g,
@@ -493,6 +501,53 @@ $("freshBtn").onclick = async () => {
         "</tbody></table></div>"
       : '<div class="empty">no freshness samples in the window (last 24h)</div>';
   } catch (e) { setErr("freshErr", e); }
+};
+
+/* ---------- 5. connectors ---------- */
+
+/* Staleness thresholds: green under 15 minutes, amber under 24 hours, red
+   beyond. Age is measured from last_event_at (source-side event time),
+   falling back to updated_at (last heartbeat) when no event time was ever
+   reported. */
+function connAge(row) {
+  const t = row.last_event_at || row.updated_at;
+  if (!t) return { label: "never", cls: "b-conf-3" };
+  const ms = Date.now() - new Date(t).getTime();
+  const label =
+    ms < 0 ? "just now" :
+    ms < 60e3 ? Math.round(ms / 1e3) + "s ago" :
+    ms < 3600e3 ? Math.round(ms / 60e3) + "m ago" :
+    ms < 86400e3 ? (ms / 3600e3).toFixed(1) + "h ago" :
+    (ms / 86400e3).toFixed(1) + "d ago";
+  const cls = ms < 15 * 60e3 ? "b-conf-0" : ms < 24 * 3600e3 ? "b-conf-2" : "b-conf-3";
+  return { label, cls };
+}
+
+$("connBtn").onclick = async () => {
+  clearErr("connErr"); $("connOut").innerHTML = "";
+  const tenant = requireTenant("connErr");
+  if (!tenant) return;
+  try {
+    const rows = await api("/v1/admin/connector-status?tenant_id=" + encodeURIComponent(tenant),
+      { headers: adminHeaders() });
+    $("connOut").innerHTML = rows.length
+      ? '<div class="tablewrap"><table><thead><tr>' +
+        '<th>source</th><th class="num">items</th><th>cursor</th><th>last event</th><th>heartbeat</th>' +
+        "</tr></thead><tbody>" +
+        rows.map(r => {
+          const age = connAge(r);
+          const cur = r.cursor == null ? "—"
+            : (String(r.cursor).length > 40 ? esc(String(r.cursor).slice(0, 40)) + "…" : esc(String(r.cursor)));
+          return "<tr><td>" + kindBadge(r.source) +
+            '</td><td class="num">' + esc(r.items_synced) +
+            "</td><td>" + cur +
+            '</td><td><span class="badge ' + age.cls + '">' + esc(age.label) + "</span>" +
+            (r.last_event_at ? "" : ' <span class="badge b-trust">no event time</span>') +
+            "</td><td>" + esc(fmtTime(r.updated_at)) + "</td></tr>";
+        }).join("") +
+        "</tbody></table></div>"
+      : '<div class="empty">no connector heartbeats for this tenant yet</div>';
+  } catch (e) { setErr("connErr", e); }
 };
 </script>
 </body>

@@ -45,20 +45,27 @@ pub struct ErasureReport {
     pub knowledge_invalidated: u64,
     pub quarantine_preview: u64,
     pub audit_log: u64,
+    /// Media blobs purged by explicit `media_ids` (tenant-checked). Media has
+    /// no automatic subject attribution in v0 — operators list candidates via
+    /// GET /v1/admin/media and name them on the erasure request.
+    pub media: u64,
 }
 
 impl PostgresAdapter {
     /// POST /v1/admin/erasure — lineage-driven hard purge, one transaction.
-    /// At least one of `subject` / `entity` is required.
+    /// At least one of `subject` / `entity` / `media_ids` is required.
+    /// `media_ids` are explicit, operator-named media blobs purged in the
+    /// same transaction (tenant-checked: foreign-tenant ids delete nothing).
     pub async fn erase(
         &self,
         tenant: TenantId,
         subject: Option<&str>,
         entity: Option<&str>,
+        media_ids: &[Uuid],
     ) -> Result<ErasureReport> {
-        if subject.is_none() && entity.is_none() {
+        if subject.is_none() && entity.is_none() && media_ids.is_empty() {
             return Err(StorageError::InvalidInput(
-                "erasure requires a subject and/or an entity".into(),
+                "erasure requires a subject, an entity, and/or media_ids".into(),
             ));
         }
         let mut report = ErasureReport::default();
@@ -254,7 +261,21 @@ impl PostgresAdapter {
                     .rows_affected();
         }
 
-        // 8. Finally the L0 episodes themselves.
+        // 8. Explicitly named media blobs, same transaction. Tenant-checked:
+        //    an id belonging to another tenant (or unknown) deletes nothing
+        //    and shows up as a shortfall in the returned count. Media has no
+        //    subject attribution in v0, so this is operator-named, not walked.
+        if !media_ids.is_empty() {
+            report.media = sqlx::query("DELETE FROM media WHERE tenant_id = $1 AND id = ANY($2)")
+                .bind(tenant)
+                .bind(media_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+        }
+
+        // 9. Finally the L0 episodes themselves.
         report.episodes = sqlx::query("DELETE FROM episodes WHERE tenant_id = $1 AND id = ANY($2)")
             .bind(tenant)
             .bind(&episode_ids)
@@ -263,8 +284,8 @@ impl PostgresAdapter {
             .map_err(db_err)?
             .rows_affected();
 
-        // 9. ONE surviving audit row: verb='erasure', counts, sha256 of the
-        //    identifiers — no plaintext PII beyond that.
+        // 10. ONE surviving audit row: verb='erasure', counts, sha256 of the
+        //     identifiers — no plaintext PII beyond that.
         let summary = serde_json::json!({
             "subject_sha256": subject.map(sha256_hex),
             "entity_sha256": entity.map(sha256_hex),

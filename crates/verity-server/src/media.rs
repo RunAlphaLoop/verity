@@ -277,6 +277,56 @@ pub(crate) async fn get_media(
     Ok(([(header::CONTENT_TYPE, mime)], bytes))
 }
 
+// ---------- admin listing (erasure support, task 28) ----------
+
+#[derive(Deserialize)]
+pub(crate) struct AdminMediaParams {
+    tenant_id: Uuid,
+    #[serde(default = "default_media_limit")]
+    limit: usize,
+}
+
+fn default_media_limit() -> usize {
+    200
+}
+
+/// GET /v1/admin/media?tenant_id= (admin): list a tenant's media blobs —
+/// id, filename, sha256, size, created — newest first. This is the operator
+/// surface for finding subject-attributable blobs to name in an erasure
+/// request's `media_ids` (media rows carry no subject attribution in v0).
+/// Metadata only; bytes are never returned here.
+pub(crate) async fn admin_list_media(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<AdminMediaParams>,
+) -> HandlerResult<Json<Vec<serde_json::Value>>> {
+    state.admin.check(&headers)?;
+    let rows = sqlx::query(
+        "SELECT id, filename, sha256, mime, size_bytes, created_at
+         FROM media WHERE tenant_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(p.tenant_id)
+    .bind(p.limit.clamp(1, 1000) as i64)
+    .fetch_all(state.pool())
+    .await
+    .map_err(internal)?;
+    rows.iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(internal)?,
+                "filename": row.try_get::<Option<String>, _>("filename").map_err(internal)?,
+                "sha256": row.try_get::<String, _>("sha256").map_err(internal)?,
+                "mime": row.try_get::<String, _>("mime").map_err(internal)?,
+                "size_bytes": row.try_get::<i64, _>("size_bytes").map_err(internal)?,
+                "created_at": row.try_get::<chrono::DateTime<Utc>, _>("created_at").map_err(internal)?,
+            }))
+        })
+        .collect::<HandlerResult<Vec<_>>>()
+        .map(Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::split_text;

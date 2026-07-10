@@ -417,44 +417,9 @@ impl StorageAdapter for PostgresAdapter {
 
     async fn append_episode(&self, ep: NewEpisode) -> Result<EpisodeId> {
         let id = Uuid::now_v7();
-        // Envelope encryption (SPEC §8a, v0 contract — crypto.rs): the DEK is
-        // provisioned lazily either way; with a KEK configured the payload is
-        // stored AES-256-GCM in payload_enc and the jsonb column carries the
-        // '{}' sentinel. Reads that need the payload go through
-        // episode_payload(); the serving read path never does.
-        let dek = self.tenant_dek(ep.tenant_id).await?;
-        let (payload, payload_enc, encrypted): (serde_json::Value, Option<Vec<u8>>, Option<bool>) =
-            if self.kek.is_some() {
-                let plaintext = serde_json::to_vec(&ep.payload).map_err(db_err)?;
-                (
-                    serde_json::json!({}),
-                    Some(crate::crypto::encrypt(&dek, &plaintext)?),
-                    Some(true),
-                )
-            } else {
-                (ep.payload.clone(), None, None)
-            };
-        sqlx::query(
-            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
-                                   payload_enc, payload_encrypted,
-                                   content_hash, trust_tier, writer_sub, writer_azp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-        )
-        .bind(id)
-        .bind(ep.tenant_id)
-        .bind(&ep.source)
-        .bind(&ep.source_entity)
-        .bind(ep.kind.as_str())
-        .bind(&payload)
-        .bind(&payload_enc)
-        .bind(encrypted)
-        .bind(&ep.content_hash)
-        .bind(ep.trust_tier as i16)
-        .bind(&ep.writer_sub)
-        .bind(&ep.writer_azp)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        self.insert_episode_tx(&mut tx, id, &ep).await?;
+        tx.commit().await.map_err(db_err)?;
         Ok(id)
     }
 
@@ -632,23 +597,25 @@ impl StorageAdapter for PostgresAdapter {
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let episode_id = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
-                                   content_hash, trust_tier, writer_sub, writer_azp)
-             VALUES ($1, $2, 'agent', $3, $4, $5, $6, $7, $8, $9)",
+        // The action's L0 provenance episode rides the shared encrypted
+        // insert path (insert_episode_tx) — the serialized action payload is
+        // ciphertext at rest whenever a KEK is configured.
+        self.insert_episode_tx(
+            &mut tx,
+            episode_id,
+            &NewEpisode {
+                tenant_id: action.tenant_id,
+                source: "agent".into(),
+                source_entity: Some(action.action_id.clone()),
+                kind: EpisodeKind::AgentAction,
+                payload: serde_json::to_value(&action).map_err(db_err)?,
+                content_hash: format!("action-{}", action.action_id),
+                trust_tier: TrustTier::Observation,
+                writer_sub: action.actor_sub.clone(),
+                writer_azp: action.actor_azp.clone(),
+            },
         )
-        .bind(episode_id)
-        .bind(action.tenant_id)
-        .bind(&action.action_id)
-        .bind(EpisodeKind::AgentAction.as_str())
-        .bind(serde_json::to_value(&action).map_err(db_err)?)
-        .bind(format!("action-{}", action.action_id))
-        .bind(TrustTier::Observation as i16)
-        .bind(&action.actor_sub)
-        .bind(&action.actor_azp)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        .await?;
 
         let inserted = sqlx::query(
             "INSERT INTO actions (id, tenant_id, action_id, actor_sub, actor_azp, action_type,
@@ -845,21 +812,25 @@ impl StorageAdapter for PostgresAdapter {
         let categories: Vec<String> = row.try_get("categories").map_err(db_err)?;
 
         let episode_id = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
-                                   content_hash, trust_tier, writer_sub, writer_azp)
-             VALUES ($1, $2, 'knowledge', $3, $4, $5, $6, $7, NULL, NULL)",
+        // Publish provenance goes through the shared encrypted insert path;
+        // the statement stays readable via the §7g carve-out chunk below —
+        // the episode payload is lineage, not the serving copy.
+        self.insert_episode_tx(
+            &mut tx,
+            episode_id,
+            &NewEpisode {
+                tenant_id: tenant,
+                source: "knowledge".into(),
+                source_entity: Some(id.to_string()),
+                kind: EpisodeKind::KnowledgePublish,
+                payload: serde_json::json!({ "knowledge_id": id, "statement": statement }),
+                content_hash: format!("knowledge-{id}"),
+                trust_tier: TrustTier::Observation,
+                writer_sub: None,
+                writer_azp: None,
+            },
         )
-        .bind(episode_id)
-        .bind(tenant)
-        .bind(id.to_string())
-        .bind(EpisodeKind::KnowledgePublish.as_str())
-        .bind(serde_json::json!({ "knowledge_id": id, "statement": statement }))
-        .bind(format!("knowledge-{id}"))
-        .bind(TrustTier::Observation as i16)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        .await?;
 
         // The §7g carve-out artifact: kind='knowledge', entity-free, broad
         // visibility. Lineage lives in knowledge_evidence, NEVER here.
@@ -1152,6 +1123,59 @@ impl StorageAdapter for PostgresAdapter {
 }
 
 impl PostgresAdapter {
+    /// The ONE L0 episode insert path (SPEC §8a): every episode row — agent
+    /// observations, CDC envelopes, doc versions, action provenance,
+    /// knowledge-publish provenance — is written here, so envelope encryption
+    /// cannot be bypassed by an inline INSERT elsewhere. With a KEK
+    /// configured the payload is stored AES-256-GCM under the tenant DEK in
+    /// `payload_enc` and the jsonb column carries the `'{}'` sentinel; reads
+    /// that need the payload go through `episode_payload()` — the serving
+    /// read path never does. The DEK is provisioned lazily either way.
+    async fn insert_episode_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: EpisodeId,
+        ep: &NewEpisode,
+    ) -> Result<()> {
+        // Note: DEK provisioning runs on the pool, outside `tx` — it is
+        // idempotent (ON CONFLICT DO NOTHING + re-read), so a rolled-back
+        // caller transaction at worst leaves a provisioned DEK behind.
+        let dek = self.tenant_dek(ep.tenant_id).await?;
+        let (payload, payload_enc, encrypted): (serde_json::Value, Option<Vec<u8>>, Option<bool>) =
+            if self.kek.is_some() {
+                let plaintext = serde_json::to_vec(&ep.payload).map_err(db_err)?;
+                (
+                    serde_json::json!({}),
+                    Some(crate::crypto::encrypt(&dek, &plaintext)?),
+                    Some(true),
+                )
+            } else {
+                (ep.payload.clone(), None, None)
+            };
+        sqlx::query(
+            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
+                                   payload_enc, payload_encrypted,
+                                   content_hash, trust_tier, writer_sub, writer_azp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(id)
+        .bind(ep.tenant_id)
+        .bind(&ep.source)
+        .bind(&ep.source_entity)
+        .bind(ep.kind.as_str())
+        .bind(&payload)
+        .bind(&payload_enc)
+        .bind(encrypted)
+        .bind(&ep.content_hash)
+        .bind(ep.trust_tier as i16)
+        .bind(&ep.writer_sub)
+        .bind(&ep.writer_azp)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn insert_action_chunk(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         a: &ActionWrite,

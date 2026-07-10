@@ -237,12 +237,16 @@ def test_debezium_envelope_from_search_event() -> None:
 
 
 def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
-    seen: dict = {}
+    seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["auth"] = request.headers.get("Authorization")
-        seen["body"] = json.loads(request.content)
+        seen.append(
+            {
+                "url": str(request.url),
+                "auth": request.headers.get("Authorization"),
+                "body": json.loads(request.content),
+            }
+        )
         return httpx.Response(
             200, json={"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
         )
@@ -254,15 +258,45 @@ def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
         transport=httpx.MockTransport(handler),
     )
     events = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), POLICY)
-    summary = sink.post(events)
+    summary = sink.post(events, cursor="2026-07-09T16:00:05.000Z")
 
     assert summary == {"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
-    assert seen["url"] == (
+    # First request: the delivery batch itself.
+    assert seen[0]["url"] == (
         "http://verity.local:7717/v1/ingest/debezium"
         "?tenant_id=0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001&pk=id"
     )
-    assert seen["auth"] == "Bearer secret-token"
-    assert seen["body"] == [VerityDebeziumSink.envelope(e) for e in events]
+    assert seen[0]["auth"] == "Bearer secret-token"
+    assert seen[0]["body"] == [VerityDebeziumSink.envelope(e) for e in events]
+    # Second request: the best-effort heartbeat, after successful delivery.
+    assert seen[1]["url"] == "http://verity.local:7717/v1/admin/connector-status"
+    assert seen[1]["auth"] == "Bearer secret-token"
+    assert seen[1]["body"] == {
+        "tenant_id": "0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        "source": "hubspot",
+        "items_synced": 2,
+        "last_event_at": max(e.valid_from for e in events).isoformat(),
+        "cursor": "2026-07-09T16:00:05.000Z",
+    }
+    assert len(seen) == 2
+
+
+def test_sink_heartbeat_failure_never_fails_the_sync() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/connector-status":
+            return httpx.Response(500, text="heartbeat plane down")
+        return httpx.Response(
+            200, json={"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
+        )
+
+    sink = VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        transport=httpx.MockTransport(handler),
+    )
+    events = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), POLICY)
+    # The 500 on the heartbeat is swallowed; the delivery summary survives.
+    assert sink.post(events) == {"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
 
 
 def test_sink_no_events_no_post() -> None:

@@ -7,6 +7,7 @@
 
 mod audit;
 mod compliance;
+mod connectors;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
@@ -254,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/dsar/export", get(compliance::dsar_export))
         .route("/v1/admin/audit", get(audit::admin_audit))
         .route("/v1/admin/quarantine", get(webhooks::admin_quarantine))
+        .route("/v1/admin/media", get(media::admin_list_media))
+        .route(
+            "/v1/admin/connector-status",
+            post(connectors::post_status).get(connectors::get_status),
+        )
         .route("/v1/admin/principals", post(admin_principals))
         .route(
             "/v1/admin/groups",

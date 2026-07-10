@@ -372,6 +372,49 @@ def test_verity_sink_posts_to_documents_endpoint():
     assert posted == [("POST", DOCUMENTS_PATH, body)]
 
 
+def test_verity_sink_heartbeat_reports_batch_then_resets():
+    posted: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"recorded": True})
+
+    sink = VerityDocumentSink(
+        "http://verity.local:8080", client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    sink.deliver(
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": DOC_ID,
+            "valid_from": "2026-02-03T10:00:00.000Z",
+        }
+    )
+    sink.deliver(
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": TXT_ID,
+            "valid_from": "2026-02-01T09:00:00.000Z",  # older: never wins
+        }
+    )
+    sink.heartbeat(cursor="412")
+    assert posted[-1] == (
+        "/v1/admin/connector-status",
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "items_synced": 2,
+            "cursor": "412",
+            "last_event_at": "2026-02-03T10:00:00.000Z",
+        },
+    )
+    # Accumulators reset: a heartbeat with nothing delivered posts nothing.
+    calls_before = len(posted)
+    sink.heartbeat(cursor="413")
+    assert len(posted) == calls_before
+
+
 def test_verity_sink_raises_on_rejection():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error": "visibility-or-acl required"})

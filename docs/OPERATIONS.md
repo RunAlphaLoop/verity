@@ -72,13 +72,15 @@ verity-cli restore <file>
   (`at-rest envelope encryption disabled — set VERITY_KEK`), DEKs are stored
   as plaintext bytes (length is the wrap marker: 32 = plaintext,
   longer = wrapped), and payloads stay plaintext jsonb.
-- **v0 encryption coverage, stated honestly:** episode payloads written via
-  `append_episode` (agent observations, CDC envelopes, webhook payloads,
-  document-version metadata). NOT yet encrypted: episodes written inline by
-  `record_action` and `publish_knowledge`, chunk/fact plaintext projections
-  (they are hard-purged by lineage instead), `media.bytes`, and
-  `quarantine_preview.payload`. DEK granularity is per-tenant, not yet
-  per-data-subject/per-source.
+- **Encryption coverage (v0.2), stated honestly:** ALL episode payloads —
+  every insert into `episodes` flows through one shared encrypted path
+  (`PostgresAdapter::insert_episode_tx`): `append_episode` (agent
+  observations, CDC envelopes, webhook payloads, document-version metadata),
+  `record_action` (the serialized action provenance episode), and
+  `publish_knowledge` (the publish provenance episode). NOT yet encrypted:
+  chunk/fact plaintext projections (they are hard-purged by lineage instead),
+  `media.bytes`, and `quarantine_preview.payload`. DEK granularity is
+  per-tenant, not yet per-data-subject/per-source.
 
 ### KEK rotation (v0 stance: offline re-wrap, documented not automated)
 
@@ -100,6 +102,7 @@ plaintext until rotated by the same offline procedure.
 ```
 POST /v1/admin/erasure          (admin bearer token)
 { "tenant_id": "...", "subject": "user:jane@corp.example" }   // and/or "entity": "contact:jane@corp.example"
+                                                              // and/or "media_ids": ["<uuid>", ...]
 ```
 
 Distinct from `memory.forget` (SPEC §8f): forget is scope-bound
@@ -120,16 +123,35 @@ chunk tagged with the entity — multi-tag chunks are deleted whole, never
 tag-stripped** (conservative over-deletion: a shared chunk that mentions the
 erased entity goes away for everyone).
 
+**SpiceDB tuples (v0.2):** when ReBAC is configured (`VERITY_SPICEDB_URL`)
+and the subject is a `user:` principal, the subject's relationship tuples
+are deleted from SpiceDB **before** the storage purge. Ordering is
+fail-closed by construction: a tuple-delete failure aborts the whole erasure
+with 502 and nothing is purged — at worst the retry over-retains for a
+while; the reverse order could leave a purged subject still granting group
+membership after a partial failure. Without ReBAC (or for non-`user:`
+subjects, which have no SpiceDB object) the response reports
+`rebac_tuples_deleted: false` and tuples must be removed via
+`DELETE /v1/admin/groups` / SpiceDB directly.
+
+**Media blobs (v0.2):** media rows carry no subject attribution, so erasure
+never *walks* to them — the operator names them: list candidates with
+`GET /v1/admin/media?tenant_id=` (id, filename, sha256, size, created;
+metadata only) and pass the subject-attributable ids as `media_ids` on the
+erasure request. Named blobs are hard-deleted in the same transaction,
+tenant-checked (a foreign or unknown id deletes nothing and shows up as a
+shortfall in the returned `media` count).
+
 One audit row survives per erasure: `verb = 'erasure'`, the per-table counts,
 and sha256 hashes of the subject/entity — no plaintext identifiers.
 
 **What erasure does NOT cover yet (v0, honest list):**
 
-- **SpiceDB tuples** — group memberships naming the subject must be removed
-  via `DELETE /v1/admin/groups` / SpiceDB directly.
-- **Media blobs** (`media` table) — no subject attribution exists on media
-  rows yet; purge manually if a blob is subject-attributable.
-- `freshness_samples` — telemetry only; carries source names and timestamps,
+- **Automatic media discovery** — `media_ids` is operator-named; nothing
+  links a blob to a subject server-side yet. Chunks derived from text-like
+  media ARE walked (by episode provenance) when the uploader is the erased
+  subject, but the blob itself must be named explicitly.
+- `connector_status` / `freshness_samples` — telemetry only; carries source names and timestamps,
   no subject data (documented n/a).
 - Other actors' audit rows whose `result_ids` reference now-deleted rows —
   the ids are opaque UUIDs with no payload (the SPEC §8b "skeleton").

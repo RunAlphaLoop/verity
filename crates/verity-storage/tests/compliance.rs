@@ -217,6 +217,116 @@ async fn without_kek_payloads_stay_plaintext_and_dek_is_unwrapped() {
     );
 }
 
+/// Task 28: record_action's L0 provenance episode must flow through the same
+/// encrypted insert path as append_episode — sentinel payload, ciphertext in
+/// payload_enc, decrypt-on-demand roundtrip.
+#[tokio::test]
+async fn record_action_episode_is_encrypted_with_kek() {
+    let Some((adapter, tenant)) = setup(Some(kek())).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let action_id = format!("act-{}", uuid::Uuid::now_v7());
+    adapter
+        .record_action(ActionWrite {
+            tenant_id: tenant,
+            action_id: action_id.clone(),
+            actor_sub: Some("user:enc-actor".into()),
+            actor_azp: Some("agent:enc".into()),
+            action_type: "email.sent".into(),
+            entities: vec!["account:acme".into()],
+            summary: "sent a confidential renewal email".into(),
+            payload: json!({ "to": "cfo@acme.example" }),
+            outcome: ActionOutcome::Succeeded,
+            occurred_at: Utc::now(),
+            visibility: vec![7],
+            confidentiality: Confidentiality::Internal,
+        })
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT id, payload, payload_enc, payload_encrypted FROM episodes
+         WHERE tenant_id = $1 AND kind = 'agent_action' AND source_entity = $2",
+    )
+    .bind(tenant)
+    .bind(&action_id)
+    .fetch_one(adapter.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<serde_json::Value, _>("payload").unwrap(),
+        json!({}),
+        "action episode payload must be the sentinel, not the serialized action"
+    );
+    assert!(
+        row.try_get::<Option<Vec<u8>>, _>("payload_enc")
+            .unwrap()
+            .is_some(),
+        "action episode must carry ciphertext"
+    );
+    assert_eq!(
+        row.try_get::<Option<bool>, _>("payload_encrypted").unwrap(),
+        Some(true)
+    );
+    // Roundtrip: decrypt-on-demand recovers the serialized action.
+    let episode: uuid::Uuid = row.try_get("id").unwrap();
+    let decrypted = adapter
+        .episode_payload(tenant, episode)
+        .await
+        .unwrap()
+        .expect("episode exists");
+    assert_eq!(decrypted["summary"], "sent a confidential renewal email");
+    assert_eq!(decrypted["payload"]["to"], "cfo@acme.example");
+}
+
+/// Task 28 companion: publish_knowledge's provenance episode also rides the
+/// shared encrypted path.
+#[tokio::test]
+async fn publish_knowledge_episode_is_encrypted_with_kek() {
+    let Some((adapter, tenant)) = setup(Some(kek())).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let e1 = interaction(&adapter, tenant, "account:alpha", None, "agent:a").await;
+    let e2 = interaction(&adapter, tenant, "account:beta", None, "agent:b").await;
+    let e3 = interaction(&adapter, tenant, "account:gamma", None, "agent:c").await;
+    let item = adapter
+        .propose_knowledge(KnowledgeProposal {
+            tenant_id: tenant,
+            statement: "Renewal conversations stall without an executive sponsor.".into(),
+            categories: vec![],
+            evidence: vec![e1, e2, e3],
+            proposed_by_sub: None,
+            proposed_by_azp: Some("agent:proposer".into()),
+        })
+        .await
+        .unwrap();
+    adapter
+        .publish_knowledge(tenant, item.id, vec![7], 3, None)
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT payload, payload_enc FROM episodes
+         WHERE tenant_id = $1 AND kind = 'knowledge_publish' AND source_entity = $2",
+    )
+    .bind(tenant)
+    .bind(item.id.to_string())
+    .fetch_one(adapter.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<serde_json::Value, _>("payload").unwrap(),
+        json!({}),
+        "publish episode payload must be the sentinel"
+    );
+    assert!(row
+        .try_get::<Option<Vec<u8>>, _>("payload_enc")
+        .unwrap()
+        .is_some());
+}
+
 // ---------- hard erasure ----------
 
 #[tokio::test]
@@ -296,7 +406,10 @@ async fn subject_erasure_hard_deletes_and_cascades_knowledge() {
         "subject's chunk retrievable before erasure"
     );
 
-    let report = adapter.erase(tenant, Some(subject), None).await.unwrap();
+    let report = adapter
+        .erase(tenant, Some(subject), None, &[])
+        .await
+        .unwrap();
     assert_eq!(
         report.episodes, 2,
         "subject's observation episode + the action's L0 episode: {report:?}"
@@ -419,7 +532,10 @@ async fn entity_erasure_deletes_facts_and_multitag_chunks() {
         .await
         .unwrap();
 
-    let report = adapter.erase(tenant, None, Some(entity)).await.unwrap();
+    let report = adapter
+        .erase(tenant, None, Some(entity), &[])
+        .await
+        .unwrap();
     assert_eq!(report.episodes, 1);
     assert_eq!(report.facts, 1);
     assert_eq!(
@@ -455,7 +571,75 @@ async fn entity_erasure_deletes_facts_and_multitag_chunks() {
     assert_eq!(other, 1);
 
     // Neither-subject-nor-entity requests fail closed.
-    assert!(adapter.erase(tenant, None, None).await.is_err());
+    assert!(adapter.erase(tenant, None, None, &[]).await.is_err());
+}
+
+/// Task 28: erasure with explicit media_ids purges the named blobs in the
+/// same transaction, tenant-checked — a foreign tenant's id deletes nothing.
+#[tokio::test]
+async fn erasure_purges_listed_media_tenant_checked() {
+    let Some((adapter, tenant)) = setup(None).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let (_, other_tenant) = setup(None).await.unwrap();
+
+    async fn insert_media(adapter: &PostgresAdapter, tenant: TenantId, name: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO media (id, tenant_id, sha256, mime, filename, bytes, size_bytes)
+             VALUES ($1, $2, 'deadbeef', 'text/plain', $3, $4, 5)",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(name)
+        .bind(b"hello".to_vec())
+        .execute(adapter.pool())
+        .await
+        .unwrap();
+        id
+    }
+    let mine = insert_media(&adapter, tenant, "subject-photo.txt").await;
+    let kept = insert_media(&adapter, tenant, "unrelated.txt").await;
+    let foreign = insert_media(&adapter, other_tenant, "foreign.txt").await;
+
+    // Media-only erasure is legal (no subject/entity), and only the named,
+    // tenant-owned blob goes.
+    let report = adapter
+        .erase(tenant, None, None, &[mine, foreign])
+        .await
+        .unwrap();
+    assert_eq!(
+        report.media, 1,
+        "only the tenant-owned id purges: {report:?}"
+    );
+    assert_eq!(report.episodes, 0);
+
+    let count = |id: uuid::Uuid| {
+        let pool = adapter.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(mine).await, 0, "named blob hard-deleted");
+    assert_eq!(count(kept).await, 1, "unnamed blob survives");
+    assert_eq!(count(foreign).await, 1, "foreign tenant's blob survives");
+
+    // Combined subject + media erasure works in one call/transaction.
+    let subject = "user:media-subject";
+    interaction(&adapter, tenant, "account:m", Some(subject), "agent:m").await;
+    let second = insert_media(&adapter, tenant, "second.txt").await;
+    let report = adapter
+        .erase(tenant, Some(subject), None, &[second])
+        .await
+        .unwrap();
+    assert_eq!(report.media, 1);
+    assert_eq!(report.episodes, 1);
+    assert_eq!(count(second).await, 0);
 }
 
 // ---------- DSAR export ----------

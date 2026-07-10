@@ -444,7 +444,9 @@ def main(argv: list[str] | None = None) -> int:
             await connector.aclose()
 
     events, next_cursor = asyncio.run(run_once())
-    summary = sink.post(events)
+    # The shared sink heartbeats /v1/admin/connector-status after delivery
+    # (best-effort; source rides on the events, so this reports "salesforce").
+    summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
     print(f"poll: {len(events)} fact event(s), cursor -> {next_cursor} -> {summary}")
     return 0

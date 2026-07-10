@@ -361,8 +361,15 @@ class VerityDebeziumSink:
             "after": {"id": event.entity_id, event.field_name: event.value},
         }
 
-    def post(self, events: list[FactEvent]) -> dict:
-        """POST a batch; returns the server's write summary."""
+    def post(self, events: list[FactEvent], cursor: str | None = None) -> dict:
+        """POST a batch; returns the server's write summary.
+
+        After a successful delivery a best-effort heartbeat goes to
+        ``POST /v1/admin/connector-status`` (source, batch size, newest event
+        time, and — when the runner passes it — the cursor). A heartbeat
+        failure NEVER fails the sync: the facts are already committed and the
+        heartbeat is telemetry (see migrations/0012_connector_status.sql).
+        """
         if not events:
             return {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
         headers = {}
@@ -376,7 +383,34 @@ class VerityDebeziumSink:
                 headers=headers,
             )
             response.raise_for_status()
-            return response.json()
+            summary = response.json()
+            self._heartbeat(client, headers, events, cursor)
+            return summary
+
+    def _heartbeat(
+        self,
+        client: httpx.Client,
+        headers: dict,
+        events: list[FactEvent],
+        cursor: str | None,
+    ) -> None:
+        """Best-effort connector heartbeat; swallows every failure."""
+        try:
+            body = {
+                "tenant_id": self.tenant_id,
+                "source": events[0].source,
+                "items_synced": len(events),
+                "last_event_at": max(e.valid_from for e in events).isoformat(),
+            }
+            if cursor is not None:
+                body["cursor"] = cursor
+            client.post(
+                f"{self.url.rstrip('/')}/v1/admin/connector-status",
+                json=body,
+                headers=headers,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never fail the sync
+            pass
 
 
 # ---------- runner ----------
@@ -447,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
             await connector.aclose()
 
     events, next_cursor = asyncio.run(run_once())
-    summary = sink.post(events)
+    summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
     print(f"poll: {len(events)} fact event(s), cursor -> {next_cursor} -> {summary}")
     return 0

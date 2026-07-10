@@ -304,6 +304,35 @@ impl Rebac {
         Ok(())
     }
 
+    /// Erasure support (SPEC §8b + task 28): delete every relationship whose
+    /// SUBJECT is this user — in the Verity schema a `user` object never
+    /// appears as a resource (it has no relations), so removing its subject
+    /// tuples removes the user from the graph entirely. Called by the
+    /// erasure handler BEFORE the storage purge (fail-closed ordering:
+    /// a failure here aborts the erasure with 502 — tuples must never
+    /// outlive the data they granted access to).
+    pub(crate) async fn delete_subject_relationships(
+        &self,
+        tenant: TenantId,
+        user_name: &str,
+    ) -> RebacResult<()> {
+        self.post(
+            "/v1/relationships/delete",
+            json!({
+                "relationshipFilter": {
+                    "resourceType": "group",
+                    "optionalRelation": "member",
+                    "optionalSubjectFilter": {
+                        "subjectType": "user",
+                        "optionalSubjectId": object_id(tenant, user_name),
+                    }
+                }
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// All groups the subject transitively has `membership` on, as
     /// `group:<name>` principal strings. Fully-consistent LookupResources.
     ///
@@ -544,5 +573,20 @@ mod tests {
             .await
             .expect("re-resolve");
         assert_eq!(groups, vec!["group:sales-west".to_string()]);
+
+        // Erasure seam (task 28): deleting the subject's tuples empties the
+        // closure — the user object is gone from the graph.
+        rebac
+            .delete_subject_relationships(tenant, "alice@corp.example")
+            .await
+            .expect("subject tuple delete");
+        let groups = rebac
+            .user_groups(tenant, "alice@corp.example")
+            .await
+            .expect("post-erasure resolve");
+        assert!(
+            groups.is_empty(),
+            "subject tuples must be gone after erasure: {groups:?}"
+        );
     }
 }

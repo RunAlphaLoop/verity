@@ -28,25 +28,63 @@ pub(crate) struct ErasureRequest {
     subject: Option<String>,
     /// Entity: erases episodes with `source_entity = entity`, facts keyed on
     /// it, chunks tagged with it (multi-tag chunks deleted whole), actions
-    /// targeting it. At least one of subject/entity is required.
+    /// targeting it. At least one of subject/entity/media_ids is required.
     #[serde(default)]
     entity: Option<String>,
+    /// Explicit media blobs to purge in the same transaction (tenant-checked
+    /// in storage). Media rows carry no subject attribution in v0, so the
+    /// operator names them — GET /v1/admin/media lists the candidates.
+    #[serde(default)]
+    media_ids: Vec<Uuid>,
 }
 
 /// POST /v1/admin/erasure (admin) — the GDPR hard-purge path (SPEC §8b),
 /// distinct from `memory.forget` invalidation. One transaction; returns
 /// per-table hard-delete counts; leaves exactly one audit row (verb
 /// 'erasure', sha256-hashed identifiers, no plaintext PII).
+///
+/// ReBAC ordering (task 28, fail closed): when SpiceDB is configured and the
+/// subject is a `user:` principal, the subject's relationship tuples are
+/// deleted FIRST. A tuple-delete failure aborts the whole erasure with 502 —
+/// nothing is purged, nothing is half-erased; the operator retries once
+/// SpiceDB is healthy. The alternative order (storage first) could leave a
+/// deleted subject still granting group membership after a partial failure,
+/// which is the direction that leaks; this order at worst over-RETAINS
+/// (tuples gone, data pending retry), never over-grants.
 pub(crate) async fn admin_erasure(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<ErasureRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    let mut rebac_tuples_deleted = false;
+    if let (Some(rebac), Some(subject)) = (&state.rebac, req.subject.as_deref()) {
+        if let Some((crate::rebac::PrincipalKind::User, name)) =
+            crate::rebac::parse_principal(subject)
+        {
+            rebac
+                .delete_subject_relationships(req.tenant_id, name)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("spicedb tuple delete failed — erasure aborted (fail closed, nothing was purged): {e}"),
+                    )
+                })?;
+            rebac_tuples_deleted = true;
+        }
+        // Non-`user:` subjects have no SpiceDB object by construction
+        // (rebac.rs models users and groups only) — nothing to delete.
+    }
     let report = state
         .storage
         .inner()
-        .erase(req.tenant_id, req.subject.as_deref(), req.entity.as_deref())
+        .erase(
+            req.tenant_id,
+            req.subject.as_deref(),
+            req.entity.as_deref(),
+            &req.media_ids,
+        )
         .await
         .map_err(|e| match e {
             StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
@@ -54,7 +92,13 @@ pub(crate) async fn admin_erasure(
         })?;
     // Facts were hard-deleted underneath the L1 current-truth cache.
     state.storage.flush_facts();
-    Ok(Json(serde_json::json!({ "erased": report })))
+    Ok(Json(serde_json::json!({
+        "erased": report,
+        // Honest signal for the operator runbook: false means either ReBAC
+        // is not configured (delete tuples via SpiceDB directly) or the
+        // subject was not a `user:` principal (no tuples exist for it).
+        "rebac_tuples_deleted": rebac_tuples_deleted,
+    })))
 }
 
 #[derive(Deserialize)]

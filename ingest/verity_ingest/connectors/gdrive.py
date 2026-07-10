@@ -91,6 +91,7 @@ DOC_EXPORT_MIME = "text/plain"
 
 PRINCIPALS_PATH = "/v1/admin/principals"
 DOCUMENTS_PATH = "/v1/ingest/documents"
+CONNECTOR_STATUS_PATH = "/v1/admin/connector-status"
 
 # Field masks: ask Google for exactly what we consume, nothing more.
 _CHANGES_FIELDS = (
@@ -582,10 +583,45 @@ class VerityDocumentSink:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._client = client or httpx.Client(timeout=30.0, headers=headers)
         self._base_url = base_url.rstrip("/")
+        # Heartbeat accumulators (task 28): what this sink delivered since the
+        # last heartbeat() call — tenant/source come from the request bodies.
+        self._delivered = 0
+        self._tenant_id: str | None = None
+        self._source: str | None = None
+        self._last_event_at: str | None = None
 
     def deliver(self, request: dict) -> None:
         response = self._client.post(f"{self._base_url}{DOCUMENTS_PATH}", json=request)
         response.raise_for_status()
+        self._delivered += 1
+        self._tenant_id = request.get("tenant_id", self._tenant_id)
+        self._source = request.get("source", self._source)
+        valid_from = request.get("valid_from")
+        if valid_from and (self._last_event_at is None or valid_from > self._last_event_at):
+            self._last_event_at = valid_from
+
+    def heartbeat(self, cursor: str | None = None) -> None:
+        """Best-effort heartbeat to ``POST /v1/admin/connector-status`` after
+        a delivery batch; resets the accumulators. Never raises — a heartbeat
+        failure must never fail (or replay) a sync that already delivered."""
+        if not self._delivered or not self._tenant_id or not self._source:
+            return
+        try:
+            body: dict[str, Any] = {
+                "tenant_id": self._tenant_id,
+                "source": self._source,
+                "items_synced": self._delivered,
+            }
+            if cursor is not None:
+                body["cursor"] = cursor
+            if self._last_event_at:
+                body["last_event_at"] = self._last_event_at
+            self._client.post(f"{self._base_url}{CONNECTOR_STATUS_PATH}", json=body)
+        except Exception:  # noqa: BLE001 — telemetry only
+            pass
+        finally:
+            self._delivered = 0
+            self._last_event_at = None
 
 
 class DryRunSink:
@@ -636,6 +672,11 @@ def run_once(
         sink.deliver(build_document_request(event, registry, connector.config.tenant_id))
         delivered += 1
     _save_cursor(state_file, next_cursor)
+    # Best-effort connector heartbeat (task 28): sinks that support it
+    # (VerityDocumentSink) report the batch; DryRunSink et al. just skip.
+    heartbeat = getattr(sink, "heartbeat", None)
+    if heartbeat is not None:
+        heartbeat(cursor=next_cursor)
     return delivered
 
 
