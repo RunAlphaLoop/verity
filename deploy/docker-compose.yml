@@ -60,6 +60,29 @@ services:
       timeout: 3s
       retries: 20
 
+  # Ingest-plane orchestration (SPEC §5): Temporal DEV server — the
+  # single-binary `temporal server start-dev` from the CLI image, chosen over
+  # temporalio/auto-setup because it needs no companion Postgres/Elasticsearch
+  # and boots in seconds. State is deliberately ephemeral (in-memory SQLite,
+  # no --db-filename, no volume): connector cursors replay safely into keyed
+  # L1 upserts, so nothing critical is lost on restart. PRODUCTION NOTE: real
+  # deployments run a proper Temporal cluster (self-hosted with a durable
+  # Postgres/Cassandra datastore, or Temporal Cloud) — the dev server is
+  # single-process, unreplicated, and wipes history on restart by design.
+  # See docs/OPERATIONS.md ("Ingest orchestration").
+  temporal:
+    image: temporalio/temporal:latest
+    container_name: verity-temporal
+    command: server start-dev --ip 0.0.0.0
+    ports:
+      - "7233:7233" # gRPC (workers, schedules helper)
+      - "8233:8233" # Web UI
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
 volumes:
   verity-pgdata:
   verity-qdrant:

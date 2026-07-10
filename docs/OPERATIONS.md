@@ -1,4 +1,4 @@
-# Verity operations — backup/restore, encryption keys, erasure (v0)
+# Verity operations — backup/restore, encryption keys, erasure, ingest orchestration (v0)
 
 Operational companion to SPEC §8 (deletion, retention & compliance) and
 §11b (backup/restore/DR). Everything here describes the **v0 slice** that
@@ -174,3 +174,91 @@ admin authority — the export itself writes a `dsar_export` audit row), the
 chunks derived from them, the subject's actions, their access-event skeleton
 from the audit log, and knowledge items they proposed. Same exact-string
 subject matching caveat as erasure.
+
+## Ingest orchestration (Temporal) — durable connector scheduling
+
+Operational companion to SPEC §5: "the ingest plane … runs on durable
+execution; **Temporal is mandatory before the managed connector fleet
+ships**." This replaces running the connectors' `--once` runners under cron.
+The connector code itself is unchanged — orchestration wraps the existing
+`poll()` + sink classes; the one behavioral difference is that **the cursor
+lives in Temporal workflow state, not in `.verity/*_cursor` files**.
+
+### Dev vs production Temporal (read this first)
+
+`deploy/docker-compose.yml` ships a `temporal` service running the
+single-binary **dev server** (`temporalio/temporal` CLI image,
+`temporal server start-dev`): gRPC on `localhost:7233`, Web UI on
+`http://localhost:8233`. It keeps state in memory and **loses all workflow
+history on restart — by design**. That is safe here because nothing critical
+lives only in Temporal: on a lost chain the Schedule restarts the workflow
+with `cursor=None` and the connectors replay (HubSpot/Salesforce from epoch
+into deterministic keyed L1 upserts; Drive re-arms its change feed and the
+reconciliation crawl covers the gap). At-least-once, never silent loss.
+
+**Production deployments run a real Temporal cluster** — self-hosted
+(`temporalio/auto-setup` or Helm, backed by a durable Postgres/Cassandra
+datastore) or Temporal Cloud. The dev server is single-process,
+unreplicated, and unsupported for production by Temporal themselves. Point
+`TEMPORAL_ADDRESS`/`TEMPORAL_NAMESPACE` at the cluster; nothing else changes.
+
+### Running the worker
+
+```
+pip install 'verity-ingest[orchestration]'          # temporalio SDK (optional extra)
+docker compose -f deploy/docker-compose.yml up -d temporal
+
+export TEMPORAL_ADDRESS=localhost:7233              # default
+export VERITY_CONNECTORS=hubspot,salesforce         # EMPTY by default: enabling a sync is explicit
+export VERITY_SYNC_INTERVAL=300                     # seconds; per-connector: VERITY_SYNC_INTERVAL_HUBSPOT=60
+export HUBSPOT_PRIVATE_APP_TOKEN=... HUBSPOT_VISIBILITY=1,2      # connector's own env contract
+export VERITY_TENANT_ID=<tenant uuid> VERITY_URL=http://127.0.0.1:7717
+
+python -m verity_ingest.orchestration.worker
+```
+
+The worker registers `ConnectorSyncWorkflow` + the poll-cycle activity on
+task queue `verity-ingest` (`VERITY_TASK_QUEUE`). Run more workers on the
+same queue to scale horizontally. Visibility policies stay fail-closed:
+`HUBSPOT_VISIBILITY` / `SALESFORCE_VISIBILITY` are required, no default.
+
+### Applying schedules
+
+```
+python -m verity_ingest.orchestration.schedules             # dry-run: prints the plan
+python -m verity_ingest.orchestration.schedules --apply     # create/update
+```
+
+One Temporal Schedule per enabled connector (`verity-sync-<connector>`,
+overlap policy SKIP). The workflow itself loops durably — activity → cursor
+into workflow state → sleep interval → continue-as-new — so the Schedule is
+a supervisor: it starts the chain and restarts it if it ever dies; while the
+chain is alive every tick is skipped. Re-run `--apply` after changing
+intervals; it updates in place.
+
+### What happens on failure
+
+- A poll or delivery failure fails the **activity attempt**; Temporal
+  retries it with exponential backoff (5s initial, ×2, capped at 5 min,
+  unlimited attempts — a dead credential should page via connector-status
+  staleness, not silently drop the sync).
+- The cursor advances **only after sink delivery succeeds**: the activity
+  returns the next cursor last, so every retry re-polls the same window.
+  At-least-once into deterministic keyed upserts; a window is never skipped.
+- Config errors (missing visibility policy, unknown connector) are
+  **non-retryable** — they surface immediately in the workflow instead of
+  burning a backoff loop on an operator omission.
+- Activities heartbeat per page/delivery; a 2-minute heartbeat gap fails the
+  attempt (hung SaaS call), and the retry takes over.
+- Watch it all in the dev UI: `http://localhost:8233`.
+
+### One-off smoke test (no schedule)
+
+```
+temporal workflow execute --task-queue verity-ingest --type ConnectorSyncWorkflow \
+  --workflow-id connector-sync-hubspot-once \
+  --input '{"connector": "hubspot", "max_cycles": 1}'
+```
+
+`max_cycles: 1` is the `--once` equivalent: one poll cycle, returns the
+resulting cursor, no sleep, no continue-as-new.

@@ -14,6 +14,9 @@ dev = ["pytest>=8", "ruff>=0.5"]
 # Live Google Drive access only (BYOT service-account auth); fixture tests
 # and the rest of the ingest plane never import it.
 gdrive = ["google-auth>=2.29"]
+# Temporal-backed durable connector scheduling (SPEC §5: Temporal is mandatory
+# before the managed connector fleet); only verity_ingest.orchestration imports it.
+orchestration = ["temporalio>=1.7"]
 
 [build-system]
 requires = ["hatchling"]
