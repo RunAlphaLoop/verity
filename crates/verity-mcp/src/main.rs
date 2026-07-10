@@ -183,6 +183,66 @@ struct BriefParams {
     entity: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct IngestTextParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// The document text to ingest verbatim (plain text, markdown, JSON, …).
+    content: String,
+    /// Entity tags, e.g. ["account:acme-corp"]. Must be inside the scope's
+    /// entity_scope; omit to inherit the whole scope.
+    entities: Option<Vec<String>>,
+    /// Reserved for future use (stable document identity for re-ingestion);
+    /// accepted but not yet sent to the server.
+    #[allow(dead_code)]
+    document_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct IngestFileParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// Path to a LOCAL UTF-8 text file. Allowed extensions: .txt, .md,
+    /// .json, .csv, .html. Maximum size: 512 KB.
+    path: String,
+    /// Entity tags, e.g. ["account:acme-corp"]. Must be inside the scope's
+    /// entity_scope; omit to inherit the whole scope.
+    entities: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct IngestUrlParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// Public http(s) URL of the page to read and remember.
+    url: String,
+    /// Entity tags, e.g. ["account:acme-corp"]. Must be inside the scope's
+    /// entity_scope; omit to inherit the whole scope.
+    entities: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ForgetRefKind {
+    Chunk,
+    Episode,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ForgetParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// What to forget: "chunk" (one recall result) or "episode" (one
+    /// remembered observation and the chunks derived from it).
+    ref_kind: ForgetRefKind,
+    /// Id of the chunk or episode, as returned by memory_recall provenance
+    /// or memory_remember / the ingest tools.
+    id: String,
+    /// Why this memory must be forgotten (kept in the audit trail),
+    /// e.g. "customer data-deletion request" or "ingested by mistake".
+    reason: String,
+}
+
 // ---------- REST proxy plumbing ----------
 
 impl VerityMcp {
@@ -232,9 +292,114 @@ impl VerityMcp {
         self.proxy(self.http.post(self.endpoint(path)).json(body))
             .await
     }
+
+    /// Multipart POST /v1/files: fields `scope_handle`, `entities`
+    /// (comma-separated, only when tags were given), and `file`.
+    async fn post_file(
+        &self,
+        scope_handle: String,
+        entities: Option<Vec<String>>,
+        file_name: String,
+        content: String,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut form = reqwest::multipart::Form::new().text("scope_handle", scope_handle);
+        if let Some(entities) = entities.filter(|e| !e.is_empty()) {
+            form = form.text("entities", entities.join(","));
+        }
+        form = form.part(
+            "file",
+            reqwest::multipart::Part::text(content).file_name(file_name),
+        );
+        self.proxy(self.http.post(self.endpoint("/v1/files")).multipart(form))
+            .await
+    }
 }
 
-// ---------- the seven tools (SPEC §9a naming, snake_case) ----------
+/// A tool-level error the agent can see and react to (bad input, unreadable
+/// file, unreachable URL) — as opposed to a protocol-level ErrorData.
+fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
+}
+
+// ---------- local helpers for the ingest tools ----------
+
+/// Extensions memory_ingest_file accepts (UTF-8 text-like content only).
+const INGEST_FILE_EXTENSIONS: [&str; 5] = ["txt", "md", "json", "csv", "html"];
+/// memory_ingest_file size cap.
+const MAX_FILE_BYTES: u64 = 512 * 1024;
+/// memory_ingest_url download cap.
+const MAX_URL_BYTES: usize = 2 * 1024 * 1024;
+/// memory_ingest_url fetch timeout.
+const URL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Naive HTML → text: drop <script>/<style> blocks, strip every tag, decode
+/// the common entities, collapse whitespace. Deliberately hand-rolled — good
+/// enough for recall indexing, no HTML-parser dependency.
+fn html_to_text(html: &str) -> String {
+    let html = strip_tag_blocks(html, "script");
+    let html = strip_tag_blocks(&html, "style");
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                text.push(' '); // tags separate words: "<p>a</p><p>b</p>" -> "a b"
+            }
+            '>' if in_tag => in_tag = false,
+            _ if in_tag => {}
+            _ => text.push(c),
+        }
+    }
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Remove `<tag …>…</tag>` blocks (case-insensitive), content included.
+/// An unclosed block is dropped through end-of-input.
+fn strip_tag_blocks(html: &str, tag: &str) -> String {
+    // ASCII lowercasing preserves byte offsets, so indices found in `lower`
+    // are valid char boundaries in `html`.
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}");
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0;
+    while let Some(found) = lower[pos..].find(&open) {
+        let start = pos + found;
+        out.push_str(&html[pos..start]);
+        pos = match lower[start..].find(&close) {
+            Some(rel) => {
+                let close_start = start + rel;
+                match lower[close_start..].find('>') {
+                    Some(gt) => close_start + gt + 1,
+                    None => lower.len(),
+                }
+            }
+            None => lower.len(),
+        };
+    }
+    out.push_str(&html[pos..]);
+    out
+}
+
+/// File name for a fetched page, from the last non-empty URL path segment.
+fn file_name_from_url(url: &reqwest::Url) -> String {
+    url.path()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("webpage.txt")
+        .to_owned()
+}
+
+// ---------- the thirteen tools (SPEC §9a naming, snake_case) ----------
 
 #[tool_router]
 impl VerityMcp {
@@ -368,6 +533,199 @@ impl VerityMcp {
     }
 
     #[tool(
+        name = "memory_ingest_text",
+        description = "Ingest a document-sized piece of text into shared memory verbatim, so it becomes searchable via memory_recall. Use for pasted documents, meeting transcripts, reports, or notes you already hold in-context — anything bigger than the one-line observations memory_remember is for. Tag entities so the content surfaces on their briefs."
+    )]
+    async fn memory_ingest_text(
+        &self,
+        Parameters(p): Parameters<IngestTextParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // document_id is reserved (schema-only) until the server keys
+        // re-ingestion on it; deliberately not sent on the wire.
+        #[derive(Serialize)]
+        struct Body {
+            scope_handle: String,
+            observation: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            entities: Option<Vec<String>>,
+        }
+        let body = Body {
+            scope_handle: p.scope_handle,
+            observation: p.content,
+            entities: p.entities,
+        };
+        self.post_json("/v1/episodes", &body).await
+    }
+
+    #[tool(
+        name = "memory_ingest_file",
+        description = "Read a LOCAL text file and ingest its contents into shared memory, so it becomes searchable via memory_recall. Use when the knowledge lives in a file on this machine rather than in-context. Accepts UTF-8 .txt/.md/.json/.csv/.html up to 512 KB; anything else is rejected with an error."
+    )]
+    async fn memory_ingest_file(
+        &self,
+        Parameters(p): Parameters<IngestFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = std::path::Path::new(&p.path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !INGEST_FILE_EXTENSIONS.contains(&ext.as_str()) {
+            return tool_error(format!(
+                "unsupported file type {:?}: memory_ingest_file accepts only UTF-8 text files with extension .txt, .md, .json, .csv, or .html",
+                p.path
+            ));
+        }
+        let meta = match tokio::fs::metadata(path).await {
+            Ok(meta) => meta,
+            Err(e) => return tool_error(format!("cannot read file {:?}: {e}", p.path)),
+        };
+        if !meta.is_file() {
+            return tool_error(format!("{:?} is not a regular file", p.path));
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return tool_error(format!(
+                "file {:?} is {} bytes; memory_ingest_file caps at {MAX_FILE_BYTES} bytes (512 KB)",
+                p.path,
+                meta.len()
+            ));
+        }
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) => return tool_error(format!("cannot read file {:?}: {e}", p.path)),
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                return tool_error(format!(
+                    "file {:?} is not valid UTF-8 text; memory_ingest_file accepts text files only",
+                    p.path
+                ))
+            }
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.txt")
+            .to_owned();
+        self.post_file(p.scope_handle, p.entities, file_name, content)
+            .await
+    }
+
+    #[tool(
+        name = "memory_ingest_url",
+        description = "Read and remember a public webpage: fetch an http(s) URL (10s timeout, 2 MB cap), reduce HTML to plain readable text, and ingest it into shared memory for memory_recall. Use when an agent should retain the contents of an article, documentation page, or other public page. Non-HTML text responses are ingested unmodified."
+    )]
+    async fn memory_ingest_url(
+        &self,
+        Parameters(p): Parameters<IngestUrlParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = match reqwest::Url::parse(&p.url) {
+            Ok(url) => url,
+            Err(e) => return tool_error(format!("invalid URL {:?}: {e}", p.url)),
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return tool_error(format!(
+                "unsupported URL scheme {:?}: memory_ingest_url fetches http/https only",
+                url.scheme()
+            ));
+        }
+        let resp = match self
+            .http
+            .get(url.clone())
+            .timeout(URL_FETCH_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return tool_error(format!("failed to fetch {url}: {e}")),
+        };
+        if !resp.status().is_success() {
+            return tool_error(format!("failed to fetch {url}: HTTP {}", resp.status()));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut resp = resp;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > MAX_URL_BYTES {
+                        return tool_error(format!(
+                            "response from {url} exceeds the {MAX_URL_BYTES}-byte (2 MB) cap"
+                        ));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => return tool_error(format!("failed while reading {url}: {e}")),
+            }
+        }
+        let body = match String::from_utf8(bytes) {
+            Ok(body) => body,
+            Err(_) => {
+                return tool_error(format!(
+                    "response from {url} is not UTF-8 text; memory_ingest_url handles text content only"
+                ))
+            }
+        };
+        let looks_like_html = content_type.contains("html")
+            || (content_type.is_empty()
+                && (body
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("<!doctype")
+                    || body.trim_start().to_ascii_lowercase().starts_with("<html")));
+        let content = if looks_like_html {
+            html_to_text(&body)
+        } else {
+            body
+        };
+        if content.trim().is_empty() {
+            return tool_error(format!("no textual content extracted from {url}"));
+        }
+        let file_name = file_name_from_url(&url);
+        self.post_file(p.scope_handle, p.entities, file_name, content)
+            .await
+    }
+
+    #[tool(
+        name = "memory_forget",
+        description = "Invalidate one specific memory — a chunk (recall result) or an episode (remembered observation) — by id, with an audited reason. Use when a memory is wrong, sensitive, or was ingested by mistake, so it stops surfacing in recall for every agent. Take ids from memory_recall provenance or memory_remember/ingest results."
+    )]
+    async fn memory_forget(
+        &self,
+        Parameters(p): Parameters<ForgetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        #[derive(Serialize)]
+        struct RefBody {
+            kind: ForgetRefKind,
+            id: String,
+        }
+        #[derive(Serialize)]
+        struct Body {
+            scope_handle: String,
+            #[serde(rename = "ref")]
+            target: RefBody,
+            reason: String,
+        }
+        let body = Body {
+            scope_handle: p.scope_handle,
+            target: RefBody {
+                kind: p.ref_kind,
+                id: p.id,
+            },
+            reason: p.reason,
+        };
+        self.post_json("/v1/forget", &body).await
+    }
+
+    #[tool(
         name = "memory_whoami",
         description = "Return this server's configured identity defaults: Verity URL, tenant, principal tokens, and actor sub/azp. Diagnostic only — identity is process configuration and can never be changed through tool arguments."
     )]
@@ -395,9 +753,11 @@ impl ServerHandler for VerityMcp {
                  memory_open_scope once to get a scope_handle, then pass it to every \
                  other tool. Check memory_activity before side-effecting actions; \
                  record completed actions with memory_record_action; persist durable \
-                 knowledge with memory_remember; query with memory_recall (search) or \
-                 memory_get (exact field). All results are filtered to what this \
-                 agent's configured identity is allowed to see.",
+                 knowledge with memory_remember; ingest documents with \
+                 memory_ingest_text / memory_ingest_file / memory_ingest_url; \
+                 retract bad memories with memory_forget; query with memory_recall \
+                 (search) or memory_get (exact field). All results are filtered to \
+                 what this agent's configured identity is allowed to see.",
             )
     }
 }
@@ -413,4 +773,35 @@ async fn main() -> anyhow::Result<()> {
     let service = VerityMcp::new(cli).serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_name_from_url, html_to_text};
+
+    #[test]
+    fn html_to_text_strips_script_style_tags_and_entities() {
+        let html = "<!DOCTYPE html><html><head><title>T</title>\
+                    <STYLE>body { color: red; }</STYLE>\
+                    <script type=\"text/javascript\">var x = \"<p>sneaky</p>\";</script>\
+                    </head><body>\n  <h1>Hello&nbsp;&amp; welcome</h1>\
+                    <p>line   one</p><p>line&#39;s two &lt;3</p></body></html>";
+        assert_eq!(
+            html_to_text(html),
+            "T Hello & welcome line one line's two <3"
+        );
+    }
+
+    #[test]
+    fn html_to_text_drops_unclosed_script_through_eof() {
+        assert_eq!(html_to_text("<p>kept</p><script>var dropped;"), "kept");
+    }
+
+    #[test]
+    fn file_name_from_url_takes_last_segment_or_falls_back() {
+        let url = reqwest::Url::parse("https://example.com/docs/page.html?q=1").unwrap();
+        assert_eq!(file_name_from_url(&url), "page.html");
+        let root = reqwest::Url::parse("https://example.com/").unwrap();
+        assert_eq!(file_name_from_url(&root), "webpage.txt");
+    }
 }
