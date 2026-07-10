@@ -60,3 +60,20 @@ on the heap. Same corpus/machine as the entry above.
 Finding 4 resolved: **2.7x p99 improvement**, BM25 now inside the 50ms envelope at p95/p99.
 Hybrid tail is now dominated by the dense side's 1%-selectivity valley (finding 2), which
 remains the top optimization target.
+
+---
+
+## 2026-07-09 (later) — local query encoder measured
+
+**Setup:** all-MiniLM-L6-v2 ONNX (384-d, matching the chunk schema), CPU-only via ONNX
+Runtime, single thread, 100 short queries, Apple M3 Pro. Semantic ordering verified by test
+(related queries must beat unrelated by >0.2 cosine).
+
+| Case | p50 | p95 | p99 |
+|---|---|---|---|
+| local query encode (MiniLM-L6 ONNX) | 11.03ms | 12.21ms | 13.61ms |
+
+Inside SPEC §4a's 5–15ms local-encoder budget. Warm-cache encoder load ~190ms; first-run
+model download ~4.6s. **End-to-end dense recall including encoding** at 100k/1% selectivity
+is therefore ~37ms p50 / ~48ms p95 (encode + filtered ANN, additive worst case) — the
+number the <50ms p95 claim must hold against as corpus size grows.

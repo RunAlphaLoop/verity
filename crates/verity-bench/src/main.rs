@@ -94,11 +94,21 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         k: usize,
     },
+    /// Benchmark the local query encoder (SPEC §4a) — the embedding cost that
+    /// honest recall numbers must include. Needs no database.
+    Encode {
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Encode { queries } = cli.command {
+        return encode(queries);
+    }
+
     let adapter = PostgresAdapter::connect(&cli.dsn)
         .await
         .context("connecting to Postgres — is deploy/docker-compose.yml up?")?;
@@ -110,6 +120,7 @@ async fn main() -> Result<()> {
             facts,
         } => seed(&adapter, chunks, entities, facts).await,
         Command::Run { queries, k } => run(&adapter, queries, k).await,
+        Command::Encode { .. } => unreachable!("handled above"),
     }
 }
 
@@ -318,6 +329,47 @@ async fn run(adapter: &PostgresAdapter, n_queries: usize, k: usize) -> Result<()
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
     println!("\nresults written to {path}");
     println!("(corpus={corpus}; report p50/p95/p99 with this context — numbers without corpus size and selectivity are not honest numbers)");
+    Ok(())
+}
+
+/// Local query-encoder latency (SPEC §4a): tokenizer + MiniLM-L6 ONNX forward
+/// pass + mean-pool + normalize, per short synthetic query. This is the cost
+/// every published dense/hybrid recall number must carry on cache misses.
+fn encode(n_queries: usize) -> Result<()> {
+    println!(
+        "loading {} ({}-d; first run downloads to the hf-hub cache)...",
+        verity_encoder::MODEL_ID,
+        verity_encoder::DIM
+    );
+    let started = Instant::now();
+    let encoder = verity_encoder::QueryEncoder::load()?;
+    println!("encoder ready in {:.1?}", started.elapsed());
+
+    for _ in 0..5 {
+        encoder.encode("warmup query about renewal pricing for the acme account")?;
+    }
+
+    let mut rng = rand::rng();
+    let mut hist = Histogram::<u64>::new(3)?;
+    for i in 0..n_queries {
+        let query = format!(
+            "{} {} status for account {}",
+            WORDS.choose(&mut rng).expect("word pool"),
+            WORDS.choose(&mut rng).expect("word pool"),
+            i % 100,
+        );
+        let t = Instant::now();
+        let v = encoder.encode(&query)?;
+        hist.record(t.elapsed().as_micros() as u64)?;
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        anyhow::ensure!(
+            v.len() == verity_encoder::DIM && (norm - 1.0).abs() < 1e-3,
+            "embedding sanity check failed: len {}, norm {norm}",
+            v.len()
+        );
+    }
+    print_case("local query encode (MiniLM-L6 ONNX)", &hist, 1.0, 1);
+    println!("\n({n_queries} short queries, single thread, cold cache per query — SPEC §4a budgets 5-15ms)");
     Ok(())
 }
 

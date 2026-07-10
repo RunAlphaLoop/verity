@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 verity-core = { path = "../verity-core" }
+verity-encoder = { path = "../verity-encoder" }
 verity-storage = { path = "../verity-storage" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
