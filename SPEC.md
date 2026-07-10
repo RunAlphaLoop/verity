@@ -1,4 +1,4 @@
-# Verity — Technical & Product Specification (v1.3)
+# Verity — Technical & Product Specification (v1.4)
 
 **Name:** Verity (founder-approved 2026-07-09; run trademark/domain clearance before the first public artifact).
 **One-liner:** The open-source, permission-aware shared context plane for enterprise AI agents — always fresh from systems of record, provably scoped, fast enough for the inner loop.
@@ -9,6 +9,8 @@
 **Changes from v1.1 (founder request, 2026-07-09):** cross-agent activity awareness is now first-class. Agents can record what they *did* (not just what they observed) as **Action records** — an append-only, scoped, per-entity activity timeline — and any agent can ask "what has been done on this entity, by whom?" via `memory.activity` before acting. See §2 (Action records), §9 (new verbs), §13 (MVP scope).
 
 **Changes from v1.2 (founder request, 2026-07-09):** a **generalized knowledge layer** — what the organization *learns* across scoped interactions, without the interactions themselves ever crossing streams. Knowledge items are entity-free semantic memories (patterns, objections, playbooks) promoted from scoped episodic memory through a consolidation pipeline with hard de-identification gates: k-distinct-entity support, category-size floors, a provenance firewall, and automatic retraction when sources are forgotten. See §2 (Knowledge items), §7g (the retrieval carve-out), §9 (verbs).
+
+**Changes from v1.3 (founder request, 2026-07-09):** §5e — **ingestion ergonomics**. The OSS core ships receiving surfaces, never vendor OAuth apps: bring-your-own-token (verified viable for 20/20 surveyed systems), a layered entry-point funnel (MCP write tools → CLI → envelope endpoints → minted webhook URLs → file drop → LlamaIndex/LangChain sinks → declarative source manifests → native flagships), one structural ACL choke point with provenance tags on every fact, Nango as an optional BYO-OAuth profile, and the shared-OAuth-app (rclone) pattern rejected for core but reborn as the cloud "OAuth concierge." Merge stays cloud-only; Alloy evaluated and declined as primary (no ACL model — docs/research/ALLOY-EVALUATION.md).
 
 ---
 
@@ -396,6 +398,236 @@ The founder's directive — don't hand-build dozens of OAuth integrations — is
 - **Verity Cloud** holds the Merge Professional relationship and resells long-tail connectivity with honest per-source freshness labels on the SLO dashboard (webhook-backed: seconds; polled: cadence-dependent). This is a clean cloud revenue line that never gates OSS features.
 - **Self-hosters** bring their own Merge account (free ≤3 linked accounts, daily sync — disclosed in docs) or use native/community connectors. Verity's freshness SLOs are always reported per connector-and-plan, so a Launch-tier Merge source shows its true daily cadence rather than inheriting flagship claims.
 - Per-source freshness metadata already exists in the connector registry (§5); Merge sources populate it from their sync/webhook mode. Nothing in the enforcement plane (§6–7) changes: Merge-ingested ACLs resolve through the same Identity Plane crosswalks and fail-closed rules.
+
+### 5e. Ingestion ergonomics: getting data in without Merge and without hosting OAuth
+
+**Decision.** The Apache-2.0 core ships *receiving surfaces*, not vendor OAuth apps. Developers bring their own first-party credentials (BYOT) — verified viable for 20/20 surveyed systems as of July 2026 — and Verity provides a layered funnel of entry points that all terminate at one structural choke point in the Rust write path: **a fact is accepted only if it carries exactly one of {a real AclEnvelope, a reference to an admin-assigned visibility policy}; anything else is quarantined.** No SDK, sink, CLI flag, or endpoint can bypass this. Merge remains strictly cloud-edition; Nango remains an optional BYO-OAuth-app profile. The founder question — "easy without a Merge account, without us building OAuth clients" — is answered by v0.1 in ~4 weeks of the plan below.
+
+Every fact carries an **ACL provenance tag** from day one: `mirrored | approximated | admin-assigned | quarantined`. This is what keeps the two-lane story (convenience lane vs truth lane) honest in the product rather than in the docs, and it is cheap now and retrofit-expensive later.
+
+---
+
+### 5e.1 The layered funnel (entry points in adoption order)
+
+Each entry point reuses the existing push lane, HMAC scope handles, and fail-closed quarantine. Exactly one credential is ever issued by us: the Verity scope handle.
+
+| # | Entry point | One-line pitch | Lane |
+|---|---|---|---|
+| 1 | **MCP write tools** (`remember`/`ingest_text`, `ingest_file`, `ingest_url`) on the existing MCP server | Paste one MCP config into Claude/Cursor and the agent itself is the universal connector — zero installs for users already in an agent. | Convenience |
+| 2 | **`verity` CLI**: `verity dev` (embedded server + bundled local embeddings) and `verity add <file\|dir\|url\|->` | Empty laptop to permission-filtered query in five minutes, zero Docker, zero third-party keys; `--visibility` is enforced by the argument parser. | Convenience |
+| 3 | **Canonical envelope endpoints** (`POST /v1/episodes`, `POST /v1/facts`) | curl-in-60-seconds: one header, one JSON body, `visibility` required when no ACL block. Already ~80% built. | Convenience |
+| 4 | **Minted scoped webhook URLs** (`verity webhook mint <name> --visibility <policy>`) | Any system that can POST JSON — GitHub, Stripe, Zapier, n8n, cron jobs, internal services — becomes a push source with no connector and no OAuth; Estuary HTTP-Ingest pattern. | Convenience → Manifest |
+| 5 | **`POST /v1/files`** (multipart) | Drop a file; server does parse→chunk→embed via the Apache-2.0 `unstructured` library — the OpenAI/Anthropic pattern developers already know. | Convenience |
+| 6 | **Framework sinks**: `VerityVectorStore` (LlamaIndex) + LangChain vector-store/retriever | Two thin classes convert 300+ LlamaHub readers and 100–200+ LangChain loaders into free Verity connectors (the proven Zep/Mem0 move). Required `visibility_policy` constructor arg. | Convenience |
+| 7 | **pg_net/Supabase trigger snippet** | Copy-paste Postgres trigger POSTing row changes to a minted webhook URL — CDC-lite on-ramp to the already-built Debezium truth lane. | Convenience → Truth |
+| 8 | **Declarative source manifests** (YAML, §5e.3) on the webhook endpoint | Any REST/webhook source becomes a reviewable config file — LLM-draftable, fixture-tested, human-approved at the ACL block; connectors are data, not code. | Manifest |
+| 9 | **Native flagship connectors** (Drive, SharePoint/Graph, Salesforce, Slack, HubSpot, Debezium) | Source-fidelity AclEnvelopes, push freshness, 31ms-to-queryable — the graduation path and the moat. | Truth |
+
+The demo climax is not ingestion speed — that is table stakes in 2026. The climax is minute 4 of the quickstart: `verity handle create --as intern@co --groups interns`, re-run the same query, and watch team-scoped facts disappear from the answer. Permission-differentiated memory is the thing no surveyed competitor does; the quickstart demonstrates the invariant instead of documenting it.
+
+---
+
+### 5e.2 The bring-your-own-token doctrine
+
+**Doctrine.** BYOT is the *only* auth mode of the OSS core. Every connector quickstart reads: "create a key / private app / service account / self-registered OAuth client **in your own tenant**, paste it into Verity." Hosted OAuth apps are required only for multi-tenant SaaS distribution — exactly the cloud-edition problem Merge and the (future) OAuth concierge cover. The July 2026 coverage survey confirms zero systems require a vendor-registered app for a customer to grant first-party access:
+
+| System | Self-serve credential | Push under that credential | ACL readability (tier) |
+|---|---|---|---|
+| Google Drive/Workspace | Service account + DWD (admin-console config) | Yes — `changes.watch` (needs public HTTPS); `changes.list` poll fallback | **A** — `permissions.list` is best-in-class |
+| Microsoft 365/SharePoint | App registration in customer's own Entra tenant; `Sites.Selected` scoping | Yes — Graph change notifications + delta (needs public HTTPS) | **A** — `/permissions` endpoints |
+| Box | Custom app + Client Credentials Grant, own-admin approval | Yes | **A** — collaborations endpoints |
+| Dropbox | Scoped app, short-lived + refresh tokens | Yes | **A** — sharing member lists |
+| GitHub | Fine-grained PAT or customer-created GitHub App | Yes — webhooks fully manageable via REST | **A** — collaborators/teams/levels |
+| Jira/Confluence | Scoped API tokens (service-account tokens; **api.atlassian.com gateway URLs mandatory** — classic tokens expired May 2026) | Yes — admin/REST webhooks | **A** — security levels, space perms, restrictions |
+| Salesforce | Customer-created Connected App + client_credentials (**post-Sept-2025 crackdown helps us**: vendor-distributed apps got harder, customer-created stayed easy) | Yes — CDC via Pub/Sub API | **A** — `*Share` tables, ObjectPermissions (hardest reconstruction of the 20) |
+| Slack | App-from-manifest in own workspace, bot token | Yes — **Socket Mode: push with zero public endpoint** | **B** — channel membership |
+| Linear | Personal API key (scoped) | Yes — first-class webhooks via API | **B** — team membership |
+| Asana | PAT | Yes — but webhook dies with its token (health-check required) | **B** — project/team membership |
+| Front | Scoped API token | Yes — rule + app webhooks | **B** — inbox membership |
+| Monday | Personal API token | Yes — GraphQL webhook mutation | **B** — board subscribers |
+| Airtable | Scoped PAT with per-base grants | Yes — full Webhooks API under PAT | **B** (Enterprise only; else policy) |
+| Zendesk | **API tokens dying Jul 2026–Apr 2027** → customer-created OAuth client + client_credentials (still self-serve) | Yes — Admin Center or API | **B** — group/org/brand |
+| HubSpot | Private app token (~2 min; not the new Service Keys — no webhook support) | Yes — but webhook subscriptions are **UI-configured only** | **C** — no per-record ACL API |
+| Notion | Internal integration token | Yes — integration webhooks (2025+) | **C** — per-page permissions not exposed |
+| Intercom | Private app / workspace token | Yes — UI-configured webhooks | **C** — workspace-flat |
+| Gong | Access Key + Secret (Technical Admin) | Yes — Automation Rule webhooks; tight rate limits | **C** — permission profiles not exposed |
+| Stripe | Restricted API keys | Yes — webhook endpoints via API | **C** — no per-user model (n/a) |
+| Postgres/MySQL | DB credentials + replication slot/binlog | Yes — Debezium lane already built | **C** — unless schema encodes principals |
+
+Three engineering consequences, all absorbed once in the SDK rather than per-connector:
+
+1. **Credential-lifecycle abstraction** with four shapes — `{static key/PAT | client_credentials minting | refresh-token rotation | service-account JWT}` — plus expiry telemetry and webhook-health re-establishment hooks (Asana). Zendesk, Atlassian, and Dropbox already force this; the industry trend is "API key" → "self-registered OAuth client with machine grants." All three proposals and the judge agree: this is settled, non-optional.
+2. **Webhook receivability, three ways, declared per source**: (a) public HTTPS ingest endpoint; (b) Socket-Mode delivery (Slack's native connector uses it directly — we do *not* build a generic WebSocket lane until a second vendor ships the pattern); (c) delta/poll fallback (`changes.list`, Graph delta, manifest poll block) so no source is push-blocked, including firewalled self-hosters.
+3. **Credential wizards, not OAuth clients**: `verity connect slack` opens api.slack.com/apps preloaded with our shipped app manifest (~3 min); `verity connect github` uses a pasted fine-grained PAT *once, from the developer's machine*, to register a webhook at a minted URL — the credential is never stored unless a reconciliation poll is declared. HubSpot/Drive/Salesforce wizards ship with their truth-lane native connectors.
+
+For Verity's **own** MCP server: implement the 2025-11-25 MCP auth spec (RFC 9728 Protected Resource Metadata + CIMD URL-as-client_id, DCR fallback) so any MCP client connects to a self-hosted Verity with zero pre-registration — the agent-side mirror of the same doctrine. Roadmapped; first to slip on overrun since `verity dev` local use needs none of it.
+
+---
+
+### 5e.3 Source manifests: connectors are config
+
+A source manifest is a YAML file executed by the Rust ingest runtime. Manifests are **data, not code** — reviewable, diffable, registry-hostable with zero supply-chain code execution (the anti-Singer decision). One manifest serves both lanes: webhook = freshness, poll = reconciliation backstop for lost deliveries.
+
+```yaml
+manifest_version: 1
+source:
+  name: linear
+  auth:
+    ref: secret://linear-service-key        # ALWAYS a secret-store reference; credentials never inline
+    shape: static_key                       # static_key | client_credentials | refresh_token | service_account_jwt
+  webhook:
+    signature:
+      scheme: hmac_sha256                   # per-provider verification scheme
+      header: Linear-Signature
+      secret_ref: secret://linear-webhook-secret
+
+entities:
+  - type: issue
+    route:                                  # predicate-gated routing (Debezium SMT idiom)
+      when: "type = 'Issue' and action in ['create','update']"
+      operation: upsert
+    primary_key: "data.id"                  # deterministic PK → idempotent duplicate absorption
+    valid_from: "data.updatedAt"            # bi-temporal timestamp extraction
+    observed_at: "$now()"
+    map:                                    # JSONata field mappings (dialect declared, subset can grow)
+      title: "data.title"
+      state: "data.state.name"
+      team: "data.team.key"
+
+poll:                                       # optional reconciliation backstop — minimal by design
+  endpoint: "https://api.linear.app/graphql"
+  interval: 15m
+  cursor: opaque                            # Singer/Meltano-style: server echoes state back, connector treats as opaque
+
+acl_policy:                                 # REQUIRED-BY-ABSENCE-BEHAVIOR; enum-constrained; human-gated
+  mode: map                                 # map | static | quarantine (absent ⇒ quarantine)
+  identity_namespace: source_native_id      # email | source_native_id | verity_group (Glean's distinction)
+  principals: "team.members[].id"
+  approximation: true                       # mandatory for Tier B; note surfaces in admin approval UI
+  note: "Team membership approximates issue visibility; private-team boundaries honored, guest access excluded."
+
+fixtures:                                   # conformance harness ships WITH the format, not after
+  - input: fixtures/issue_update.json
+    expect:
+      facts: fixtures/issue_update.facts.json
+      acl_envelopes: fixtures/issue_update.acl.json
+```
+
+**Hard rules, enforced by schema and runtime, not docs:**
+
+- `acl_policy` has exactly three modes and **no defaultable value**. `map` extracts principals via JSONata (from the payload or a companion permissions fetch); `static` references a policy in the registry (never inline); `quarantine` is the behavior when the block is absent or when a `map` expression fails at runtime. Fail closed, always.
+- **Tier contracts, registry-enforced**: Tier A sources MUST use `map` (the registry rejects Tier A manifests with `static`); Tier B uses `map` against container membership and MUST set `approximation: true` with a human-readable note; Tier C MUST use `static` and the source **refuses to start** without an assigned policy — quarantine becomes an onboarding step, never a runtime surprise.
+- **Human gate**: activating any `map`/`static` manifest requires an explicit admin approval recorded in the audit log.
+- **LLM authoring stance**: LLMs may draft everything *except* the `acl_policy` block — the authoring flow is structurally forbidden from emitting it, so an unreviewed LLM manifest can only ever quarantine. This is the highest-severity failure mode in the design (a wrong ACL block is a permission leak into shared agent memory, not a broken sync; no surveyed product has this failure class), so it gets structural protection: no default to hallucinate, fixtures asserting expected AclEnvelopes, deterministic `verity manifest test` pass/fail, human approval of the ACL block only. The Airbyte-AI-Assistant/Superglue playbook ("LLM drafts, deterministic harness verifies, human approves") is the validated prior art; the connector-authoring MCP itself is deferred to Q2, after the format has survived real community authors.
+- **Mapping dialect**: JSONata, evaluated by `jsonata-core` (pure Rust, full 2.1.0 reference-test conformance — validate in week 2–3, off the critical path; fallback is a Verity-defined subset or the reference JS implementation in a WASM sandbox). Hard evaluator limits regardless: wall time, recursion depth, output size, no network — JSONata permits recursion, so limits are mandatory. CEL-style predicates only if JSONata proves awkward for routing; never CEL for field mapping.
+- **Convention over configuration**: a documented Verity-native webhook payload shape needs zero mapping (Debezium-outbox style), so the 5-minute wow for a well-behaved source is: mint URL, curl payload, fact queryable.
+- **Drift detection** in production (mapping-failure rate, unexpected-field rate) degrades to quarantine — never to mis-filing.
+- The Python connector SDK remains the documented escape hatch for the ~20% of sources config cannot express (Airbyte's manifest-only share sets the empirical ceiling).
+- **Community registry**: a git repo of signed YAML files at v0.1 (near-zero cost). Certification tiers, moderation, and `verity connect <name>` fetch machinery wait until ≥10 community manifests exist.
+
+---
+
+### 5e.4 Ecosystem sinks: be a great sink, never a loader
+
+We build zero loaders. Extraction is commoditized; permission-aware destinations are not.
+
+- **`verity-llamaindex`**: one `VerityVectorStore` class (~1 week). Every LlamaHub reader (300+) becomes a de-facto Verity connector.
+- **`verity-langchain`**: vector-store + retriever package (~1 week, heavy code share with the above). 100–200+ community loaders inherited.
+- Both take a **required `visibility_policy` constructor argument with no default** — loaders strip source ACLs by construction, so this lane is always policy-based (`admin-assigned` provenance) and anything arriving without a policy hits quarantine. Bypass is impossible, not discouraged.
+- Docs position sinks explicitly as **snapshot-grade convenience lane** — no push freshness, no per-object ACLs — with in-product graduation prompts to the truth lane.
+- **PyAirbyte destination bridge: cut from v0.1–v0.3.** Batch-only, interface-drift-prone, redundant with the framework sinks for snapshots, and the lane most likely to blur the convenience/truth distinction. Revisit on demand signal.
+- Ongoing tax budgeted honestly: ~2–4 days/quarter of framework-version churn across the two sink packages.
+
+---
+
+### 5e.5 Where Merge, Nango, and shared OAuth apps fit
+
+**Merge — cloud edition only, unchanged.** The managed long-tail grid is exactly the multi-tenant-SaaS problem hosted OAuth apps exist for. It never enters the OSS core, and nothing in this section touches its value prop: the OSS core trades one-click connect for sovereignty, deliberately.
+
+**Nango — optional docker-compose profile, Lane 2.** Nango self-hosted (ELv2, free tier) covers precisely what we need and nothing we don't: OAuth flows, token refresh, credential-injecting proxy for ~800 APIs. Its excluded features (syncs, webhooks, MCP server) don't matter because our connectors own push and ACL retrieval natively. Users still register their *own* OAuth apps with each provider. Two obligations before GA: counsel review of the ELv2 internal-use posture (embedding behind our product is generally permitted; reselling Nango-as-a-service is not), and never labeling it "open source" in our docs (ELv2 is not OSI-approved).
+
+**The rclone shared-OAuth-app pattern — verdict: legal, tolerated, and wrong for the OSS core.** Shipping a shared client_id/secret in the binary is practically and ToS-tolerated (Google treats installed-app secrets as non-secret), but three hard costs kill it as a core path: (1) a shared per-client_id quota — rclone users get ~2 files/sec — makes it a bad permanent transport; (2) full-Drive scope requires restricted-scope verification plus an annual CASA audit, so there is no CASA-free shared-app path for ACL-faithful Drive ingest; (3) the redirect-URI problem — self-hosted domains can't be pre-registered — forces a hosted callback relay into existence anyway. HubSpot caps unlisted public apps at 25 installs; Google device-code flow is a dead end for Drive (only `drive.file`/`drive.appdata` allowed). Only Slack's unlisted public distribution is genuinely cheap and review-free.
+
+**Conclusion**: the shared-app play becomes the cloud-adjacent **OAuth concierge** — Verity Cloud owns one verified app per flagship provider (Slack unlisted distribution; HubSpot via marketplace listing; Google via restricted-scope verification + annual CASA Tier 2, budget low-thousands USD/yr) plus the callback relay, and hands refresh tokens *down* to the self-hosted instance, Tailscale-style, storing nothing. The OSS core remains fully functional if the concierge disappears. Not built this quarter. The same verdict applies to the Google/Microsoft webhook relay for firewalled self-hosters: correct instinct, cloud edition, later — the documented self-hosted answer is the delta-poll fallback.
+
+**Composio, Arcade, Keycloak — no.** The first two are closed cloud credential brokers (tokens resting in a third-party cloud breaks the sovereignty story and the fail-closed posture); Keycloak solves identity federation, not third-party API credential lifecycle.
+
+---
+
+### 5e.6 ACL integrity per entry point
+
+One choke point, many doors. Enforcement is structural at every surface:
+
+| Entry point | Enforcement mechanism | Failure behavior | Provenance tag |
+|---|---|---|---|
+| Raw API (`/v1/episodes`, `/v1/facts`) | `visibility` field or ACL block required in envelope | Absent → quarantine (400 in strict/sync mode) | admin-assigned |
+| Minted webhook URLs | Visibility policy bound **at mint time** into the URL's scope handle; payloads may narrow visibility, never widen; blast radius = one URL, instantly revocable | Unmappable payload → quarantine-preview (`verity tail` shows raw payloads) | admin-assigned |
+| `verity add` (CLI) | `--visibility` required by the argument parser | Omission is a **usage error naming the invariant** — the first teaching moment, never a silent default | admin-assigned |
+| MCP write tools | Required `visibility` parameter, **capped by the scope handle's ceiling** (a team-scoped handle cannot write org-visible facts) | Omitted → tool error | admin-assigned |
+| `POST /v1/files` | Required multipart form field | Absent → 400 | admin-assigned |
+| Framework sinks | Required `visibility_policy` constructor arg, no kwarg default | Anything without one → quarantine | admin-assigned |
+| Manifests, `map` mode | JSONata principal extraction + declared `identity_namespace`; fixtures assert expected AclEnvelopes; admin approval logged; drift → quarantine | Mapping failure → quarantine, never mis-filing | mirrored (Tier A) / approximated (Tier B) |
+| Manifests, `static` mode | Policy by reference; Tier C refuses to start without one | Absent block → quarantine-only operation | admin-assigned |
+| Native truth-lane connectors | SDK contract tiers: Tier A MUST emit real AclEnvelopes from source permission APIs; Tier B emits container-membership ACLs with approximation note; Tier C requires setup-time policy | Unmappable ACL → quarantine (existing invariant) | mirrored / approximated |
+| Debezium / pg_net lane | Schema-declared principal columns (`map`) or admin policy (`static`) | Neither declared → quarantine | mirrored / admin-assigned |
+
+Query results display the visibility label and provenance tag per hit; audit views answer "which policy covers which source." Bi-temporal facts retain ACL provenance (manifest version, mapping expression, approval record), so a bad mapping is auditable and retroactively revocable. Honest limit, stated plainly in docs: pushed payloads and ecosystem loaders don't carry per-object ACLs — genuine fidelity comes only from Tier A sources. The two lanes are labeled everywhere and never blurred.
+
+---
+
+### 5e.7 Build order and honest costs
+
+Two-person team, parallel Rust/Python tracks, ~13–15 engineer-weeks total, founder-question answer live at week 4.
+
+**v0.1 — Weeks 1–4: the founder answer (the 5-minute wow).**
+
+| Item | Cost |
+|---|---|
+| MCP write tools (server + scope enforcement exist) | 2–4 days |
+| `verity` CLI: `dev` embedded server + local embeddings, `add` with required `--visibility`, `mcp install`, `webhook mint`, `tail`, `query`; refusal-message and printed-next-step polish is where the wow lives — budget real time | 2–3 weeks |
+| Canonical envelope endpoints hardening (`visibility`-or-ACL gate) | days |
+| Minted webhook URLs — **static visibility binding only**; Verity-native zero-mapping payload shape; unknown shapes → quarantine-preview; all declarative mapping deferred to v0.3 | 1–1.5 weeks |
+| ACL provenance tag on every fact (cheap now, retrofit-expensive later) | days |
+| jsonata-core validation spike, off the critical path | ~3 days, week 2–3 |
+| Quickstart with the quickstart climax: per-principal query divergence at minute 4 | with CLI polish |
+
+**v0.2 — Weeks 4–8: the multiplier.**
+
+| Item | Cost |
+|---|---|
+| `POST /v1/files` via `unstructured` (Python ingest plane) | ~1 week |
+| LlamaIndex `VerityVectorStore` + LangChain package | ~2 weeks combined |
+| pg_net/Supabase trigger snippet + docs page (Debezium lane exists) | 1–2 days |
+| Credential-lifecycle abstraction (4 shapes + expiry telemetry + webhook-health hooks) | 1.5–2 weeks |
+| Two credential wizards only: `verity connect slack` (app-from-manifest, Socket Mode) and `verity connect github` (PAT used once, never stored) | ~1 week |
+
+**v0.3 — Weeks 8–12: the scaling substrate.**
+
+| Item | Cost |
+|---|---|
+| Manifest v1: schema + Rust interpreter (auth-ref resolution, HMAC verify, predicate routing, JSONata mapping, PK + bi-temporal extraction, `acl_policy` evaluation, quarantine wiring) — reuses the episodes/Debezium fact pipeline | 3–4 weeks |
+| `acl_policy` enum + tier contracts + admin approval gate + policy registry API | 1–1.5 weeks |
+| Conformance harness: `fixtures[]`, `verity manifest test`, CI mode, drift-to-quarantine metrics — **ships with the format, not after** | ~1 week |
+| Minimal poll/reconciliation block (opaque echoed cursor + interval + list endpoint — deliberately **not** a full Airbyte paginator; the weird 20% goes to the Python SDK escape hatch) | ~1.5 weeks |
+| Community manifest repo (signed YAML in git) | near zero |
+
+**Q2 and later** (explicitly out of this quarter): LLM manifest-authoring MCP (after the format survives real authors), MCP 2025-11-25 auth for our own server (~1 week; first to slip), registry certification/moderation machinery, cloud OAuth concierge + webhook relay, remaining credential wizards (with their native connectors), PyAirbyte bridge (on demand signal).
+
+**Re-verify before GA docs**: HubSpot Service Keys webhook support (beta may add it); Gong rate limits against a real contract (public numbers conflict); Zendesk token-migration tooling; Nango ELv2 counsel sign-off.
+
+---
+
+### 5e.8 What we explicitly refuse to build
+
+1. **Per-source OAuth clients in the OSS core.** Zero, ever. BYOT covers 20/20 systems; hosted OAuth is a cloud-edition problem Merge and the concierge own.
+2. **A no-code connector-builder UI.** Manifests + coding agents cover it; the drafting-from-quarantine-samples UI is polish, not v0.x.
+3. **Our own document parsers.** Embed `unstructured` (Apache-2.0-compatible); expose chunking overrides later.
+4. **A generic WebSocket receive lane.** Slack is the only confirmed Socket-Mode vendor; its native connector uses it directly. Revisit when a second vendor ships the pattern.
+5. **Keycloak or any identity-server dependency for ingest.** Identity federation ≠ third-party API credential lifecycle.
+6. **Composio/Arcade or any closed cloud credential broker in the OSS path.** Self-hosted tokens never rest in a third-party cloud.
+7. **A shared Google/HubSpot client_id shipped in the OSS binary as a primary path.** Shared quota pain lands on users while CASA obligations land on us; the concierge does this properly, cloud-side, later.
+8. **Per-source loaders.** LlamaIndex/LangChain/the manifest plane exist so we never maintain extraction code for the long tail.
+9. **Default visibility values, anywhere.** No SDK kwarg default, no manifest default, no LLM-emittable `acl_policy`. The absence of a visibility decision is always a refusal or a quarantine — never an assumption.
 
 ---
 
