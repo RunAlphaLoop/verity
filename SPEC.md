@@ -1,10 +1,12 @@
-# Verity — Technical & Product Specification (v1.1)
+# Verity — Technical & Product Specification (v1.2)
 
 **Name:** Verity (founder-approved 2026-07-09; run trademark/domain clearance before the first public artifact).
 **One-liner:** The open-source, permission-aware shared context plane for enterprise AI agents — always fresh from systems of record, provably scoped, fast enough for the inner loop.
 **License:** Apache 2.0, permanently. One codebase. Nothing security-critical ever paywalled.
 
 **Changes from v1.0:** this revision resolves the completeness critique in the architecture itself, not in a risks list. Query embedding is now inside the latency budget with a local ONNX query encoder; a first-class Identity Plane (§6) makes source-ACL inheritance actually enforceable; the ReBAC engine decision is made — **SpiceDB**, because its true push Watch API and ZedToken consistency are load-bearing for our materialization design (OpenFGA only offers paginated `ReadChanges` polling); a Deletion, Retention & Compliance plane (§8) reconciles "invalidate-never-delete" with GDPR via crypto-shredding and a lineage-driven hard-purge pipeline; entity-tagging is stated honestly as a deterministic/probabilistic split with quarantine-by-default and a tagger-recall benchmark metric; `memory.remember` is retrievable at launch; MediaObject + retrieve-by-text ships in v0.1; concurrency targets, read-your-writes semantics, backup/restore/DR, tenant-model reconciliation, embedding-model migration, backfill, schema evolution, purpose-policy authoring, audit-log operations, signed-URI lifecycle, cross-source precedence, cost model, and OSS HA posture are all specified. The MVP is re-baselined at 12 weeks with an explicit staffing assumption.
+
+**Changes from v1.1 (founder request, 2026-07-09):** cross-agent activity awareness is now first-class. Agents can record what they *did* (not just what they observed) as **Action records** — an append-only, scoped, per-entity activity timeline — and any agent can ask "what has been done on this entity, by whom?" via `memory.activity` before acting. See §2 (Action records), §9 (new verbs), §13 (MVP scope).
 
 ---
 
@@ -21,6 +23,7 @@ Enterprises run agents across sales, support, marketing, and ops, but each agent
 | Permissions | `user_id` namespacing | Namespacing | Agent-bound | **Source-ACL inheritance + directory-synced identity + ReBAC + entity/purpose scoping, enforced in the index** |
 | Freshness | N/A (app's problem) | Bi-temporal, LLM ingestion | Sleep-time consolidation | **Two-lane CDC/poll sync; deterministic supersession; published freshness SLOs** |
 | Structured records | LLM-extracted to prose | LLM-extracted from JSON episodes | Files | **A CRM row stays a row — deterministic keyed upsert, no LLM in the write path** |
+| Cross-agent awareness | None (no actor model) | None (no actor model) | Letta-agents only | **Action records: scoped, token-authenticated activity timeline any framework's agents can read before acting (§2)** |
 | Read latency (published) | ~0.88s p50 | ~150–200ms p95 | ~300ms p95 | **Target <50ms p95 scoped recall *including local query encoding*; ~5ms pinned-brief/record reads (honest, measured curves; remote-embedder configs excluded and labeled)** |
 
 We do not compete with Mem0/Letta on chat personalization; we interoperate with them. We are "open-source Glean-for-agents": the vendor-neutral layer against Salesforce/Glean/Notion memory silos, and the permission-aware layer that Airbyte's Context Store and Weaviate Engram lack.
@@ -70,6 +73,38 @@ Per-entity **pinned briefs** (Letta-block-style summaries attached to agents, re
 - **Tier 2 (observations):** agent writes are append-only L0 proposals with mandatory provenance. **New in v1.1 (launch-functional write→read loop):** every Tier-2 observation is *also* deterministically materialized as a retrievable chunk at write time — the raw observation text is embedded (local encoder), tagged with the entity tags inherited from the scope handle it was written under (deterministic, no extraction), stamped `trust_tier = agent_observation`, and indexed into the writer's scope. Asynchronous arbitration (Mem0-style ADD/UPDATE/DELETE/NOOP) into structured L2 facts remains a v0.3 refinement layered on top — but agents can read back what agents wrote from day one, ranked below Tier 1 at recall, quarantinable when originating from low-trust sources (web pages, inbound email).
 
 This is the OWASP ASI06 memory-poisoning defense by construction. Remediation is surgical: one command invalidates everything derived from a poisoned L0 episode via lineage — a demoable security feature.
+
+### Action records — cross-agent activity awareness (new in v1.2)
+
+Observations answer "what is true"; **Action records answer "what has been done."** A sales agent that quoted pricing, a support agent that issued a credit, a marketing agent that sent a sequence email — every consequential agent act is recordable, and any agent operating on the same entity can see it before acting. This is the coordination layer that prevents duplicate outreach, contradictory promises, and blind handoffs — and it is a capability **no OSS memory system ships** (Letta's activity is bound to Letta agents; Mem0/Zep have no actor model at all).
+
+**Semantics — a timeline, not a belief store.** Actions are events: append-only, never superseded, never decayed into untruth ("the email was sent" stays true forever). They are therefore *not* L1/L2 facts. An Action is an L0 episode (`kind = agent_action`) plus a deterministically-projected row in an indexed **activity timeline** — no LLM anywhere in the path, same write latency class as `remember`.
+
+```
+action {
+  action_id:    client-supplied idempotency key (retry-safe)
+  actor:        user sub + agent azp + act delegation chain   // from the token, never self-reported
+  action_type:  namespaced verb, e.g. "email.sent", "quote.issued", "ticket.updated", "call.scheduled"
+  entities:     target entity tags (must ⊆ the writing scope's entity_scope; server-verified)
+  summary:      one-line human/agent-readable description
+  payload:      structured detail (jsonb; e.g. quote amount, message id)
+  outcome:      succeeded | failed | pending
+  occurred_at:  event time
+  provenance:   L0 episode id
+}
+```
+
+**Scoping is identical to everything else — actions are often the most sensitive memory there is.** A `quote.issued` action carries the amount; it inherits the confidentiality class of its subject matter (quotes/pricing default to `restricted`, §7b) and the entity tags of the scope it was written under. An agent in a scope bound to customer A sees only actions targeting customer A; the fail-closed rules, audit logging, and the scope-soundness fuzzer (§7e) cover the activity read path like every other read path.
+
+**Read paths:**
+- `memory.activity(entity, since?, action_types?, actors?)` — the scoped timeline query: an indexed range read (no ANN), latency class of `get`, with cursor pagination.
+- **Pinned briefs get a "recent agent activity" section** (last N consequential actions), so the hottest coordination signal arrives with zero extra calls.
+- Actions are also embedded as Tier-2 chunks (same deterministic path as observations), so semantic `recall` surfaces them ("has anyone discussed discounting with acme?").
+- `memory.subscribe` fires on new actions for watched entities — agent B learns within seconds that agent A just acted.
+
+**Trust & anti-gaming:** the `actor` triple comes from the authenticated token, never from arguments — an agent cannot impersonate another agent's actions or scrub its own (append-only; `memory.forget` can invalidate an action's *retrievability* with an audited reason, but the L0 episode and audit trail remain). Recording an action is voluntary at the API level but adapters make it automatic where possible (e.g. the framework adapters expose an `act()` wrapper that records on completion).
+
+**Deliberately deferred:** coordination *primitives* (claims/leases — "agent A is working on this renewal, back off") are v0.x candidates layered on the same timeline; awareness ships first, arbitration later.
 
 ### Ranking
 Composite `similarity × recency-decay × trust-tier × importance` applies to episodic/agent-written memory only. L1 facts: no decay, current-until-superseded.
@@ -474,7 +509,7 @@ Three layers, one engine, one verb set.
 ### 9a. MCP server (first-class, stateless 2026-07-28 spec)
 No session affinity; server-minted MemoryScope handles for cross-call state; `ttlMs`/`cacheScope` hints on entity reads; `subscriptions/listen` for change notifications; native consumption of EMA/ID-JAG tokens (the `(user, agent, on-behalf-of)` tuple is the authorization subject — never agent-supplied IDs).
 
-Tool surface — six verbs, no sprawl:
+Tool surface — eight verbs, no sprawl:
 
 ```jsonc
 // memory.open_scope — start a purpose-bound session
@@ -509,6 +544,25 @@ Tool surface — six verbs, no sprawl:
                  "entities": ["account:acme-corp"] } }   // entities must ⊆ scope's entity_scope; server-verified
 // writer identity, trust tier = agent_observation, provenance chain stamped server-side
 
+// memory.record_action — append to the entity activity timeline (§2 Action records).
+// Idempotent on action_id; actor identity from the token, never from arguments.
+{ "tool": "memory.record_action",
+  "arguments": { "scope_handle": "vs_9f2...",
+                 "action_id": "a-7f31c",
+                 "action_type": "quote.issued",
+                 "entities": ["account:acme-corp"],
+                 "summary": "Issued renewal quote at $84,000 (12mo, net-30).",
+                 "payload": { "amount": 84000, "term_months": 12 },
+                 "outcome": "succeeded",
+                 "occurred_at": "2026-07-09T17:41:02Z" } }
+
+// memory.activity — the scoped cross-agent timeline: "what has been done here, by whom?"
+// Indexed range read, latency class of memory.get. Answer BEFORE acting.
+{ "tool": "memory.activity",
+  "arguments": { "scope_handle": "vs_9f2...", "entity": "account:acme-corp",
+                 "since": "2026-07-02T00:00:00Z", "action_types": ["email.*", "quote.*"] } }
+// → [ { actor: {sub, azp}, action_type: "quote.issued", summary: "...", occurred_at, provenance }, ... ]
+
 // memory.forget — audited invalidation (belief semantics; invalidate-never-delete;
 // compliance erasure is a separate admin verb, never agent-reachable — §8f)
 { "tool": "memory.forget",
@@ -533,6 +587,8 @@ POST /v1/scopes                          # mint MemoryScope handle
 POST /v1/recall                          # scoped hybrid search
 GET  /v1/records/{source}/{entity}/{field}?as_of=...   # bi-temporal point read
 POST /v1/episodes                        # remember (L0 append + Tier-2 chunk)
+POST /v1/actions                         # record_action (idempotent on action_id)
+GET  /v1/activity?entity=...&since=...   # scoped agent-activity timeline
 POST /v1/ingest/debezium                 # first-class CDC envelope input
 POST /v1/admin/quarantine/{episode_id}/rollback   # surgical poison rollback
 POST /v1/admin/erasure                   # crypto-shred + hard-purge (admin-only, §8)
@@ -667,7 +723,7 @@ Goal: prove the two wedges — **provably scoped recall** and **live supersessio
 - Audit log of every `(subject, scope, results)` tuple, with retention/access controls per §7e.
 
 ### Milestone C — "The demo and the numbers" (weeks 8–12)
-- MCP server (stateless 2026-07-28 spec; open_scope/recall/get/remember/forget/pin) + gRPC/REST; **one** framework adapter (LangGraph BaseStore); others fast-follow in v0.2.
+- MCP server (stateless 2026-07-28 spec; open_scope/recall/get/remember/**record_action/activity**/forget/pin) + gRPC/REST; **one** framework adapter (LangGraph BaseStore); others fast-follow in v0.2. Action records ship in v0.1 — the write path is a deterministic append + indexed timeline read (no LLM, no new infrastructure); brief "recent activity" sections land with pinned briefs in the same milestone.
 - Connectors: **HubSpot** (webhooks+journal, <5s field-change-to-queryable), **Google Drive** (ACL inheritance + Docling + directory sync), **Debezium envelope** — each with field-mapping, ACL-mapping, *and identity-mapping* conformance tests; backfill with progress UI.
 - **MediaObject store + retrieve-by-text/answer-from-pixels** with scope-bound signed URIs (§10) — the v0.1 multimodal commitment, honored.
 - **Compliance plane v0:** hard-purge pipeline + DEK destruction (`/v1/admin/erasure`), per-source retention workers, DSAR export CLI; `verity backup`/`restore` with the §11b ordering and fail-closed restore.
@@ -675,7 +731,7 @@ Goal: prove the two wedges — **provably scoped recall** and **live supersessio
 - **The "Scoped Recall Benchmark" v0** (branded, open, reproducible) — five metrics defined, **three shipped at launch:** (1) cross-entity/tenant leakage rate under adversarial probes incl. prompt injection — target **0**; (2) stale-fact citation rate after a CDC update — target **~0%**; (4) p95 scoped-read latency vs corpus size *and vs QPS*, local-encoder and remote-embedder curves labeled separately. **(3) per-connector freshness lag ships as the public dashboard in v0.2; (5) entity-tagger recall ships with probabilistic tagging in v0.3.** Whoever defines the metric owns the category conversation; defining all five now and shipping honestly-labeled subsets beats shipping five rushed numbers.
 
 ### Launch demo (the whole pitch in one screen)
-A CrewAI agent and a Claude agent share memory about the same account. (1) Edit a deal amount in HubSpot → both agents cite the new value in **<5 seconds**, with provenance and `valid_from`. (2) A session scoped to customer A is **actively prompt-injected** to fetch customer B's quote — and provably fails, with the attempt visible in the audit log and the scope inspector showing exactly why. (3) An agent `remember`s an observation and retrieves it in its next turn — then a second agent sees it seconds later. (4) One command rolls back everything derived from a poisoned observation; one admin command crypto-shreds a departed contact's data and prints the signed purge report.
+A CrewAI agent and a Claude agent share memory about the same account. (1) Edit a deal amount in HubSpot → both agents cite the new value in **<5 seconds**, with provenance and `valid_from`. (2) A session scoped to customer A is **actively prompt-injected** to fetch customer B's quote — and provably fails, with the attempt visible in the audit log and the scope inspector showing exactly why. (3) An agent `remember`s an observation and retrieves it in its next turn — then a second agent sees it seconds later. (4) **The sales agent issues a quote and records the action; the support agent, asked about a refund minutes later, checks `memory.activity` first and sees the quote before answering** — cross-agent awareness, live. (5) One command rolls back everything derived from a poisoned observation; one admin command crypto-shreds a departed contact's data and prints the signed purge report.
 
 **Explicitly out of v0.1:** Salesforce connector + Microsoft Graph/SCIM directory sync (v0.2), remaining framework adapters (v0.2), freshness public dashboard / benchmark metric 3 (v0.2), admin-mutating web UI incl. schema-drift mapping UI (v0.2; CLI covers it at launch), Temporal (v0.3, before managed fleet), Qdrant scale profile + tiered multitenancy (v0.3), L2 LLM fact extraction + probabilistic entity tagging + benchmark metric 5 + sleep-time consolidation (v0.3), native multimodal embedding (v0.x per §10), `subscriptions/listen` (v0.2), Merge.dev long-tail connector (v0.3 — File Storage category first, per §5d), Nango OAuth layer for community connectors (v0.4), embedding-model migration tooling (v0.2 — the dual-vector schema exists at launch; the orchestrated cutover tool follows).
 
