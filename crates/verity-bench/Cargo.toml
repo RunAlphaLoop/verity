@@ -1,0 +1,19 @@
+[package]
+name = "verity-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+verity-storage = { path = "../verity-storage" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+hdrhistogram = { workspace = true }

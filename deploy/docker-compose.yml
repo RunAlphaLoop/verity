@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: paradedb/paradedb:latest-pg17
+    container_name: verity-postgres
+    environment:
+      POSTGRES_USER: verity
+      POSTGRES_PASSWORD: verity
+      POSTGRES_DB: verity
+    ports:
+      - "5433:5432"
+    volumes:
+      - verity-pgdata:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c maintenance_work_mem=512MB
+      -c max_parallel_maintenance_workers=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verity -d verity"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  verity-pgdata:
