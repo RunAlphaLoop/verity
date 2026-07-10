@@ -43,3 +43,20 @@ local ONNX encoder not yet built).
    tighter LIMIT with pre-intersection.
 5. Missing from these numbers: query embedding (local encoder, budgeted 5–15ms), network
    hop, concurrency. Single-query latency only — QPS-under-load is a required follow-up.
+
+---
+
+## 2026-07-09 (later) — BM25 fast-field fix
+
+**Change:** scope-filter columns (tenant_id, visibility, confidentiality) added to the bm25
+index as fast fields (migration 0003), letting pg_search filter inside Tantivy instead of
+on the heap. Same corpus/machine as the entry above.
+
+| Case | p50 | p95 | p99 | prior p99 |
+|---|---|---|---|---|
+| BM25 @ 1% selectivity | 23.23ms | 30.46ms | **32.59ms** | 87.17ms |
+| hybrid (dense+BM25) @ 1% | 30.70ms | 44.86ms | 55.90ms | 58.17ms |
+
+Finding 4 resolved: **2.7x p99 improvement**, BM25 now inside the 50ms envelope at p95/p99.
+Hybrid tail is now dominated by the dense side's 1%-selectivity valley (finding 2), which
+remains the top optimization target.
