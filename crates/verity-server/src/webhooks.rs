@@ -39,6 +39,12 @@ pub(crate) struct MintWebhookRequest {
     entity_scope: Vec<String>,
     #[serde(default = "default_confidentiality")]
     confidentiality: Confidentiality,
+    /// Manifest binding (SPEC §5e.3, task 30): inbound payloads route through
+    /// the manifest runtime instead of the native shape. Binding a draft is
+    /// legal — it quarantines everything until the manifest passes the human
+    /// gate.
+    #[serde(default)]
+    manifest_id: Option<Uuid>,
 }
 
 fn default_confidentiality() -> Confidentiality {
@@ -59,6 +65,23 @@ pub(crate) async fn mint_webhook(
             "a webhook needs a non-empty visibility set (empty = nothing it writes is ever readable)".into(),
         ));
     }
+    if let Some(manifest_id) = req.manifest_id {
+        // Bindable = exists in this tenant; activation state is checked per
+        // delivery so revoking approval takes effect immediately.
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM manifests WHERE id = $1 AND tenant_id = $2")
+                .bind(manifest_id)
+                .bind(req.tenant_id)
+                .fetch_optional(state.pool())
+                .await
+                .map_err(internal)?;
+        if exists.is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "manifest_id does not name a manifest in this tenant".into(),
+            ));
+        }
+    }
     let mut raw = [0u8; 32];
     use rand_core::RngCore;
     rand_core::OsRng.fill_bytes(&mut raw);
@@ -66,8 +89,8 @@ pub(crate) async fn mint_webhook(
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO webhooks (id, tenant_id, name, token_hash, visibility, entity_scope,
-                               confidentiality)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                               confidentiality, manifest_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(id)
     .bind(req.tenant_id)
@@ -76,6 +99,7 @@ pub(crate) async fn mint_webhook(
     .bind(&req.visibility)
     .bind(&req.entity_scope)
     .bind(req.confidentiality as i16)
+    .bind(req.manifest_id)
     .execute(state.pool())
     .await
     .map_err(internal)?;
@@ -133,16 +157,19 @@ struct NativeFact {
     valid_from: Option<DateTime<Utc>>,
 }
 
-struct Webhook {
-    id: Uuid,
-    tenant_id: TenantId,
-    name: String,
-    visibility: Vec<PrincipalToken>,
-    entity_scope: Vec<String>,
-    confidentiality: Confidentiality,
+pub(crate) struct Webhook {
+    pub(crate) id: Uuid,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) name: String,
+    pub(crate) visibility: Vec<PrincipalToken>,
+    pub(crate) entity_scope: Vec<String>,
+    pub(crate) confidentiality: Confidentiality,
+    /// Manifest binding: Some ⇒ payloads route through the manifest runtime
+    /// (manifests::deliver), never the native shape below.
+    pub(crate) manifest_id: Option<Uuid>,
 }
 
-async fn quarantine(
+pub(crate) async fn quarantine(
     state: &AppState,
     hook: &Webhook,
     payload: serde_json::Value,
@@ -171,13 +198,14 @@ async fn quarantine(
 pub(crate) async fn webhook_post(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> HandlerResult<(StatusCode, Json<serde_json::Value>)> {
     // Freshness SLO event time (task 21): webhooks carry no source clock, so
     // receipt time is the event time — the sample measures receipt→queryable.
     let received_at = Utc::now();
     let row = sqlx::query(
-        "SELECT id, tenant_id, name, visibility, entity_scope, confidentiality
+        "SELECT id, tenant_id, name, visibility, entity_scope, confidentiality, manifest_id
          FROM webhooks WHERE token_hash = $1 AND revoked_at IS NULL",
     )
     .bind(token_hash(&token))
@@ -192,7 +220,15 @@ pub(crate) async fn webhook_post(
         visibility: row.try_get("visibility").map_err(internal)?,
         entity_scope: row.try_get("entity_scope").map_err(internal)?,
         confidentiality: conf_from_i16(row.try_get("confidentiality").map_err(internal)?),
+        manifest_id: row.try_get("manifest_id").map_err(internal)?,
     };
+
+    // Manifest-bound webhooks route through the manifest runtime (SPEC §5e.3)
+    // instead of the native shape below.
+    if let Some(manifest_id) = hook.manifest_id {
+        return crate::manifests::deliver(&state, &hook, manifest_id, &headers, &body, received_at)
+            .await;
+    }
 
     // Unparseable bytes → quarantine (the raw text is preserved for preview).
     let raw: serde_json::Value = match serde_json::from_slice(&body) {

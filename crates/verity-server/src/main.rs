@@ -11,6 +11,9 @@ mod connectors;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
+#[cfg(test)]
+mod manifest_tests;
+mod manifests;
 mod media;
 mod purpose;
 mod rebac;
@@ -267,6 +270,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
+        .route(
+            "/v1/manifests",
+            post(manifests::upload_manifest).get(manifests::list_manifests),
+        )
+        .route(
+            "/v1/manifests/{id}/activate",
+            post(manifests::activate_manifest),
+        )
         .route("/v1/webhooks", post(webhooks::mint_webhook))
         .route("/v1/webhooks/{id}", delete(webhooks::revoke_webhook))
         .route("/wh/{token}", post(webhooks::webhook_post))

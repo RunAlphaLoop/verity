@@ -2,11 +2,13 @@
 members = [
     "crates/verity-core",
     "crates/verity-storage",
+    "crates/verity-storage-qdrant",
     "crates/verity-server",
     "crates/verity-bench",
     "crates/verity-encoder",
     "crates/verity-mcp",
     "crates/verity-cli",
+    "crates/verity-manifest",
 ]
 resolver = "2"
 

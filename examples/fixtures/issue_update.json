@@ -1,0 +1,39 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "createdAt": "2026-07-01T12:34:56.789Z",
+  "organizationId": "0a2f6c4e-9d31-4b8a-b7e2-5c1d8f6a3e90",
+  "webhookTimestamp": 1751372096789,
+  "url": "https://linear.app/acme/issue/ENG-42/fix-webhook-handler-timeout",
+  "data": {
+    "id": "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21",
+    "identifier": "ENG-42",
+    "title": "Fix webhook handler timeout",
+    "priority": 2,
+    "createdAt": "2026-06-28T09:12:00.000Z",
+    "updatedAt": "2026-07-01T12:34:56.789Z",
+    "state": {
+      "id": "b1e2d3c4-0001-4abc-9def-111111111111",
+      "name": "In Progress",
+      "type": "started",
+      "color": "#f2c94c"
+    },
+    "team": {
+      "id": "1f53bd35-7777-4a2b-8c1d-222222222222",
+      "key": "ENG",
+      "name": "Engineering"
+    },
+    "assignee": {
+      "id": "usr-3c4d5e6f-0002-4abc-9def-333333333333",
+      "name": "Jane Doe",
+      "email": "jane@acme.dev"
+    },
+    "labels": [
+      { "id": "lbl-1", "name": "bug" }
+    ]
+  },
+  "updatedFrom": {
+    "updatedAt": "2026-06-30T10:00:00.000Z",
+    "title": "Webhook handler times out"
+  }
+}

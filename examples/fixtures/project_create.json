@@ -1,0 +1,13 @@
+{
+  "action": "create",
+  "type": "Project",
+  "createdAt": "2026-07-03T10:00:00.000Z",
+  "organizationId": "0a2f6c4e-9d31-4b8a-b7e2-5c1d8f6a3e90",
+  "webhookTimestamp": 1751536800000,
+  "url": "https://linear.app/acme/project/q3-reliability",
+  "data": {
+    "id": "prj-5d6e7f80-0003-4abc-9def-555555555555",
+    "name": "Q3 Reliability",
+    "state": "started"
+  }
+}
