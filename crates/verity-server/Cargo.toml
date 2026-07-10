@@ -20,5 +20,10 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand_core = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
