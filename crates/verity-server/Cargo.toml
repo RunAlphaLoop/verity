@@ -29,3 +29,6 @@ base64 = { workspace = true }
 rand_core = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# ReBAC plane (task 10): SpiceDB HTTP-gateway client + revocation cache.
+reqwest = { workspace = true }
+moka = { workspace = true }

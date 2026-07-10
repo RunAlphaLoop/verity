@@ -179,15 +179,15 @@ impl PostgresAdapter {
                 .to_string()
         };
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(text)
-        .bind(scope.tenant_id)
-        .bind(&scope.principals)
-        .bind(scope.max_confidentiality as i16)
-        .bind(q.k as i64)
-        .bind(&scope.entity_scope)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            .bind(text)
+            .bind(scope.tenant_id)
+            .bind(&scope.principals)
+            .bind(scope.max_confidentiality as i16)
+            .bind(q.k as i64)
+            .bind(&scope.entity_scope)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         rows.iter().map(row_to_hit).collect()
     }
 }

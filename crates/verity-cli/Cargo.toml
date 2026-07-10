@@ -1,0 +1,23 @@
+[package]
+name = "verity-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The server crate already owns the bin name `verity`; this ships as
+# `verity-cli` until the SPEC §5e.1 rename (server -> `verity-server` bin,
+# CLI -> `verity`) lands as its own change.
+[[bin]]
+name = "verity-cli"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }

@@ -1,0 +1,312 @@
+//! `verity-cli dev` — empty laptop to permission-filtered query in five
+//! minutes (SPEC §5e.1 entry point #2). Each phase is idempotent: a healthy
+//! /healthz skips docker + spawn entirely, the "dev" tenant upserts to the
+//! same id, and re-minting the scope just refreshes its expiry.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+
+use crate::{config, ui, util, Ctx};
+
+/// Broad dev principal token: `dev` mints the org-wide scope over [1] and
+/// every quickstart example passes `--visibility 1`.
+const DEV_PRINCIPALS: &[i32] = &[1];
+
+pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
+    ui::banner("verity dev — local memory plane, five minutes");
+    println!();
+
+    // Repo discovery is best-effort while the server is already up (we only
+    // need it for the mcp binary path in the summary), mandatory otherwise.
+    let repo = util::repo_root(repo_flag.as_deref());
+
+    // (a)–(c) infrastructure, skipped wholesale when /healthz already answers.
+    if util::healthz(&ctx.http, &ctx.url).await {
+        ui::step_ok(
+            "server",
+            &format!("already running at {} — reusing it", ctx.url),
+        );
+    } else {
+        let repo = repo.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        docker_up(repo)?;
+        wait_for_postgres().await?;
+        let bin = ensure_server_built(repo)?;
+        spawn_and_wait(ctx, repo, &bin).await?;
+    }
+
+    // (d) first-run setup: tenant → scope → config. All idempotent.
+    let tenant_id = create_tenant(ctx).await?;
+    let (handle, expires) = util::mint_scope(ctx, &tenant_id, DEV_PRINCIPALS, "cli:dev", 43_200)
+        .await
+        .context("the server is up but scope minting failed")?;
+    let expiry_note = chrono::DateTime::parse_from_rfc3339(&expires)
+        .map(|t| util::human_remaining(t.with_timezone(&chrono::Utc)))
+        .unwrap_or_else(|_| "12h".into());
+    ui::step_ok(
+        "scope",
+        &format!(
+            "org-wide handle minted (principals {DEV_PRINCIPALS:?}, expires in {expiry_note})"
+        ),
+    );
+
+    ctx.config.url = Some(ctx.url.clone());
+    ctx.config.tenant_id = Some(tenant_id.clone());
+    ctx.config.scope_handle = Some(handle);
+    ctx.config.principals = Some(DEV_PRINCIPALS.to_vec());
+    config::save(&ctx.config_path, &ctx.config)?;
+    ui::step_ok("config", &ctx.config_path.display().to_string());
+
+    // (e) the summary people copy-paste from.
+    print_summary(ctx, &tenant_id, repo.ok().as_deref());
+    Ok(())
+}
+
+// ---------- (a) docker compose up ----------
+
+fn docker_up(repo: &Path) -> Result<()> {
+    let compose = repo.join("deploy").join("docker-compose.yml");
+    let output = Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(&compose)
+        .args(["up", "-d"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "docker not found on PATH\n  → install Docker Desktop (or colima + docker CLI) and re-run `verity-cli dev`"
+                )
+            } else {
+                anyhow::anyhow!("failed to run docker compose: {e}")
+            }
+        })?;
+    if !output.status.success() {
+        bail!(
+            "docker compose up failed:\n{}\n  → is the Docker daemon running? Start Docker Desktop and re-run `verity-cli dev`",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    ui::step_ok("postgres", "docker compose up -d (paradedb pg17)");
+    Ok(())
+}
+
+// ---------- (b) wait for pg health ----------
+
+async fn wait_for_postgres() -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let health = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{.State.Health.Status}}",
+                "verity-postgres",
+            ])
+            .output();
+        if let Ok(out) = health {
+            if String::from_utf8_lossy(&out.stdout).trim() == "healthy" {
+                ui::step_ok(
+                    "pg ready",
+                    &format!("healthy after {:.1}s", started.elapsed().as_secs_f32()),
+                );
+                return Ok(());
+            }
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            bail!(
+                "postgres (container verity-postgres) did not report healthy within 120s\n  \
+                 → inspect it with `docker logs verity-postgres`, then re-run `verity-cli dev`"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+// ---------- (c) build if missing, spawn, wait for /healthz ----------
+
+fn ensure_server_built(repo: &Path) -> Result<PathBuf> {
+    let bin = repo.join("target").join("release").join("verity");
+    if bin.is_file() {
+        return Ok(bin);
+    }
+    println!(
+        "  {} {}  release binary missing — building verity-server (first run only, a few minutes)",
+        ui::yellow("…"),
+        ui::pad("build", 8)
+    );
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "verity-server"])
+        .current_dir(repo)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "cargo not found on PATH\n  → install Rust via https://rustup.rs and re-run `verity-cli dev`"
+                )
+            } else {
+                anyhow::anyhow!("failed to run cargo build: {e}")
+            }
+        })?;
+    if !status.success() {
+        bail!("cargo build --release -p verity-server failed — fix the build and re-run `verity-cli dev`");
+    }
+    if !bin.is_file() {
+        bail!("build succeeded but {} is missing", bin.display());
+    }
+    Ok(bin)
+}
+
+async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path) -> Result<()> {
+    let log_path = ctx
+        .config_path
+        .parent()
+        .map(|d| d.join("server.log"))
+        .unwrap_or_else(|| PathBuf::from("verity-server.log"));
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("cannot open server log {}", log_path.display()))?;
+    // The spawned server must listen where this invocation expects it
+    // (--url may point off the 7717 default).
+    let listen = ctx
+        .url
+        .strip_prefix("http://")
+        .or_else(|| ctx.url.strip_prefix("https://"))
+        .unwrap_or("127.0.0.1:7717");
+    let mut child = Command::new(bin)
+        .args(["--listen", listen])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().context("log handle clones")?)
+        .stderr(log)
+        .spawn()
+        .with_context(|| format!("cannot start {}", bin.display()))?;
+    let pid = child.id();
+
+    // First launch may download the query-encoder model; be patient.
+    let started = Instant::now();
+    loop {
+        if util::healthz(&ctx.http, &ctx.url).await {
+            ui::step_ok(
+                "server",
+                &format!(
+                    "listening at {} (pid {pid}, logs {}) after {:.1}s",
+                    ctx.url,
+                    log_path.display(),
+                    started.elapsed().as_secs_f32()
+                ),
+            );
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().ok().flatten() {
+            bail!(
+                "the server exited immediately ({status})\n  → read {} for the reason (usually the DB DSN or a port already in use)",
+                log_path.display()
+            );
+        }
+        if started.elapsed() > Duration::from_secs(180) {
+            bail!(
+                "the server did not answer /healthz within 180s (first run downloads the local \
+                 embedding model)\n  → watch {} and re-run `verity-cli dev` once it settles",
+                log_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+// ---------- (d) tenant ----------
+
+async fn create_tenant(ctx: &Ctx) -> Result<String> {
+    let mut req = ctx
+        .http
+        .post(format!("{}/v1/admin/tenants", ctx.url))
+        .json(&serde_json::json!({ "name": "dev" }));
+    if let Some(token) = &ctx.config.admin_token {
+        req = req.bearer_auth(token);
+    }
+    let (status, body) = util::send(req, &ctx.url).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        bail!(
+            "the server requires an admin token for tenant creation\n  \
+             → add admin_token = \"<the server's VERITY_ADMIN_TOKEN>\" to {} and re-run `verity-cli dev`",
+            ctx.config_path.display()
+        );
+    }
+    let json = util::expect_json(
+        status,
+        &body,
+        "re-run `verity-cli dev` once the server is healthy",
+    )?;
+    let tenant_id = json["tenant_id"]
+        .as_str()
+        .context("tenant response carries tenant_id")?
+        .to_string();
+    let reused = ctx.config.tenant_id.as_deref() == Some(tenant_id.as_str());
+    ui::step_ok(
+        "tenant",
+        &format!(
+            "\"dev\" → {tenant_id}{}",
+            if reused { " (reused)" } else { "" }
+        ),
+    );
+    Ok(tenant_id)
+}
+
+// ---------- (e) the copy-paste summary ----------
+
+fn print_summary(ctx: &Ctx, tenant_id: &str, repo: Option<&Path>) {
+    let mcp_bin = repo
+        .map(|r| r.join("target/release/verity-mcp").display().to_string())
+        .unwrap_or_else(|| "/path/to/verity/target/release/verity-mcp".to_string());
+    let user = util::actor_sub().unwrap_or_else(|| "user:me".into());
+
+    println!();
+    println!("  {}", ui::bold("Verity is up."));
+    println!();
+    let kv =
+        |label: &str, value: &str| println!("    {}  {value}", ui::dim(&format!("{label:<13}")));
+    kv("server", &ctx.url);
+    kv("tenant (dev)", tenant_id);
+    kv(
+        "scope handle",
+        &format!(
+            "saved to {} (org-wide, principals [1])",
+            ctx.config_path.display()
+        ),
+    );
+    println!();
+    println!("  {}", ui::bold("Connect Claude Code (MCP):"));
+    println!();
+    println!("      claude mcp add verity \\");
+    println!("        -e VERITY_URL={} \\", ctx.url);
+    println!("        -e VERITY_TENANT_ID={tenant_id} \\");
+    println!("        -e VERITY_PRINCIPALS=1 \\");
+    println!("        -e VERITY_ACTOR_SUB={user} \\");
+    println!("        -e VERITY_ACTOR_AZP=agent:claude-code \\");
+    println!("        -- {mcp_bin}");
+    println!();
+    println!("  {}", ui::bold("Next steps:"));
+    println!();
+    let step = |n: u32, what: &str, cmd: &str| {
+        println!("    {n}. {}  {}", ui::pad(what, 18), ui::cyan(cmd));
+    };
+    step(1, "add a memory", "verity-cli add README.md --visibility 1");
+    step(2, "query it back", "verity-cli query \"what is verity\"");
+    step(
+        3,
+        "wire a webhook",
+        "verity-cli webhook mint my-system --visibility 1",
+    );
+    println!();
+    println!(
+        "    {}",
+        ui::dim("every write needs --visibility: Verity never guesses who may see a memory.",)
+    );
+}

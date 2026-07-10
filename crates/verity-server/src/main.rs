@@ -6,9 +6,13 @@
 //! that seam is documented in scope.rs and POST /v1/scopes.
 
 mod audit;
+#[cfg(test)]
+mod identity_tests;
 mod ingest;
 mod media;
 mod purpose;
+mod rebac;
+mod revocation;
 mod scope;
 mod webhooks;
 
@@ -24,6 +28,8 @@ use serde::Deserialize;
 
 use audit::spawn_audit;
 use purpose::PurposePack;
+use rebac::Rebac;
+use revocation::RevocationPlane;
 use scope::{ScopeMinter, ScopePayload};
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
@@ -105,6 +111,13 @@ pub(crate) struct AppState {
     pub(crate) minter: ScopeMinter,
     pub(crate) purposes: PurposePack,
     pub(crate) admin: AdminAuth,
+    /// SpiceDB seam (task 10). None = ReBAC disabled: dev mode, caller-
+    /// supplied principals at mint, restricted-class hits dropped.
+    pub(crate) rebac: Option<Rebac>,
+    pub(crate) revocations: RevocationPlane,
+    /// `VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC=1` — explicit opt-out of the
+    /// fail-closed restricted drop when no ReBAC engine is configured.
+    pub(crate) allow_restricted_without_rebac: bool,
 }
 
 impl AppState {
@@ -118,6 +131,19 @@ impl AppState {
     /// principals) that live outside the StorageAdapter seam.
     pub(crate) fn pool(&self) -> &sqlx::PgPool {
         self.storage.inner().pool()
+    }
+
+    /// Build the enforcement Scope from a verified handle, subtracting tokens
+    /// with an in-window revocation tombstone (SPEC §7b rule 3, v0.1
+    /// contract — see revocation.rs). Every scoped read path goes through
+    /// here so already-minted handles pick up revocations immediately.
+    async fn scope_for(&self, payload: &ScopePayload) -> HandlerResult<Scope> {
+        let mut scope = payload.to_scope();
+        scope.principals = self
+            .revocations
+            .subtract(self.pool(), scope.tenant_id, &scope.principals)
+            .await?;
+        Ok(scope)
     }
 
     pub(crate) async fn encode(&self, text: &str) -> HandlerResult<Option<Vec<f32>>> {
@@ -171,6 +197,19 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // ReBAC plane (task 10): configured => schema must be writable at startup
+    // (a deployment that configured authz never runs without it); absent =>
+    // dev mode with caller-supplied principals, warned.
+    let rebac = Rebac::from_env();
+    match &rebac {
+        Some(r) => r
+            .ensure_schema()
+            .await
+            .map_err(|e| anyhow::anyhow!("spicedb configured but unusable: {e}"))?,
+        None => tracing::warn!(
+            "ReBAC disabled (set VERITY_SPICEDB_URL to enable) — scope principals are caller-supplied; restricted-class hits will be dropped"
+        ),
+    }
     // L1 current-truth cache: the `get` hot path (SPEC §4b). 1M entries ≈ a
     // few hundred MB ceiling; invalidated on upsert, so never serves stale.
     let state = Arc::new(AppState {
@@ -179,6 +218,10 @@ async fn main() -> anyhow::Result<()> {
         minter: ScopeMinter::from_env(),
         purposes: PurposePack::from_env()?,
         admin: AdminAuth::from_env(),
+        rebac,
+        revocations: RevocationPlane::from_env(),
+        allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
+            .is_ok_and(|v| v == "1"),
     });
 
     let app = Router::new()
@@ -197,6 +240,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/audit", get(audit::admin_audit))
         .route("/v1/admin/quarantine", get(webhooks::admin_quarantine))
         .route("/v1/admin/principals", post(admin_principals))
+        .route(
+            "/v1/admin/groups",
+            post(admin_group_add).delete(admin_group_remove),
+        )
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
         .route("/v1/webhooks", post(webhooks::mint_webhook))
@@ -220,10 +267,17 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Deserialize)]
 struct OpenScopeRequest {
     tenant_id: TenantId,
-    // Milestone seam (scope.rs): principals are caller-supplied at mint time
-    // until token→identity→ReBAC resolution exists. After minting, scope is
+    // Dev-mode seam (scope.rs): caller-supplied principals, used when ReBAC
+    // is disabled (or when no `subject` is given). After minting, scope is
     // immutable and every verb enforces from the signed payload only.
+    #[serde(default)]
     principals: Vec<PrincipalToken>,
+    /// Identity-resolved minting (task 10): `"user:alice@corp.example"`.
+    /// Requires ReBAC (VERITY_SPICEDB_URL); the principal set is resolved
+    /// server-side (the user plus its transitive SpiceDB group closure) and
+    /// mutually exclusive with caller-supplied `principals`.
+    #[serde(default)]
+    subject: Option<String>,
     #[serde(default)]
     entity_scope: Vec<String>,
     #[serde(default = "default_confidentiality")]
@@ -269,14 +323,63 @@ async fn open_scope(
             ));
         }
     }
+    // Identity plane (task 10): with ReBAC enabled, a `subject` is resolved
+    // server-side into the user's principal token plus its transitive group
+    // closure. Self-asserted principals are rejected alongside a subject —
+    // identity being live means the caller no longer names its own powers.
+    let (principals, subject) = match (&state.rebac, req.subject) {
+        (Some(rebac), Some(subject)) => {
+            if !req.principals.is_empty() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "supply either subject or principals, not both — principals are resolved server-side when identity is live".into(),
+                ));
+            }
+            let Some((rebac::PrincipalKind::User, name)) = rebac::parse_principal(&subject) else {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "subject must be a user principal: \"user:<id>\"".into(),
+                ));
+            };
+            // Fail closed: an unresolvable subject mints nothing.
+            let groups = rebac.user_groups(req.tenant_id, name).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("identity resolution failed: {e}"),
+                )
+            })?;
+            let mut principal_strings = vec![subject.clone()];
+            principal_strings.extend(groups);
+            let tokens: Vec<PrincipalToken> =
+                upsert_principal_tokens(state.pool(), req.tenant_id, &principal_strings)
+                    .await?
+                    .into_iter()
+                    .map(|(_, t)| t)
+                    .collect();
+            // Resolution-time tombstone subtraction (SPEC §7b rule 3).
+            let tokens = state
+                .revocations
+                .subtract(state.pool(), req.tenant_id, &tokens)
+                .await?;
+            (tokens, Some(subject))
+        }
+        (None, Some(_)) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subject-based scopes require ReBAC (set VERITY_SPICEDB_URL); supply principals directly in dev mode".into(),
+            ));
+        }
+        (_, None) => (req.principals, None),
+    };
     let (handle, expires_at) = state.minter.mint(
         ScopePayload {
             tenant_id: req.tenant_id,
-            principals: req.principals,
+            principals,
             entity_scope: req.entity_scope,
             max_confidentiality,
             actor_sub: req.actor_sub,
             actor_azp: req.actor_azp,
+            subject,
             expires_at: Utc::now(), // overwritten by mint
         },
         req.ttl_seconds,
@@ -317,13 +420,16 @@ async fn recall(
         (None, None) => None,
     };
     let query = RecallQuery {
-        scope: payload.to_scope(),
+        scope: state.scope_for(&payload).await?,
         embedding,
         text: req.text,
         k: req.k.min(100),
     };
     let summary = query.text.clone();
     let hits = state.storage.recall(query).await.map_err(internal)?;
+    // Restricted-class recheck (SPEC §7b rule 4, v0.1 approximation): live
+    // re-resolution when ReBAC is on, fail-closed drop when it is off.
+    let hits = revocation::enforce_restricted(&state, &payload, hits).await?;
     spawn_audit(
         &state,
         &payload,
@@ -704,7 +810,7 @@ async fn activity(
 ) -> HandlerResult<Json<Vec<ActionRecord>>> {
     let payload = state.verify_scope(&p.scope_handle)?;
     let query = ActivityQuery {
-        scope: payload.to_scope(),
+        scope: state.scope_for(&payload).await?,
         entity: p.entity,
         since: p.since,
         action_types: p
@@ -791,30 +897,30 @@ struct PrincipalsRequest {
     principals: Vec<String>,
 }
 
-/// POST /v1/admin/principals (admin): map source-native principal strings to
-/// materialized int tokens. Allocation is max(token)+1 per tenant inside one
-/// transaction (serialized by a per-tenant advisory lock); existing principals
-/// keep their token forever — connectors can call this idempotently.
-async fn admin_principals(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<PrincipalsRequest>,
-) -> HandlerResult<Json<serde_json::Value>> {
-    state.admin.check(&headers)?;
-    let mut tx = state.pool().begin().await.map_err(internal)?;
+/// Map principal strings to materialized int tokens, allocating where absent.
+/// Allocation is max(token)+1 per tenant inside one transaction (serialized
+/// by a per-tenant advisory lock); existing principals keep their token
+/// forever — idempotent. Shared by POST /v1/admin/principals, identity-
+/// resolved open_scope, and the group plane (task 10).
+pub(crate) async fn upsert_principal_tokens(
+    pool: &sqlx::PgPool,
+    tenant_id: TenantId,
+    principals: &[String],
+) -> HandlerResult<Vec<(String, PrincipalToken)>> {
+    let mut tx = pool.begin().await.map_err(internal)?;
     // Serialize concurrent allocators for the same tenant so max(token)+1
     // can't race the UNIQUE (tenant_id, token) constraint into an error.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
-        .bind(req.tenant_id.to_string())
+        .bind(tenant_id.to_string())
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
-    let mut mappings = serde_json::Map::new();
-    for principal in &req.principals {
+    let mut mappings = Vec::with_capacity(principals.len());
+    for principal in principals {
         let existing: Option<i32> = sqlx::query_scalar(
             "SELECT token FROM principals WHERE tenant_id = $1 AND principal = $2",
         )
-        .bind(req.tenant_id)
+        .bind(tenant_id)
         .bind(principal)
         .fetch_optional(&mut *tx)
         .await
@@ -825,14 +931,14 @@ async fn admin_principals(
                 let next: i32 = sqlx::query_scalar(
                     "SELECT COALESCE(MAX(token), 0) + 1 FROM principals WHERE tenant_id = $1",
                 )
-                .bind(req.tenant_id)
+                .bind(tenant_id)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(internal)?;
                 sqlx::query(
                     "INSERT INTO principals (tenant_id, principal, token) VALUES ($1, $2, $3)",
                 )
-                .bind(req.tenant_id)
+                .bind(tenant_id)
                 .bind(principal)
                 .bind(next)
                 .execute(&mut *tx)
@@ -841,10 +947,176 @@ async fn admin_principals(
                 next
             }
         };
-        mappings.insert(principal.clone(), serde_json::json!(token));
+        mappings.push((principal.clone(), token));
     }
     tx.commit().await.map_err(internal)?;
+    Ok(mappings)
+}
+
+/// POST /v1/admin/principals (admin): connector-facing principal→token upsert.
+async fn admin_principals(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PrincipalsRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mappings: serde_json::Map<String, serde_json::Value> =
+        upsert_principal_tokens(state.pool(), req.tenant_id, &req.principals)
+            .await?
+            .into_iter()
+            .map(|(p, t)| (p, serde_json::json!(t)))
+            .collect();
     Ok(Json(serde_json::json!({ "mappings": mappings })))
+}
+
+// ---------- admin: group membership (task 10 — the tuple plane) ----------
+
+#[derive(Deserialize)]
+struct GroupMembershipRequest {
+    tenant_id: TenantId,
+    /// `"group:sales"` — SpiceDB object ids are tenant-prefixed server-side
+    /// (`group:<tenant>_sales`), so tenants can never cross even in a shared
+    /// SpiceDB (see rebac.rs).
+    group: String,
+    /// `"user:alice@corp.example"` or `"group:inner"` (nested).
+    member: String,
+}
+
+fn parse_membership(
+    req: &GroupMembershipRequest,
+) -> HandlerResult<(&str, rebac::PrincipalKind, &str)> {
+    let Some((rebac::PrincipalKind::Group, group_name)) = rebac::parse_principal(&req.group) else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "group must be \"group:<name>\"".into(),
+        ));
+    };
+    let Some((member_kind, member_name)) = rebac::parse_principal(&req.member) else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "member must be \"user:<id>\" or \"group:<name>\"".into(),
+        ));
+    };
+    if member_kind == rebac::PrincipalKind::Group && member_name == group_name {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a group cannot be a member of itself".into(),
+        ));
+    }
+    Ok((group_name, member_kind, member_name))
+}
+
+fn require_rebac(state: &AppState) -> HandlerResult<&Rebac> {
+    state.rebac.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "group management requires ReBAC (set VERITY_SPICEDB_URL)".into(),
+    ))
+}
+
+/// POST /v1/admin/groups (admin): write a membership tuple. The group's
+/// principal token is allocated eagerly so visibility sets and revocation
+/// tombstones can reference it.
+async fn admin_group_add(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<GroupMembershipRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let rebac = require_rebac(&state)?;
+    let (group_name, member_kind, member_name) = parse_membership(&req)?;
+    let mappings = upsert_principal_tokens(
+        state.pool(),
+        req.tenant_id,
+        &[req.group.clone(), req.member.clone()],
+    )
+    .await?;
+    rebac
+        .write_membership(req.tenant_id, group_name, member_kind, member_name)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("spicedb write failed: {e}"),
+            )
+        })?;
+    let tokens: serde_json::Map<String, serde_json::Value> = mappings
+        .into_iter()
+        .map(|(p, t)| (p, serde_json::json!(t)))
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "written": true, "tokens": tokens }),
+    ))
+}
+
+/// DELETE /v1/admin/groups (admin): remove a membership tuple, writing
+/// revocation tombstones FIRST (fail-closed ordering — a failure here aborts
+/// the delete and over-hides, never under-hides).
+///
+/// Conservative resolution: the removed member subtree (the user, or every
+/// transitive user of the removed inner group) loses the group principal and
+/// all its transitive ancestors. Tombstone semantics are tenant-wide token
+/// subtraction for the revocation window — see revocation.rs.
+async fn admin_group_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<GroupMembershipRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let rebac = require_rebac(&state)?;
+    let (group_name, member_kind, member_name) = parse_membership(&req)?;
+    let gateway = |e: rebac::RebacError| (StatusCode::BAD_GATEWAY, format!("spicedb: {e}"));
+
+    // 1. Resolve — while the tuple graph still holds — who loses what.
+    let affected: Vec<String> = match member_kind {
+        rebac::PrincipalKind::User => vec![req.member.clone()],
+        rebac::PrincipalKind::Group => {
+            let mut users = rebac
+                .group_users(req.tenant_id, member_name)
+                .await
+                .map_err(gateway)?;
+            // The inner group itself is part of the removed subtree; record
+            // it even when it currently has no user members.
+            users.push(req.member.clone());
+            users
+        }
+    };
+    let lost_principals = rebac
+        .group_and_ancestors(req.tenant_id, group_name)
+        .await
+        .map_err(gateway)?;
+    // Only principals that ever materialized a token can appear in a
+    // visibility set or a handle; unmaterialized ones have nothing to revoke.
+    let lost_tokens: Vec<(String, PrincipalToken)> = {
+        let rows: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT principal, token FROM principals
+             WHERE tenant_id = $1 AND principal = ANY($2)",
+        )
+        .bind(req.tenant_id)
+        .bind(&lost_principals)
+        .fetch_all(state.pool())
+        .await
+        .map_err(internal)?;
+        rows
+    };
+
+    // 2. Durable tombstones BEFORE the tuple delete.
+    let tombstones = state
+        .revocations
+        .record(state.pool(), req.tenant_id, &affected, &lost_tokens)
+        .await?;
+
+    // 3. Remove the tuple.
+    rebac
+        .delete_membership(req.tenant_id, group_name, member_kind, member_name)
+        .await
+        .map_err(gateway)?;
+
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "tombstones": tombstones,
+        "revoked_principals": lost_tokens.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        "affected_members": affected,
+    })))
 }
 
 // ---------- brief ----------
@@ -865,7 +1137,7 @@ async fn brief(
     axum::extract::Query(q): axum::extract::Query<BriefQuery>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     let payload = state.verify_scope(&q.scope_handle)?;
-    let scope = payload.to_scope();
+    let scope = state.scope_for(&payload).await?;
     let (memory, actions) = tokio::join!(
         state.storage.latest_chunks(&scope, &entity, 10),
         state.storage.activity(ActivityQuery {
@@ -878,6 +1150,9 @@ async fn brief(
         })
     );
     let memory = memory.map_err(internal)?;
+    // Restricted-class recheck applies to the brief's memory leg exactly as
+    // to recall (SPEC §7b rule 4).
+    let memory = revocation::enforce_restricted(&state, &payload, memory).await?;
     let actions = actions.map_err(internal)?;
     spawn_audit(
         &state,

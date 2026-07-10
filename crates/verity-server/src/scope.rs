@@ -34,6 +34,13 @@ pub struct ScopePayload {
     pub max_confidentiality: Confidentiality,
     pub actor_sub: Option<String>,
     pub actor_azp: Option<String>,
+    /// Identity-resolved handles (roadmap task 10): the `user:<id>` principal
+    /// the token set was resolved FROM. Present iff the scope was minted via
+    /// ReBAC subject resolution; read paths use it to re-resolve the caller's
+    /// CURRENT group set for the restricted-class recheck. serde-defaulted so
+    /// pre-identity handles keep verifying.
+    #[serde(default)]
+    pub subject: Option<String>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -89,7 +96,7 @@ impl ScopeMinter {
         }
     }
 
-    fn ephemeral() -> Self {
+    pub(crate) fn ephemeral() -> Self {
         let mut key = [0u8; 32];
         use rand_core::RngCore;
         rand_core::OsRng.fill_bytes(&mut key);
@@ -185,6 +192,7 @@ mod tests {
             max_confidentiality: Confidentiality::Confidential,
             actor_sub: Some("user:matt".into()),
             actor_azp: Some("agent:sales-bot".into()),
+            subject: None,
             expires_at: Utc::now(),
         }
     }

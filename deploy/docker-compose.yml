@@ -25,5 +25,22 @@ services:
       timeout: 3s
       retries: 20
 
+  # ReBAC engine (SPEC §7a): SpiceDB with the in-memory datastore — dev/v0.1
+  # posture; production moves to a Postgres-backed datastore. gRPC on 50051,
+  # HTTP gateway on 8443 (the v0.1 Rust client speaks the HTTP gateway; the
+  # preshared key is the bearer token on both surfaces).
+  spicedb:
+    image: authzed/spicedb
+    container_name: verity-spicedb
+    command: serve --grpc-preshared-key verity-dev-key --http-enabled
+    ports:
+      - "50051:50051"
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
 volumes:
   verity-pgdata:
