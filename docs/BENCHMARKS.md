@@ -227,3 +227,24 @@ activity ops/s — the 70/20/10 mix at saturation.)
    so the activity column measures the scoped timeline query at trivial table size — path
    coverage, not a scale claim. No HTTP hop, no rate limiting, no encoder anywhere in the
    load loop; a served deployment adds all three.
+
+---
+
+## 2026-07-10 — entity-bound BM25 breach fixed: 542.7ms → 12.6ms p50 (43x)
+
+**Fix (migration 0008 + adapter):** `entity_tags` and `kind` join the bm25 index with
+**keyword tokenizers** (the default tokenizer splits "account:0", so term_set could never
+match raw values — first attempt returned 0 hits), and entity-bound sparse queries become
+two stages: a Tantivy boolean pre-filter (`term_set(entity_tags) OR term(kind,'knowledge')`
+— any-overlap plus the §7g carve-out) scoring a candidate set bounded by the entity's own
+chunks, then the exact `<@` subset residual over the MATERIALIZED candidates.
+Filter-then-rank, never truncate-then-authorize; mixing the residual into the `@@@` query
+breaks the TopK plan and heap-scans the full match set.
+
+| Case (1M chunks) | before | **after p50/p95/p99** |
+|---|---|---|
+| BM25 entity-bound + broad visibility | 542.7 / 724.5ms | **12.6 / 16.5 / 19.2ms** |
+| BM25 @ 1% (regression check) | 15.9 / 17.8ms | 18.3 / 22.4 / 24.8ms |
+| hybrid @ 1% (regression check) | 16.0 / 17.9ms | 17.4 / 21.3 / 32.3ms |
+
+All retrieval paths back inside the <50ms p95 envelope at 1M.

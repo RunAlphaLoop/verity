@@ -134,7 +134,16 @@ impl PostgresAdapter {
         // int[] fast field has exact overlap semantics — and matches nothing
         // for an empty principal array, preserving fail-closed. tenant/
         // confidentiality/valid_to push down as indexed scalars (0004).
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        // Entity-bound scopes pre-filter INSIDE Tantivy: term_set on the
+        // keyword-tokenized entity_tags field is any-overlap — a superset of
+        // the required subset semantics — with the §7g knowledge carve-out
+        // OR'd in on the indexed kind field. The exact `<@` residual check
+        // runs over a MATERIALIZED candidate set that is bounded by the
+        // entity's own chunk count (never the corpus), because mixing the
+        // residual into the @@@ query breaks the TopK plan and heap-scans the
+        // full match set (measured 542ms p50; docs/BENCHMARKS.md). This is
+        // filter-then-rank, never truncate-then-authorize.
+        let sql = if scope.entity_scope.is_empty() {
             "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
@@ -143,11 +152,33 @@ impl PostgresAdapter {
                AND tenant_id = $2
                AND valid_to IS NULL
                AND confidentiality <= $4
-               {}
              ORDER BY paradedb.score(id) DESC
-             LIMIT $5",
-            entity_scope_predicate(scope, "$6"),
-        )))
+             LIMIT $5"
+                .to_string()
+        } else {
+            "WITH cand AS MATERIALIZED (
+                 SELECT id, paradedb.score(id) AS score
+                 FROM chunks
+                 WHERE content @@@ $1
+                   AND id @@@ paradedb.term_set('visibility', $3)
+                   AND id @@@ paradedb.boolean(should => ARRAY[
+                           paradedb.term_set('entity_tags', $6),
+                           paradedb.term('kind', 'knowledge')
+                       ])
+                   AND tenant_id = $2
+                   AND valid_to IS NULL
+                   AND confidentiality <= $4
+             )
+             SELECT c.id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
+                    cand.score AS score
+             FROM cand JOIN chunks c ON c.id = cand.id
+             WHERE (c.kind = 'knowledge'
+                    OR (c.entity_tags <> '{}' AND c.entity_tags <@ $6))
+             ORDER BY cand.score DESC
+             LIMIT $5"
+                .to_string()
+        };
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(text)
         .bind(scope.tenant_id)
         .bind(&scope.principals)
