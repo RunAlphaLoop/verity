@@ -120,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/debezium", post(ingest_debezium))
         .route("/v1/briefs/{entity}", get(brief))
         .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
+        .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -559,6 +561,106 @@ async fn brief(
         "recent_activity": actions,
         // L1 record linkage lands with cross-source entity resolution (§7f).
     })))
+}
+
+// ---------- knowledge (SPEC v1.3 §2) ----------
+
+#[derive(Deserialize)]
+struct ProposeLearningRequest {
+    scope_handle: String,
+    statement: String,
+    #[serde(default)]
+    categories: Vec<String>,
+    /// Supporting L0 episode ids; attribution is read server-side.
+    #[serde(default)]
+    evidence: Vec<EpisodeId>,
+}
+
+/// A proposal, never a publish: runs the de-identification gate; gate failures
+/// are stored quarantined (auditable), gate passes await review + k-support.
+async fn propose_learning(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ProposeLearningRequest>,
+) -> HandlerResult<Json<KnowledgeItem>> {
+    let payload = state.verify_scope(&req.scope_handle)?;
+    state
+        .storage
+        .propose_knowledge(KnowledgeProposal {
+            tenant_id: payload.tenant_id,
+            statement: req.statement,
+            categories: req.categories,
+            evidence: req.evidence,
+            proposed_by_sub: payload.actor_sub.clone(),
+            proposed_by_azp: payload.actor_azp.clone(),
+        })
+        .await
+        .map(Json)
+        .map_err(internal)
+}
+
+#[derive(Deserialize)]
+struct ListKnowledgeParams {
+    tenant_id: TenantId,
+    status: Option<KnowledgeStatus>,
+}
+
+/// Review queue (admin/audit plane — same auth seam as ingest).
+async fn list_knowledge(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(p): axum::extract::Query<ListKnowledgeParams>,
+) -> HandlerResult<Json<Vec<KnowledgeItem>>> {
+    state
+        .storage
+        .list_knowledge(p.tenant_id, p.status)
+        .await
+        .map(Json)
+        .map_err(internal)
+}
+
+#[derive(Deserialize)]
+struct PublishKnowledgeRequest {
+    tenant_id: TenantId,
+    /// Broad principal set the published knowledge is visible to.
+    visibility: Vec<PrincipalToken>,
+    #[serde(default = "default_k_min")]
+    k_min: i32,
+}
+
+fn default_k_min() -> i32 {
+    3
+}
+
+async fn publish_knowledge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<PublishKnowledgeRequest>,
+) -> HandlerResult<Json<KnowledgeItem>> {
+    // k_min is clamped server-side: k=2 lets either supporting party infer
+    // the other's interaction (SPEC v1.3 §2).
+    let k_min = req.k_min.max(3);
+    // Embed the statement so published knowledge rides the dense leg too.
+    let items = state
+        .storage
+        .list_knowledge(req.tenant_id, Some(KnowledgeStatus::Candidate))
+        .await
+        .map_err(internal)?;
+    let statement = items
+        .iter()
+        .find(|k| k.id == id)
+        .map(|k| k.statement.clone());
+    let embedding = match statement {
+        Some(s) => state.encode(&s).await.ok().flatten(),
+        None => None,
+    };
+    state
+        .storage
+        .publish_knowledge(req.tenant_id, id, req.visibility, k_min, embedding)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            other => internal(other),
+        })
 }
 
 fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {

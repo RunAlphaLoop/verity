@@ -104,6 +104,31 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.latest_chunks(scope, entity, limit).await
     }
 
+    async fn propose_knowledge(&self, proposal: KnowledgeProposal) -> Result<KnowledgeItem> {
+        self.inner.propose_knowledge(proposal).await
+    }
+
+    async fn publish_knowledge(
+        &self,
+        tenant: TenantId,
+        id: uuid::Uuid,
+        visibility: Vec<PrincipalToken>,
+        k_min: i32,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<KnowledgeItem> {
+        self.inner
+            .publish_knowledge(tenant, id, visibility, k_min, embedding)
+            .await
+    }
+
+    async fn list_knowledge(
+        &self,
+        tenant: TenantId,
+        status: Option<KnowledgeStatus>,
+    ) -> Result<Vec<KnowledgeItem>> {
+        self.inner.list_knowledge(tenant, status).await
+    }
+
     async fn retire_entity(
         &self,
         tenant: TenantId,

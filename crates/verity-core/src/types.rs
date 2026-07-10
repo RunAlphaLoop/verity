@@ -55,6 +55,7 @@ pub enum EpisodeKind {
     DocVersion,
     Observation,
     AgentAction,
+    KnowledgePublish,
     WebSnapshot,
 }
 
@@ -66,6 +67,7 @@ impl EpisodeKind {
             Self::DocVersion => "doc_version",
             Self::Observation => "observation",
             Self::AgentAction => "agent_action",
+            Self::KnowledgePublish => "knowledge_publish",
             Self::WebSnapshot => "web_snapshot",
         }
     }
@@ -165,6 +167,8 @@ pub struct RecallHit {
     pub content: String,
     pub score: f32,
     pub entity_tags: Vec<String>,
+    /// "content" (scoped memory) or "knowledge" (published, entity-free — §7g).
+    pub kind: String,
     pub trust_tier: TrustTier,
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
@@ -236,6 +240,59 @@ pub struct ActivityQuery {
     /// Filter by agent identity (actor_azp).
     pub actors: Vec<String>,
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeStatus {
+    /// Passed the de-identification gate; awaiting review + support checks.
+    Candidate,
+    /// Failed the gate — held for audit, never retrievable outside audit scopes.
+    Quarantined,
+    /// Broad-visibility semantic memory; retrievable via the §7g carve-out.
+    Published,
+    Invalidated,
+}
+
+impl KnowledgeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Quarantined => "quarantined",
+            Self::Published => "published",
+            Self::Invalidated => "invalidated",
+        }
+    }
+}
+
+/// An agent- or worker-proposed generalization (SPEC v1.3 §2). A proposal,
+/// never a publish: it enters the gate + review pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeProposal {
+    pub tenant_id: TenantId,
+    pub statement: String,
+    pub categories: Vec<String>,
+    /// Supporting L0 episodes; entity/writer/trust attribution is read from
+    /// the episodes themselves, never caller-supplied.
+    pub evidence: Vec<EpisodeId>,
+    pub proposed_by_sub: Option<String>,
+    pub proposed_by_azp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeItem {
+    pub id: Uuid,
+    pub statement: String,
+    pub categories: Vec<String>,
+    pub status: KnowledgeStatus,
+    pub quarantine_reason: Option<String>,
+    pub distinct_entities: i32,
+    pub episode_count: i32,
+    pub writer_count: i32,
+    pub has_tier1_evidence: bool,
+    pub first_seen: DateTime<Utc>,
+    pub last_reinforced: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, thiserror::Error)]

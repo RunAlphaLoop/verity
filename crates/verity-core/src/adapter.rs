@@ -63,6 +63,35 @@ pub trait StorageAdapter: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RecallHit>>;
 
+    /// Propose a generalization for the knowledge layer (SPEC v1.3 §2). Runs
+    /// the deterministic de-identification gate against the tenant's entity
+    /// lexicon: gate-passing proposals become `Candidate`, failures are stored
+    /// `Quarantined` with the reason (auditable, never retrievable). Support
+    /// metrics (distinct entities, writers, tier-1 presence) are computed from
+    /// the evidence episodes, never trusted from the caller.
+    async fn propose_knowledge(&self, proposal: KnowledgeProposal) -> Result<KnowledgeItem>;
+
+    /// Publish a candidate at broad visibility. Enforces the promotion gates:
+    /// `distinct_entities >= k_min` and (`writer_count >= 2` or tier-1
+    /// evidence). On success the statement is indexed as a `kind='knowledge'`
+    /// chunk retrievable via the §7g carve-out. The category-size floor is NOT
+    /// yet enforceable (needs entity→category facts) and is documented as such.
+    async fn publish_knowledge(
+        &self,
+        tenant: TenantId,
+        id: uuid::Uuid,
+        visibility: Vec<PrincipalToken>,
+        k_min: i32,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<KnowledgeItem>;
+
+    /// Review-queue listing (admin/audit plane).
+    async fn list_knowledge(
+        &self,
+        tenant: TenantId,
+        status: Option<KnowledgeStatus>,
+    ) -> Result<Vec<KnowledgeItem>>;
+
     /// Source hard-delete propagation (SPEC §8c, bi-temporal half): close all
     /// current facts for an entity at `deleted_at`. History stays queryable
     /// via `fact_as_of`; crypto-shred hard purge is a separate admin pipeline.

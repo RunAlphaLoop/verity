@@ -158,6 +158,23 @@ struct ActivityParams {
     limit: Option<u32>,
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+struct ProposeLearningParams {
+    /// Scope handle from memory_open_scope.
+    scope_handle: String,
+    /// The generalization, written about CATEGORIES, never entities — no
+    /// customer names, quotes, or identifying amounts. Statements containing
+    /// known entity identifiers are quarantined, not published.
+    statement: String,
+    /// Category tags, e.g. ["industry:healthcare", "objection:dpa"].
+    #[serde(default)]
+    categories: Vec<String>,
+    /// Supporting episode ids (from memory_remember results or recall
+    /// provenance). Attribution is computed server-side from these.
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct BriefParams {
     /// Scope handle from memory_open_scope.
@@ -322,6 +339,17 @@ impl VerityMcp {
         }
         let req = self.http.get(self.endpoint("/v1/activity")).query(&query);
         self.proxy(req).await
+    }
+
+    #[tool(
+        name = "memory_propose_learning",
+        description = "Propose a cross-customer generalization for the shared knowledge layer — a PROPOSAL, never a publish: it enters a de-identification gate, needs support from 3+ distinct entities, and awaits review. Use when you notice a pattern that would help agents on OTHER accounts (objection trends, segment behaviors, playbooks). Write about categories, never name customers."
+    )]
+    async fn memory_propose_learning(
+        &self,
+        Parameters(p): Parameters<ProposeLearningParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.post_json("/v1/knowledge", &p).await
     }
 
     #[tool(

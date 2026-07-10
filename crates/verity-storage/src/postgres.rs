@@ -35,6 +35,16 @@ impl PostgresAdapter {
         &self.pool
     }
 
+    async fn get_knowledge(&self, tenant: TenantId, id: Uuid) -> Result<KnowledgeItem> {
+        let row = sqlx::query("SELECT * FROM knowledge WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row_to_knowledge(&row)
+    }
+
     /// Below this many matching rows, brute-force distance over the filtered
     /// subset beats HNSW iterative traversal (measured at 1M chunks: exact
     /// 11ms vs HNSW 72ms p50 at 1% selectivity — docs/BENCHMARKS.md). The
@@ -90,7 +100,7 @@ impl PostgresAdapter {
         // Safe: the predicate string is assembled from constants only; all
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
                     1 - (embedding <=> $1) AS score
              FROM chunks
              WHERE tenant_id = $2
@@ -125,7 +135,7 @@ impl PostgresAdapter {
         // for an empty principal array, preserving fail-closed. tenant/
         // confidentiality/valid_to push down as indexed scalars (0004).
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
              WHERE content @@@ $1
@@ -153,12 +163,14 @@ impl PostgresAdapter {
 
 /// Entity scoping, deny-by-default (SPEC §7d): in an entity-bound scope a chunk
 /// is retrievable only when its tags are non-empty and a subset of the scope's
-/// entity set; zero-tag content is excluded from entity-bound scopes.
+/// entity set; zero-tag content is excluded. The one verified exception (§7g):
+/// `kind = 'knowledge'` chunks — positively entity-free, published through the
+/// de-identification gates — are admitted into entity-bound scopes.
 fn entity_scope_predicate(scope: &Scope, bind: &str) -> String {
     if scope.entity_scope.is_empty() {
         String::new()
     } else {
-        format!("AND entity_tags <> '{{}}' AND entity_tags <@ {bind}")
+        format!("AND (kind = 'knowledge' OR (entity_tags <> '{{}}' AND entity_tags <@ {bind}))")
     }
 }
 
@@ -174,9 +186,33 @@ fn row_to_hit(row: &PgRow) -> Result<RecallHit> {
             .or_else(|_| row.try_get::<f32, _>("score"))
             .map_err(db_err)?,
         entity_tags: row.try_get("entity_tags").map_err(db_err)?,
+        kind: row.try_get("kind").map_err(db_err)?,
         trust_tier: tier_from_i16(row.try_get("trust_tier").map_err(db_err)?),
         valid_from: row.try_get("valid_from").map_err(db_err)?,
         provenance: row.try_get("provenance").map_err(db_err)?,
+    })
+}
+
+fn row_to_knowledge(row: &PgRow) -> Result<KnowledgeItem> {
+    let status = match row.try_get::<String, _>("status").map_err(db_err)?.as_str() {
+        "candidate" => KnowledgeStatus::Candidate,
+        "quarantined" => KnowledgeStatus::Quarantined,
+        "published" => KnowledgeStatus::Published,
+        _ => KnowledgeStatus::Invalidated,
+    };
+    Ok(KnowledgeItem {
+        id: row.try_get("id").map_err(db_err)?,
+        statement: row.try_get("statement").map_err(db_err)?,
+        categories: row.try_get("categories").map_err(db_err)?,
+        status,
+        quarantine_reason: row.try_get("quarantine_reason").map_err(db_err)?,
+        distinct_entities: row.try_get("distinct_entities").map_err(db_err)?,
+        episode_count: row.try_get("episode_count").map_err(db_err)?,
+        writer_count: row.try_get("writer_count").map_err(db_err)?,
+        has_tier1_evidence: row.try_get("has_tier1_evidence").map_err(db_err)?,
+        first_seen: row.try_get("first_seen").map_err(db_err)?,
+        last_reinforced: row.try_get("last_reinforced").map_err(db_err)?,
+        published_at: row.try_get("published_at").map_err(db_err)?,
     })
 }
 
@@ -482,6 +518,236 @@ impl StorageAdapter for PostgresAdapter {
         Ok(true)
     }
 
+    async fn propose_knowledge(&self, proposal: KnowledgeProposal) -> Result<KnowledgeItem> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Evidence attribution comes from the episodes themselves.
+        let evidence = sqlx::query(
+            "SELECT id, source_entity, writer_azp, trust_tier FROM episodes
+             WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(proposal.tenant_id)
+        .bind(&proposal.evidence)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        // De-identification gate (SPEC v1.3 §2, deterministic): the statement
+        // must not contain any known entity identifier — entity tags on chunks
+        // and actions (with and without their "type:" prefix) or L1 entity ids.
+        // Terms shorter than 4 chars are skipped as false-positive noise; such
+        // identifiers are caught by review, which is on by default.
+        let lexicon: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT term FROM (
+                 SELECT unnest(entity_tags) AS term FROM chunks WHERE tenant_id = $1
+                 UNION SELECT unnest(entities) FROM actions WHERE tenant_id = $1
+                 UNION SELECT entity_id FROM facts WHERE tenant_id = $1
+             ) t",
+        )
+        .bind(proposal.tenant_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let statement_lc = proposal.statement.to_lowercase();
+        let leaked = lexicon.iter().find_map(|term| {
+            let bare = term.rsplit(':').next().unwrap_or(term);
+            [term.as_str(), bare]
+                .into_iter()
+                .find(|t| t.len() >= 4 && statement_lc.contains(&t.to_lowercase()))
+                .map(str::to_string)
+        });
+
+        let mut distinct_entities: Vec<String> = Vec::new();
+        let mut writers: Vec<String> = Vec::new();
+        let mut has_tier1 = false;
+        for row in &evidence {
+            if let Ok(Some(e)) = row.try_get::<Option<String>, _>("source_entity") {
+                if !distinct_entities.contains(&e) {
+                    distinct_entities.push(e);
+                }
+            }
+            if let Ok(Some(w)) = row.try_get::<Option<String>, _>("writer_azp") {
+                if !writers.contains(&w) {
+                    writers.push(w);
+                }
+            }
+            has_tier1 |= matches!(row.try_get::<i16, _>("trust_tier"), Ok(1));
+        }
+
+        let (status, reason) = match &leaked {
+            Some(term) => (
+                KnowledgeStatus::Quarantined,
+                Some(format!(
+                    "statement contains known entity identifier {term:?}"
+                )),
+            ),
+            None => (KnowledgeStatus::Candidate, None),
+        };
+
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO knowledge (id, tenant_id, statement, categories, status,
+                                    quarantine_reason, distinct_entities, episode_count,
+                                    writer_count, has_tier1_evidence,
+                                    proposed_by_sub, proposed_by_azp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(id)
+        .bind(proposal.tenant_id)
+        .bind(&proposal.statement)
+        .bind(&proposal.categories)
+        .bind(status.as_str())
+        .bind(&reason)
+        .bind(distinct_entities.len() as i32)
+        .bind(evidence.len() as i32)
+        .bind(writers.len() as i32)
+        .bind(has_tier1)
+        .bind(&proposal.proposed_by_sub)
+        .bind(&proposal.proposed_by_azp)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        for row in &evidence {
+            sqlx::query(
+                "INSERT INTO knowledge_evidence (knowledge_id, episode_id, entity, writer_azp, trust_tier)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(row.try_get::<Uuid, _>("id").map_err(db_err)?)
+            .bind(row.try_get::<Option<String>, _>("source_entity").map_err(db_err)?)
+            .bind(row.try_get::<Option<String>, _>("writer_azp").map_err(db_err)?)
+            .bind(row.try_get::<i16, _>("trust_tier").map_err(db_err)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        self.get_knowledge(proposal.tenant_id, id).await
+    }
+
+    async fn publish_knowledge(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        visibility: Vec<PrincipalToken>,
+        k_min: i32,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<KnowledgeItem> {
+        if visibility.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "publishing requires a non-empty visibility set".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(
+            "SELECT statement, categories, status, distinct_entities, writer_count,
+                    has_tier1_evidence
+             FROM knowledge WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| StorageError::InvalidInput("unknown knowledge item".into()))?;
+
+        let status: String = row.try_get("status").map_err(db_err)?;
+        if status != "candidate" {
+            return Err(StorageError::InvalidInput(format!(
+                "only candidates can be published (status: {status})"
+            )));
+        }
+        // Promotion gates (SPEC v1.3 §2). Category-size floor is not yet
+        // enforceable — it needs entity→category facts (documented seam).
+        let distinct: i32 = row.try_get("distinct_entities").map_err(db_err)?;
+        let writers: i32 = row.try_get("writer_count").map_err(db_err)?;
+        let tier1: bool = row.try_get("has_tier1_evidence").map_err(db_err)?;
+        if distinct < k_min {
+            return Err(StorageError::InvalidInput(format!(
+                "k-support unmet: {distinct} distinct entities < k_min {k_min}"
+            )));
+        }
+        if writers < 2 && !tier1 {
+            return Err(StorageError::InvalidInput(
+                "corroboration unmet: needs >=2 distinct writers or tier-1 evidence".into(),
+            ));
+        }
+
+        let statement: String = row.try_get("statement").map_err(db_err)?;
+        let categories: Vec<String> = row.try_get("categories").map_err(db_err)?;
+
+        let episode_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
+                                   content_hash, trust_tier, writer_sub, writer_azp)
+             VALUES ($1, $2, 'knowledge', $3, $4, $5, $6, $7, NULL, NULL)",
+        )
+        .bind(episode_id)
+        .bind(tenant)
+        .bind(id.to_string())
+        .bind(EpisodeKind::KnowledgePublish.as_str())
+        .bind(serde_json::json!({ "knowledge_id": id, "statement": statement }))
+        .bind(format!("knowledge-{id}"))
+        .bind(TrustTier::Observation as i16)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        // The §7g carve-out artifact: kind='knowledge', entity-free, broad
+        // visibility. Lineage lives in knowledge_evidence, NEVER here.
+        sqlx::query(
+            "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
+                                 content_hash, embedding, visibility, entity_tags,
+                                 confidentiality, trust_tier, valid_from, provenance,
+                                 kind, categories)
+             VALUES ($1, $2, 'knowledge', $3, 0, $4, $5, $6, $7, '{}', $8, $9, now(), $10,
+                     'knowledge', $11)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(format!("knowledge:{id}"))
+        .bind(&statement)
+        .bind(format!("knowledge-{id}"))
+        .bind(embedding.map(Vector::from))
+        .bind(&visibility)
+        .bind(Confidentiality::Internal as i16)
+        .bind(TrustTier::Observation as i16)
+        .bind(episode_id)
+        .bind(&categories)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            "UPDATE knowledge SET status = 'published', published_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        self.get_knowledge(tenant, id).await
+    }
+
+    async fn list_knowledge(
+        &self,
+        tenant: TenantId,
+        status: Option<KnowledgeStatus>,
+    ) -> Result<Vec<KnowledgeItem>> {
+        let rows = sqlx::query(
+            "SELECT * FROM knowledge
+             WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2)
+             ORDER BY first_seen DESC LIMIT 200",
+        )
+        .bind(tenant)
+        .bind(status.map(|s| s.as_str()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_knowledge).collect()
+    }
+
     async fn latest_chunks(
         &self,
         scope: &Scope,
@@ -497,7 +763,7 @@ impl StorageAdapter for PostgresAdapter {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT id, document_id, seq, content, entity_tags, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
                     0.0::float8 AS score
              FROM chunks
              WHERE tenant_id = $1
