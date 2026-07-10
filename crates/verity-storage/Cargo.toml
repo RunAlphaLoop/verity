@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 verity-core = { path = "../verity-core" }
+moka = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 pgvector = { workspace = true }

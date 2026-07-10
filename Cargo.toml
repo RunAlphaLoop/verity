@@ -4,6 +4,7 @@ members = [
     "crates/verity-storage",
     "crates/verity-server",
     "crates/verity-bench",
+    "crates/verity-encoder",
 ]
 resolver = "2"
 
@@ -32,3 +33,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 rand_distr = "0.5"
 hdrhistogram = "7"
+moka = { version = "0.12", features = ["sync"] }
+ort = "2.0.0-rc.12"
+tokenizers = "0.23"
+hf-hub = "0.5"

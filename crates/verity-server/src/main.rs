@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
-use verity_storage::PostgresAdapter;
+use verity_storage::{CachedAdapter, PostgresAdapter};
 
 /// `verity_core::types::Result` shadows std's; handlers need the two-arg form.
 type HandlerResult<T> = std::result::Result<T, (StatusCode, String)>;
@@ -35,7 +35,7 @@ struct Cli {
 }
 
 struct AppState {
-    storage: PostgresAdapter,
+    storage: CachedAdapter<PostgresAdapter>,
 }
 
 #[tokio::main]
@@ -43,9 +43,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    let storage = PostgresAdapter::connect(&cli.dsn).await?;
-    storage.migrate().await?;
-    let state = Arc::new(AppState { storage });
+    let pg = PostgresAdapter::connect(&cli.dsn).await?;
+    pg.migrate().await?;
+    // L1 current-truth cache: the `get` hot path (SPEC §4b). 1M entries ≈ a
+    // few hundred MB ceiling; invalidated on upsert, so never serves stale.
+    let state = Arc::new(AppState {
+        storage: CachedAdapter::new(pg, 1_000_000),
+    });
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
