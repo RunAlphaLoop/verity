@@ -345,6 +345,72 @@ pub enum ForgetRef {
     Episode(EpisodeId),
 }
 
+/// A materialized L3 brief row (SPEC §2 L3). The `body` is the recomputed
+/// summary produced under a broad MATERIALIZATION scope — it is metadata and a
+/// cached summary, NEVER the served item set. Serving always re-derives the
+/// actual `recent_memory`/`recent_activity` under the caller's scope, so no
+/// materialized item can leak (main.rs::brief). `source_visibility` is the
+/// INTERSECTION of contributing chunk/action visibilities (derived-scope
+/// inheritance, fail-closed): the brief-level summary is visible only to
+/// principals present in ALL its sources; an empty intersection = nobody.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedBrief {
+    pub entity: String,
+    pub body: serde_json::Value,
+    pub source_visibility: Vec<PrincipalToken>,
+    pub is_stale: bool,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub source_version: i64,
+}
+
+/// Which dense vector column `recall` searches (SPEC §5c query-routing
+/// cutover). `V1` = the original `embedding` column (default); `V2` = the
+/// migration's `embedding_v2` named vector, selected once a cutover flips the
+/// per-tenant/global `embedding_route` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingRoute {
+    V1,
+    V2,
+}
+
+impl EmbeddingRoute {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+    pub fn from_str_lossy(s: &str) -> Self {
+        if s == "v2" {
+            Self::V2
+        } else {
+            Self::V1
+        }
+    }
+}
+
+/// Backfill coverage for an embedding-model migration (SPEC §5c): the cutover
+/// gate refuses to flip below 100% unless forced.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EmbeddingCoverage {
+    pub total: i64,
+    pub covered: i64,
+}
+
+impl EmbeddingCoverage {
+    pub fn is_complete(&self) -> bool {
+        self.total == 0 || self.covered >= self.total
+    }
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]

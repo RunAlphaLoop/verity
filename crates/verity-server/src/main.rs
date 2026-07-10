@@ -269,6 +269,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/debezium", post(ingest_debezium))
         .route("/v1/ingest/documents", post(ingest_documents))
         .route("/v1/briefs/{entity}", get(brief))
+        .route("/v1/admin/briefs/refresh", post(admin_refresh_briefs))
+        .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
+        .route("/v1/admin/reembed/cutover", post(admin_reembed_cutover))
         .route("/v1/admin/tenants", post(create_tenant))
         .route("/v1/admin/erasure", post(compliance::admin_erasure))
         .route("/v1/admin/dsar/export", get(compliance::dsar_export))
@@ -1190,11 +1193,30 @@ struct BriefQuery {
     scope_handle: String,
 }
 
-/// The entity brief (SPEC §2 L3, v0.1 deterministic form): current state of an
-/// entity in one call — newest memory + recent agent activity. Assembled
-/// on-read under the CALLER's scope, so derived-visibility inheritance is
-/// trivially correct; precomputed briefs with lineage-intersection visibility
-/// arrive with the async L3 workers.
+/// On-read refresh debounce (SPEC §2: "recompute lazily"): a stale brief older
+/// than this since its last sync is refreshed on read; a stale brief refreshed
+/// more recently serves its cached body and defers to the batch/sleep-time
+/// path, so a hot entity under write pressure doesn't refresh on every GET.
+const BRIEF_REFRESH_DEBOUNCE_SECS: i64 = 5;
+
+/// The entity brief (SPEC §2 L3): current state of an entity in one call —
+/// newest memory + recent agent activity + L3 staleness metadata.
+///
+/// SCOPE SOUNDNESS (the load-bearing decision): the materialized `briefs` row
+/// is computed under a BROAD materialization scope, so it must NEVER be served
+/// as items. Instead:
+///   - `recent_memory` / `recent_activity` are re-derived HERE under the
+///     CALLER's scope via the same scoped `latest_chunks`/`activity` +
+///     restricted recheck that `recall` uses — so a caller can never see an
+///     item their scope excludes (the fuzzer's brief predicate holds by
+///     construction: these are the exact scoped read paths it already probes).
+///   - the materialized row supplies ONLY metadata (`is_stale`,
+///     `last_synced_at`, `source_version`) and a cached `summary`.
+///   - derived-scope inheritance (SPEC §2): the cached `summary` is gated by
+///     the brief's `source_visibility` = INTERSECTION of contributing source
+///     visibilities. A caller missing from ANY source cannot see the
+///     brief-level summary (it is withheld: `summary: null`), even though they
+///     may still see the subset of individual items their own scope admits.
 async fn brief(
     State(state): State<Arc<AppState>>,
     Path(entity): Path<String>,
@@ -1202,6 +1224,35 @@ async fn brief(
 ) -> HandlerResult<Json<serde_json::Value>> {
     let payload = state.verify_scope(&q.scope_handle)?;
     let scope = state.scope_for(&payload).await?;
+
+    // Lazy materialization: fetch (or first-time create) the brief row, then
+    // refresh if stale and past the debounce window. Refresh recomputes the
+    // metadata + cached summary; it is not on the item-serving path.
+    let materialized = state
+        .storage
+        .get_brief(scope.tenant_id, &entity)
+        .await
+        .map_err(internal)?;
+    let materialized = match materialized {
+        None => Some(
+            state
+                .storage
+                .refresh_brief(scope.tenant_id, &entity)
+                .await
+                .map_err(internal)?,
+        ),
+        Some(b) if b.is_stale && brief_refresh_due(&b) => Some(
+            state
+                .storage
+                .refresh_brief(scope.tenant_id, &entity)
+                .await
+                .map_err(internal)?,
+        ),
+        Some(b) => Some(b),
+    };
+
+    // Items always served under the CALLER's scope (no materialized item ever
+    // leaves this handler).
     let (memory, actions) = tokio::join!(
         state.storage.latest_chunks(&scope, &entity, 10),
         state.storage.activity(ActivityQuery {
@@ -1218,6 +1269,30 @@ async fn brief(
     // to recall (SPEC §7b rule 4).
     let memory = revocation::enforce_restricted(&state, &payload, memory).await?;
     let actions = actions.map_err(internal)?;
+
+    // Derived-scope inheritance gate on the cached summary (SPEC §2): the
+    // summary is visible only to a caller whose principals intersect the
+    // brief's source_visibility (the intersection of ALL contributing
+    // sources). Empty source_visibility => visible to nobody (fail-closed).
+    let (is_stale, last_synced_at, source_version, summary) = match &materialized {
+        Some(b) => {
+            let visible = b
+                .source_visibility
+                .iter()
+                .any(|t| scope.principals.contains(t));
+            let summary = if visible {
+                b.body
+                    .get("memory_count")
+                    .zip(b.body.get("activity_count"))
+                    .map(|(m, a)| serde_json::json!({ "memory_count": m, "activity_count": a }))
+            } else {
+                None
+            };
+            (b.is_stale, b.last_synced_at, b.source_version, summary)
+        }
+        None => (true, None, 0, None),
+    };
+
     spawn_audit(
         &state,
         &payload,
@@ -1234,7 +1309,179 @@ async fn brief(
         "generated_at": Utc::now(),
         "recent_memory": memory,
         "recent_activity": actions,
+        // L3 staleness metadata (SPEC §2: returned on every read).
+        "is_stale": is_stale,
+        "last_synced_at": last_synced_at,
+        "source_version": source_version,
+        // Cached brief-level summary, gated by derived-scope inheritance; null
+        // when the caller isn't in the intersection of all contributing sources.
+        "summary": summary,
         // L1 record linkage lands with cross-source entity resolution (§7f).
+    })))
+}
+
+/// A stale brief is refreshed on read only if it hasn't synced within the
+/// debounce window (or never synced).
+fn brief_refresh_due(b: &verity_core::types::MaterializedBrief) -> bool {
+    match b.last_synced_at {
+        None => true,
+        Some(t) => (Utc::now() - t).num_seconds() >= BRIEF_REFRESH_DEBOUNCE_SECS,
+    }
+}
+
+// ---------- admin: L3 brief batch refresh (the sleep-time path) ----------
+
+#[derive(Deserialize)]
+struct AdminTenantParam {
+    tenant: TenantId,
+}
+
+/// POST /v1/admin/briefs/refresh?tenant= — recompute every stale brief for a
+/// tenant (SPEC §2 L3 sleep-time recompute). Admin-gated. Returns the count.
+async fn admin_refresh_briefs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<AdminTenantParam>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let refreshed = state
+        .storage
+        .refresh_stale_briefs(p.tenant)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({ "refreshed": refreshed })))
+}
+
+// ---------- admin: embedding-migration tooling (SPEC §5c) ----------
+
+#[derive(Deserialize)]
+struct ReembedBatchRequest {
+    /// Target model id; registered on first batch (idempotent).
+    model: String,
+    /// Restrict to one tenant, else backfill across all tenants.
+    #[serde(default)]
+    tenant: Option<TenantId>,
+    #[serde(default = "default_reembed_batch")]
+    batch: i64,
+}
+
+fn default_reembed_batch() -> i64 {
+    256
+}
+
+/// POST /v1/admin/reembed/batch — the encoder lives in the server, so the CLI
+/// drives batches and the server re-embeds. Walks up to `batch` current chunks
+/// lacking `embedding_v2`, re-encodes each from its stored canonical text
+/// (SPEC §5c: re-embed, never re-fetch), and fills `embedding_v2`. Returns
+/// counts + remaining coverage so the CLI can loop and show progress. Requires
+/// the local encoder (503 when sparse-only).
+async fn admin_reembed_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReembedBatchRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    if state.encoder.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reembed requires the local encoder; this server is sparse-only".into(),
+        ));
+    }
+    // Dims match today (both 384); register the target so the registry + the
+    // per-chunk model marker are honest. A true dim change needs a wider
+    // column (docs/EMBEDDING_MIGRATION.md).
+    state
+        .storage
+        .register_embedding_model(&req.model, verity_encoder::DIM as i32)
+        .await
+        .map_err(internal)?;
+
+    let pending = state
+        .storage
+        .chunks_needing_v2(req.tenant, req.batch.clamp(1, 10_000))
+        .await
+        .map_err(internal)?;
+
+    let mut filled_rows: Vec<(ChunkId, Vec<f32>)> = Vec::with_capacity(pending.len());
+    for (id, content) in &pending {
+        if let Some(vec) = state.encode(content).await? {
+            filled_rows.push((*id, vec));
+        }
+    }
+    let written = state
+        .storage
+        .fill_embedding_v2(&req.model, &filled_rows)
+        .await
+        .map_err(internal)?;
+
+    let coverage = state
+        .storage
+        .embedding_v2_coverage(req.tenant)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "model": req.model,
+        "scanned": pending.len(),
+        "written": written,
+        "coverage": { "total": coverage.total, "covered": coverage.covered,
+                      "fraction": coverage.fraction() },
+        "done": pending.is_empty(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct CutoverRequest {
+    /// Restrict the cutover to one tenant, else flip the global default.
+    #[serde(default)]
+    tenant: Option<TenantId>,
+    /// Route to flip to (default v2 — the point of cutover).
+    #[serde(default = "default_cutover_route")]
+    route: EmbeddingRoute,
+    /// Force the flip below 100% backfill coverage (SPEC §5c: uncovered chunks
+    /// fall back to sparse-only for the new route — an explicit acknowledgment).
+    #[serde(default)]
+    force: bool,
+}
+
+fn default_cutover_route() -> EmbeddingRoute {
+    EmbeddingRoute::V2
+}
+
+/// POST /v1/admin/reembed/cutover — flip the dense query route (SPEC §5c step
+/// 2). Coverage-gated: refuses to flip to V2 below 100% backfill unless
+/// `force` (which acknowledges uncovered chunks drop to sparse-only for the new
+/// route). Flipping back to V1 is always allowed (rollback).
+async fn admin_reembed_cutover(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CutoverRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let coverage = state
+        .storage
+        .embedding_v2_coverage(req.tenant)
+        .await
+        .map_err(internal)?;
+    if req.route == EmbeddingRoute::V2 && !coverage.is_complete() && !req.force {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "backfill coverage {:.1}% (< 100%); pass force=true to cut over anyway (uncovered chunks fall back to sparse-only for the new route)",
+                coverage.fraction() * 100.0
+            ),
+        ));
+    }
+    state
+        .storage
+        .set_embedding_route(req.tenant, req.route)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "route": req.route.as_str(),
+        "tenant": req.tenant,
+        "coverage": { "total": coverage.total, "covered": coverage.covered,
+                      "fraction": coverage.fraction() },
+        "forced": req.force && !coverage.is_complete(),
     })))
 }
 

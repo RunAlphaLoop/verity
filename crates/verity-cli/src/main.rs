@@ -16,6 +16,7 @@ mod connect;
 mod dev;
 mod mcp;
 mod query;
+mod reembed;
 mod status;
 mod tail;
 mod ui;
@@ -116,6 +117,34 @@ tokens (POST /v1/scopes, actor cli:add) and uploads under that handle."
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Embedding-model migration (SPEC §5c): backfill the embedding_v2 named
+    /// vector, then flip the dense query route. The server holds the encoder;
+    /// this drives batches and shows progress. Admin surface (needs
+    /// admin_token in the config when the server requires it).
+    #[command(
+        long_about = "Embedding-model migration tooling (SPEC §5c dual named-vector backfill + \
+query-routing cutover).\n\n\
+`verity-cli reembed --model <id>` loops the server's batch re-embed endpoint until every current \
+chunk's embedding_v2 is filled from stored canonical text (never a re-fetch), printing coverage.\n\n\
+`verity-cli reembed cutover --to v2` flips recall's dense leg to the new vector; the server refuses \
+below 100% coverage unless --force (uncovered chunks then fall back to sparse-only for the new route).\n\n\
+Dims match today (both 384), so this is honest plumbing + routing, not a real model swap — a true \
+dimension change needs a wider column (docs/EMBEDDING_MIGRATION.md)."
+    )]
+    Reembed {
+        /// Target model id (registered in the named-vector registry on first
+        /// batch). Required for backfill; ignored by the `cutover` subcommand.
+        #[arg(long)]
+        model: Option<String>,
+        /// Restrict to one tenant (uuid); default backfills all tenants.
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Chunks per server round-trip.
+        #[arg(long, default_value_t = 256)]
+        batch: i64,
+        #[command(subcommand)]
+        command: Option<ReembedCommand>,
+    },
     /// Server health, config, tenant, and the decoded scope handle.
     Status,
     /// Back up the dockerized Postgres (pg_dump -Fc) into <dir>, with a
@@ -172,6 +201,23 @@ enum ConnectCommand {
         /// WOULD be sent instead of sending it (no PAT asked for).
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReembedCommand {
+    /// Flip the dense query route once backfill is complete (SPEC §5c step 2).
+    Cutover {
+        /// Restrict the cutover to one tenant (uuid); default = global flip.
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Route to flip to: v2 (cut over) or v1 (rollback).
+        #[arg(long, default_value = "v2")]
+        to: String,
+        /// Cut over below 100% coverage (uncovered chunks fall back to
+        /// sparse-only for the new route — an explicit acknowledgment).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -268,6 +314,23 @@ async fn run() -> Result<()> {
         Command::Tail { once } => tail::run(&ctx, once).await,
         Command::Mcp { command } => match command {
             McpCommand::Install { run, repo } => mcp::install(&ctx, repo, run).await,
+        },
+        Command::Reembed {
+            model,
+            tenant,
+            batch,
+            command,
+        } => match command {
+            Some(ReembedCommand::Cutover { tenant, to, force }) => {
+                reembed::cutover(&ctx, tenant.as_deref(), &to, force).await
+            }
+            None => match model {
+                Some(model) => reembed::backfill(&ctx, &model, tenant.as_deref(), batch).await,
+                None => anyhow::bail!(
+                    "reembed needs --model <id> to backfill, or the `cutover` subcommand\n  \
+                     → e.g. verity-cli reembed --model bge-small-en-v2"
+                ),
+            },
         },
         Command::Status => status::run(&ctx).await,
         Command::Backup { dir } => backup::backup(&dir).await,

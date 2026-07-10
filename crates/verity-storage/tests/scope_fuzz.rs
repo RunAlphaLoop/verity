@@ -193,6 +193,16 @@ async fn no_read_path_leaks_across_scopes() {
         action_models.push(model);
     }
 
+    // Materialize an L3 brief per entity under the BROAD materialization scope
+    // (this is what the sleep-time worker does). Its body sees everything; the
+    // point of the brief probe below is that materializing it must NOT change
+    // what a caller-scoped brief read (latest_chunks — the item-serving path)
+    // returns. If materialization ever leaked into serving, Path 5 would catch
+    // it because latest_chunks is exactly the brief handler's memory leg.
+    for entity in ENTITIES {
+        adapter.refresh_brief(tenant, entity).await.unwrap();
+    }
+
     // --- Probe every read path with randomized scopes.
     let chunk_by_doc = |doc: &str| chunk_models.iter().find(|c| c.doc == doc);
     let mut probes = 0usize;
@@ -335,8 +345,45 @@ async fn no_read_path_leaks_across_scopes() {
                 act.action_id, model.visibility, model.confidentiality
             );
         }
+
+        // Path 5: materialized brief item-serving (SPEC §2 L3). The brief is
+        // materialized under a broad scope, but the SERVED items come through
+        // the caller-scoped latest_chunks path — probe it against an entity
+        // that already has a materialized (broad) brief and assert the same
+        // no-leak predicate. This is the "materialized brief never leaks an
+        // item the caller's scope excludes" invariant.
+        let brief_entity = ENTITIES.choose(&mut rng).unwrap().to_string();
+        // The brief exists (materialized above); serving is caller-scoped.
+        let brief_items = adapter
+            .latest_chunks(&scope, &brief_entity, 100)
+            .await
+            .unwrap();
+        probes += 1;
+        let entity_query_ok =
+            scope.entity_scope.is_empty() || scope.entity_scope.contains(&brief_entity);
+        for hit in &brief_items {
+            assert!(
+                hit.entity_tags.contains(&brief_entity),
+                "LEAK via brief: {} returned for entity {brief_entity} it isn't tagged with",
+                hit.document_id
+            );
+            if let Some(model) = chunk_by_doc(&hit.document_id) {
+                assert!(
+                    model.visibility.iter().any(|t| scope.principals.contains(t))
+                        && model.confidentiality <= scope.max_confidentiality as i16
+                        && entity_query_ok,
+                    "LEAK via brief: materialized brief for {brief_entity} served item {} the scope {scope:?} excludes (vis {:?}, conf {})",
+                    hit.document_id, model.visibility, model.confidentiality
+                );
+                assert!(
+                    !model.superseded || hit.content.contains("current"),
+                    "STALE LEAK via brief: superseded {} served",
+                    hit.document_id
+                );
+            }
+        }
     }
     println!(
-        "scope fuzz: {probes} probes across recall(bm25), recall(hybrid), activity — no leaks"
+        "scope fuzz: {probes} probes across recall(bm25), recall(hybrid), activity, brief — no leaks"
     );
 }

@@ -165,6 +165,17 @@ impl PostgresAdapter {
 
     async fn recall_dense(&self, q: &RecallQuery, embedding: &[f32]) -> Result<Vec<RecallHit>> {
         let scope = &q.scope;
+        // Query-routing cutover (SPEC §5c step 2): once a tenant's route is
+        // flipped to V2, the dense leg searches the `embedding_v2` named vector
+        // and its HNSW index. Chunks not yet backfilled (embedding_v2 IS NULL)
+        // fall out of the dense leg — sparse/BM25 still covers them, exactly as
+        // SPEC §5c's "uncovered chunks fall back to sparse-only for the new
+        // route" describes. Column name is a validated constant, never caller
+        // data.
+        let col = match self.embedding_route(scope.tenant_id).await? {
+            EmbeddingRoute::V1 => "embedding",
+            EmbeddingRoute::V2 => "embedding_v2",
+        };
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
         // Selectivity router: ask the planner for its row estimate (pure
@@ -178,7 +189,7 @@ impl PostgresAdapter {
             "EXPLAIN (FORMAT JSON) SELECT 1 FROM chunks
              WHERE tenant_id = $1
                AND valid_to IS NULL
-               AND embedding IS NOT NULL
+               AND {col} IS NOT NULL
                AND visibility && $2
                AND confidentiality <= $3
                {}",
@@ -212,15 +223,15 @@ impl PostgresAdapter {
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
-                    1 - (embedding <=> $1) AS score
+                    1 - ({col} <=> $1) AS score
              FROM chunks
              WHERE tenant_id = $2
                AND valid_to IS NULL
-               AND embedding IS NOT NULL
+               AND {col} IS NOT NULL
                AND visibility && $3
                AND confidentiality <= $4
                {}
-             ORDER BY embedding <=> $1
+             ORDER BY {col} <=> $1
              LIMIT $5",
             entity_scope_predicate(scope, "$6"),
         )))
@@ -477,6 +488,21 @@ impl StorageAdapter for PostgresAdapter {
                 }
             }
         };
+        // Staleness (SPEC §2 L3): an L1 change retires the entity's brief. A
+        // no-op upsert (Unchanged/StaleEvent) leaves briefs alone. The fact's
+        // source-native entity_id is the lineage key; briefs materialized under
+        // a matching entity tag pick it up.
+        if matches!(
+            outcome,
+            FactUpsertOutcome::Inserted | FactUpsertOutcome::Superseded
+        ) {
+            mark_briefs_stale_tx(
+                &mut tx,
+                fact.tenant_id,
+                std::slice::from_ref(&fact.key.entity_id),
+            )
+            .await?;
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(outcome)
     }
@@ -568,6 +594,17 @@ impl StorageAdapter for PostgresAdapter {
             .map_err(db_err)?;
             written += result.rows_affected() as usize;
         }
+        // Derived-view staleness (SPEC §2 L3): a write to any chunk marks the
+        // briefs of the entities it touches STALE, synchronously, in the same
+        // transaction (cheap UPDATE; recompute is lazy/batch). Entity tags are
+        // the lineage key for briefs.
+        let affected: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.entity_tags.iter().cloned())
+            .collect();
+        if let Some(t) = chunks.first().map(|c| c.tenant_id) {
+            mark_briefs_stale_tx(&mut tx, t, &affected).await?;
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(written)
     }
@@ -648,6 +685,8 @@ impl StorageAdapter for PostgresAdapter {
             return Ok(false);
         }
         Self::insert_action_chunk(&mut tx, &action, episode_id).await?;
+        // Staleness: an action for an entity retires its brief (SPEC §2 L3).
+        mark_briefs_stale_tx(&mut tx, action.tenant_id, &action.entities).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(true)
     }
@@ -1120,6 +1159,259 @@ impl StorageAdapter for PostgresAdapter {
         .map_err(db_err)?;
         rows.iter().map(row_to_action).collect()
     }
+
+    // ---- L3 materialized briefs (SPEC §2 L3) ----
+
+    async fn refresh_brief(&self, tenant: TenantId, entity: &str) -> Result<MaterializedBrief> {
+        // Materialize under a BROAD scope (no visibility/confidentiality
+        // ceiling): the row is a cache + metadata, never the served payload.
+        // Serving re-derives items under the caller's scope, so this breadth is
+        // safe — it never widens what a caller can see.
+        let mem_rows = sqlx::query(
+            "SELECT content, entity_tags, kind, visibility, confidentiality, valid_from
+             FROM chunks
+             WHERE tenant_id = $1
+               AND valid_to IS NULL
+               AND entity_tags @> ARRAY[$2]::text[]
+             ORDER BY valid_from DESC
+             LIMIT 10",
+        )
+        .bind(tenant)
+        .bind(entity)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let act_rows = sqlx::query(
+            "SELECT action_id, action_type, summary, visibility, confidentiality, occurred_at
+             FROM actions
+             WHERE tenant_id = $1
+               AND entities @> ARRAY[$2]::text[]
+             ORDER BY occurred_at DESC
+             LIMIT 10",
+        )
+        .bind(tenant)
+        .bind(entity)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Derived-scope inheritance (SPEC §2, fail-closed): source_visibility =
+        // INTERSECTION of every contributing chunk/action visibility. A brief
+        // is visible only to principals present in ALL its sources. Empty
+        // corpus => empty intersection => visible to nobody (fail-closed).
+        let mut visibilities: Vec<Vec<i32>> = Vec::new();
+        let mut recent_memory = Vec::new();
+        for r in &mem_rows {
+            let vis: Vec<i32> = r.try_get("visibility").map_err(db_err)?;
+            visibilities.push(vis);
+            recent_memory.push(serde_json::json!({
+                "content": r.try_get::<String, _>("content").map_err(db_err)?,
+                "kind": r.try_get::<String, _>("kind").map_err(db_err)?,
+                "confidentiality": r.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+                "valid_from": r.try_get::<DateTime<Utc>, _>("valid_from").map_err(db_err)?,
+            }));
+        }
+        let mut recent_activity = Vec::new();
+        for r in &act_rows {
+            let vis: Vec<i32> = r.try_get("visibility").map_err(db_err)?;
+            visibilities.push(vis);
+            recent_activity.push(serde_json::json!({
+                "action_id": r.try_get::<String, _>("action_id").map_err(db_err)?,
+                "action_type": r.try_get::<String, _>("action_type").map_err(db_err)?,
+                "summary": r.try_get::<String, _>("summary").map_err(db_err)?,
+                "occurred_at": r.try_get::<DateTime<Utc>, _>("occurred_at").map_err(db_err)?,
+            }));
+        }
+        let source_visibility = intersect_visibilities(&visibilities);
+
+        let body = serde_json::json!({
+            "recent_memory": recent_memory,
+            "recent_activity": recent_activity,
+            "memory_count": mem_rows.len(),
+            "activity_count": act_rows.len(),
+        });
+
+        // UPSERT: clear stale, stamp last_synced_at, keep source_version (it is
+        // bumped only by stale-marking writes, so a reader can tell whether the
+        // body predates a known write even right after a refresh).
+        let row = sqlx::query(
+            "INSERT INTO briefs (tenant_id, entity, body, source_visibility,
+                                 is_stale, last_synced_at, source_version)
+             VALUES ($1, $2, $3, $4, false, now(), 0)
+             ON CONFLICT (tenant_id, entity) DO UPDATE
+               SET body = EXCLUDED.body,
+                   source_visibility = EXCLUDED.source_visibility,
+                   is_stale = false,
+                   last_synced_at = now()
+             RETURNING entity, body, source_visibility, is_stale, last_synced_at, source_version",
+        )
+        .bind(tenant)
+        .bind(entity)
+        .bind(&body)
+        .bind(&source_visibility)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row_to_brief(&row)
+    }
+
+    async fn get_brief(&self, tenant: TenantId, entity: &str) -> Result<Option<MaterializedBrief>> {
+        let row = sqlx::query(
+            "SELECT entity, body, source_visibility, is_stale, last_synced_at, source_version
+             FROM briefs WHERE tenant_id = $1 AND entity = $2",
+        )
+        .bind(tenant)
+        .bind(entity)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.as_ref().map(row_to_brief).transpose()
+    }
+
+    async fn mark_briefs_stale(&self, tenant: TenantId, entities: &[String]) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let n = mark_briefs_stale_tx(&mut tx, tenant, entities).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(n)
+    }
+
+    async fn refresh_stale_briefs(&self, tenant: TenantId) -> Result<u64> {
+        let entities: Vec<String> =
+            sqlx::query_scalar("SELECT entity FROM briefs WHERE tenant_id = $1 AND is_stale")
+                .bind(tenant)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let mut refreshed = 0u64;
+        for entity in &entities {
+            self.refresh_brief(tenant, entity).await?;
+            refreshed += 1;
+        }
+        Ok(refreshed)
+    }
+
+    // ---- Embedding-model migration (SPEC §5c) ----
+
+    async fn register_embedding_model(&self, id: &str, dim: i32) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO embedding_models (id, dim) VALUES ($1, $2)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(dim)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn chunks_needing_v2(
+        &self,
+        tenant: Option<TenantId>,
+        limit: i64,
+    ) -> Result<Vec<(ChunkId, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM chunks
+             WHERE ($1::uuid IS NULL OR tenant_id = $1)
+               AND valid_to IS NULL
+               AND embedding IS NOT NULL
+               AND embedding_v2 IS NULL
+             ORDER BY id
+             LIMIT $2",
+        )
+        .bind(tenant)
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<Uuid, _>("id").map_err(db_err)?,
+                    r.try_get::<String, _>("content").map_err(db_err)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn fill_embedding_v2(&self, model: &str, rows: &[(ChunkId, Vec<f32>)]) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let mut written = 0u64;
+        for (id, vec) in rows {
+            let r = sqlx::query(
+                "UPDATE chunks SET embedding_v2 = $1, embedding_v2_model = $2
+                 WHERE id = $3 AND embedding_v2 IS NULL",
+            )
+            .bind(Vector::from(vec.clone()))
+            .bind(model)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            written += r.rows_affected();
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(written)
+    }
+
+    async fn embedding_v2_coverage(&self, tenant: Option<TenantId>) -> Result<EmbeddingCoverage> {
+        let row = sqlx::query(
+            "SELECT count(*) AS total,
+                    count(*) FILTER (WHERE embedding_v2 IS NOT NULL) AS covered
+             FROM chunks
+             WHERE ($1::uuid IS NULL OR tenant_id = $1)
+               AND valid_to IS NULL
+               AND embedding IS NOT NULL",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(EmbeddingCoverage {
+            total: row.try_get("total").map_err(db_err)?,
+            covered: row.try_get("covered").map_err(db_err)?,
+        })
+    }
+
+    async fn embedding_route(&self, tenant: TenantId) -> Result<EmbeddingRoute> {
+        // Per-tenant row wins over the global (NULL-tenant) default.
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM settings
+             WHERE key = 'embedding_route'
+               AND (tenant_id = $1 OR tenant_id IS NULL)
+             ORDER BY tenant_id NULLS LAST
+             LIMIT 1",
+        )
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(value
+            .map(|v| EmbeddingRoute::from_str_lossy(&v))
+            .unwrap_or(EmbeddingRoute::V1))
+    }
+
+    async fn set_embedding_route(
+        &self,
+        tenant: Option<TenantId>,
+        route: EmbeddingRoute,
+    ) -> Result<()> {
+        // The unique index is on COALESCE(tenant_id, zero-uuid), so upsert keys
+        // on that expression.
+        sqlx::query(
+            "INSERT INTO settings (tenant_id, key, value, updated_at)
+             VALUES ($1, 'embedding_route', $2, now())
+             ON CONFLICT (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid), key)
+             DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(route.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 impl PostgresAdapter {
@@ -1236,6 +1528,66 @@ async fn insert_fact_row(
     .await
     .map_err(db_err)?;
     Ok(())
+}
+
+/// Mark the briefs of `entities` STALE in the same transaction as the write
+/// that caused it (SPEC §2 L3: synchronous, cheap staleness marking off the
+/// hot recompute path). `source_version` bumps so a reader can detect a body
+/// that predates known writes. Only touches already-materialized briefs —
+/// non-existent ones are created lazily on first read. Distinct-dedups the
+/// input so the UPDATE stays a single pass.
+async fn mark_briefs_stale_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: TenantId,
+    entities: &[String],
+) -> Result<u64> {
+    if entities.is_empty() {
+        return Ok(0);
+    }
+    let mut uniq: Vec<String> = entities.to_vec();
+    uniq.sort();
+    uniq.dedup();
+    let r = sqlx::query(
+        "UPDATE briefs
+           SET is_stale = true, source_version = source_version + 1
+         WHERE tenant_id = $1 AND entity = ANY($2)",
+    )
+    .bind(tenant)
+    .bind(&uniq)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(r.rows_affected())
+}
+
+/// Set-intersection of contributing visibility arrays (derived-scope
+/// inheritance, SPEC §2). Empty input (no sources) => empty set => visible to
+/// nobody (fail-closed). Order-independent; result is sorted+deduped.
+fn intersect_visibilities(lists: &[Vec<i32>]) -> Vec<i32> {
+    let mut iter = lists.iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+    let mut acc: std::collections::BTreeSet<i32> = first.iter().copied().collect();
+    for list in iter {
+        let s: std::collections::HashSet<i32> = list.iter().copied().collect();
+        acc.retain(|t| s.contains(t));
+        if acc.is_empty() {
+            break;
+        }
+    }
+    acc.into_iter().collect()
+}
+
+fn row_to_brief(row: &PgRow) -> Result<MaterializedBrief> {
+    Ok(MaterializedBrief {
+        entity: row.try_get("entity").map_err(db_err)?,
+        body: row.try_get("body").map_err(db_err)?,
+        source_visibility: row.try_get("source_visibility").map_err(db_err)?,
+        is_stale: row.try_get("is_stale").map_err(db_err)?,
+        last_synced_at: row.try_get("last_synced_at").map_err(db_err)?,
+        source_version: row.try_get("source_version").map_err(db_err)?,
+    })
 }
 
 fn row_to_action(row: &PgRow) -> Result<ActionRecord> {

@@ -172,4 +172,52 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
         self.inner.activity(query).await
     }
+
+    async fn refresh_brief(&self, tenant: TenantId, entity: &str) -> Result<MaterializedBrief> {
+        self.inner.refresh_brief(tenant, entity).await
+    }
+
+    async fn get_brief(&self, tenant: TenantId, entity: &str) -> Result<Option<MaterializedBrief>> {
+        self.inner.get_brief(tenant, entity).await
+    }
+
+    async fn mark_briefs_stale(&self, tenant: TenantId, entities: &[String]) -> Result<u64> {
+        self.inner.mark_briefs_stale(tenant, entities).await
+    }
+
+    async fn refresh_stale_briefs(&self, tenant: TenantId) -> Result<u64> {
+        self.inner.refresh_stale_briefs(tenant).await
+    }
+
+    async fn register_embedding_model(&self, id: &str, dim: i32) -> Result<()> {
+        self.inner.register_embedding_model(id, dim).await
+    }
+
+    async fn chunks_needing_v2(
+        &self,
+        tenant: Option<TenantId>,
+        limit: i64,
+    ) -> Result<Vec<(ChunkId, String)>> {
+        self.inner.chunks_needing_v2(tenant, limit).await
+    }
+
+    async fn fill_embedding_v2(&self, model: &str, rows: &[(ChunkId, Vec<f32>)]) -> Result<u64> {
+        self.inner.fill_embedding_v2(model, rows).await
+    }
+
+    async fn embedding_v2_coverage(&self, tenant: Option<TenantId>) -> Result<EmbeddingCoverage> {
+        self.inner.embedding_v2_coverage(tenant).await
+    }
+
+    async fn embedding_route(&self, tenant: TenantId) -> Result<EmbeddingRoute> {
+        self.inner.embedding_route(tenant).await
+    }
+
+    async fn set_embedding_route(
+        &self,
+        tenant: Option<TenantId>,
+        route: EmbeddingRoute,
+    ) -> Result<()> {
+        self.inner.set_embedding_route(tenant, route).await
+    }
 }
