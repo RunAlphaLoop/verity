@@ -1,6 +1,6 @@
 # Verity Roadmap — what's built, what's left
 
-> Status as of 2026-07-09. The build contract is [SPEC.md](SPEC.md) (v1.4); measured
+> Status as of 2026-07-10. The build contract is [SPEC.md](SPEC.md) (v1.4); measured
 > numbers live in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Estimates assume the
 > spec's staffing model: 2 engineers + AI-assisted development.
 
@@ -27,36 +27,40 @@
 
 ---
 
-## 🔨 v0.1 close-out (the founder answer + security spine) — ~6–8 weeks
+## 🔨 v0.1 close-out — ✅ SHIPPED 2026-07-10
+
+Every item landed with tests (37 Rust + 33 Python, scope fuzzer green). As-built notes
+mark where the v0.1 slice is narrower than the original line item — those deltas roll
+into v0.2/v0.3.
 
 **Ingestion DX (§5e.7 v0.1 slice):**
-- [ ] `verity` CLI: `dev` (embedded server + bundled embeddings), `add <file|dir|url|->` with required `--visibility`, `webhook mint`, `tail`, `query`, `mcp install` (2–3 wks — the 5-minute wow lives here)
-- [ ] Minted scoped webhook URLs (static visibility binding; native payload shape; quarantine-preview) (1–1.5 wks)
-- [ ] MCP write tools beyond `remember`: `ingest_text`, `ingest_file`, `ingest_url` (2–4 days)
-- [ ] ACL provenance tag on every fact (`mirrored|approximated|admin-assigned|quarantined`) (days — retrofit-expensive later)
-- [ ] `POST /v1/files` via `unstructured` in the Python plane (1 wk)
-- [ ] Connector/admin/ingest auth tokens (the documented trusted-plane seam) (days)
+- [x] `verity-cli`: `dev` / `add <file|dir|url|->` (required `--visibility`, teaching refusal) / `query` / `webhook mint` / `tail` / `mcp install` / `status`. *As built: dev uses docker-compose Postgres; the single-binary embedded mode is future.*
+- [x] Minted scoped webhook URLs: narrow-only visibility, native payload → episode+chunk+facts, unknown shapes → quarantine preview, revocation
+- [x] MCP write tools: `ingest_text`, `ingest_file`, `ingest_url`, `forget` (13 tools total)
+- [x] ACL provenance tag on every fact/chunk (`mirrored|approximated|admin-assigned|quarantined`), surfaced on reads
+- [x] `POST /v1/files` multipart + paragraph chunking + embedding. *As built: Rust-native text-like handling; `unstructured`/PDF parsing is v0.2.*
+- [x] Admin/ingest bearer auth (constant-time; dev-mode warn when unset)
 
 **Scope plane completion (Milestone B):**
-- [ ] SpiceDB integration: sidecar/child-process packaging, Watch-driven visibility materialization, principal expansion pre-paid at `open_scope` (2–3 wks)
-- [ ] Identity Plane: canonical principal registry, Google Admin SDK directory sync (nested groups), per-connector crosswalks, conformance fixtures (2 wks)
-- [ ] Revocation tombstones: changelog durability, replica fencing, cold-start fail-closed replay (1–1.5 wks)
-- [ ] Mandatory live BatchCheck on `restricted`-class results (days)
-- [ ] Purpose binding via YAML policy packs (1 wk)
-- [ ] Audit log of every `(subject, scope, results)` tuple (days)
-- [ ] Session write-through buffer — read-your-writes for `remember`→`recall` (1 wk)
-- [ ] `memory.forget` (audited invalidation) + knowledge retraction cascade (1 wk)
+- [x] SpiceDB integration (HTTP gateway seam): schema, nested groups, subject-resolved `open_scope` (422 on self-asserted principals when live). *As built: resolution at mint + windowed re-read subtraction; Watch-driven index materialization is v0.2.*
+- [x] Identity: canonical principal registry (`/v1/admin/principals`), group management API, Drive connector principal crosswalk. *As built: Google Admin SDK directory sync not yet — groups arrive via API/connectors.*
+- [x] Revocation tombstones: durable-before-delete, windowed subtraction at mint AND read time (cold-start safe by durability). *Replica fan-out is v0.2 with the changelog.*
+- [x] Restricted-class live recheck against fresh membership; restricted DROPPED when ReBAC off (fail closed, env override for dev)
+- [x] Purpose packs (YAML): confidentiality clamp + entity-scope requirements at mint
+- [x] Audit log on every scoped read + admin query endpoint
+- [x] Read-your-writes: holds by construction (remember indexes synchronously in-process); the cross-replica write-through buffer arrives with multi-replica serving
+- [x] `memory.forget` (chunk/episode) + knowledge retraction cascade (support recount → invalidated below k)
 
 **Connectors (truth lane):**
-- [ ] HubSpot native connector: private-app token, v4 webhooks + journal, field/ACL/identity conformance tests (2 wks)
-- [ ] Google Drive native connector: `changes.watch` + poll fallback, Docling/unstructured parsing, **Drive ACL inheritance** (2–3 wks)
+- [x] HubSpot: BYOT private-app token, search-API cursor polling, v3 webhook payload mapping, Debezium-envelope sink, 12 conformance tests. *Webhook subscriptions are UI-configured (HubSpot limitation).*
+- [x] Google Drive: BYOT service account, changes.list cursor, permissions.list → AclEnvelope (Tier A mirroring), ACL-before-content, anyone→quarantine, 21 conformance tests. *Docs export + text download; Docling/PDF parsing is v0.2.*
 
 **Multimodal v0.1 commitment:**
-- [ ] MediaObject store + retrieve-by-text/answer-from-pixels with scope-bound signed URIs (1–1.5 wks)
+- [x] MediaObject store (sha256, bytea) + HMAC-signed scope-checked media URLs; text-like files chunk+embed on upload. *Lance/S3 blob tier and media-backed recall citations are v0.3.*
 
 **Honesty debts (benchmarks):**
-- [ ] QPS-under-load + concurrency benchmark (spec has no load numbers yet) (days)
-- [ ] Entity-bound + broad-visibility BM25 bench case (heap-filter regression risk noted in 0004) (day)
+- [x] Load benchmark: ~170 QPS saturation (M3 Pro), queueing curve recorded; §4d cloud-shape run still owed before any public QPS claim
+- [x] Entity-bound + broad-visibility BM25: breach found (542ms) and fixed (12.6ms p50) via keyword-tokenized Tantivy pre-filter + materialized residual
 
 ## 📦 v0.2 — the multiplier (~4–6 weeks)
 

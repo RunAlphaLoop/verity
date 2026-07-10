@@ -4,7 +4,10 @@
 
 Enterprises run agents across sales, support, marketing, and ops, but each agent is an island: the context they need lives in CRMs, ticketing systems, docs, and wikis. Verity mirrors those systems of record into a bi-temporal memory store via CDC/webhooks, inherits source ACLs into a Zanzibar-style permission graph, compiles caller scope into every retrieval as a mandatory pre-filter, and serves scoped hybrid recall — exposed MCP-first to any agent framework.
 
-**Status: pre-alpha.** Milestone A ("the engine is honest") is under construction. See [SPEC.md](SPEC.md) — the build contract — and [docs/research/](docs/research/) for the research that produced it.
+**Status: v0.1.** The engine is measured (<50ms p95 every retrieval path at 1M chunks,
+query encoding included), the scope plane is fuzzed in CI, identity resolves through
+SpiceDB, and the ingestion funnel is live (CLI, MCP, minted webhooks, file drop,
+HubSpot + Google Drive connectors, Debezium CDC). See [SPEC.md](SPEC.md) — the build contract — and [docs/research/](docs/research/) for the research that produced it.
 
 ## The three claims
 
@@ -27,10 +30,17 @@ deploy/                 # docker-compose for the Postgres profile
 ## Quickstart (dev)
 
 ```sh
-docker compose -f deploy/docker-compose.yml up -d   # Postgres 17 + pgvector + pg_search
+cargo run --release -p verity-cli -- dev            # compose up + server + tenant + scope handle
+verity-cli add ./docs --visibility 1                # ingest a directory (visibility is never guessed)
+verity-cli query "what do we know about pricing?"   # scoped hybrid recall with provenance tags
+verity-cli webhook mint my-system --visibility 1    # any system that can POST JSON is now a source
+```
+
+Benchmarks (`docs/BENCHMARKS.md` is the honesty log — every number measured, never quoted):
+
+```sh
 cargo run -p verity-bench -- seed --chunks 100000   # synthetic corpus with realistic ACL shape
-cargo run -p verity-bench -- run                    # p50/p95/p99 latency: filtered ANN, point reads
-cargo run --release -p verity-server                # REST API on 127.0.0.1:7717
+cargo run -p verity-bench -- run                    # p50/p95/p99 per path; load --sweep for QPS
 ```
 
 ## Connect an agent (MCP)

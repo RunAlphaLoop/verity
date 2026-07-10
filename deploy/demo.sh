@@ -74,3 +74,19 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$VERITY/v1/recall" \
 show "tampered scope handle       -> HTTP $CODE"
 
 say "Done. Same memory, three agents: live truth in milliseconds, awareness of each other's actions, and scoping enforced in the index — not in the prompt."
+
+say "5) v0.1 additions: webhook source, file drop, forget"
+WH=$(curl -s -X POST "$VERITY/v1/webhooks" -H 'content-type: application/json' \
+  -d "{\"tenant_id\":\"$TENANT\",\"name\":\"demo-system\",\"visibility\":[11]}" | jq -r .url)
+curl -s -X POST "$VERITY$WH" -H 'content-type: application/json' \
+  -d '{"content":"Acme signed the pilot agreement for the fall rollout.","entities":["account:acme"]}' >/dev/null
+WH_HIT=$(curl -s -X POST "$VERITY/v1/recall" -H 'content-type: application/json' \
+  -d "{\"scope_handle\":\"$SALES\",\"text\":\"pilot agreement\",\"k\":1}" | jq -r '.[0].content' | cut -c1-60)
+show "webhook-minted source posted a memory -> $WH_HIT"
+EPI=$(curl -s -X POST "$VERITY/v1/episodes" -H 'content-type: application/json' \
+  -d "{\"scope_handle\":\"$SALES\",\"observation\":\"Temporary note: wrong pricing quoted, please disregard.\"}" | jq -r .episode_id)
+curl -s -X POST "$VERITY/v1/forget" -H 'content-type: application/json' \
+  -d "{\"scope_handle\":\"$SALES\",\"ref\":{\"kind\":\"episode\",\"id\":\"$EPI\"},\"reason\":\"retracted\"}" >/dev/null
+HITS=$(curl -s -X POST "$VERITY/v1/recall" -H 'content-type: application/json' \
+  -d "{\"scope_handle\":\"$SALES\",\"text\":\"wrong pricing disregard\",\"k\":5}" | jq '[.[] | select(.content | contains("disregard"))] | length')
+show "forget(episode) -> retracted note now returns $HITS results"
