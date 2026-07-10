@@ -10,7 +10,8 @@
 //! sees exactly ~s of the corpus. Token 0 is the "all company" broad token on
 //! every chunk (the unfiltered baseline).
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -100,6 +101,21 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         queries: usize,
     },
+    /// QPS-under-load (SPEC §4d): N concurrent tasks run a mixed workload
+    /// (70% hybrid recall @ 1% selectivity, 20% L1 point reads, 10% activity
+    /// timeline reads) against the adapter in-process — same pattern as `run`,
+    /// no HTTP hop, no query encoder.
+    Load {
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 30)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Run concurrency levels {4, 16, 64} sequentially instead of --concurrency.
+        #[arg(long, default_value_t = false)]
+        sweep: bool,
+    },
 }
 
 #[tokio::main]
@@ -120,6 +136,15 @@ async fn main() -> Result<()> {
             facts,
         } => seed(&adapter, chunks, entities, facts).await,
         Command::Run { queries, k } => run(&adapter, queries, k).await,
+        Command::Load {
+            concurrency,
+            duration_secs,
+            k,
+            sweep,
+        } => {
+            let levels: &[usize] = if sweep { &[4, 16, 64] } else { &[concurrency] };
+            load(Arc::new(adapter), levels, duration_secs, k).await
+        }
         Command::Encode { .. } => unreachable!("handled above"),
     }
 }
@@ -186,6 +211,7 @@ async fn seed(
             trust_tier: TrustTier::Authoritative,
             valid_from: Utc::now(),
             provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
         });
         if batch.len() == 500 {
             adapter.upsert_chunks(std::mem::take(&mut batch)).await?;
@@ -211,6 +237,7 @@ async fn seed(
                 value: serde_json::json!(i),
                 valid_from: Utc::now(),
                 provenance: episode,
+                acl_provenance: AclProvenance::AdminAssigned,
             })
             .await?;
     }
@@ -304,6 +331,45 @@ async fn run(adapter: &PostgresAdapter, n_queries: usize, k: usize) -> Result<()
         }
         report.push(print_case(
             label,
+            &hist,
+            total_hits as f64 / n_queries as f64,
+            k,
+        ));
+    }
+
+    // BM25 with an entity-bound scope over the *broad* visibility token: the
+    // migration-0004 caveat probe. Visibility/validity are pushed into Tantivy,
+    // but `entity_tags <@ scope` stays a heap filter — a broad principal set
+    // maximizes the pushed-down candidate set that filter must chew through.
+    {
+        let mut hist = Histogram::<u64>::new(3)?;
+        let mut total_hits = 0usize;
+        for _ in 0..n_queries {
+            let scope = Scope {
+                tenant_id: tenant,
+                principals: vec![BROAD_TOKEN],
+                entity_scope: vec!["account:0".into()],
+                max_confidentiality: Confidentiality::Confidential,
+            };
+            let text = format!(
+                "{} {}",
+                WORDS.choose(&mut rng).expect("word pool"),
+                WORDS.choose(&mut rng).expect("word pool")
+            );
+            let t = Instant::now();
+            let hits = adapter
+                .recall(RecallQuery {
+                    scope,
+                    embedding: None,
+                    text: Some(text),
+                    k,
+                })
+                .await?;
+            hist.record(t.elapsed().as_micros() as u64)?;
+            total_hits += hits.len();
+        }
+        report.push(print_case(
+            "BM25 entity-bound + broad visibility",
             &hist,
             total_hits as f64 / n_queries as f64,
             k,

@@ -328,6 +328,7 @@ async fn ingest_debezium(
                             value,
                             valid_from: ev.occurred_at,
                             provenance: episode,
+                            acl_provenance: AclProvenance::Mirrored,
                         })
                         .await
                         .map_err(internal)?;
@@ -406,6 +407,7 @@ async fn remember(
             trust_tier: TrustTier::Observation,
             valid_from: Utc::now(),
             provenance: episode_id,
+            acl_provenance: AclProvenance::AdminAssigned,
         }])
         .await
         .map_err(internal)?;

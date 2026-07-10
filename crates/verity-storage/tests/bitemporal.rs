@@ -56,6 +56,7 @@ async fn supersession_lifecycle() {
         value,
         valid_from: at,
         provenance: episode,
+        acl_provenance: AclProvenance::AdminAssigned,
     };
 
     // First value ever.
@@ -117,6 +118,7 @@ async fn recall_fails_closed() {
             trust_tier: TrustTier::Authoritative,
             valid_from: Utc::now(),
             provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
         }])
         .await
         .unwrap();

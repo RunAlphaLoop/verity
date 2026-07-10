@@ -47,6 +47,7 @@ async fn cached_read_never_serves_superseded_value() {
         value,
         valid_from: at,
         provenance: episode,
+        acl_provenance: AclProvenance::AdminAssigned,
     };
 
     adapter

@@ -100,7 +100,7 @@ impl PostgresAdapter {
         // Safe: the predicate string is assembled from constants only; all
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
                     1 - (embedding <=> $1) AS score
              FROM chunks
              WHERE tenant_id = $2
@@ -135,7 +135,7 @@ impl PostgresAdapter {
         // for an empty principal array, preserving fail-closed. tenant/
         // confidentiality/valid_to push down as indexed scalars (0004).
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
              WHERE content @@@ $1
@@ -187,6 +187,9 @@ fn row_to_hit(row: &PgRow) -> Result<RecallHit> {
             .map_err(db_err)?,
         entity_tags: row.try_get("entity_tags").map_err(db_err)?,
         kind: row.try_get("kind").map_err(db_err)?,
+        acl_provenance: AclProvenance::from_str_lossy(
+            &row.try_get::<String, _>("acl_provenance").map_err(db_err)?,
+        ),
         trust_tier: tier_from_i16(row.try_get("trust_tier").map_err(db_err)?),
         valid_from: row.try_get("valid_from").map_err(db_err)?,
         provenance: row.try_get("provenance").map_err(db_err)?,
@@ -413,8 +416,9 @@ impl StorageAdapter for PostgresAdapter {
             let result = sqlx::query(
                 "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
                                      content_hash, embedding, visibility, entity_tags,
-                                     confidentiality, trust_tier, valid_from, provenance)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                     confidentiality, trust_tier, valid_from, provenance,
+                                     acl_provenance)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (tenant_id, source, document_id, seq, valid_from) DO NOTHING",
             )
             .bind(Uuid::now_v7())
@@ -431,6 +435,7 @@ impl StorageAdapter for PostgresAdapter {
             .bind(c.trust_tier as i16)
             .bind(c.valid_from)
             .bind(c.provenance)
+            .bind(c.acl_provenance.as_str())
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -763,7 +768,7 @@ impl StorageAdapter for PostgresAdapter {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT id, document_id, seq, content, entity_tags, kind, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
                     0.0::float8 AS score
              FROM chunks
              WHERE tenant_id = $1
@@ -871,8 +876,10 @@ impl PostgresAdapter {
         sqlx::query(
             "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
                                  content_hash, embedding, visibility, entity_tags,
-                                 confidentiality, trust_tier, valid_from, provenance)
-             VALUES ($1, $2, 'agent', $3, 0, $4, $5, NULL, $6, $7, $8, $9, $10, $11)
+                                 confidentiality, trust_tier, valid_from, provenance,
+                                 acl_provenance)
+             VALUES ($1, $2, 'agent', $3, 0, $4, $5, NULL, $6, $7, $8, $9, $10, $11,
+                     'admin-assigned')
              ON CONFLICT (tenant_id, source, document_id, seq, valid_from) DO NOTHING",
         )
         .bind(Uuid::now_v7())
@@ -901,8 +908,8 @@ async fn insert_fact_row(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO facts (id, tenant_id, source, entity_id, field, value,
-                            valid_from, valid_to, provenance)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                            valid_from, valid_to, provenance, acl_provenance)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(fact.tenant_id)
@@ -913,6 +920,7 @@ async fn insert_fact_row(
     .bind(fact.valid_from)
     .bind(valid_to)
     .bind(fact.provenance)
+    .bind(fact.acl_provenance.as_str())
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -960,5 +968,8 @@ fn row_to_fact(row: &PgRow) -> Result<FactRow> {
         superseded_by: row.try_get("superseded_by").map_err(db_err)?,
         recorded_at: row.try_get("recorded_at").map_err(db_err)?,
         provenance: row.try_get("provenance").map_err(db_err)?,
+        acl_provenance: AclProvenance::from_str_lossy(
+            &row.try_get::<String, _>("acl_provenance").map_err(db_err)?,
+        ),
     })
 }

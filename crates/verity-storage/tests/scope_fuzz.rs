@@ -132,6 +132,7 @@ async fn no_read_path_leaks_across_scopes() {
             trust_tier: TrustTier::Authoritative,
             valid_from: now - Duration::hours(2),
             provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
         });
         // A superseded chunk gets a newer version with a sentinel marker so a
         // leak of the OLD version is detectable.
@@ -150,6 +151,7 @@ async fn no_read_path_leaks_across_scopes() {
                 trust_tier: TrustTier::Authoritative,
                 valid_from: now - Duration::hours(1),
                 provenance: episode,
+                acl_provenance: AclProvenance::AdminAssigned,
             });
         }
         chunk_models.push(model);

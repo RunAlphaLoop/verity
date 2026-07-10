@@ -57,6 +57,7 @@ async fn interaction(
             trust_tier: TrustTier::Observation,
             valid_from: Utc::now(),
             provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
         }])
         .await
         .unwrap();

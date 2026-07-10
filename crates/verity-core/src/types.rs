@@ -33,6 +33,40 @@ pub enum Confidentiality {
     Restricted = 3,
 }
 
+/// How a memory's visibility was determined (SPEC §5e.6). Surfaced on every
+/// read so the convenience lane and the truth lane are labeled in-product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AclProvenance {
+    /// Real per-object ACLs mirrored from the source system (Tier A).
+    Mirrored,
+    /// Container-membership approximation (Tier B).
+    Approximated,
+    /// Explicit admin/agent-assigned visibility policy.
+    AdminAssigned,
+    Quarantined,
+}
+
+impl AclProvenance {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mirrored => "mirrored",
+            Self::Approximated => "approximated",
+            Self::AdminAssigned => "admin-assigned",
+            Self::Quarantined => "quarantined",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "mirrored" => Self::Mirrored,
+            "approximated" => Self::Approximated,
+            "quarantined" => Self::Quarantined,
+            _ => Self::AdminAssigned,
+        }
+    }
+}
+
 /// Provenance stamped on every L0 episode; everything above L0 links back here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewEpisode {
@@ -90,6 +124,7 @@ pub struct FactWrite {
     pub value: serde_json::Value,
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
+    pub acl_provenance: AclProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +138,7 @@ pub struct FactRow {
     pub superseded_by: Option<FactId>,
     pub recorded_at: DateTime<Utc>,
     pub provenance: EpisodeId,
+    pub acl_provenance: AclProvenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +169,7 @@ pub struct ChunkWrite {
     pub trust_tier: TrustTier,
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
+    pub acl_provenance: AclProvenance,
 }
 
 /// The caller's compiled scope, resolved server-side from token + MemoryScope
@@ -169,6 +206,7 @@ pub struct RecallHit {
     pub entity_tags: Vec<String>,
     /// "content" (scoped memory) or "knowledge" (published, entity-free — §7g).
     pub kind: String,
+    pub acl_provenance: AclProvenance,
     pub trust_tier: TrustTier,
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
