@@ -3584,6 +3584,7 @@ dependencies = [
  "chrono",
  "moka",
  "pgvector",
+ "rand 0.9.4",
  "serde_json",
  "sqlx",
  "tokio",
