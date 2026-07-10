@@ -1,0 +1,19 @@
+{
+  "tenant_id": "018f6b7a-aaaa-7000-8000-000000000000",
+  "episode_id": "018f6b7a-0000-7000-8000-000000000002",
+  "l2_facts": [
+    {
+      "subject": "Verity",
+      "relation": "is",
+      "object": "an open-source memory plane"
+    }
+  ],
+  "tag_suggestions": [],
+  "knowledge_candidates": [
+    {
+      "statement": "Support tickets always mention the renewal date.",
+      "categories": [],
+      "evidence": ["018f6b7a-0000-7000-8000-000000000002"]
+    }
+  ]
+}

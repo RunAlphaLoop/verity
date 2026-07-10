@@ -262,3 +262,59 @@ temporal workflow execute --task-queue verity-ingest --type ConnectorSyncWorkflo
 
 `max_cycles: 1` is the `--once` equivalent: one poll cycle, returns the
 resulting cursor, no sleep, no continue-as-new.
+
+## Consolidation plane (sleep-time L2 extraction + knowledge, v0.3)
+
+The consolidation worker is the async plane that turns unstructured L0
+episodes into structured memory (SPEC §2 L2, knowledge items, §7d tagging).
+It runs in the trusted server plane — like connectors, it is not an agent and
+has no conversational output channel.
+
+### Loop
+
+```
+python3 -m verity_ingest.consolidation \
+  --base-url http://127.0.0.1:7717 --tenant-id <uuid> \
+  --extractor deterministic          # or: anthropic (needs ANTHROPIC_API_KEY)
+```
+
+`--once` does a single lease → extract → complete pass (tests, cron). The
+admin token rides `--admin-token` or `$VERITY_ADMIN_TOKEN`.
+
+- `POST /v1/admin/consolidation/lease {tenant_id, limit}` hands out
+  unprocessed **non-CDC** episodes (observation / webhook / doc_version) with
+  payloads decrypted, leased 5 minutes. CDC episodes are skipped by
+  construction: their L1 extraction is deterministic at ingest (SPEC §2 L1 —
+  structured data never goes through LLM extraction).
+- `POST /v1/admin/consolidation/complete` writes the extraction. Completing
+  twice is an acknowledged no-op (`already_processed`), so crashed workers
+  just retry after lease expiry.
+
+### What complete() writes
+
+- **L2 facts** become deterministic bi-temporal upserts under source `l2`,
+  keyed `(l2, normalized subject, normalized relation)` — same-key writes
+  supersede structurally, exactly like L1. Read them back via
+  `GET /v1/records/l2/<subject>/<relation>`.
+- **Tag suggestions** (SPEC §7d probabilistic tags) land in a review queue:
+  `GET /v1/admin/tag-suggestions`, `POST /v1/admin/tag-suggestions/{id}/approve`.
+  **Suggest-only is the default.** `VERITY_AUTO_TAG=1` applies suggestions at
+  confidence >= 0.9 immediately (acl_provenance/visibility untouched) — note
+  that adding a tag WIDENS what entity-bound scopes can retrieve, which is why
+  the default posture is human review.
+- **Knowledge candidates** go through the existing propose_knowledge gate,
+  after a similarity-merge check: a statement matching an existing
+  candidate/published item (normalized-exact, or statement-embedding cosine >=
+  `VERITY_KNOWLEDGE_MERGE_THRESHOLD`, default 0.85) accrues its evidence onto
+  that item — support accrual across scoped sessions — instead of minting a
+  duplicate. Publishing still requires the k-support/review gates.
+
+### Extractors
+
+`DeterministicExtractor` (default, used by all tests) is regex/rule-based:
+"X is Y" sentences, "key: value" lines, entity-name echo into tag suggestions
+at 0.95, and a knowledge candidate for sentences carrying a generalization
+marker ("always", "consistently", "customers … tend"). `AnthropicExtractor`
+is the LLM seam behind `ANTHROPIC_API_KEY` (Messages API, strict-JSON
+structured outputs); without the key it refuses to construct and the
+deterministic extractor is the honest fallback.

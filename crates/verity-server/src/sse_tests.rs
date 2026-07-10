@@ -48,6 +48,8 @@ async fn test_state(max_conns: usize) -> Option<(Arc<AppState>, TenantId)> {
         revocations: RevocationPlane::new(300),
         allow_restricted_without_rebac: false,
         subscribers: Subscribers::new(max_conns),
+        auto_tag: false,
+        knowledge_merge_threshold: crate::consolidation::DEFAULT_MERGE_THRESHOLD,
     });
     Some((state, tenant))
 }

@@ -1,0 +1,29 @@
+{
+  "episodes": [
+    {
+      "episode_id": "018f6b7a-0000-7000-8000-000000000002",
+      "source": "gdrive",
+      "source_entity": "doc-42",
+      "kind": "doc_version",
+      "recorded_at": "2026-07-09T12:00:00Z",
+      "leased_until": "2026-07-09T12:05:00Z",
+      "payload": {
+        "document_id": "doc-42",
+        "content_hash": "abc123",
+        "bytes": 96
+      },
+      "chunks": [
+        {
+          "chunk_id": "018f6b7a-0000-7000-8000-00000000000b",
+          "content": "Verity is an open-source memory plane.",
+          "entity_tags": []
+        },
+        {
+          "chunk_id": "018f6b7a-0000-7000-8000-00000000000c",
+          "content": "Support tickets always mention the renewal date.",
+          "entity_tags": []
+        }
+      ]
+    }
+  ]
+}

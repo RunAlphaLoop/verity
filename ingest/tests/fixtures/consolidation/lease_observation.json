@@ -1,0 +1,23 @@
+{
+  "episodes": [
+    {
+      "episode_id": "018f6b7a-0000-7000-8000-000000000001",
+      "source": "agent",
+      "source_entity": "account:acme",
+      "kind": "observation",
+      "recorded_at": "2026-07-09T12:00:00Z",
+      "leased_until": "2026-07-09T12:05:00Z",
+      "payload": {
+        "observation": "Acme Corp is evaluating the enterprise tier.\nRenewal Stage: negotiation.\nHealthcare customers consistently require DPA redlines before security review.",
+        "entities": ["account:acme"]
+      },
+      "chunks": [
+        {
+          "chunk_id": "018f6b7a-0000-7000-8000-00000000000a",
+          "content": "Acme Corp is evaluating the enterprise tier.\nRenewal Stage: negotiation.\nHealthcare customers consistently require DPA redlines before security review.",
+          "entity_tags": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "tenant_id": "018f6b7a-aaaa-7000-8000-000000000000",
+  "episode_id": "018f6b7a-0000-7000-8000-000000000001",
+  "l2_facts": [
+    {
+      "subject": "Acme Corp",
+      "relation": "is",
+      "object": "evaluating the enterprise tier"
+    },
+    {
+      "subject": "account:acme",
+      "relation": "Renewal Stage",
+      "object": "negotiation"
+    }
+  ],
+  "tag_suggestions": [
+    {
+      "chunk_id": "018f6b7a-0000-7000-8000-00000000000a",
+      "tag": "account:acme",
+      "confidence": 0.95
+    }
+  ],
+  "knowledge_candidates": [
+    {
+      "statement": "Healthcare customers consistently require DPA redlines before security review.",
+      "categories": [],
+      "evidence": ["018f6b7a-0000-7000-8000-000000000001"]
+    }
+  ]
+}

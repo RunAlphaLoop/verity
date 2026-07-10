@@ -4136,6 +4136,7 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "moka",
+ "pgvector",
  "rand_core 0.6.4",
  "reqwest",
  "serde",

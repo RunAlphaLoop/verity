@@ -8,6 +8,9 @@
 mod audit;
 mod compliance;
 mod connectors;
+mod consolidation;
+#[cfg(test)]
+mod consolidation_tests;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
@@ -130,6 +133,14 @@ pub(crate) struct AppState {
     pub(crate) allow_restricted_without_rebac: bool,
     /// Live SSE subscription gauge (task 21): capped, 429 beyond.
     pub(crate) subscribers: subscribe::Subscribers,
+    /// `VERITY_AUTO_TAG=1` — consolidation tag suggestions at >= 0.9
+    /// confidence are applied to chunks immediately. Default OFF: auto-tags
+    /// widen retrieval scope for entity-bound scopes (SPEC §7d), so the
+    /// default posture is suggest-only with human approval.
+    pub(crate) auto_tag: bool,
+    /// Cosine-similarity floor for knowledge candidate merge (support
+    /// accrual) — `VERITY_KNOWLEDGE_MERGE_THRESHOLD`, default 0.85.
+    pub(crate) knowledge_merge_threshold: f32,
 }
 
 impl AppState {
@@ -235,6 +246,11 @@ async fn main() -> anyhow::Result<()> {
         allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
+        auto_tag: std::env::var("VERITY_AUTO_TAG").is_ok_and(|v| v == "1"),
+        knowledge_merge_threshold: std::env::var("VERITY_KNOWLEDGE_MERGE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(consolidation::DEFAULT_MERGE_THRESHOLD),
     });
 
     let app = Router::new()
@@ -262,6 +278,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connector-status",
             post(connectors::post_status).get(connectors::get_status),
+        )
+        .route("/v1/admin/consolidation/lease", post(consolidation::lease))
+        .route(
+            "/v1/admin/consolidation/complete",
+            post(consolidation::complete),
+        )
+        .route(
+            "/v1/admin/tag-suggestions",
+            get(consolidation::list_tag_suggestions),
+        )
+        .route(
+            "/v1/admin/tag-suggestions/{id}/approve",
+            post(consolidation::approve_tag_suggestion),
         )
         .route("/v1/admin/principals", post(admin_principals))
         .route(
