@@ -1,6 +1,6 @@
 # Verity Roadmap — what's built, what's left
 
-> Status as of 2026-07-10. The build contract is [SPEC.md](SPEC.md) (v1.4); measured
+> Status as of 2026-07-10 (v0.3 shipped). The build contract is [SPEC.md](SPEC.md) (v1.4); measured
 > numbers live in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Estimates assume the
 > spec's staffing model: 2 engineers + AI-assisted development.
 
@@ -79,17 +79,21 @@ and BM25 query-syntax injection (user text now via paradedb.match). As-built del
 - [x] Compliance v0: per-tenant DEKs, ALL episode paths encrypted, erasure deletes SpiceDB tuples first-or-abort + media purge, DSAR export, backup/restore. Remaining plaintext surfaces (chunks/facts/media bytes) listed in docs/OPERATIONS.md
 - [x] docs/snippets/pg-net-trigger.md
 
-## 🏗 v0.3 — the scaling substrate (~6–8 weeks)
+## 🏗 v0.3 — the scaling substrate — ✅ SHIPPED 2026-07-10
 
-- [ ] Source manifests v1: schema + Rust interpreter (JSONata mapping, predicate routing, `acl_policy` tiers, admin approval gate) + conformance harness + community registry repo (5–6 wks)
-- [ ] L2 extraction: async LLM fact extraction, `(subject, relation)` supersession, sleep-time consolidation workers (3–4 wks)
-- [ ] Knowledge consolidation worker: cross-scope clustering, similarity-merge on propose, support accrual (2 wks)
-- [ ] L3 materialized briefs with lineage, staleness metadata, derived-scope inheritance (2 wks)
-- [ ] Probabilistic entity tagging + quarantine thresholds + tagger-recall benchmark metric (2 wks)
-- [ ] Qdrant scale profile behind the `StorageAdapter` trait (2–3 wks)
-- [ ] Temporal for the ingest plane (required before any managed connector fleet) (2 wks)
-- [ ] Embedding-model migration tooling (dual-vector cutover orchestration) (1 wk)
-- [ ] Scoped Recall Benchmark v0 as a branded, reproducible public harness (2 wks)
+106 Rust + 93 ingest + 115 integrations tests green; scope fuzzer green against
+BOTH storage profiles; SRB harness reports 0 leaks / 1220 adversarial probes.
+As-built deltas noted per item.
+
+- [x] Source manifests v1: verity-manifest crate (schema, dot-path mapping — JSONata crates disqualified for a fail-closed path, documented — predicate routing, acl_policy tiers, human activation gate, hmac signature verify, fixture conformance), server wiring, Linear example. *Community registry repo is future.*
+- [x] L2 extraction: lease/complete endpoints, (subject,relation) supersession via existing L1 machinery, Python worker (deterministic extractor for tests + Anthropic seam)
+- [x] Knowledge consolidation: propose-or-merge by statement-embedding similarity, support accrual on merge
+- [x] L3 materialized briefs: synchronous stale-marking, lazy/batch refresh, fail-closed intersection derived-scope inheritance, caller-scope re-filtering (fuzzer brief probe green)
+- [x] Probabilistic entity tagging: suggest-only by default (VERITY_AUTO_TAG opt-in), approve endpoint. *Tagger-recall benchmark metric (SRB #5) still defined-not-reported — needs an eval corpus.*
+- [x] Qdrant scale profile: second StorageAdapter, scope fuzzer passes against it (480 probes, 0 leaks) — the seam is real
+- [x] Temporal orchestration: durable connector scheduling, at-least-once cursor invariant tested (retry never advances past a failed delivery)
+- [x] Embedding migration: dual-vector backfill + verity-cli reembed + coverage-gated cutover routing. *Same-dim plumbing; a true dim change needs a wider column (machinery is dimension-agnostic).*
+- [x] Scoped Recall Benchmark v0: verity-bench srb (leakage/staleness/latency), self-labeling run conditions, first report in docs/benchmark/. **0 leaks / 1220 adversarial probes.**
 
 ## ☁️ Cloud / later (fundraising-dependent)
 
