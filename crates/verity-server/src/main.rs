@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/activity", get(activity))
         .route("/v1/ingest/debezium", post(ingest_debezium))
         .route("/v1/briefs/{entity}", get(brief))
+        .route("/v1/admin/tenants", post(create_tenant))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -498,6 +499,25 @@ async fn activity(
         .await
         .map(Json)
         .map_err(internal)
+}
+
+// ---------- admin (trusted plane, same auth seam as ingest) ----------
+
+#[derive(Deserialize)]
+struct CreateTenantRequest {
+    name: String,
+}
+
+async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateTenantRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let id = state
+        .storage
+        .create_tenant(&req.name)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({ "tenant_id": id })))
 }
 
 // ---------- brief ----------
