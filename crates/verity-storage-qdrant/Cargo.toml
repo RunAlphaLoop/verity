@@ -1,0 +1,31 @@
+[package]
+name = "verity-storage-qdrant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+verity-storage = { path = "../verity-storage" }
+qdrant-client = "1.18"
+sqlx = { workspace = true }
+pgvector = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+# qdrant-bench bin (seed + filtered dense recall latency, docs/BENCHMARKS.md).
+clap = { workspace = true }
+anyhow = { workspace = true }
+hdrhistogram = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[[bin]]
+name = "qdrant-bench"
+path = "src/bin/qdrant_bench.rs"

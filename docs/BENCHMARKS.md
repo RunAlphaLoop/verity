@@ -248,3 +248,43 @@ breaks the TopK plan and heap-scans the full match set.
 | hybrid @ 1% (regression check) | 16.0 / 17.9ms | 17.4 / 21.3 / 32.3ms |
 
 All retrieval paths back inside the <50ms p95 envelope at 1M.
+
+---
+
+## 2026-07-10 — Qdrant SCALE profile lands: first Qdrant-vs-Postgres curve at 100k
+
+**Setup:** `verity-storage-qdrant`'s `qdrant-bench`: 100,000 chunks (384-d unit vectors)
+seeded through the hybrid adapter's real dual-write path into BOTH profiles — a dedicated
+`verity_qbench` Postgres database (ParadeDB pg17, pgvector HNSW m=16/ef_construction=64,
+ANALYZE'd) and one fresh Qdrant collection (v1.18.2, named 384-d cosine vector, payload
+indexes on visibility/entity_tags/confidentiality/kind/valid_from, default HNSW, optimizer
+green before measuring). Both engines in Docker on Apple M3 Pro / 36 GB. Filtered DENSE
+recall through each profile's `StorageAdapter::recall`, k=10, 200 queries per case,
+in-process client — no HTTP API hop, no query encoder (+~12ms p50 per the encoder entry).
+Selectivity constructed as in `verity-bench`: token 0 on every chunk (broad), token 2 with
+p=0.01 (1%).
+
+| Case (100k chunks, dense recall) | p50 | p95 | p99 |
+|---|---|---|---|
+| Qdrant @ 1% selectivity | **1.09ms** | **1.61ms** | 2.01ms |
+| Qdrant broad token (~100%) | 11.18ms | 13.82ms | 15.48ms |
+| Postgres @ 1% selectivity | 3.44ms | 4.87ms | 6.29ms |
+| Postgres broad token (~100%) | 3.61ms | 7.02ms | 11.75ms |
+
+**Findings:**
+
+1. **At the selective end Qdrant's filter-aware traversal wins** (1.1ms vs 3.4ms p50 at
+   1%): no selectivity router needed — cardinality estimation over the payload index picks
+   the plan inside the engine. This is the shape the SCALE profile was chosen for.
+2. **On the broad token Qdrant is ~3x slower than pgvector here** (11.2ms vs 3.6ms p50):
+   every candidate pays a filter check against the payload index plus a gRPC hop, on an
+   untuned default HNSW. Not a problem at this corpus size (well inside the envelope), but
+   worth rechecking at 1M+ before reading anything into it.
+3. **This is NOT the scale claim.** 100k on a dev laptop under Docker says nothing about
+   Qdrant's 10M+ regime — the profile exists for corpus sizes past the Postgres profile's
+   ~5–10M honest ceiling, and that claim needs 10M+ vectors on server hardware, measured,
+   before it appears here. This entry only establishes parity of the trait contract and a
+   baseline curve.
+4. Caveats: single-query latency only (no QPS-under-load for this profile yet); hybrid
+   recall in this profile still runs its BM25 leg in Postgres (pg_search) + local RRF, so
+   its sparse numbers are the Postgres profile's; the machine also hosted both containers.
