@@ -41,4 +41,15 @@ pub trait StorageAdapter: Send + Sync {
     /// Scoped hybrid recall: filtered ANN and/or BM25, fused. Filters are
     /// pushed into the index — pre-filtering only, never truncate-then-authorize.
     async fn recall(&self, query: RecallQuery) -> Result<Vec<RecallHit>>;
+
+    /// Append to the activity timeline (SPEC §2, Action records): writes the
+    /// L0 episode and the timeline row in one transaction, and indexes the
+    /// summary as a Tier-2 chunk so semantic recall surfaces it. Idempotent on
+    /// (tenant, action_id) — returns false when the action was already recorded.
+    async fn record_action(&self, action: ActionWrite) -> Result<bool>;
+
+    /// Scoped timeline read. Same fail-closed contract as `recall`: empty
+    /// principal set reads nothing; an entity-bound scope may only query
+    /// entities it covers.
+    async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>>;
 }

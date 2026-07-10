@@ -54,6 +54,7 @@ pub enum EpisodeKind {
     Webhook,
     DocVersion,
     Observation,
+    AgentAction,
     WebSnapshot,
 }
 
@@ -64,6 +65,7 @@ impl EpisodeKind {
             Self::Webhook => "webhook",
             Self::DocVersion => "doc_version",
             Self::Observation => "observation",
+            Self::AgentAction => "agent_action",
             Self::WebSnapshot => "web_snapshot",
         }
     }
@@ -166,6 +168,74 @@ pub struct RecallHit {
     pub trust_tier: TrustTier,
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOutcome {
+    Succeeded,
+    Failed,
+    Pending,
+}
+
+impl ActionOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+/// A consequential agent act, destined for the append-only activity timeline
+/// (SPEC §2, Action records). Actor fields are stamped server-side from the
+/// authenticated token — an adapter must never accept them from tool arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionWrite {
+    pub tenant_id: TenantId,
+    /// Client idempotency key: replaying the same (tenant, action_id) is a no-op.
+    pub action_id: String,
+    pub actor_sub: Option<String>,
+    pub actor_azp: Option<String>,
+    /// Namespaced verb, e.g. "quote.issued", "email.sent".
+    pub action_type: String,
+    pub entities: Vec<String>,
+    pub summary: String,
+    pub payload: serde_json::Value,
+    pub outcome: ActionOutcome,
+    pub occurred_at: DateTime<Utc>,
+    pub visibility: Vec<PrincipalToken>,
+    pub confidentiality: Confidentiality,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub id: Uuid,
+    pub action_id: String,
+    pub actor_sub: Option<String>,
+    pub actor_azp: Option<String>,
+    pub action_type: String,
+    pub entities: Vec<String>,
+    pub summary: String,
+    pub payload: serde_json::Value,
+    pub outcome: ActionOutcome,
+    pub occurred_at: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+    pub provenance: EpisodeId,
+}
+
+/// Timeline query: "what has been done on this entity, by whom?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityQuery {
+    pub scope: Scope,
+    pub entity: String,
+    pub since: Option<DateTime<Utc>>,
+    /// Exact types ("quote.issued") or prefix patterns ("email.*").
+    pub action_types: Vec<String>,
+    /// Filter by agent identity (actor_azp).
+    pub actors: Vec<String>,
+    pub limit: usize,
 }
 
 #[derive(Debug, thiserror::Error)]

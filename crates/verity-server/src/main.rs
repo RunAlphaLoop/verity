@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/recall", post(recall))
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
+        .route("/v1/actions", post(record_action))
+        .route("/v1/activity", get(activity))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -120,6 +122,98 @@ async fn get_record(
         Ok(None) => Err((StatusCode::NOT_FOUND, "no current value".into())),
         Err(e) => Err(internal(e)),
     }
+}
+
+#[derive(Deserialize)]
+struct RecordActionRequest {
+    tenant_id: TenantId,
+    action_id: String,
+    // Placeholder until the scope engine lands (Milestone B): identity will be
+    // taken from the auth token, and visibility from the scope handle.
+    actor_sub: Option<String>,
+    actor_azp: Option<String>,
+    action_type: String,
+    entities: Vec<String>,
+    summary: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+    outcome: ActionOutcome,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    visibility: Vec<PrincipalToken>,
+}
+
+async fn record_action(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RecordActionRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let recorded = state
+        .storage
+        .record_action(ActionWrite {
+            tenant_id: req.tenant_id,
+            action_id: req.action_id,
+            actor_sub: req.actor_sub,
+            actor_azp: req.actor_azp,
+            action_type: req.action_type,
+            entities: req.entities,
+            summary: req.summary,
+            payload: req.payload,
+            outcome: req.outcome,
+            occurred_at: req.occurred_at,
+            visibility: req.visibility,
+            confidentiality: Confidentiality::Internal,
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({ "recorded": recorded })))
+}
+
+#[derive(Deserialize)]
+struct ActivityParams {
+    tenant_id: TenantId,
+    entity: String,
+    /// Comma-separated principal tokens (scope-engine placeholder).
+    principals: String,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    action_types: Option<String>,
+    #[serde(default = "default_activity_limit")]
+    limit: usize,
+}
+
+fn default_activity_limit() -> usize {
+    50
+}
+
+async fn activity(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(p): axum::extract::Query<ActivityParams>,
+) -> HandlerResult<Json<Vec<ActionRecord>>> {
+    let principals: Vec<PrincipalToken> = p
+        .principals
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let query = ActivityQuery {
+        scope: Scope {
+            tenant_id: p.tenant_id,
+            principals,
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Confidential,
+        },
+        entity: p.entity,
+        since: p.since,
+        action_types: p
+            .action_types
+            .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+            .unwrap_or_default(),
+        actors: vec![],
+        limit: p.limit,
+    };
+    state
+        .storage
+        .activity(query)
+        .await
+        .map(Json)
+        .map_err(internal)
 }
 
 fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {

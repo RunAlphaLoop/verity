@@ -375,6 +375,148 @@ impl StorageAdapter for PostgresAdapter {
             )),
         }
     }
+
+    async fn record_action(&self, action: ActionWrite) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let episode_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
+                                   content_hash, trust_tier, writer_sub, writer_azp)
+             VALUES ($1, $2, 'agent', $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(episode_id)
+        .bind(action.tenant_id)
+        .bind(&action.action_id)
+        .bind(EpisodeKind::AgentAction.as_str())
+        .bind(serde_json::to_value(&action).map_err(db_err)?)
+        .bind(format!("action-{}", action.action_id))
+        .bind(TrustTier::Observation as i16)
+        .bind(&action.actor_sub)
+        .bind(&action.actor_azp)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO actions (id, tenant_id, action_id, actor_sub, actor_azp, action_type,
+                                  entities, summary, payload, outcome, occurred_at,
+                                  visibility, confidentiality, provenance)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (tenant_id, action_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(action.tenant_id)
+        .bind(&action.action_id)
+        .bind(&action.actor_sub)
+        .bind(&action.actor_azp)
+        .bind(&action.action_type)
+        .bind(&action.entities)
+        .bind(&action.summary)
+        .bind(&action.payload)
+        .bind(action.outcome.as_str())
+        .bind(action.occurred_at)
+        .bind(&action.visibility)
+        .bind(action.confidentiality as i16)
+        .bind(episode_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        if inserted.rows_affected() == 0 {
+            // Idempotent replay: discard the episode too.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(false);
+        }
+        Self::insert_action_chunk(&mut tx, &action, episode_id).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(true)
+    }
+
+    async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
+        let scope = &query.scope;
+        // Fail closed, same contract as recall.
+        if scope.principals.is_empty() {
+            return Ok(Vec::new());
+        }
+        // An entity-bound scope may only query entities it covers.
+        if !scope.entity_scope.is_empty() && !scope.entity_scope.contains(&query.entity) {
+            return Ok(Vec::new());
+        }
+        // Patterns split into exact matches and "prefix.*" wildcards so the SQL
+        // stays fully bind-parameterized.
+        let (exact, prefixes): (Vec<String>, Vec<String>) = query
+            .action_types
+            .iter()
+            .cloned()
+            .partition(|t| !t.ends_with(".*"));
+        let prefixes: Vec<String> = prefixes
+            .into_iter()
+            .map(|p| p.trim_end_matches(".*").to_string())
+            .collect();
+
+        let rows = sqlx::query(
+            "SELECT * FROM actions
+             WHERE tenant_id = $1
+               AND entities @> ARRAY[$2]::text[]
+               AND visibility && $3
+               AND confidentiality <= $4
+               AND occurred_at >= COALESCE($5, '-infinity'::timestamptz)
+               AND (cardinality($6::text[]) = 0 AND cardinality($7::text[]) = 0
+                    OR action_type = ANY($6)
+                    OR EXISTS (SELECT 1 FROM unnest($7::text[]) p
+                               WHERE action_type LIKE p || '.%'))
+               AND (cardinality($8::text[]) = 0 OR actor_azp = ANY($8))
+             ORDER BY occurred_at DESC
+             LIMIT $9",
+        )
+        .bind(scope.tenant_id)
+        .bind(&query.entity)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
+        .bind(query.since)
+        .bind(&exact)
+        .bind(&prefixes)
+        .bind(&query.actors)
+        .bind(query.limit.clamp(1, 500) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_action).collect()
+    }
+}
+
+impl PostgresAdapter {
+    async fn insert_action_chunk(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        a: &ActionWrite,
+        episode: EpisodeId,
+    ) -> Result<()> {
+        // Actions surface in semantic recall too (SPEC §2): the summary is
+        // indexed as a Tier-2 chunk. Embedding is added when the local encoder
+        // joins the write path; BM25 covers it until then.
+        sqlx::query(
+            "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
+                                 content_hash, embedding, visibility, entity_tags,
+                                 confidentiality, trust_tier, valid_from, provenance)
+             VALUES ($1, $2, 'agent', $3, 0, $4, $5, NULL, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (tenant_id, source, document_id, seq, valid_from) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(a.tenant_id)
+        .bind(format!("action:{}", a.action_id))
+        .bind(format!("{}: {}", a.action_type, a.summary))
+        .bind(format!("action-{}", a.action_id))
+        .bind(&a.visibility)
+        .bind(&a.entities)
+        .bind(a.confidentiality as i16)
+        .bind(TrustTier::Observation as i16)
+        .bind(a.occurred_at)
+        .bind(episode)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 async fn insert_fact_row(
@@ -401,6 +543,32 @@ async fn insert_fact_row(
     .await
     .map_err(db_err)?;
     Ok(())
+}
+
+fn row_to_action(row: &PgRow) -> Result<ActionRecord> {
+    let outcome = match row
+        .try_get::<String, _>("outcome")
+        .map_err(db_err)?
+        .as_str()
+    {
+        "succeeded" => ActionOutcome::Succeeded,
+        "failed" => ActionOutcome::Failed,
+        _ => ActionOutcome::Pending,
+    };
+    Ok(ActionRecord {
+        id: row.try_get("id").map_err(db_err)?,
+        action_id: row.try_get("action_id").map_err(db_err)?,
+        actor_sub: row.try_get("actor_sub").map_err(db_err)?,
+        actor_azp: row.try_get("actor_azp").map_err(db_err)?,
+        action_type: row.try_get("action_type").map_err(db_err)?,
+        entities: row.try_get("entities").map_err(db_err)?,
+        summary: row.try_get("summary").map_err(db_err)?,
+        payload: row.try_get("payload").map_err(db_err)?,
+        outcome,
+        occurred_at: row.try_get("occurred_at").map_err(db_err)?,
+        recorded_at: row.try_get("recorded_at").map_err(db_err)?,
+        provenance: row.try_get("provenance").map_err(db_err)?,
+    })
 }
 
 fn row_to_fact(row: &PgRow) -> Result<FactRow> {
