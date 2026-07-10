@@ -482,6 +482,27 @@ impl StorageAdapter for PostgresAdapter {
         Ok(true)
     }
 
+    async fn retire_entity(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        entity_id: &str,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE facts SET valid_to = $1
+             WHERE tenant_id = $2 AND source = $3 AND entity_id = $4 AND valid_to IS NULL",
+        )
+        .bind(deleted_at)
+        .bind(tenant)
+        .bind(source)
+        .bind(entity_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
+
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
         let scope = &query.scope;
         // Fail closed, same contract as recall.

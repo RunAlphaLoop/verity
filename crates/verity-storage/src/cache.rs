@@ -95,6 +95,26 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.record_action(action).await
     }
 
+    async fn retire_entity(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        entity_id: &str,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<u64> {
+        let retired = self
+            .inner
+            .retire_entity(tenant, source, entity_id, deleted_at)
+            .await?;
+        if retired > 0 {
+            // The cache is keyed by (tenant, FactKey) and can't enumerate an
+            // entity's fields; deletes are rare, so a full flush keeps the
+            // never-serve-superseded guarantee without per-key bookkeeping.
+            self.facts.invalidate_all();
+        }
+        Ok(retired)
+    }
+
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
         self.inner.activity(query).await
     }

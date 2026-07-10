@@ -52,4 +52,16 @@ pub trait StorageAdapter: Send + Sync {
     /// principal set reads nothing; an entity-bound scope may only query
     /// entities it covers.
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>>;
+
+    /// Source hard-delete propagation (SPEC §8c, bi-temporal half): close all
+    /// current facts for an entity at `deleted_at`. History stays queryable
+    /// via `fact_as_of`; crypto-shred hard purge is a separate admin pipeline.
+    /// Returns the number of facts retired.
+    async fn retire_entity(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        entity_id: &str,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<u64>;
 }

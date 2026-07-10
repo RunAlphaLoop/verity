@@ -5,6 +5,7 @@
 //! accepts caller-supplied principals until the identity/ReBAC planes land —
 //! that seam is documented in scope.rs and POST /v1/scopes.
 
+mod ingest;
 mod scope;
 
 use std::sync::Arc;
@@ -116,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/episodes", post(remember))
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
+        .route("/v1/ingest/debezium", post(ingest_debezium))
         .with_state(state);
 
     tracing::info!("verity listening on {}", cli.listen);
@@ -223,6 +225,8 @@ async fn recall(
 #[derive(Deserialize)]
 struct RecordQuery {
     scope_handle: String,
+    /// Bi-temporal read: the value as of this event time. Absent = current.
+    as_of: Option<DateTime<Utc>>,
 }
 
 async fn get_record(
@@ -236,11 +240,110 @@ async fn get_record(
         entity_id: entity,
         field,
     };
-    match state.storage.current_fact(payload.tenant_id, &key).await {
+    let result = match q.as_of {
+        Some(as_of) => {
+            state
+                .storage
+                .fact_as_of(payload.tenant_id, &key, as_of)
+                .await
+        }
+        None => state.storage.current_fact(payload.tenant_id, &key).await,
+    };
+    match result {
         Ok(Some(fact)) => Ok(Json(fact)),
-        Ok(None) => Err((StatusCode::NOT_FOUND, "no current value".into())),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "no value for that key/time".into())),
         Err(e) => Err(internal(e)),
     }
+}
+
+// ---------- ingest (trusted connector plane — not scope-handle gated;
+// authn for connectors arrives with the ingest-token work) ----------
+
+#[derive(Deserialize)]
+struct IngestParams {
+    tenant_id: TenantId,
+    /// Primary-key field within the row image.
+    #[serde(default = "default_pk")]
+    pk: String,
+}
+
+fn default_pk() -> String {
+    "id".into()
+}
+
+async fn ingest_debezium(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(p): axum::extract::Query<IngestParams>,
+    Json(body): Json<serde_json::Value>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let envelopes: Vec<&serde_json::Value> = match &body {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        one => vec![one],
+    };
+
+    let (mut written, mut superseded, mut retired, mut unchanged) = (0u64, 0u64, 0u64, 0u64);
+    for envelope in envelopes {
+        let ev = ingest::parse_envelope(envelope, &p.pk)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+        let episode = state
+            .storage
+            .append_episode(NewEpisode {
+                tenant_id: p.tenant_id,
+                source: ev.source.clone(),
+                source_entity: Some(ev.entity_id.clone()),
+                kind: EpisodeKind::CdcEvent,
+                content_hash: format!("{:x}", md5ish(&ev.raw.to_string())),
+                payload: ev.raw.clone(),
+                trust_tier: TrustTier::Authoritative,
+                writer_sub: None,
+                writer_azp: None,
+            })
+            .await
+            .map_err(internal)?;
+
+        match ev.op {
+            ingest::Op::Delete => {
+                retired += state
+                    .storage
+                    .retire_entity(p.tenant_id, &ev.source, &ev.entity_id, ev.occurred_at)
+                    .await
+                    .map_err(internal)?;
+            }
+            ingest::Op::Upsert => {
+                for (field, value) in ev.fields {
+                    let outcome = state
+                        .storage
+                        .upsert_fact(FactWrite {
+                            tenant_id: p.tenant_id,
+                            key: FactKey {
+                                source: ev.source.clone(),
+                                entity_id: ev.entity_id.clone(),
+                                field,
+                            },
+                            value,
+                            valid_from: ev.occurred_at,
+                            provenance: episode,
+                        })
+                        .await
+                        .map_err(internal)?;
+                    match outcome {
+                        FactUpsertOutcome::Inserted => written += 1,
+                        FactUpsertOutcome::Superseded => superseded += 1,
+                        FactUpsertOutcome::Unchanged => unchanged += 1,
+                        FactUpsertOutcome::StaleEvent => {}
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "facts_inserted": written,
+        "facts_superseded": superseded,
+        "facts_unchanged": unchanged,
+        "facts_retired": retired,
+    })))
 }
 
 // ---------- remember ----------
