@@ -8,6 +8,10 @@ services:
       POSTGRES_DB: verity
     ports:
       - "5433:5432"
+    # Parallel index builds (HNSW especially) allocate maintenance_work_mem in
+    # dynamic shared memory; Docker's 64MB default fails them with
+    # "could not resize shared memory segment: No space left on device".
+    shm_size: 1gb
     volumes:
       - verity-pgdata:/var/lib/postgresql/data
     command: >

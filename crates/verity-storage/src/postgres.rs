@@ -35,15 +35,58 @@ impl PostgresAdapter {
         &self.pool
     }
 
+    /// Below this many matching rows, brute-force distance over the filtered
+    /// subset beats HNSW iterative traversal (measured at 1M chunks: exact
+    /// 11ms vs HNSW 72ms p50 at 1% selectivity — docs/BENCHMARKS.md). The
+    /// probe that decides is capped at this bound, so broad scopes pay a few
+    /// bounded milliseconds, not a full count.
+    const EXACT_SCAN_MAX_ROWS: i64 = 20_000;
+
     async fn recall_dense(&self, q: &RecallQuery, embedding: &[f32]) -> Result<Vec<RecallHit>> {
         let scope = &q.scope;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Iterative scans keep filtered recall from collapsing under selective
-        // predicates (pgvector 0.8, SPEC §4).
-        sqlx::query("SET LOCAL hnsw.iterative_scan = relaxed_order")
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+
+        // Selectivity router: ask the planner for its row estimate (pure
+        // planning, no scan — an actual count via GIN builds the full bitmap
+        // before LIMIT and costs ~100ms on broad scopes), then pick the
+        // winning plan. The 1–10% selectivity band is where HNSW-under-filter
+        // collapses (the "valley", docs/BENCHMARKS.md finding 2). Estimates
+        // come from pg_stats' most_common_elems on the visibility array;
+        // order-of-magnitude accuracy is all the routing decision needs.
+        let plan: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (FORMAT JSON) SELECT 1 FROM chunks
+             WHERE tenant_id = $1
+               AND valid_to IS NULL
+               AND embedding IS NOT NULL
+               AND visibility && $2
+               AND confidentiality <= $3
+               {}",
+            entity_scope_predicate(scope, "$4"),
+        )))
+        .bind(scope.tenant_id)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
+        .bind(&scope.entity_scope)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let estimated_rows = plan[0]["Plan"]["Plan Rows"].as_i64().unwrap_or(i64::MAX);
+
+        if estimated_rows <= Self::EXACT_SCAN_MAX_ROWS {
+            // Small filtered set: exact top-k over it (perfect recall, and
+            // faster than graph traversal under selective filters).
+            sqlx::query("SET LOCAL enable_indexscan = off")
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        } else {
+            // Broad set: HNSW with iterative scans so selective predicates
+            // don't collapse recall (pgvector 0.8, SPEC §4).
+            sqlx::query("SET LOCAL hnsw.iterative_scan = relaxed_order")
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
         // Safe: the predicate string is assembled from constants only; all
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(

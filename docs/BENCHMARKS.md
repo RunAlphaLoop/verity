@@ -77,3 +77,51 @@ Inside SPEC §4a's 5–15ms local-encoder budget. Warm-cache encoder load ~190ms
 model download ~4.6s. **End-to-end dense recall including encoding** at 100k/1% selectivity
 is therefore ~37ms p50 / ~48ms p95 (encode + filtered ANN, additive worst case) — the
 number the <50ms p95 claim must hold against as corpus size grows.
+
+---
+
+## 2026-07-09 (later) — 1M chunks: the valley collapses, then the selectivity router kills it
+
+**Setup:** 1,000,000 chunks, same machine/profile. Bulk-loaded with secondary indexes
+dropped (292s load; the incremental path was ~12x slower — bulk loads must drop/rebuild).
+Two operational findings on the way: (a) Docker's 64MB default shm fails parallel HNSW
+builds silently (`could not resize shared memory segment`) — compose now sets `shm_size: 1gb`;
+(b) an accidental run against the index-less table measured the exact-scan curve:
+brute-forcing a 1%-filtered subset took **11ms p50** while HNSW iterative scan took
+**72.6ms p50** on the same query — the planner picks graph traversal exactly where it loses.
+
+**Fix (this session): adapter-side selectivity router.** Before the dense query, a
+sub-millisecond `EXPLAIN` row estimate routes: ≤20k estimated matches → exact top-k over
+the filtered subset (perfect recall, no graph); above → HNSW iterative scan. (First
+attempt used a capped `count(*)` probe — wrong: GIN builds its full bitmap before LIMIT,
+costing ~100ms on broad scopes. Planner estimates are free and order-of-magnitude is all
+routing needs.)
+
+| Case | pre-router p50/p95 | **routed p50/p95/p99** |
+|---|---|---|
+| unfiltered ANN | 9.5 / 53.1ms | 9.8 / 18.6 / 21.1ms |
+| filtered ANN @ 0.1% | 1.9 / 2.8ms | 2.2 / 3.7 / 7.2ms |
+| filtered ANN @ 1% | **72.6 / 155.1ms** | **15.1 / 25.4 / 49.2ms** |
+| filtered ANN @ 10% | 18.8 / 77.3ms | 13.1 / 19.7 / 27.4ms |
+| filtered ANN @ 50% | 6.0 / 7.9ms | 5.7 / 10.1 / 13.3ms |
+| BM25 @ 1% | — | 282.1 / 329.7 / 359.9ms |
+| hybrid @ 1% | — | 284.9 / 330.0 / 381.4ms |
+| L1 point read | — | 0.29 / 0.51 / 0.94ms |
+
+**Findings:**
+
+1. **The <50ms p95 claim holds at 1M for scoped dense recall, encoder included.** Worst
+   dense case (1% valley) is 25.4ms p95 + ~12ms encode ≈ **~37ms p95 end-to-end**. The
+   valley (finding 2 of the 100k entry) is eliminated by routing, not tuning — selective
+   scopes get *exact* (perfect-recall) top-k, broad scopes get HNSW.
+2. **The `get` path is flat with corpus size:** 0.29ms p50 at 1M vs 0.33ms at 100k.
+3. **BM25 at 1M is the new breach: ~280ms p50.** The fast-field fix that held at 100k does
+   not carry; pg_search is scoring the full match set before our filters bite. Hybrid
+   inherits it. Next steps: push scope filters into the Tantivy query itself
+   (`paradedb` filter syntax), or route hybrid's sparse leg through the same
+   selectivity router (exact term-match over small filtered subsets). Until fixed, the
+   honest hybrid number at 1M is ~330ms p95 — dense-only recall is the fast path.
+4. Planner-estimate routing depends on healthy `pg_stats` on the visibility array —
+   `ANALYZE` after bulk loads is load-bearing; the real system's roaring-bitmap scope
+   masks (SPEC §3) replace the estimate with exact posting-list sizes, making routing
+   deterministic.
