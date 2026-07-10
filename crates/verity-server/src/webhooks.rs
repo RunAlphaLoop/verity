@@ -173,6 +173,9 @@ pub(crate) async fn webhook_post(
     Path(token): Path<String>,
     body: axum::body::Bytes,
 ) -> HandlerResult<(StatusCode, Json<serde_json::Value>)> {
+    // Freshness SLO event time (task 21): webhooks carry no source clock, so
+    // receipt time is the event time — the sample measures receipt→queryable.
+    let received_at = Utc::now();
     let row = sqlx::query(
         "SELECT id, tenant_id, name, visibility, entity_scope, confidentiality
          FROM webhooks WHERE token_hash = $1 AND revoked_at IS NULL",
@@ -315,6 +318,10 @@ pub(crate) async fn webhook_post(
             .map_err(internal)?;
         facts_written += 1;
     }
+
+    // Sampled only for accepted payloads — quarantined ones never became
+    // queryable, so they carry no freshness signal.
+    crate::slo::record_sample(state.pool(), hook.tenant_id, &source, received_at).await;
 
     Ok((
         StatusCode::OK,

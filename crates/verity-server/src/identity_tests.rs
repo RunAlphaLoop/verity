@@ -48,6 +48,7 @@ async fn test_state(
         rebac,
         revocations: RevocationPlane::new(300),
         allow_restricted_without_rebac: allow_restricted,
+        subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
     });
     Some((state, tenant))
 }

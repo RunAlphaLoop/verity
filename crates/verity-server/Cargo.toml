@@ -32,3 +32,6 @@ tracing-subscriber = { workspace = true }
 # ReBAC plane (task 10): SpiceDB HTTP-gateway client + revocation cache.
 reqwest = { workspace = true }
 moka = { workspace = true }
+# SSE subscriptions (task 21): poll-loop event streams.
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

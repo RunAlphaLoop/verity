@@ -14,6 +14,10 @@ mod purpose;
 mod rebac;
 mod revocation;
 mod scope;
+mod slo;
+#[cfg(test)]
+mod sse_tests;
+mod subscribe;
 mod webhooks;
 
 use std::sync::Arc;
@@ -118,6 +122,8 @@ pub(crate) struct AppState {
     /// `VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC=1` — explicit opt-out of the
     /// fail-closed restricted drop when no ReBAC engine is configured.
     pub(crate) allow_restricted_without_rebac: bool,
+    /// Live SSE subscription gauge (task 21): capped, 429 beyond.
+    pub(crate) subscribers: subscribe::Subscribers,
 }
 
 impl AppState {
@@ -222,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         revocations: RevocationPlane::from_env(),
         allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
             .is_ok_and(|v| v == "1"),
+        subscribers: subscribe::Subscribers::from_env(),
     });
 
     let app = Router::new()
@@ -232,6 +239,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/episodes", post(remember))
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
+        .route("/v1/subscribe", get(subscribe::subscribe))
+        .route("/v1/slo/freshness", get(slo::freshness))
         .route("/v1/forget", post(forget))
         .route("/v1/ingest/debezium", post(ingest_debezium))
         .route("/v1/ingest/documents", post(ingest_documents))
@@ -568,6 +577,9 @@ async fn ingest_debezium(
                 }
             }
         }
+        // Freshness SLO sample (task 21): envelope event time vs the moment
+        // the derived writes above became queryable. Best-effort telemetry.
+        slo::record_sample(state.pool(), p.tenant_id, &ev.source, ev.occurred_at).await;
     }
 
     Ok(Json(serde_json::json!({
