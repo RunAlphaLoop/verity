@@ -125,3 +125,33 @@ routing needs.)
    `ANALYZE` after bulk loads is load-bearing; the real system's roaring-bitmap scope
    masks (SPEC §3) replace the estimate with exact posting-list sizes, making routing
    deterministic.
+
+---
+
+## 2026-07-09 (later) — BM25 pushdown: finding 3 resolved, all paths inside the envelope
+
+**Root cause (pg_search 0.24.1):** the array-overlap operator `&&` is not pushable into
+Tantivy, and `valid_to` wasn't indexed — so BM25 queries heap-fetched the *entire* text
+match set (~540k rows for a 2-term OR query) to evaluate scope filters before top-k.
+The 0003 fast-field change was necessary but not sufficient.
+
+**Fix (migration 0004 + adapter):** visibility expressed as `id @@@
+paradedb.term_set('visibility', $principals)` — exact overlap semantics inside the Tantivy
+boolean, matches nothing on an empty principal set (fail-closed preserved) — and `valid_to`
+added to the bm25 index so `IS NULL` rewrites to a must_not-exists clause. Zero heap_filter
+nodes remain in the plan (~1.9k buffers/query vs ~480k).
+
+| Case (1M chunks) | before | **after p50/p95/p99** |
+|---|---|---|
+| BM25 @ 1% selectivity | 282.1 / 329.7ms | **15.9 / 17.8 / 18.7ms** |
+| hybrid (dense+BM25) @ 1% | 284.9 / 330.0ms | **16.0 / 17.9 / 21.8ms** |
+
+**Scoreboard at 1M, worst case per path (p95):** get 0.5ms · dense recall 25.4ms ·
+BM25 17.8ms · hybrid 17.9ms · +12ms query encode ⇒ **every retrieval path is inside the
+<50ms p95 envelope, encoder included.**
+
+Caveats recorded: term_set's must-clause shifts raw scores by a constant (+1.0) — ranking
+identical, RRF unaffected; `entity_tags <@` subset filtering remains a heap filter over the
+(now small) pushed-down candidate set — add an entity-bound+broad-visibility bench case
+before claiming that combination; one bm25 index per table means the migration briefly
+drops search availability during rebuild (~1.6s at 1M).

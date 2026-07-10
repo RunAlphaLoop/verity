@@ -118,14 +118,20 @@ impl PostgresAdapter {
 
     async fn recall_bm25(&self, q: &RecallQuery, text: &str) -> Result<Vec<RecallHit>> {
         let scope = &q.scope;
+        // Visibility rides INTO the Tantivy query: `&&` is not a pushable
+        // operator for pg_search, and heap-filtering the raw match set costs
+        // ~280ms at 1M rows (docs/BENCHMARKS.md finding 3). term_set on the
+        // int[] fast field has exact overlap semantics — and matches nothing
+        // for an empty principal array, preserving fail-closed. tenant/
+        // confidentiality/valid_to push down as indexed scalars (0004).
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT id, document_id, seq, content, entity_tags, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
              WHERE content @@@ $1
+               AND id @@@ paradedb.term_set('visibility', $3)
                AND tenant_id = $2
                AND valid_to IS NULL
-               AND visibility && $3
                AND confidentiality <= $4
                {}
              ORDER BY paradedb.score(id) DESC
