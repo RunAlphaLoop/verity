@@ -1,4 +1,4 @@
-# Verity — Technical & Product Specification (v1.2)
+# Verity — Technical & Product Specification (v1.3)
 
 **Name:** Verity (founder-approved 2026-07-09; run trademark/domain clearance before the first public artifact).
 **One-liner:** The open-source, permission-aware shared context plane for enterprise AI agents — always fresh from systems of record, provably scoped, fast enough for the inner loop.
@@ -7,6 +7,8 @@
 **Changes from v1.0:** this revision resolves the completeness critique in the architecture itself, not in a risks list. Query embedding is now inside the latency budget with a local ONNX query encoder; a first-class Identity Plane (§6) makes source-ACL inheritance actually enforceable; the ReBAC engine decision is made — **SpiceDB**, because its true push Watch API and ZedToken consistency are load-bearing for our materialization design (OpenFGA only offers paginated `ReadChanges` polling); a Deletion, Retention & Compliance plane (§8) reconciles "invalidate-never-delete" with GDPR via crypto-shredding and a lineage-driven hard-purge pipeline; entity-tagging is stated honestly as a deterministic/probabilistic split with quarantine-by-default and a tagger-recall benchmark metric; `memory.remember` is retrievable at launch; MediaObject + retrieve-by-text ships in v0.1; concurrency targets, read-your-writes semantics, backup/restore/DR, tenant-model reconciliation, embedding-model migration, backfill, schema evolution, purpose-policy authoring, audit-log operations, signed-URI lifecycle, cross-source precedence, cost model, and OSS HA posture are all specified. The MVP is re-baselined at 12 weeks with an explicit staffing assumption.
 
 **Changes from v1.1 (founder request, 2026-07-09):** cross-agent activity awareness is now first-class. Agents can record what they *did* (not just what they observed) as **Action records** — an append-only, scoped, per-entity activity timeline — and any agent can ask "what has been done on this entity, by whom?" via `memory.activity` before acting. See §2 (Action records), §9 (new verbs), §13 (MVP scope).
+
+**Changes from v1.2 (founder request, 2026-07-09):** a **generalized knowledge layer** — what the organization *learns* across scoped interactions, without the interactions themselves ever crossing streams. Knowledge items are entity-free semantic memories (patterns, objections, playbooks) promoted from scoped episodic memory through a consolidation pipeline with hard de-identification gates: k-distinct-entity support, category-size floors, a provenance firewall, and automatic retraction when sources are forgotten. See §2 (Knowledge items), §7g (the retrieval carve-out), §9 (verbs).
 
 ---
 
@@ -106,8 +108,46 @@ action {
 
 **Deliberately deferred:** coordination *primitives* (claims/leases — "agent A is working on this renewal, back off") are v0.x candidates layered on the same timeline; awareness ships first, arbitration later.
 
+### Knowledge items — generalized learning without cross-scope leakage (new in v1.3)
+
+Scoped memory answers "what happened with customer A"; **knowledge items answer "what have we learned across customers"** — objection patterns, segment behaviors, playbooks that work, failure modes to avoid. The tension is fundamental: the learning is valuable precisely because it crosses scopes, and dangerous for exactly the same reason. Verity's answer: **generalization is a privilege earned through provable de-identification, never a default behavior of recall.**
+
+**What a knowledge item is.** An entity-FREE semantic memory whose subject is a *category*, never an entity:
+
+```
+knowledge_item {
+  statement:       "Healthcare-segment customers consistently require DPA
+                    redlines before security review; budget ~2 extra weeks."
+  categories:      ["industry:healthcare", "objection:dpa", "stage:security_review"]
+  support:         { distinct_entities: 7, episodes: 23, writers: 4,
+                     first_seen, last_reinforced, contradictions: 1 }
+  status:          candidate | quarantined | published | invalidated
+  confidence:      derived from support + contradiction history
+  visibility:      broad (org principal) once published; confidentiality ≥ internal
+  lineage:         → supporting L2 facts → L0 episodes   [NEVER in the recall payload]
+  valid_from/to:   bi-temporal like everything else — knowledge gets superseded
+                   ("post-repricing, this objection stopped appearing")
+}
+```
+
+**The promotion pipeline (async, sleep-time — never on any hot path):**
+
+1. **Candidate extraction.** The L2 consolidation workers (v0.3+) propose generalization candidates from scoped facts/episodes, rewritten to reference categories, not entities. Agents may also propose directly via `memory.propose_learning` — a *proposal*, never a publish.
+2. **De-identification gate (deterministic, not vibes).** The candidate statement is screened against the L1-derived lexicon of entity names/aliases/domains, quoted-span detection against source episodes, and identifying-value checks (amounts/dates that match restricted-class facts). Any hit → rejected back to scoped memory. An LLM wrote the candidate; a deterministic gate decides whether it can leave its scope.
+3. **k-distinct-entity support.** Published only when supported by evidence from **≥ k distinct entities** (default k=3, per-tenant configurable). k=2 is explicitly refused as a default: with two supporting customers, either one can subtract their own interaction and learn the other's. Support must also span **≥2 distinct writers or include Tier-1 evidence** — one agent repeating itself across k entities must not self-promote (poisoning path).
+4. **Category-size floor.** Every category referenced must contain **≥ m entities in L1** (default m=5). "Our aerospace customers negotiate hard" deanonymizes perfectly when there is one aerospace customer, regardless of k.
+5. **Quarantine → publish.** Gate-passing candidates land in a review queue (admin UI / API). Auto-publish thresholds are configurable but OFF by default; publishing grants broad visibility.
+
+**The provenance firewall.** Lineage from a knowledge item back to its supporting episodes exists — it powers invalidation, poisoning rollback, and audit — but is **never included in recall/brief payloads** and is readable only under an audit-class scope. Support counts exposed to agents are bucketed (`several | many | extensive`), not exact, to blunt membership inference.
+
+**Retraction cascade (composes with §8).** `memory.forget` or hard erasure of a source episode triggers a support recount on every knowledge item in its lineage; below k, the item auto-invalidates (`reason: support_withdrawn`). The right-to-erasure story extends to what was *learned from* the erased data with zero new machinery — this is the lineage-from-day-one investment paying out.
+
+**Honest limits, stated:** the de-identification gate is deterministic against *known* identifiers; a sufficiently unusual pattern can still be identifying in ways no lexicon catches (the small-category problem generalizes). Mitigations are the category floor, bucketed support, human review before publish, and — for tenants that need it — keeping auto-publish off permanently. We say "engineered de-identification with auditable gates," never "differential privacy" (we do not add calibrated noise, and won't claim what we don't do).
+
+**Rollout:** schema + `memory.propose_learning` + quarantine/review + the §7g retrieval carve-out ship early (deterministic, no LLM); automatic candidate extraction ships with the L2 consolidation workers (v0.3+); the review UI joins the web UI.
+
 ### Ranking
-Composite `similarity × recency-decay × trust-tier × importance` applies to episodic/agent-written memory only. L1 facts: no decay, current-until-superseded.
+Composite `similarity × recency-decay × trust-tier × importance` applies to episodic/agent-written memory only. L1 facts: no decay, current-until-superseded. Published knowledge items rank by `similarity × confidence` (support-derived, contradiction-penalized) with slow decay driven by `last_reinforced` — knowledge that stops being reinforced ages out of top-k long before it is invalidated.
 
 ---
 
@@ -454,6 +494,12 @@ L1 keys include `source`, so when HubSpot and Salesforce both hold the Acme acco
 
 ---
 
+### 7g. The knowledge carve-out in entity-bound scopes (new in v1.3)
+
+Zero-tag semantics (§7d) exclude untagged content from entity-bound scopes because a missing tag might mean *unclassified sensitive content*. **Published knowledge items are the one principled exception:** they are not un-tagged, they are **positively verified entity-free** — they passed the de-identification gate, carry k-distinct-entity support, and hold `status: published`. An agent in a session scoped to customer A therefore retrieves: (a) content tagged within its entity scope, and (b) published knowledge items matching the query — and nothing else. This is exactly the founder's requirement: the specifics of two customer interactions never cross streams; what was *learned* across them is available to both.
+
+Enforcement notes: the carve-out keys on the item's verified `status`, stamped at publish time into the index payload (`kind: knowledge`), never on the absence of tags; candidates and quarantined items remain invisible outside audit scopes; the scope-soundness fuzzer gains knowledge-item cases (a quarantined item surfacing in any non-audit scope, or any tagged chunk sneaking through the carve-out, fails the build).
+
 ## 8. Deletion, Retention & Compliance (new section in v1.1)
 
 "Invalidate, never delete" is the right *belief-management* semantics and the wrong *compliance* posture if it's the only machinery. An enterprise trust product must survive its first DSAR. This section makes L0 immutability and GDPR Article 17 coexist.
@@ -509,7 +555,7 @@ Three layers, one engine, one verb set.
 ### 9a. MCP server (first-class, stateless 2026-07-28 spec)
 No session affinity; server-minted MemoryScope handles for cross-call state; `ttlMs`/`cacheScope` hints on entity reads; `subscriptions/listen` for change notifications; native consumption of EMA/ID-JAG tokens (the `(user, agent, on-behalf-of)` tuple is the authorization subject — never agent-supplied IDs).
 
-Tool surface — eight verbs, no sprawl:
+Tool surface — nine verbs, no sprawl:
 
 ```jsonc
 // memory.open_scope — start a purpose-bound session
@@ -562,6 +608,17 @@ Tool surface — eight verbs, no sprawl:
   "arguments": { "scope_handle": "vs_9f2...", "entity": "account:acme-corp",
                  "since": "2026-07-02T00:00:00Z", "action_types": ["email.*", "quote.*"] } }
 // → [ { actor: {sub, azp}, action_type: "quote.issued", summary: "...", occurred_at, provenance }, ... ]
+
+// memory.propose_learning — propose a generalization for the knowledge layer (§2).
+// A PROPOSAL, never a publish: it enters the de-identification gate + k-support
+// pipeline and the review queue. The agent's scoped evidence rides as lineage.
+{ "tool": "memory.propose_learning",
+  "arguments": { "scope_handle": "vs_9f2...",
+                 "statement": "Healthcare-segment customers consistently require DPA redlines before security review.",
+                 "categories": ["industry:healthcare", "objection:dpa"],
+                 "evidence": ["episode:019f...", "fact:l2/8812"] } }
+// → { "status": "candidate", "knowledge_id": "k-3f1..." } — visible only in audit
+//   scopes until it passes the gates and a reviewer (or configured policy) publishes.
 
 // memory.forget — audited invalidation (belief semantics; invalidate-never-delete;
 // compliance erasure is a separate admin verb, never agent-reachable — §8f)
