@@ -1,0 +1,23 @@
+[project]
+name = "verity-llamaindex"
+version = "0.1.0"
+description = "Verity sink for LlamaIndex: a permission-aware VectorStore destination. Snapshot-grade convenience lane (SPEC §5e.4) — every LlamaHub reader becomes a de-facto Verity connector."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "httpx>=0.27",
+    "llama-index-core>=0.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "respx>=0.21", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["verity_llamaindex"]
+
+[tool.ruff]
+line-length = 100
