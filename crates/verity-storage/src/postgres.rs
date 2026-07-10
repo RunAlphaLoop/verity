@@ -52,6 +52,7 @@ impl PostgresAdapter {
              FROM chunks
              WHERE tenant_id = $2
                AND valid_to IS NULL
+               AND embedding IS NOT NULL
                AND visibility && $3
                AND confidentiality <= $4
                {}

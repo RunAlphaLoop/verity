@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 verity-core = { path = "../verity-core" }
+verity-encoder = { path = "../verity-encoder" }
 verity-storage = { path = "../verity-storage" }
 tokio = { workspace = true }
 axum = { workspace = true }

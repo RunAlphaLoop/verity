@@ -36,6 +36,9 @@ struct Cli {
 
 struct AppState {
     storage: CachedAdapter<PostgresAdapter>,
+    /// Local query encoder (SPEC §4a). None = sparse-only recall; the server
+    /// stays up if model download fails, it just loses the dense leg.
+    encoder: Option<Arc<verity_encoder::QueryEncoder>>,
 }
 
 #[tokio::main]
@@ -45,10 +48,18 @@ async fn main() -> anyhow::Result<()> {
 
     let pg = PostgresAdapter::connect(&cli.dsn).await?;
     pg.migrate().await?;
+    let encoder = match tokio::task::spawn_blocking(verity_encoder::QueryEncoder::load).await? {
+        Ok(enc) => Some(Arc::new(enc)),
+        Err(e) => {
+            tracing::warn!("query encoder unavailable, recall is sparse-only: {e:#}");
+            None
+        }
+    };
     // L1 current-truth cache: the `get` hot path (SPEC §4b). 1M entries ≈ a
     // few hundred MB ceiling; invalidated on upsert, so never serves stale.
     let state = Arc::new(AppState {
         storage: CachedAdapter::new(pg, 1_000_000),
+        encoder,
     });
 
     let app = Router::new()
@@ -87,6 +98,22 @@ async fn recall(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecallRequest>,
 ) -> HandlerResult<Json<Vec<RecallHit>>> {
+    // Text-only requests get the dense leg via the local encoder (hybrid
+    // recall); callers may still send a precomputed embedding instead.
+    let embedding = match (req.embedding, &req.text, &state.encoder) {
+        (Some(e), _, _) => Some(e),
+        (None, Some(text), Some(encoder)) => {
+            let encoder = Arc::clone(encoder);
+            let text = text.clone();
+            Some(
+                tokio::task::spawn_blocking(move || encoder.encode(&text))
+                    .await
+                    .map_err(internal)?
+                    .map_err(internal)?,
+            )
+        }
+        (None, _, _) => None,
+    };
     let query = RecallQuery {
         scope: Scope {
             tenant_id: req.tenant_id,
@@ -94,7 +121,7 @@ async fn recall(
             entity_scope: req.entity_scope,
             max_confidentiality: Confidentiality::Confidential,
         },
-        embedding: req.embedding,
+        embedding,
         text: req.text,
         k: req.k.min(100),
     };

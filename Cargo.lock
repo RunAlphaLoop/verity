@@ -3299,6 +3299,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "verity-core",
+ "verity-encoder",
  "verity-storage",
 ]
 
