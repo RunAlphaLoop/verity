@@ -372,7 +372,10 @@ async fn remember(
         .append_episode(NewEpisode {
             tenant_id: payload.tenant_id,
             source: "agent".into(),
-            source_entity: None,
+            // Entity attribution rides on the episode: it drives the knowledge
+            // layer's distinct-entity support counting. Single-column for now;
+            // multi-entity observations attribute to their first entity.
+            source_entity: entities.first().cloned(),
             kind: EpisodeKind::Observation,
             payload: serde_json::json!({ "observation": req.observation, "entities": entities }),
             content_hash: format!("{:x}", md5ish(&req.observation)),
