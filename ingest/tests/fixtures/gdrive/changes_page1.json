@@ -1,0 +1,20 @@
+{
+  "kind": "drive#changeList",
+  "nextPageToken": "387-page-2",
+  "changes": [
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "time": "2026-07-09T10:00:12.000Z",
+      "removed": false,
+      "fileId": "1QplanDocAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "time": "2026-07-09T10:02:41.000Z",
+      "removed": true,
+      "fileId": "1GoneFileBBBBBBBBBBBBBBBBBBBBBBBB"
+    }
+  ]
+}

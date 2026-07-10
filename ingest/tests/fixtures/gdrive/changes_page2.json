@@ -1,0 +1,34 @@
+{
+  "kind": "drive#changeList",
+  "newStartPageToken": "412",
+  "changes": [
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "time": "2026-07-09T10:05:03.000Z",
+      "removed": false,
+      "fileId": "1OncallTxtCCCCCCCCCCCCCCCCCCCCCC"
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "time": "2026-07-09T10:07:44.000Z",
+      "removed": false,
+      "fileId": "1PricingPdfDDDDDDDDDDDDDDDDDDDDD"
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "time": "2026-07-09T10:09:15.000Z",
+      "removed": false,
+      "fileId": "1OldNotesTrashEEEEEEEEEEEEEEEEEE"
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "drive",
+      "time": "2026-07-09T10:10:00.000Z",
+      "removed": false,
+      "fileId": ""
+    }
+  ]
+}

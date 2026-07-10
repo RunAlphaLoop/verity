@@ -1,0 +1,1 @@
+Oncall notes: rotate the pager every Monday. Escalate Drive 429s to #infra.

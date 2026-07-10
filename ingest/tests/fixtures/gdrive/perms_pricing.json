@@ -1,0 +1,20 @@
+{
+  "kind": "drive#permissionList",
+  "permissions": [
+    {
+      "kind": "drive#permission",
+      "id": "22222222222222222222",
+      "type": "user",
+      "emailAddress": "bob@corp.example",
+      "role": "writer",
+      "deleted": false
+    },
+    {
+      "kind": "drive#permission",
+      "id": "anyoneWithLink",
+      "type": "anyone",
+      "role": "reader",
+      "deleted": false
+    }
+  ]
+}

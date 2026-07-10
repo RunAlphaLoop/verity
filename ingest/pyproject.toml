@@ -11,6 +11,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
+# Live Google Drive access only (BYOT service-account auth); fixture tests
+# and the rest of the ingest plane never import it.
+gdrive = ["google-auth>=2.29"]
 
 [build-system]
 requires = ["hatchling"]

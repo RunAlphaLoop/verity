@@ -1,0 +1,4 @@
+Q3 Plan
+
+Ship the Google Drive Tier-A ACL mirror: changes.list truth lane,
+permissions.list envelopes, fail-closed quarantine for anyone-links.
