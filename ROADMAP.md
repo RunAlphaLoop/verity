@@ -69,14 +69,14 @@ Two serving bugs found & fixed along the way: entity-bound BM25 breach (542→12
 and BM25 query-syntax injection (user text now via paradedb.match). As-built deltas noted.
 
 - [x] Framework sinks: LlamaIndex + LangChain packages (real deps, 32 tests, live round-trips)
-- [x] LangGraph `BaseStore` adapter (23 tests). *Other adapters (CrewAI, ADK, OpenAI Sessions) still pending.*
+- [x] All six framework adapters: LlamaIndex, LangChain, LangGraph, CrewAI (StorageBackend — ExternalMemory was removed in CrewAI 1.0), Google ADK, OpenAI Agents Session (115 integrations tests)
 - [x] Credential lifecycle: 4 shapes, expiry telemetry, 401-invalidate-retry-once; HubSpot retrofitted. *Webhook-health hooks are seams, not yet wired to a scheduler.*
 - [x] `verity-cli connect slack` (manifest wizard) + `connect github` (PAT-used-once)
-- [x] Salesforce connector, fixture-verified slice: client_credentials + SOQL cursor polling + AccountShare metadata. *CDC Pub/Sub (gRPC) and live-org validation still need the design partner.*
-- [x] GET /v1/subscribe SSE (scoped, revocation-aware, capped). *MCP subscriptions/listen bridge pending.*
-- [x] /ui scope inspector: handle decode + live probes + quarantine/audit/freshness panels. *Backfill progress dashboard pending (needs backfill machinery).*
+- [x] Salesforce connector, fixture-verified slice: client_credentials + SOQL cursor polling + AccountShare metadata. **Open: CDC Pub/Sub + live-org validation await a design partner (founder decision).**
+- [x] GET /v1/subscribe SSE + MCP `memory_poll_changes` cursor tool (pull-not-push, decision documented)
+- [x] /ui scope inspector: handle decode + live probes + quarantine/audit/freshness + connector-status panels (staleness badges)
 - [x] Freshness samples on debezium+webhook ingest; /v1/slo/freshness percentiles
-- [x] Compliance v0: per-tenant DEKs (VERITY_KEK), L0 payload encryption at rest, /v1/admin/erasure hard purge with knowledge cascade, DSAR export, verity-cli backup/restore. *Uncovered surfaces listed in docs/OPERATIONS.md (SpiceDB tuples, media blobs, action/knowledge-publish episodes).*
+- [x] Compliance v0: per-tenant DEKs, ALL episode paths encrypted, erasure deletes SpiceDB tuples first-or-abort + media purge, DSAR export, backup/restore. Remaining plaintext surfaces (chunks/facts/media bytes) listed in docs/OPERATIONS.md
 - [x] docs/snippets/pg-net-trigger.md
 
 ## 🏗 v0.3 — the scaling substrate (~6–8 weeks)
