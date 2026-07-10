@@ -19,6 +19,7 @@ mod slo;
 #[cfg(test)]
 mod sse_tests;
 mod subscribe;
+mod ui;
 mod webhooks;
 
 use std::sync::Arc;
@@ -234,6 +235,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Read-only scope-inspector UI (SPEC §11d) — embedded, zero-build.
+        .route("/ui", get(ui::ui_page))
         .route("/v1/scopes", post(open_scope))
         .route("/v1/recall", post(recall))
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
