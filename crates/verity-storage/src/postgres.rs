@@ -241,9 +241,17 @@ impl StorageAdapter for PostgresAdapter {
                     insert_fact_row(&mut tx, new_id, &fact, Some(cur_from)).await?;
                     FactUpsertOutcome::StaleEvent
                 } else {
-                    insert_fact_row(&mut tx, new_id, &fact, None).await?;
-                    sqlx::query("UPDATE facts SET valid_to = $1, superseded_by = $2 WHERE id = $3")
+                    // Retire before insert: the one-current-row unique index is
+                    // checked immediately, so the old row must lose valid_to NULL
+                    // first. superseded_by is linked after insert (FK target).
+                    sqlx::query("UPDATE facts SET valid_to = $1 WHERE id = $2")
                         .bind(fact.valid_from)
+                        .bind(cur_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    insert_fact_row(&mut tx, new_id, &fact, None).await?;
+                    sqlx::query("UPDATE facts SET superseded_by = $1 WHERE id = $2")
                         .bind(new_id)
                         .bind(cur_id)
                         .execute(&mut *tx)
