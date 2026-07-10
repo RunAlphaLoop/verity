@@ -258,7 +258,7 @@ impl PostgresAdapter {
             "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
-             WHERE content @@@ $1
+             WHERE id @@@ paradedb.match('content', $1)
                AND id @@@ paradedb.term_set('visibility', $3)
                AND tenant_id = $2
                AND valid_to IS NULL
@@ -270,7 +270,7 @@ impl PostgresAdapter {
             "WITH cand AS MATERIALIZED (
                  SELECT id, paradedb.score(id) AS score
                  FROM chunks
-                 WHERE content @@@ $1
+                 WHERE id @@@ paradedb.match('content', $1)
                    AND id @@@ paradedb.term_set('visibility', $3)
                    AND id @@@ paradedb.boolean(should => ARRAY[
                            paradedb.term_set('entity_tags', $6),

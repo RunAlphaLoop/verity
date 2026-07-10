@@ -172,3 +172,34 @@ async fn activity_fails_closed() {
         .unwrap();
     assert!(hits.iter().all(|h| h.document_id != "action:b1"));
 }
+
+#[tokio::test]
+async fn recall_tolerates_query_syntax_characters() {
+    let Some((adapter, tenant)) = test_adapter().await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    adapter
+        .record_action(quote_action(tenant, "syn-1", Utc::now()))
+        .await
+        .unwrap();
+    // Apostrophes, quotes, colons, and parens are user text, never Tantivy
+    // query syntax (found by the sinks live smoke: `content @@@ $1` parsed
+    // the bound string as a query expression and 500'd on apostrophes).
+    for text in [
+        "the agent's renewal quote",
+        "\"quoted phrase\" and more",
+        "field:injection (attempt) AND OR",
+    ] {
+        let hits = adapter
+            .recall(RecallQuery {
+                scope: scope(tenant, vec![7]),
+                embedding: None,
+                text: Some(text.into()),
+                k: 5,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("recall failed on {text:?}: {e}"));
+        drop(hits);
+    }
+}
