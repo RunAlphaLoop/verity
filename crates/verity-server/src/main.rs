@@ -6,6 +6,7 @@
 //! that seam is documented in scope.rs and POST /v1/scopes.
 
 mod audit;
+mod compliance;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
@@ -246,6 +247,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/documents", post(ingest_documents))
         .route("/v1/briefs/{entity}", get(brief))
         .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/admin/erasure", post(compliance::admin_erasure))
+        .route("/v1/admin/dsar/export", get(compliance::dsar_export))
         .route("/v1/admin/audit", get(audit::admin_audit))
         .route("/v1/admin/quarantine", get(webhooks::admin_quarantine))
         .route("/v1/admin/principals", post(admin_principals))

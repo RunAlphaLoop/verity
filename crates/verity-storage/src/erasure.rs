@@ -1,0 +1,460 @@
+//! Hard purge + DSAR export (SPEC §8b/§8e, roadmap task 23 — v0 slice).
+//!
+//! This is the GDPR path, deliberately distinct from `memory.forget`
+//! (SPEC §8f): forget is scope-bound *invalidation* (rows keep existing with
+//! `valid_to`); erasure is an admin-initiated lineage-driven **hard DELETE**
+//! that runs in one transaction and returns per-table counts.
+//!
+//! What erasure covers (v0): L0 episodes attributable to the subject
+//! (`writer_sub`) or entity (`source_entity`), the chunks and facts derived
+//! from them (by provenance), the subject's actions (`actor_sub`) / the
+//! entity's actions (tag membership) plus their provenance episodes, the
+//! knowledge-evidence rows those episodes support (with a support recount —
+//! published items falling below the k=3 floor are invalidated and their §7g
+//! carve-out chunks retired), quarantine-preview payloads mentioning the
+//! subject/entity (conservative substring match — over-deletion by design),
+//! and the subject's audit rows. Entity purge also hard-deletes facts keyed
+//! on the entity and every chunk tagged with it — multi-tag chunks are
+//! deleted whole, never tag-stripped (conservative over-deletion, documented
+//! in docs/OPERATIONS.md along with what erasure does NOT yet cover).
+//!
+//! One audit row survives: verb='erasure' with the per-table counts and a
+//! sha256 of the subject/entity — no plaintext PII.
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use uuid::Uuid;
+
+use verity_core::types::{Result, StorageError, TenantId};
+
+use crate::postgres::{db_err, PostgresAdapter};
+
+/// Per-table hard-delete counts, returned to the caller and preserved in the
+/// surviving audit row.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ErasureReport {
+    pub episodes: u64,
+    pub chunks: u64,
+    pub facts: u64,
+    pub actions: u64,
+    pub knowledge_evidence: u64,
+    /// Published knowledge items whose distinct-entity support fell below the
+    /// k=3 privacy floor after evidence withdrawal (invalidated, not deleted:
+    /// the de-identified statement itself contains no subject data).
+    pub knowledge_invalidated: u64,
+    pub quarantine_preview: u64,
+    pub audit_log: u64,
+}
+
+impl PostgresAdapter {
+    /// POST /v1/admin/erasure — lineage-driven hard purge, one transaction.
+    /// At least one of `subject` / `entity` is required.
+    pub async fn erase(
+        &self,
+        tenant: TenantId,
+        subject: Option<&str>,
+        entity: Option<&str>,
+    ) -> Result<ErasureReport> {
+        if subject.is_none() && entity.is_none() {
+            return Err(StorageError::InvalidInput(
+                "erasure requires a subject and/or an entity".into(),
+            ));
+        }
+        let mut report = ErasureReport::default();
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+
+        // 1. Enumerate the L0 episode set (SPEC §8b: purge is a walk, not a
+        //    search): the subject's writes, the entity's source rows.
+        let mut episode_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM episodes
+             WHERE tenant_id = $1
+               AND (($2::text IS NOT NULL AND writer_sub = $2)
+                 OR ($3::text IS NOT NULL AND source_entity = $3))",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .bind(entity)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        // 2. Actions (actor_sub = subject, or entity ∈ entities). Their
+        //    provenance episodes carry the serialized action payload, so they
+        //    join the episode delete set.
+        let action_provenance: Vec<Uuid> = sqlx::query_scalar(
+            "DELETE FROM actions
+             WHERE tenant_id = $1
+               AND (($2::text IS NOT NULL AND actor_sub = $2)
+                 OR ($3::text IS NOT NULL AND $3 = ANY(entities)))
+             RETURNING provenance",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .bind(entity)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        report.actions = action_provenance.len() as u64;
+        episode_ids.extend(action_provenance);
+        episode_ids.sort_unstable();
+        episode_ids.dedup();
+
+        // 3. Chunks: derived from the episode set (provenance), plus — for
+        //    entity purge — every chunk tagged with the entity. Multi-tag
+        //    chunks are deleted whole (conservative over-deletion).
+        report.chunks = sqlx::query(
+            "DELETE FROM chunks
+             WHERE tenant_id = $1
+               AND (provenance = ANY($2)
+                 OR ($3::text IS NOT NULL AND entity_tags @> ARRAY[$3::text]))",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .bind(entity)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        // 4. Facts: by provenance, plus — entity purge — by entity_id.
+        //    Surviving rows may point at deleted ones via superseded_by;
+        //    unlink first so the self-referential FK holds.
+        sqlx::query(
+            "UPDATE facts SET superseded_by = NULL
+             WHERE tenant_id = $1 AND superseded_by IN (
+                 SELECT id FROM facts
+                 WHERE tenant_id = $1
+                   AND (provenance = ANY($2)
+                     OR ($3::text IS NOT NULL AND entity_id = $3)))",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .bind(entity)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        report.facts = sqlx::query(
+            "DELETE FROM facts
+             WHERE tenant_id = $1
+               AND (provenance = ANY($2)
+                 OR ($3::text IS NOT NULL AND entity_id = $3))",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .bind(entity)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        // 5. Knowledge-evidence withdrawal + support recount (same cascade as
+        //    forget, but the evidence rows are hard-deleted). Items whose
+        //    distinct-entity support drops below the k=3 privacy floor are
+        //    invalidated and their §7g carve-out chunks retired.
+        let mut affected_knowledge: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT ke.knowledge_id FROM knowledge_evidence ke
+             JOIN knowledge k ON k.id = ke.knowledge_id
+             WHERE k.tenant_id = $1 AND ke.episode_id = ANY($2)
+             FOR UPDATE OF k",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        affected_knowledge.sort_unstable();
+        affected_knowledge.dedup();
+        report.knowledge_evidence = sqlx::query(
+            "DELETE FROM knowledge_evidence
+             WHERE knowledge_id = ANY($1) AND episode_id = ANY($2)",
+        )
+        .bind(&affected_knowledge)
+        .bind(&episode_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        for kid in &affected_knowledge {
+            let row = sqlx::query(
+                "SELECT count(DISTINCT entity) AS entities, count(*) AS episodes
+                 FROM knowledge_evidence WHERE knowledge_id = $1",
+            )
+            .bind(kid)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let distinct: i64 = row.try_get("entities").map_err(db_err)?;
+            let episodes: i64 = row.try_get("episodes").map_err(db_err)?;
+            sqlx::query(
+                "UPDATE knowledge SET distinct_entities = $2, episode_count = $3 WHERE id = $1",
+            )
+            .bind(kid)
+            .bind(distinct as i32)
+            .bind(episodes as i32)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if distinct < 3 {
+                let invalidated = sqlx::query(
+                    "UPDATE knowledge
+                     SET status = 'invalidated', invalidated_at = now(),
+                         invalidated_reason = 'erasure_support_withdrawn'
+                     WHERE id = $1 AND status = 'published'",
+                )
+                .bind(kid)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                report.knowledge_invalidated += invalidated;
+                if invalidated > 0 {
+                    sqlx::query(
+                        "UPDATE chunks SET valid_to = now()
+                         WHERE tenant_id = $1 AND document_id = $2 AND valid_to IS NULL",
+                    )
+                    .bind(tenant)
+                    .bind(format!("knowledge:{kid}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                }
+            }
+        }
+
+        // 6. Quarantine-preview payloads mentioning the subject/entity.
+        //    Substring match is conservative by design: over-deleting an
+        //    unparsed payload is safe, retaining PII is not.
+        report.quarantine_preview = sqlx::query(
+            "DELETE FROM quarantine_preview
+             WHERE tenant_id = $1
+               AND (($2::text IS NOT NULL AND payload::text ILIKE '%' || $2 || '%')
+                 OR ($3::text IS NOT NULL AND payload::text ILIKE '%' || $3 || '%'))",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .bind(entity)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        // 7. The subject's own audit rows (their query text is their data).
+        //    Other actors' rows survive — result_ids are opaque uuids of
+        //    now-deleted rows, a skeleton with no payload (SPEC §8b "redact
+        //    payloads, preserve skeleton").
+        if let Some(subject) = subject {
+            report.audit_log =
+                sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1 AND actor_sub = $2")
+                    .bind(tenant)
+                    .bind(subject)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .rows_affected();
+        }
+
+        // 8. Finally the L0 episodes themselves.
+        report.episodes = sqlx::query("DELETE FROM episodes WHERE tenant_id = $1 AND id = ANY($2)")
+            .bind(tenant)
+            .bind(&episode_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+
+        // 9. ONE surviving audit row: verb='erasure', counts, sha256 of the
+        //    identifiers — no plaintext PII beyond that.
+        let summary = serde_json::json!({
+            "subject_sha256": subject.map(sha256_hex),
+            "entity_sha256": entity.map(sha256_hex),
+            "counts": &report,
+        });
+        sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
+                                    entity_scope, confidentiality, query_summary, result_ids)
+             VALUES ($1, $2, NULL, NULL, 'erasure', '{}', '{}', 0, $3, '{}')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(summary.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        // Facts were hard-deleted underneath any L1 cache; callers holding a
+        // CachedAdapter must flush (the server handler does).
+        tracing::info!(%tenant, ?report, "erasure completed");
+        Ok(report)
+    }
+
+    /// GET /v1/admin/dsar/export (SPEC §8e): everything attributable to a
+    /// subject, as one machine-readable JSON bundle. Episode payloads are
+    /// decrypted under admin authority; the caller audits the access.
+    pub async fn dsar_export(&self, tenant: TenantId, subject: &str) -> Result<serde_json::Value> {
+        // L0 episodes the subject wrote.
+        let rows = sqlx::query(
+            "SELECT id, source, source_entity, kind, payload, payload_enc, content_hash,
+                    trust_tier, writer_sub, writer_azp, recorded_at
+             FROM episodes WHERE tenant_id = $1 AND writer_sub = $2
+             ORDER BY recorded_at",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let mut episode_ids: Vec<Uuid> = Vec::with_capacity(rows.len());
+        let mut episodes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: Uuid = row.try_get("id").map_err(db_err)?;
+            episode_ids.push(id);
+            let payload = self
+                .decrypt_payload(
+                    tenant,
+                    row.try_get("payload").map_err(db_err)?,
+                    row.try_get("payload_enc").map_err(db_err)?,
+                )
+                .await?;
+            episodes.push(serde_json::json!({
+                "id": id,
+                "source": row.try_get::<String, _>("source").map_err(db_err)?,
+                "source_entity": row.try_get::<Option<String>, _>("source_entity").map_err(db_err)?,
+                "kind": row.try_get::<String, _>("kind").map_err(db_err)?,
+                "payload": payload,
+                "content_hash": row.try_get::<String, _>("content_hash").map_err(db_err)?,
+                "trust_tier": row.try_get::<i16, _>("trust_tier").map_err(db_err)?,
+                "writer_sub": row.try_get::<Option<String>, _>("writer_sub").map_err(db_err)?,
+                "writer_azp": row.try_get::<Option<String>, _>("writer_azp").map_err(db_err)?,
+                "recorded_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at").map_err(db_err)?,
+            }));
+        }
+
+        // Chunks derived from those episodes.
+        let chunks = sqlx::query(
+            "SELECT id, source, document_id, seq, content, entity_tags, kind,
+                    confidentiality, trust_tier, valid_from, valid_to, provenance
+             FROM chunks WHERE tenant_id = $1 AND provenance = ANY($2)
+             ORDER BY valid_from",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(db_err)?,
+                "source": row.try_get::<String, _>("source").map_err(db_err)?,
+                "document_id": row.try_get::<String, _>("document_id").map_err(db_err)?,
+                "seq": row.try_get::<i32, _>("seq").map_err(db_err)?,
+                "content": row.try_get::<String, _>("content").map_err(db_err)?,
+                "entity_tags": row.try_get::<Vec<String>, _>("entity_tags").map_err(db_err)?,
+                "kind": row.try_get::<String, _>("kind").map_err(db_err)?,
+                "confidentiality": row.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+                "trust_tier": row.try_get::<i16, _>("trust_tier").map_err(db_err)?,
+                "valid_from": row.try_get::<chrono::DateTime<chrono::Utc>, _>("valid_from").map_err(db_err)?,
+                "valid_to": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("valid_to").map_err(db_err)?,
+                "provenance": row.try_get::<Uuid, _>("provenance").map_err(db_err)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+        // The subject's actions.
+        let actions = sqlx::query(
+            "SELECT id, action_id, actor_sub, actor_azp, action_type, entities, summary,
+                    payload, outcome, occurred_at, recorded_at
+             FROM actions WHERE tenant_id = $1 AND actor_sub = $2
+             ORDER BY occurred_at",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(db_err)?,
+                "action_id": row.try_get::<String, _>("action_id").map_err(db_err)?,
+                "actor_sub": row.try_get::<Option<String>, _>("actor_sub").map_err(db_err)?,
+                "actor_azp": row.try_get::<Option<String>, _>("actor_azp").map_err(db_err)?,
+                "action_type": row.try_get::<String, _>("action_type").map_err(db_err)?,
+                "entities": row.try_get::<Vec<String>, _>("entities").map_err(db_err)?,
+                "summary": row.try_get::<String, _>("summary").map_err(db_err)?,
+                "payload": row.try_get::<serde_json::Value, _>("payload").map_err(db_err)?,
+                "outcome": row.try_get::<String, _>("outcome").map_err(db_err)?,
+                "occurred_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("occurred_at").map_err(db_err)?,
+                "recorded_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at").map_err(db_err)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+        // The subject's access events (who-retrieved-what skeleton).
+        let audit = sqlx::query(
+            "SELECT id, verb, query_summary, result_ids, at
+             FROM audit_log WHERE tenant_id = $1 AND actor_sub = $2
+             ORDER BY at",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(db_err)?,
+                "verb": row.try_get::<String, _>("verb").map_err(db_err)?,
+                "query_summary": row.try_get::<Option<String>, _>("query_summary").map_err(db_err)?,
+                "result_ids": row.try_get::<Vec<Uuid>, _>("result_ids").map_err(db_err)?,
+                "at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("at").map_err(db_err)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+        // Knowledge items the subject proposed.
+        let knowledge = sqlx::query(
+            "SELECT id, statement, categories, status, distinct_entities, episode_count,
+                    first_seen, published_at
+             FROM knowledge WHERE tenant_id = $1 AND proposed_by_sub = $2
+             ORDER BY first_seen",
+        )
+        .bind(tenant)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(db_err)?,
+                "statement": row.try_get::<String, _>("statement").map_err(db_err)?,
+                "categories": row.try_get::<Vec<String>, _>("categories").map_err(db_err)?,
+                "status": row.try_get::<String, _>("status").map_err(db_err)?,
+                "distinct_entities": row.try_get::<i32, _>("distinct_entities").map_err(db_err)?,
+                "episode_count": row.try_get::<i32, _>("episode_count").map_err(db_err)?,
+                "first_seen": row.try_get::<chrono::DateTime<chrono::Utc>, _>("first_seen").map_err(db_err)?,
+                "published_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("published_at").map_err(db_err)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+        Ok(serde_json::json!({
+            "tenant_id": tenant,
+            "subject": subject,
+            "generated_at": chrono::Utc::now(),
+            "episodes": episodes,
+            "chunks": chunks,
+            "actions": actions,
+            "audit_log": audit,
+            "knowledge": knowledge,
+        }))
+    }
+}
+
+fn sha256_hex(s: &str) -> String {
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}

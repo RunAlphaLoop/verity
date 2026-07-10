@@ -12,16 +12,127 @@ use verity_core::types::*;
 
 pub struct PostgresAdapter {
     pool: PgPool,
+    /// Deployment KEK (SPEC §8a, crypto.rs). None = envelope encryption
+    /// disabled: L0 payloads stay plaintext, DEKs are stored unwrapped.
+    kek: Option<crate::crypto::Kek>,
+    /// Unwrapped per-tenant DEKs, cached after first use (bounded; the DEK is
+    /// 32 bytes and provisioning is one row per tenant, ever).
+    deks: moka::sync::Cache<TenantId, [u8; crate::crypto::DEK_BYTES]>,
 }
 
 impl PostgresAdapter {
+    /// Connect with the KEK from env `VERITY_KEK` (warned when absent).
     pub async fn connect(dsn: &str) -> Result<Self> {
+        let kek = crate::crypto::Kek::from_env()?;
+        Self::connect_with_kek(dsn, kek).await
+    }
+
+    /// Explicit-KEK constructor: the test seam (no env mutation) and the
+    /// future config-file/KMS profiles.
+    pub async fn connect_with_kek(dsn: &str, kek: Option<crate::crypto::Kek>) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .connect(dsn)
             .await
             .map_err(db_err)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            kek,
+            deks: moka::sync::Cache::new(10_000),
+        })
+    }
+
+    /// The tenant's data-encryption key, provisioning it lazily on first use
+    /// (SPEC §8a). Stored KEK-wrapped when a KEK is configured, plaintext
+    /// otherwise; a concurrent first-writer race is settled by the primary
+    /// key — the loser re-reads the winner's DEK.
+    async fn tenant_dek(&self, tenant: TenantId) -> Result<[u8; crate::crypto::DEK_BYTES]> {
+        if let Some(dek) = self.deks.get(&tenant) {
+            return Ok(dek);
+        }
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT dek FROM tenant_deks WHERE tenant_id = $1")
+                .bind(tenant)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let dek = match stored {
+            Some(bytes) => crate::crypto::unwrap_dek(self.kek.as_ref(), &bytes)?,
+            None => {
+                let dek = crate::crypto::generate_dek();
+                let to_store = match &self.kek {
+                    Some(kek) => crate::crypto::wrap_dek(kek, &dek)?,
+                    None => dek.to_vec(),
+                };
+                let inserted = sqlx::query(
+                    "INSERT INTO tenant_deks (tenant_id, dek) VALUES ($1, $2)
+                     ON CONFLICT (tenant_id) DO NOTHING",
+                )
+                .bind(tenant)
+                .bind(&to_store)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+                if inserted.rows_affected() == 0 {
+                    // Lost the provisioning race: adopt the winner's DEK.
+                    let bytes: Vec<u8> =
+                        sqlx::query_scalar("SELECT dek FROM tenant_deks WHERE tenant_id = $1")
+                            .bind(tenant)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(db_err)?;
+                    crate::crypto::unwrap_dek(self.kek.as_ref(), &bytes)?
+                } else {
+                    dek
+                }
+            }
+        };
+        self.deks.insert(tenant, dek);
+        Ok(dek)
+    }
+
+    /// Decrypt-on-demand read of one L0 payload (SPEC §8a; used by DSAR
+    /// export and admin forensics — never by the serving read path). Returns
+    /// the plaintext payload whether or not the row is encrypted; None for an
+    /// unknown episode.
+    pub async fn episode_payload(
+        &self,
+        tenant: TenantId,
+        id: EpisodeId,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "SELECT payload, payload_enc FROM episodes WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let payload: serde_json::Value = row.try_get("payload").map_err(db_err)?;
+        let payload_enc: Option<Vec<u8>> = row.try_get("payload_enc").map_err(db_err)?;
+        self.decrypt_payload(tenant, payload, payload_enc)
+            .await
+            .map(Some)
+    }
+
+    /// Shared decrypt helper: `payload_enc` present → decrypt under the
+    /// tenant DEK (requires the KEK for wrapped DEKs, fail closed); absent →
+    /// the plaintext `payload` column is authoritative.
+    pub(crate) async fn decrypt_payload(
+        &self,
+        tenant: TenantId,
+        payload: serde_json::Value,
+        payload_enc: Option<Vec<u8>>,
+    ) -> Result<serde_json::Value> {
+        match payload_enc {
+            None => Ok(payload),
+            Some(blob) => {
+                let dek = self.tenant_dek(tenant).await?;
+                let plain = crate::crypto::decrypt(&dek, &blob)?;
+                serde_json::from_slice(&plain).map_err(db_err)
+            }
+        }
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -258,7 +369,7 @@ fn tier_from_i16(v: i16) -> TrustTier {
     }
 }
 
-fn db_err(e: impl std::fmt::Display) -> StorageError {
+pub(crate) fn db_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Database(e.to_string())
 }
 
@@ -306,17 +417,37 @@ impl StorageAdapter for PostgresAdapter {
 
     async fn append_episode(&self, ep: NewEpisode) -> Result<EpisodeId> {
         let id = Uuid::now_v7();
+        // Envelope encryption (SPEC §8a, v0 contract — crypto.rs): the DEK is
+        // provisioned lazily either way; with a KEK configured the payload is
+        // stored AES-256-GCM in payload_enc and the jsonb column carries the
+        // '{}' sentinel. Reads that need the payload go through
+        // episode_payload(); the serving read path never does.
+        let dek = self.tenant_dek(ep.tenant_id).await?;
+        let (payload, payload_enc, encrypted): (serde_json::Value, Option<Vec<u8>>, Option<bool>) =
+            if self.kek.is_some() {
+                let plaintext = serde_json::to_vec(&ep.payload).map_err(db_err)?;
+                (
+                    serde_json::json!({}),
+                    Some(crate::crypto::encrypt(&dek, &plaintext)?),
+                    Some(true),
+                )
+            } else {
+                (ep.payload.clone(), None, None)
+            };
         sqlx::query(
             "INSERT INTO episodes (id, tenant_id, source, source_entity, kind, payload,
+                                   payload_enc, payload_encrypted,
                                    content_hash, trust_tier, writer_sub, writer_azp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(id)
         .bind(ep.tenant_id)
         .bind(&ep.source)
         .bind(&ep.source_entity)
         .bind(ep.kind.as_str())
-        .bind(&ep.payload)
+        .bind(&payload)
+        .bind(&payload_enc)
+        .bind(encrypted)
         .bind(&ep.content_hash)
         .bind(ep.trust_tier as i16)
         .bind(&ep.writer_sub)

@@ -35,6 +35,14 @@ impl<S: StorageAdapter> CachedAdapter<S> {
     pub fn inner(&self) -> &S {
         &self.inner
     }
+
+    /// Drop every cached L1 row. Used by the hard-purge path (SPEC §8b
+    /// erasure), which deletes fact rows underneath this cache via the inner
+    /// adapter — same rationale as the retire_entity flush: purges are rare,
+    /// correctness beats bookkeeping.
+    pub fn flush_facts(&self) {
+        self.facts.invalidate_all();
+    }
 }
 
 #[async_trait]

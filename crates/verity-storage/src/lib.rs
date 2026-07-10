@@ -3,7 +3,11 @@
 //! ceiling ~5–10M vectors per deployment.
 
 mod cache;
+mod crypto;
+mod erasure;
 mod postgres;
 
 pub use cache::CachedAdapter;
+pub use crypto::Kek;
+pub use erasure::ErasureReport;
 pub use postgres::PostgresAdapter;

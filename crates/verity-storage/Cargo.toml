@@ -15,6 +15,12 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+# Envelope encryption for L0 payloads + DEK wrapping (SPEC §8a, crypto.rs).
+aes-gcm = "0.10"
+rand_core = { workspace = true }
+# Subject hashing for the surviving erasure audit row (SPEC §8b).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

@@ -10,6 +10,7 @@
 //! the rename ships later.
 
 mod add;
+mod backup;
 mod config;
 mod connect;
 mod dev;
@@ -117,6 +118,18 @@ tokens (POST /v1/scopes, actor cli:add) and uploads under that handle."
     },
     /// Server health, config, tenant, and the decoded scope handle.
     Status,
+    /// Back up the dockerized Postgres (pg_dump -Fc) into <dir>, with a
+    /// manifest.json recording schema version, timestamp, and KEK flag.
+    Backup {
+        /// Directory to write the dump + manifest into (created if absent).
+        dir: PathBuf,
+    },
+    /// Restore a backup file (pg_restore --clean --if-exists), then print
+    /// the SPEC §11b ordering note: ReBAC state before serving.
+    Restore {
+        /// A .dump file produced by `verity-cli backup`.
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,5 +270,7 @@ async fn run() -> Result<()> {
             McpCommand::Install { run, repo } => mcp::install(&ctx, repo, run).await,
         },
         Command::Status => status::run(&ctx).await,
+        Command::Backup { dir } => backup::backup(&dir).await,
+        Command::Restore { file } => backup::restore(&file).await,
     }
 }
