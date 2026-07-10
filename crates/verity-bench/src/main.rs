@@ -24,6 +24,8 @@ use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::PostgresAdapter;
 
+mod srb;
+
 const DIM: usize = 384;
 /// (principal token id, fraction of corpus it can see)
 const SELECTIVITY_TOKENS: &[(i32, f64)] = &[(1, 0.001), (2, 0.01), (3, 0.1), (4, 0.5)];
@@ -116,6 +118,32 @@ enum Command {
         #[arg(long, default_value_t = false)]
         sweep: bool,
     },
+    /// Scoped Recall Benchmark v0 (SPEC §13): metric 1 (cross-entity leakage
+    /// under adversarial probes, target 0) and metric 2 (stale-citation rate
+    /// after CDC supersession, target ~0) on fresh tenants it seeds itself,
+    /// plus metric 4 (scoped-read latency + QPS, local encoder included)
+    /// against the pre-seeded corpus. Emits versioned JSON and a markdown
+    /// report. Metrics 3 and 5 are defined-not-yet-reported.
+    Srb {
+        /// Tenant holding the pre-seeded latency corpus (see `seed`).
+        #[arg(long, default_value = "bench")]
+        corpus_tenant: String,
+        /// Output directory for RESULTS-<date>.{json,md}.
+        #[arg(long, default_value = "docs/benchmark")]
+        out: String,
+        /// Randomized adversarial scopes for metric 1 (each probes every read path).
+        #[arg(long, default_value_t = 200)]
+        scopes: usize,
+        /// Write→supersede→read cycles for metric 2.
+        #[arg(long, default_value_t = 100)]
+        cycles: usize,
+        /// Queries per latency case (metric 4).
+        #[arg(long, default_value_t = 200)]
+        queries: usize,
+        /// Seconds per load-sweep level (metric 4 runs N=4 and N=16).
+        #[arg(long, default_value_t = 20)]
+        load_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -144,6 +172,27 @@ async fn main() -> Result<()> {
         } => {
             let levels: &[usize] = if sweep { &[4, 16, 64] } else { &[concurrency] };
             load(Arc::new(adapter), levels, duration_secs, k).await
+        }
+        Command::Srb {
+            corpus_tenant,
+            out,
+            scopes,
+            cycles,
+            queries,
+            load_secs,
+        } => {
+            srb::run_srb(
+                Arc::new(adapter),
+                srb::SrbArgs {
+                    corpus_tenant,
+                    out,
+                    scopes,
+                    cycles,
+                    queries,
+                    load_secs,
+                },
+            )
+            .await
         }
         Command::Encode { .. } => unreachable!("handled above"),
     }
@@ -247,7 +296,25 @@ async fn seed(
 }
 
 async fn run(adapter: &PostgresAdapter, n_queries: usize, k: usize) -> Result<()> {
-    let tenant = adapter.create_tenant("bench").await?;
+    let (corpus, report) = run_suite(adapter, "bench", n_queries, k).await?;
+
+    std::fs::create_dir_all("bench-results")?;
+    let path = format!("bench-results/{}.json", Utc::now().format("%Y%m%dT%H%M%S"));
+    std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+    println!("\nresults written to {path}");
+    println!("(corpus={corpus}; report p50/p95/p99 with this context — numbers without corpus size and selectivity are not honest numbers)");
+    Ok(())
+}
+
+/// The latency suite, reusable by both the `run` subcommand and the SRB
+/// harness (metric 4). Returns (corpus size, per-case JSON reports).
+async fn run_suite(
+    adapter: &PostgresAdapter,
+    tenant_name: &str,
+    n_queries: usize,
+    k: usize,
+) -> Result<(i64, Vec<serde_json::Value>)> {
+    let tenant = adapter.create_tenant(tenant_name).await?;
     let mut rng = rand::rng();
     let mut report = Vec::new();
 
@@ -390,12 +457,7 @@ async fn run(adapter: &PostgresAdapter, n_queries: usize, k: usize) -> Result<()
     }
     report.push(print_case("L1 point read (current_fact)", &hist, 1.0, 1));
 
-    std::fs::create_dir_all("bench-results")?;
-    let path = format!("bench-results/{}.json", Utc::now().format("%Y%m%dT%H%M%S"));
-    std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
-    println!("\nresults written to {path}");
-    println!("(corpus={corpus}; report p50/p95/p99 with this context — numbers without corpus size and selectivity are not honest numbers)");
-    Ok(())
+    Ok((corpus, report))
 }
 
 /// The mixed-workload op types, in workload-share order.
@@ -559,6 +621,13 @@ async fn load_at(
 /// pass + mean-pool + normalize, per short synthetic query. This is the cost
 /// every published dense/hybrid recall number must carry on cache misses.
 fn encode(n_queries: usize) -> Result<()> {
+    encode_suite(n_queries)?;
+    println!("\n({n_queries} short queries, single thread, cold cache per query — SPEC §4a budgets 5-15ms)");
+    Ok(())
+}
+
+/// The encoder measurement, reusable by the SRB harness. Returns the case JSON.
+fn encode_suite(n_queries: usize) -> Result<serde_json::Value> {
     println!(
         "loading {} ({}-d; first run downloads to the hf-hub cache)...",
         verity_encoder::MODEL_ID,
@@ -591,9 +660,12 @@ fn encode(n_queries: usize) -> Result<()> {
             v.len()
         );
     }
-    print_case("local query encode (MiniLM-L6 ONNX)", &hist, 1.0, 1);
-    println!("\n({n_queries} short queries, single thread, cold cache per query — SPEC §4a budgets 5-15ms)");
-    Ok(())
+    Ok(print_case(
+        "local query encode (MiniLM-L6 ONNX)",
+        &hist,
+        1.0,
+        1,
+    ))
 }
 
 fn print_case(label: &str, hist: &Histogram<u64>, mean_hits: f64, k: usize) -> serde_json::Value {

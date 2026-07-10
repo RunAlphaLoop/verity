@@ -1,0 +1,271 @@
+{
+  "corpus": {
+    "chunks": 1000005
+  },
+  "date": "2026-07-10",
+  "machine": {
+    "cpu": "Apple M3 Pro",
+    "mem": "36 GB",
+    "os": "Darwin 23.6.0 arm64"
+  },
+  "metrics": {
+    "freshness_lag": {
+      "reason": "requires live connectors sampling source-event time vs queryable time; ships as the public freshness dashboard (SPEC §13, v0.2)",
+      "status": "defined_not_reported"
+    },
+    "latency": {
+      "cases": [
+        {
+          "case": "unfiltered (broad token)",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 5.939,
+          "p95_ms": 9.079,
+          "p99_ms": 11.527
+        },
+        {
+          "case": "filtered ANN @ 0.1% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 48.063,
+          "p95_ms": 81.471,
+          "p99_ms": 110.463
+        },
+        {
+          "case": "filtered ANN @ 1.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 65.311,
+          "p95_ms": 104.383,
+          "p99_ms": 127.295
+        },
+        {
+          "case": "filtered ANN @ 10.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 172.287,
+          "p95_ms": 223.743,
+          "p99_ms": 376.831
+        },
+        {
+          "case": "filtered ANN @ 50.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 1256.447,
+          "p95_ms": 2562.047,
+          "p99_ms": 2916.351
+        },
+        {
+          "case": "BM25 @ 1% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 21.087,
+          "p95_ms": 26.815,
+          "p99_ms": 31.471
+        },
+        {
+          "case": "hybrid (dense+BM25) @ 1%",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 65.599,
+          "p95_ms": 84.863,
+          "p99_ms": 107.839
+        },
+        {
+          "case": "BM25 entity-bound + broad visibility",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 17.551,
+          "p95_ms": 32.367,
+          "p99_ms": 50.591
+        },
+        {
+          "case": "L1 point read (current_fact)",
+          "k": 1,
+          "mean_hits": 1.0,
+          "p50_ms": 0.298,
+          "p95_ms": 0.388,
+          "p99_ms": 0.648
+        }
+      ],
+      "conditions": {
+        "effective_cache_size": "15545MB",
+        "note": "In-process adapter calls on the shared dev box (no HTTP hop). Dense-ANN latency at 1M chunks is dominated by whether the index+heap working set fits the engine's page cache; under memory contention from co-tenant workloads the large-footprint cases (10%/50% selectivity) become disk-bound and rise far above the warm single-tenant curve recorded in docs/BENCHMARKS.md. Correctness metrics (1, 2) are unaffected by cache state.",
+        "other_active_backends_at_start": 0,
+        "shared_buffers": "1GB"
+      },
+      "corpus_chunks": 1000005,
+      "end_to_end_note": "local query encode p95 + worst dense/hybrid recall p95, additive worst case; in-process adapter calls, no HTTP hop",
+      "end_to_end_recall_p95_ms": 2572.31,
+      "k": 10,
+      "load": {
+        "duration_secs_per_level": 20,
+        "levels": [
+          {
+            "concurrency": 4,
+            "duration_secs": 20.309334542,
+            "ops": [
+              {
+                "op": "hybrid recall @ 1%",
+                "ops": 663,
+                "ops_per_sec": 32.64508734291152,
+                "p50_ms": 112.703,
+                "p95_ms": 183.167,
+                "p99_ms": 273.919
+              },
+              {
+                "op": "current_fact",
+                "ops": 170,
+                "ops_per_sec": 8.370535216131161,
+                "p50_ms": 0.991,
+                "p95_ms": 5.075,
+                "p99_ms": 11.535
+              },
+              {
+                "op": "activity",
+                "ops": 106,
+                "ops_per_sec": 5.219274899470018,
+                "p50_ms": 0.934,
+                "p95_ms": 7.755,
+                "p99_ms": 10.047
+              }
+            ],
+            "qps": 46.234897458512705,
+            "total_ops": 939
+          },
+          {
+            "concurrency": 16,
+            "duration_secs": 20.203237292,
+            "ops": [
+              {
+                "op": "hybrid recall @ 1%",
+                "ops": 611,
+                "ops_per_sec": 30.24267800101231,
+                "p50_ms": 426.751,
+                "p95_ms": 913.407,
+                "p99_ms": 1162.239
+              },
+              {
+                "op": "current_fact",
+                "ops": 184,
+                "ops_per_sec": 9.107451312907145,
+                "p50_ms": 92.031,
+                "p95_ms": 274.943,
+                "p99_ms": 486.399
+              },
+              {
+                "op": "activity",
+                "ops": 92,
+                "ops_per_sec": 4.553725656453572,
+                "p50_ms": 91.135,
+                "p95_ms": 295.167,
+                "p99_ms": 809.983
+              }
+            ],
+            "qps": 43.90385497037303,
+            "total_ops": 887
+          }
+        ],
+        "mix": "70% hybrid recall @ 1% selectivity / 20% current_fact / 10% activity"
+      },
+      "local_encoder": {
+        "case": "local query encode (MiniLM-L6 ONNX)",
+        "k": 1,
+        "mean_hits": 1.0,
+        "p50_ms": 9.167,
+        "p95_ms": 10.263,
+        "p99_ms": 10.823
+      },
+      "queries_per_case": 200
+    },
+    "leakage": {
+      "adversarial_scopes": 200,
+      "corpus": {
+        "actions": 64,
+        "chunks": 204,
+        "sentinel_chunks": 4
+      },
+      "injection_query_strings": 10,
+      "items_checked": 20709,
+      "leakage_rate": 0.0,
+      "leaked_items": 0,
+      "leaks": [],
+      "per_path": {
+        "activity": {
+          "errors": 0,
+          "items": 587,
+          "leaks": 0,
+          "probes": 200
+        },
+        "latest_chunks": {
+          "errors": 0,
+          "items": 1889,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_bm25": {
+          "errors": 0,
+          "items": 5375,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_dense": {
+          "errors": 0,
+          "items": 4324,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_hybrid": {
+          "errors": 0,
+          "items": 5375,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_injection": {
+          "errors": 0,
+          "items": 3159,
+          "leaks": 0,
+          "probes": 220
+        }
+      },
+      "probe_errors": 0,
+      "target": 0.0,
+      "total_probes": 1220
+    },
+    "stale_citation": {
+      "consistency_timeouts": 0,
+      "cycles": 100,
+      "per_path": {
+        "current_fact": {
+          "reads": 100,
+          "stale": 0
+        },
+        "recall_bm25": {
+          "reads": 100,
+          "stale": 0
+        }
+      },
+      "stale_citation_rate": 0.0,
+      "stale_reads": 0,
+      "target": 0.0,
+      "total_reads": 200,
+      "write_to_consistent_read_gap_ms": {
+        "current_fact": {
+          "p50": 0.42,
+          "p95": 0.564,
+          "p99": 0.81
+        },
+        "recall": {
+          "p50": 11.383,
+          "p95": 13.919,
+          "p99": 18.095
+        }
+      }
+    },
+    "tagger_recall": {
+      "reason": "requires the labeled multi-entity document corpus; ships with probabilistic entity tagging (SPEC §13, v0.3)",
+      "status": "defined_not_reported"
+    }
+  },
+  "srb_version": "srb-v0"
+}
