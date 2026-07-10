@@ -1,0 +1,23 @@
+[package]
+name = "verity-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "verity-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { workspace = true }
+reqwest = { workspace = true }
+schemars = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

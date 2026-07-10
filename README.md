@@ -30,7 +30,25 @@ deploy/                 # docker-compose for the Postgres profile
 docker compose -f deploy/docker-compose.yml up -d   # Postgres 17 + pgvector + pg_search
 cargo run -p verity-bench -- seed --chunks 100000   # synthetic corpus with realistic ACL shape
 cargo run -p verity-bench -- run                    # p50/p95/p99 latency: filtered ANN, point reads
+cargo run --release -p verity-server                # REST API on 127.0.0.1:7717
 ```
+
+## Connect an agent (MCP)
+
+`verity-mcp` is a stdio MCP server any MCP-capable agent (Claude Code, LangGraph,
+CrewAI, ...) can use. Identity comes from the environment, never from tool arguments:
+
+```sh
+claude mcp add verity \
+  -e VERITY_TENANT_ID=<tenant-uuid> -e VERITY_PRINCIPALS=7 \
+  -e VERITY_ACTOR_SUB=user:you -e VERITY_ACTOR_AZP=agent:claude-code \
+  -- /path/to/target/release/verity-mcp
+```
+
+Tools: `memory_open_scope` (mint a session scope), `memory_recall` (scoped hybrid
+search), `memory_get` (bi-temporal record read), `memory_remember` (write an
+observation), `memory_record_action` / `memory_activity` (the cross-agent activity
+timeline — check what other agents did before acting), `memory_whoami`.
 
 ## License
 
