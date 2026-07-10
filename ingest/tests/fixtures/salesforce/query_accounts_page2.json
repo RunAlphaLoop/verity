@@ -1,0 +1,18 @@
+{
+  "totalSize": 3,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "Account",
+        "url": "/services/data/v62.0/sobjects/Account/001xx000003DGb3AAG"
+      },
+      "Id": "001xx000003DGb3AAG",
+      "Name": "Initech",
+      "Industry": "Manufacturing",
+      "Website": null,
+      "AnnualRevenue": 4200000.0,
+      "LastModifiedDate": "2026-07-09T02:30:00.000+0000"
+    }
+  ]
+}

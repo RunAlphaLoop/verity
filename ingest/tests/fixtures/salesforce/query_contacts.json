@@ -1,0 +1,19 @@
+{
+  "totalSize": 1,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "Contact",
+        "url": "/services/data/v62.0/sobjects/Contact/003xx000004TmiQAAS"
+      },
+      "Id": "003xx000004TmiQAAS",
+      "FirstName": "Ada",
+      "LastName": "Lovelace",
+      "Email": "ada@acme.test",
+      "Title": null,
+      "AccountId": "001xx000003DGb1AAG",
+      "LastModifiedDate": "2026-07-09T03:00:00.000+0000"
+    }
+  ]
+}

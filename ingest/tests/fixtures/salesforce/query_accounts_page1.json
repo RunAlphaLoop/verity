@@ -1,0 +1,31 @@
+{
+  "totalSize": 3,
+  "done": false,
+  "nextRecordsUrl": "/services/data/v62.0/query/01gRO0000016PIAYA2-2000",
+  "records": [
+    {
+      "attributes": {
+        "type": "Account",
+        "url": "/services/data/v62.0/sobjects/Account/001xx000003DGb1AAG"
+      },
+      "Id": "001xx000003DGb1AAG",
+      "Name": "Acme Corp",
+      "Industry": "Technology",
+      "Website": "https://acme.test",
+      "AnnualRevenue": 25000000.0,
+      "LastModifiedDate": "2026-07-08T18:04:57.000+0000"
+    },
+    {
+      "attributes": {
+        "type": "Account",
+        "url": "/services/data/v62.0/sobjects/Account/001xx000003DGb2AAG"
+      },
+      "Id": "001xx000003DGb2AAG",
+      "Name": "Globex",
+      "Industry": null,
+      "Website": "https://globex.test",
+      "AnnualRevenue": null,
+      "LastModifiedDate": "2026-07-09T01:12:03.000+0000"
+    }
+  ]
+}

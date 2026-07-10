@@ -1,0 +1,39 @@
+{
+  "totalSize": 3,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "AccountShare",
+        "url": "/services/data/v62.0/sobjects/AccountShare/00rxx0000000001AAA"
+      },
+      "Id": "00rxx0000000001AAA",
+      "AccountId": "001xx000003DGb1AAG",
+      "UserOrGroupId": "005xx000001X8UzAAK",
+      "AccountAccessLevel": "All",
+      "RowCause": "Owner"
+    },
+    {
+      "attributes": {
+        "type": "AccountShare",
+        "url": "/services/data/v62.0/sobjects/AccountShare/00rxx0000000002AAA"
+      },
+      "Id": "00rxx0000000002AAA",
+      "AccountId": "001xx000003DGb1AAG",
+      "UserOrGroupId": "00Gxx0000000001EAA",
+      "AccountAccessLevel": "Read",
+      "RowCause": "Manual"
+    },
+    {
+      "attributes": {
+        "type": "AccountShare",
+        "url": "/services/data/v62.0/sobjects/AccountShare/00rxx0000000003AAA"
+      },
+      "Id": "00rxx0000000003AAA",
+      "AccountId": "001xx000003DGb2AAG",
+      "UserOrGroupId": "005xx000001X8UzAAK",
+      "AccountAccessLevel": "Edit",
+      "RowCause": "Rule"
+    }
+  ]
+}

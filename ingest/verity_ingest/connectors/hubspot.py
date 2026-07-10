@@ -45,6 +45,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
+from verity_ingest.credentials import StaticKey
 
 SOURCE = "hubspot"
 BASE_URL = "https://api.hubapi.com"
@@ -118,21 +119,27 @@ class HubSpotConnector(Connector):
         visibility_policy: list[int],
         *,
         token: str | None = None,
+        credential: StaticKey | None = None,
         base_url: str = BASE_URL,
         properties: dict[str, list[str]] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        token = token or os.environ.get(TOKEN_ENV)
-        if not token:
-            raise RuntimeError(
-                f"no HubSpot credential: set {TOKEN_ENV} to a private-app token "
-                "(BYOT — create it in your own portal, Settings → Integrations → Private Apps)"
-            )
+        # Credential lifecycle via the shared §5e.2 abstraction. HubSpot
+        # private-app tokens are the static-key shape: no minting, no refresh
+        # (a 401 means "rotate the token", never "retry"), and no published
+        # expiry — pass a `credential` with `expiry` set to get the 7-day
+        # expiry-telemetry warning if your org rotates tokens on a schedule.
+        self.credential = credential or StaticKey(
+            TOKEN_ENV,
+            value=token,
+            missing_hint="a private-app token (BYOT — create it in your own "
+            "portal, Settings → Integrations → Private Apps)",
+        )
         self.visibility_policy = list(visibility_policy)
         self.properties = dict(DEFAULT_PROPERTIES, **(properties or {}))
         self._client = client or httpx.AsyncClient(
             base_url=base_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {self.credential.value}"},
             timeout=30.0,
         )
 
@@ -337,21 +344,24 @@ class VerityDebeziumSink:
         )
 
     @staticmethod
-    def envelope(event: HubSpotFactEvent) -> dict:
+    def envelope(event: FactEvent) -> dict:
         """One event → one bare Debezium payload (the server accepts bare
         payloads and arrays of them; see crates/verity-server/src/ingest.rs).
-        ``source`` becomes the L1 partition ``hubspot:<object_type>``."""
+        ``source.connector`` comes from the event, so this sink is shared by
+        every structured CRM connector (HubSpot, Salesforce) whose events
+        carry an ``object_type``; the L1 partition becomes
+        ``<source>:<object_type>``."""
         return {
             "op": "u",
             "source": {
-                "connector": SOURCE,
-                "table": event.object_type,
+                "connector": event.source,
+                "table": event.object_type,  # type: ignore[attr-defined]
                 "ts_ms": int(event.valid_from.timestamp() * 1000),
             },
             "after": {"id": event.entity_id, event.field_name: event.value},
         }
 
-    def post(self, events: list[HubSpotFactEvent]) -> dict:
+    def post(self, events: list[FactEvent]) -> dict:
         """POST a batch; returns the server's write summary."""
         if not events:
             return {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
