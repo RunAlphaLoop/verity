@@ -156,6 +156,144 @@ impl PostgresAdapter {
         row_to_knowledge(&row)
     }
 
+    /// Public fetch of one knowledge item (admin/review plane).
+    pub async fn knowledge_item(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+    ) -> Result<Option<KnowledgeItem>> {
+        let row = sqlx::query("SELECT * FROM knowledge WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.as_ref().map(row_to_knowledge).transpose()
+    }
+
+    /// Is per-tenant auto-publish opted IN? (knowledge-merge-tuning.md §5, the
+    /// load-bearing promise.) Reads the `knowledge_auto_publish` setting,
+    /// per-tenant row winning over the global (NULL-tenant) default. ABSENT =
+    /// OFF — the OSS-conservative default: candidates that cross k-support
+    /// become `eligible` and WAIT for a human/policy publish call, they never
+    /// auto-publish. Only 'true' (case-insensitive) enables it.
+    pub async fn knowledge_auto_publish(&self, tenant: TenantId) -> Result<bool> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM settings
+             WHERE key = 'knowledge_auto_publish'
+               AND (tenant_id = $1 OR tenant_id IS NULL)
+             ORDER BY tenant_id NULLS LAST
+             LIMIT 1",
+        )
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(value.is_some_and(|v| v.trim().eq_ignore_ascii_case("true")))
+    }
+
+    /// Set the per-tenant (or global, tenant=None) auto-publish flag. Admin
+    /// plane only. Upserts on the same COALESCE(tenant, zero-uuid) key the
+    /// embedding-route setting uses.
+    pub async fn set_knowledge_auto_publish(
+        &self,
+        tenant: Option<TenantId>,
+        enabled: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (tenant_id, key, value, updated_at)
+             VALUES ($1, 'knowledge_auto_publish', $2, now())
+             ON CONFLICT (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid), key)
+             DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(if enabled { "true" } else { "false" })
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Promote a candidate that has crossed k-support to `eligible` — the
+    /// waiting-for-human/policy state under auto-publish OFF (§5). Only a
+    /// `candidate` transitions; anything else is left untouched. Returns
+    /// whether the row moved. NEVER mints a carve-out chunk (that is publish's
+    /// job): an eligible item is not retrievable.
+    pub async fn mark_knowledge_eligible(&self, tenant: TenantId, id: Uuid) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE knowledge SET status = 'eligible', eligible_at = now()
+             WHERE tenant_id = $1 AND id = $2 AND status = 'candidate'",
+        )
+        .bind(tenant)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Reject a candidate/eligible item, REMEMBERED (§5): status = 'rejected'
+    /// with the reason, so the same canonical_statement does not resurrect as a
+    /// fresh candidate (enforced in propose_knowledge). Only a candidate or
+    /// eligible item can be rejected — rejecting a published item is refused
+    /// (retraction is `forget`'s job, not rejection). Returns the updated item;
+    /// None when there is no such rejectable row.
+    pub async fn reject_knowledge(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<Option<KnowledgeItem>> {
+        let updated = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE knowledge
+             SET status = 'rejected', rejected_at = now(), rejected_reason = $3
+             WHERE tenant_id = $1 AND id = $2 AND status IN ('candidate', 'eligible')
+             RETURNING id",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match updated {
+            Some(_) => self.get_knowledge(tenant, id).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The evidence lineage for one knowledge item (admin detail surface, §5:
+    /// "the evidence episode/entity list"). Bucketed counts are for agents; the
+    /// admin plane gets the exact rows.
+    pub async fn knowledge_evidence(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT ke.episode_id, ke.entity, ke.writer_azp, ke.trust_tier
+             FROM knowledge_evidence ke
+             JOIN knowledge k ON k.id = ke.knowledge_id
+             WHERE ke.knowledge_id = $1 AND k.tenant_id = $2
+             ORDER BY ke.episode_id",
+        )
+        .bind(id)
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| -> Result<serde_json::Value> {
+                Ok(serde_json::json!({
+                    "episode_id": r.try_get::<Uuid, _>("episode_id").map_err(db_err)?,
+                    "entity": r.try_get::<Option<String>, _>("entity").map_err(db_err)?,
+                    "writer_azp": r.try_get::<Option<String>, _>("writer_azp").map_err(db_err)?,
+                    "trust_tier": r.try_get::<i16, _>("trust_tier").map_err(db_err)?,
+                }))
+            })
+            .collect()
+    }
+
     /// Below this many matching rows, brute-force distance over the filtered
     /// subset beats HNSW iterative traversal (measured at 1M chunks: exact
     /// 11ms vs HNSW 72ms p50 at 1% selectivity — docs/BENCHMARKS.md). The
@@ -222,7 +360,7 @@ impl PostgresAdapter {
         // Safe: the predicate string is assembled from constants only; all
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     1 - ({col} <=> $1) AS score
              FROM chunks
              WHERE tenant_id = $2
@@ -266,7 +404,7 @@ impl PostgresAdapter {
         // full match set (measured 542ms p50; docs/BENCHMARKS.md). This is
         // filter-then-rank, never truncate-then-authorize.
         let sql = if scope.entity_scope.is_empty() {
-            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
              WHERE id @@@ paradedb.match('content', $1)
@@ -291,7 +429,7 @@ impl PostgresAdapter {
                    AND valid_to IS NULL
                    AND confidentiality <= $4
              )
-             SELECT c.id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
+             SELECT c.id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     cand.score AS score
              FROM cand JOIN chunks c ON c.id = cand.id
              WHERE (c.kind = 'knowledge'
@@ -340,6 +478,15 @@ fn row_to_hit(row: &PgRow) -> Result<RecallHit> {
             .map_err(db_err)?,
         entity_tags: row.try_get("entity_tags").map_err(db_err)?,
         kind: row.try_get("kind").map_err(db_err)?,
+        // Only kind='knowledge' chunks carry a stored tier (set at publish,
+        // recomputed on support accrual); content chunks are NULL. Parse it
+        // leniently — an unknown string reads as "no tier disclosed" rather
+        // than failing the read.
+        support_tier: row
+            .try_get::<Option<String>, _>("support_tier")
+            .ok()
+            .flatten()
+            .and_then(|s| support_tier_from_str(&s)),
         acl_provenance: AclProvenance::from_str_lossy(
             &row.try_get::<String, _>("acl_provenance").map_err(db_err)?,
         ),
@@ -349,23 +496,37 @@ fn row_to_hit(row: &PgRow) -> Result<RecallHit> {
     })
 }
 
+fn support_tier_from_str(s: &str) -> Option<SupportTier> {
+    match s {
+        "emerging" => Some(SupportTier::Emerging),
+        "established" => Some(SupportTier::Established),
+        "extensive" => Some(SupportTier::Extensive),
+        _ => None,
+    }
+}
+
 fn row_to_knowledge(row: &PgRow) -> Result<KnowledgeItem> {
     let status = match row.try_get::<String, _>("status").map_err(db_err)?.as_str() {
         "candidate" => KnowledgeStatus::Candidate,
         "quarantined" => KnowledgeStatus::Quarantined,
+        "eligible" => KnowledgeStatus::Eligible,
         "published" => KnowledgeStatus::Published,
+        "rejected" => KnowledgeStatus::Rejected,
         _ => KnowledgeStatus::Invalidated,
     };
+    let distinct_entities: i32 = row.try_get("distinct_entities").map_err(db_err)?;
     Ok(KnowledgeItem {
         id: row.try_get("id").map_err(db_err)?,
         statement: row.try_get("statement").map_err(db_err)?,
         categories: row.try_get("categories").map_err(db_err)?,
         status,
         quarantine_reason: row.try_get("quarantine_reason").map_err(db_err)?,
-        distinct_entities: row.try_get("distinct_entities").map_err(db_err)?,
+        distinct_entities,
+        support_tier: SupportTier::from_distinct(distinct_entities),
         episode_count: row.try_get("episode_count").map_err(db_err)?,
         writer_count: row.try_get("writer_count").map_err(db_err)?,
         has_tier1_evidence: row.try_get("has_tier1_evidence").map_err(db_err)?,
+        merge_reason: row.try_get("merge_reason").map_err(db_err)?,
         first_seen: row.try_get("first_seen").map_err(db_err)?,
         last_reinforced: row.try_get("last_reinforced").map_err(db_err)?,
         published_at: row.try_get("published_at").map_err(db_err)?,
@@ -694,6 +855,35 @@ impl StorageAdapter for PostgresAdapter {
     async fn propose_knowledge(&self, proposal: KnowledgeProposal) -> Result<KnowledgeItem> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
+        // Rejection memory (knowledge-merge-tuning.md §5): a canonical form a
+        // reviewer already rejected must NOT resurrect as a fresh candidate.
+        // Match on the canonical form when supplied (the strong key), else on
+        // the exact statement. A hit returns the remembered rejected item
+        // unchanged — the propose is a no-op, never a new candidate row.
+        let canon = proposal
+            .canonical_statement
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let rejected: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM knowledge
+             WHERE tenant_id = $1 AND status = 'rejected'
+               AND (($2::text IS NOT NULL AND canonical_statement = $2)
+                    OR ($2::text IS NULL AND statement = $3))
+             ORDER BY rejected_at DESC NULLS LAST
+             LIMIT 1",
+        )
+        .bind(proposal.tenant_id)
+        .bind(canon)
+        .bind(&proposal.statement)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(id) = rejected {
+            tx.rollback().await.map_err(db_err)?;
+            return self.get_knowledge(proposal.tenant_id, id).await;
+        }
+
         // Evidence attribution comes from the episodes themselves.
         let evidence = sqlx::query(
             "SELECT id, source_entity, writer_azp, trust_tier FROM episodes
@@ -762,8 +952,8 @@ impl StorageAdapter for PostgresAdapter {
             "INSERT INTO knowledge (id, tenant_id, statement, categories, status,
                                     quarantine_reason, distinct_entities, episode_count,
                                     writer_count, has_tier1_evidence,
-                                    proposed_by_sub, proposed_by_azp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                                    proposed_by_sub, proposed_by_azp, canonical_statement)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(id)
         .bind(proposal.tenant_id)
@@ -777,6 +967,7 @@ impl StorageAdapter for PostgresAdapter {
         .bind(has_tier1)
         .bind(&proposal.proposed_by_sub)
         .bind(&proposal.proposed_by_azp)
+        .bind(canon)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -826,9 +1017,13 @@ impl StorageAdapter for PostgresAdapter {
         .ok_or_else(|| StorageError::InvalidInput("unknown knowledge item".into()))?;
 
         let status: String = row.try_get("status").map_err(db_err)?;
-        if status != "candidate" {
+        // Both a fresh `candidate` and an `eligible` item (crossed k-support
+        // under auto-publish OFF, awaiting the human/policy gate) can publish.
+        // Everything else — quarantined, rejected, already-published,
+        // invalidated — cannot.
+        if status != "candidate" && status != "eligible" {
             return Err(StorageError::InvalidInput(format!(
-                "only candidates can be published (status: {status})"
+                "only candidate/eligible items can be published (status: {status})"
             )));
         }
         // Promotion gates (SPEC v1.3 §2). Category-size floor is not yet
@@ -849,6 +1044,10 @@ impl StorageAdapter for PostgresAdapter {
 
         let statement: String = row.try_get("statement").map_err(db_err)?;
         let categories: Vec<String> = row.try_get("categories").map_err(db_err)?;
+        // Bucketed support carried onto the carve-out chunk so recall exposes a
+        // coarse tier, never the exact count (§5). Guaranteed Some here: the
+        // k-support gate above rejected anything below distinct == k_min >= 3.
+        let tier = SupportTier::from_distinct(distinct).map(|t| t.as_str().to_string());
 
         let episode_id = Uuid::now_v7();
         // Publish provenance goes through the shared encrypted insert path;
@@ -877,9 +1076,9 @@ impl StorageAdapter for PostgresAdapter {
             "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
                                  content_hash, embedding, visibility, entity_tags,
                                  confidentiality, trust_tier, valid_from, provenance,
-                                 kind, categories)
+                                 kind, categories, support_tier)
              VALUES ($1, $2, 'knowledge', $3, 0, $4, $5, $6, $7, '{}', $8, $9, now(), $10,
-                     'knowledge', $11)",
+                     'knowledge', $11, $12)",
         )
         .bind(Uuid::now_v7())
         .bind(tenant)
@@ -892,6 +1091,7 @@ impl StorageAdapter for PostgresAdapter {
         .bind(TrustTier::Observation as i16)
         .bind(episode_id)
         .bind(&categories)
+        .bind(&tier)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -940,7 +1140,7 @@ impl StorageAdapter for PostgresAdapter {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     0.0::float8 AS score
              FROM chunks
              WHERE tenant_id = $1

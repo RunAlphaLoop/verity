@@ -24,6 +24,13 @@ use crate::{consolidation, AdminAuth, AppState};
 /// canonical-exact fast path and the worker-supplied JUDGED merge (`merge_into`)
 /// — exactly the two paths Phase 2 permits (the bare cosine auto-merge is gone).
 async fn test_state(auto_tag: bool) -> Option<(Arc<AppState>, TenantId)> {
+    test_state_cfg(auto_tag, true).await
+}
+
+/// As `test_state`, but with the `VERITY_KNOWLEDGE_AUTO_MERGE` kill switch
+/// explicitly set: `auto_merge = false` degrades consolidation to canonical-
+/// exact + human clustering (worker `merge_into` is ignored).
+async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppState>, TenantId)> {
     let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
     let pg = PostgresAdapter::connect(&dsn).await.expect("connect");
     pg.migrate().await.expect("migrate");
@@ -45,6 +52,7 @@ async fn test_state(auto_tag: bool) -> Option<(Arc<AppState>, TenantId)> {
         allow_restricted_without_rebac: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag,
+        knowledge_auto_merge: auto_merge,
     });
     Some((state, tenant))
 }
@@ -69,6 +77,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
         allow_restricted_without_rebac,
         subscribers,
         auto_tag,
+        knowledge_auto_merge,
         ..
     } = Arc::try_unwrap(state).ok()?;
     Some((
@@ -83,6 +92,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             allow_restricted_without_rebac,
             subscribers,
             auto_tag,
+            knowledge_auto_merge,
         }),
         tenant,
     ))
@@ -104,6 +114,19 @@ async fn append(
     entity: &str,
     text: &str,
 ) -> EpisodeId {
+    append_w(state, tenant, kind, entity, "agent:test", text).await
+}
+
+/// `append` with an explicit writer azp — needed to exercise the corroboration
+/// gate (>= 2 distinct writers) on the eligible/auto-publish promotion path.
+async fn append_w(
+    state: &AppState,
+    tenant: TenantId,
+    kind: EpisodeKind,
+    entity: &str,
+    writer: &str,
+    text: &str,
+) -> EpisodeId {
     state
         .storage
         .append_episode(NewEpisode {
@@ -115,7 +138,7 @@ async fn append(
             content_hash: format!("{:x}", crate::md5ish(text)),
             trust_tier: TrustTier::Observation,
             writer_sub: Some("user:test".into()),
-            writer_azp: Some("agent:test".into()),
+            writer_azp: Some(writer.into()),
         })
         .await
         .expect("episode")
@@ -684,6 +707,7 @@ async fn merge_candidates_returns_blocker_set_with_category_filter_and_cap() {
                 evidence: vec![],
                 proposed_by_sub: None,
                 proposed_by_azp: Some("test".into()),
+                canonical_statement: None,
             })
             .await
             .expect("seed item");
@@ -967,4 +991,408 @@ async fn auto_tag_applies_immediately_when_opted_in() {
         chunk_tags(&state, tenant, chunk_id).await,
         vec!["account:zed".to_string()]
     );
+}
+
+// ---------- Phase 3: kill switch, eligible/auto-publish, rejection memory ----------
+
+/// VERITY_KNOWLEDGE_AUTO_MERGE=0 (auto_merge=false): the server IGNORES a
+/// worker-supplied merge_into entirely. Only the deterministic canonical-exact
+/// fast path can merge; a judged merge_into degrades to a FRESH candidate
+/// (assisted/human-clustered, never a silent judged merge).
+#[tokio::test]
+async fn kill_switch_ignores_worker_merge_into() {
+    let Some((state, tenant)) = test_state_cfg(false, false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let obs1 = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    lease_ids(&state, tenant).await;
+
+    let body1 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs1,
+            "knowledge_candidates": [{
+                "statement": "Enterprise buyers require a signed DPA before a security review.",
+                "categories": ["security"], "evidence": [obs1],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 1");
+    let kid = body1["knowledge"][0]["knowledge_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Worker's judge said SAME and passed merge_into — but the kill switch is
+    // engaged, so the server ignores it and mints a fresh candidate instead.
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "knowledge_candidates": [{
+                "statement": "Procurement blocks the security evaluation until the DPA is executed.",
+                "evidence": [obs2],
+                "merge_into": kid,
+                "judge_reason": "same generalization",
+            }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+    assert_eq!(
+        body2["knowledge"][0]["merged"],
+        json!(false),
+        "kill switch must ignore merge_into and mint fresh"
+    );
+    assert_ne!(
+        body2["knowledge"][0]["knowledge_id"].as_str().unwrap(),
+        kid,
+        "no judged merge under the kill switch"
+    );
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(
+        items.len(),
+        2,
+        "two separate candidates — no silent judged merge"
+    );
+
+    // The canonical-exact fast path STILL works under the kill switch.
+    let obs3 = append(&state, tenant, EpisodeKind::Observation, "cust-c", "c").await;
+    let obs4 = append(&state, tenant, EpisodeKind::Observation, "cust-d", "d").await;
+    expire_leases(&state, tenant).await;
+    lease_ids(&state, tenant).await;
+    let canon = "segment_buyer requires signed_dpa before security_review";
+    let b3 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs3,
+            "knowledge_candidates": [{ "statement": "DPA before review, phrasing one.",
+                "canonical_statement": canon, "evidence": [obs3] }],
+        }),
+    )
+    .await
+    .expect("c3");
+    let b4 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs4,
+            "knowledge_candidates": [{ "statement": "DPA before review, phrasing two.",
+                "canonical_statement": canon, "evidence": [obs4] }],
+        }),
+    )
+    .await
+    .expect("c4");
+    assert_eq!(b3["knowledge"][0]["merged"], json!(false));
+    assert_eq!(
+        b4["knowledge"][0]["merged"],
+        json!(true),
+        "canonical-exact still merges"
+    );
+    assert_eq!(b4["knowledge"][0]["merge"], json!("canonical_exact"));
+}
+
+/// Auto-publish OFF (the default): a candidate crossing k-support + corroboration
+/// becomes `eligible` — reviewed-ready, NOT published, NOT retrievable. The
+/// promotion is reported on the complete() response.
+#[tokio::test]
+async fn auto_publish_off_marks_eligible_not_published() {
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    // Default is OFF.
+    assert!(!state
+        .storage
+        .inner()
+        .knowledge_auto_publish(tenant)
+        .await
+        .unwrap());
+
+    // Three distinct entities, two distinct writers → k-support + corroboration.
+    let e1 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-a",
+        "agent:x",
+        "a",
+    )
+    .await;
+    let e2 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-b",
+        "agent:x",
+        "b",
+    )
+    .await;
+    let e3 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-c",
+        "agent:y",
+        "c",
+    )
+    .await;
+    lease_ids(&state, tenant).await;
+
+    let canon = "segment_buyer requires signed_dpa before security_review";
+    // Three canonical-exact candidates accrue onto ONE item; the third crossing
+    // k=3 should flip it to eligible.
+    let mut last = json!(null);
+    for (i, ep) in [e1, e2, e3].iter().enumerate() {
+        last = complete(
+            &state,
+            json!({
+                "tenant_id": tenant, "episode_id": ep,
+                "knowledge_candidates": [{
+                    "statement": format!("Buyers need a DPA before review, phrasing {i}."),
+                    "canonical_statement": canon, "evidence": [ep],
+                }],
+            }),
+        )
+        .await
+        .expect("complete");
+    }
+    // The final complete promoted it to eligible.
+    assert_eq!(
+        last["knowledge"][0]["promotion"]["action"],
+        json!("marked_eligible")
+    );
+    assert_eq!(
+        last["knowledge"][0]["promotion"]["auto_publish"],
+        json!(false)
+    );
+
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].status,
+        KnowledgeStatus::Eligible,
+        "must be eligible, NEVER auto-published"
+    );
+    assert_eq!(items[0].distinct_entities, 3);
+
+    // An eligible item is not retrievable — no carve-out chunk exists.
+    let scope = Scope {
+        tenant_id: tenant,
+        principals: vec![7],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Confidential,
+    };
+    let hits = state
+        .storage
+        .recall(RecallQuery {
+            scope,
+            embedding: None,
+            text: Some("DPA before review".into()),
+            k: 20,
+        })
+        .await
+        .expect("recall");
+    assert!(
+        !hits.iter().any(|h| h.kind == "knowledge"),
+        "eligible item must not be retrievable"
+    );
+}
+
+/// Auto-publish ON (per-tenant opt-in) + a configured default visibility: the
+/// same k-support crossing auto-publishes THROUGH THE GATE on the worker path.
+/// Still never on the read path — publish mints the carve-out chunk as usual.
+#[tokio::test]
+async fn auto_publish_on_publishes_through_the_gate() {
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    state
+        .storage
+        .inner()
+        .set_knowledge_auto_publish(Some(tenant), true)
+        .await
+        .unwrap();
+    // Configure the default publish visibility for the auto path.
+    sqlx::query(
+        "INSERT INTO settings (tenant_id, key, value) VALUES ($1, 'knowledge_auto_publish_visibility', '7')",
+    ).bind(tenant).execute(state.pool()).await.expect("set visibility");
+
+    let e1 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-a",
+        "agent:x",
+        "a",
+    )
+    .await;
+    let e2 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-b",
+        "agent:x",
+        "b",
+    )
+    .await;
+    let e3 = append_w(
+        &state,
+        tenant,
+        EpisodeKind::Observation,
+        "cust-c",
+        "agent:y",
+        "c",
+    )
+    .await;
+    lease_ids(&state, tenant).await;
+
+    let canon = "segment_buyer requires signed_dpa before security_review";
+    let mut last = json!(null);
+    for (i, ep) in [e1, e2, e3].iter().enumerate() {
+        last = complete(
+            &state,
+            json!({
+                "tenant_id": tenant, "episode_id": ep,
+                "knowledge_candidates": [{
+                    "statement": format!("Buyers need a DPA before review, phrasing {i}."),
+                    "canonical_statement": canon, "evidence": [ep],
+                }],
+            }),
+        )
+        .await
+        .expect("complete");
+    }
+    assert_eq!(
+        last["knowledge"][0]["promotion"]["action"],
+        json!("auto_published")
+    );
+
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(items[0].status, KnowledgeStatus::Published);
+
+    // Now it IS retrievable (publish minted the carve-out chunk), carrying the
+    // emerging tier — never the exact count.
+    let scope = Scope {
+        tenant_id: tenant,
+        principals: vec![7],
+        entity_scope: vec!["cust-a".into()],
+        max_confidentiality: Confidentiality::Confidential,
+    };
+    let hits = state
+        .storage
+        .recall(RecallQuery {
+            scope,
+            embedding: None,
+            text: Some("DPA before review".into()),
+            k: 20,
+        })
+        .await
+        .expect("recall");
+    let kh = hits
+        .iter()
+        .find(|h| h.kind == "knowledge")
+        .expect("published knowledge retrievable");
+    assert_eq!(kh.support_tier, Some(SupportTier::Emerging));
+}
+
+/// The reject endpoint remembers: POST reject -> status=rejected, and a
+/// re-propose of the same canonical form via complete() does NOT resurrect it.
+#[tokio::test]
+async fn reject_endpoint_remembers_and_blocks_resurrection() {
+    use axum::extract::{Path as AxPath, Query as AxQuery};
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let e1 = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    lease_ids(&state, tenant).await;
+    let canon = "segment_buyer requires signed_dpa before security_review";
+    let body = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": e1,
+            "knowledge_candidates": [{
+                "statement": "Buyers require a DPA before review.",
+                "canonical_statement": canon, "evidence": [e1],
+            }],
+        }),
+    )
+    .await
+    .expect("complete");
+    let kid: Uuid = body["knowledge"][0]["knowledge_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Reject via the admin endpoint.
+    let req: crate::RejectKnowledgeRequest =
+        serde_json::from_value(json!({ "tenant_id": tenant, "reason": "not durable" })).unwrap();
+    let Json(rejected) = crate::admin_reject_knowledge(
+        State(state.clone()),
+        HeaderMap::new(),
+        AxPath(kid),
+        Json(req),
+    )
+    .await
+    .expect("reject");
+    assert_eq!(rejected.status, KnowledgeStatus::Rejected);
+
+    // Re-propose the SAME canonical form via complete(): must NOT resurrect.
+    let e2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    expire_leases(&state, tenant).await;
+    lease_ids(&state, tenant).await;
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": e2,
+            "knowledge_candidates": [{
+                "statement": "A paraphrase of the same rejected pattern.",
+                "canonical_statement": canon, "evidence": [e2],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+    assert_eq!(body2["knowledge"][0]["rejected_memory"], json!(true));
+    assert_eq!(
+        body2["knowledge"][0]["knowledge_id"].as_str().unwrap(),
+        kid.to_string()
+    );
+
+    // Still exactly one item, still rejected — no fresh candidate resurrected.
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, KnowledgeStatus::Rejected);
+
+    // The detail endpoint returns the item with its de-id gate result + evidence.
+    let q: AxQuery<crate::TenantQuery> =
+        AxQuery(serde_json::from_value(json!({ "tenant_id": tenant })).unwrap());
+    let Json(detail) =
+        crate::admin_knowledge_detail(State(state.clone()), HeaderMap::new(), AxPath(kid), q)
+            .await
+            .expect("detail");
+    assert_eq!(detail["status"], json!("rejected"));
+    assert_eq!(detail["deid_gate"]["passed"], json!(true));
+    assert!(detail["evidence"].is_array());
 }

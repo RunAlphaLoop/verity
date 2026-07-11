@@ -138,6 +138,14 @@ pub(crate) struct AppState {
     /// widen retrieval scope for entity-bound scopes (SPEC §7d), so the
     /// default posture is suggest-only with human approval.
     pub(crate) auto_tag: bool,
+    /// `VERITY_KNOWLEDGE_AUTO_MERGE` kill switch (knowledge-merge-tuning.md §5).
+    /// Default ON. When set to `0`, the server IGNORES worker-supplied
+    /// `merge_into` entirely: only the deterministic canonical-exact fast path
+    /// merges, so consolidation degrades to assisted/human-clustered — never a
+    /// silent judged merge. A false merge fabricates cross-customer support
+    /// (§1's governing asymmetry), so this is the emergency stop for the
+    /// judged-merge leg.
+    pub(crate) knowledge_auto_merge: bool,
 }
 
 impl AppState {
@@ -244,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
         auto_tag: std::env::var("VERITY_AUTO_TAG").is_ok_and(|v| v == "1"),
+        // Default ON: absent or anything but "0" leaves judged merges enabled.
+        knowledge_auto_merge: std::env::var("VERITY_KNOWLEDGE_AUTO_MERGE")
+            .map(|v| v != "0")
+            .unwrap_or(true),
     });
 
     let app = Router::new()
@@ -299,6 +311,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
+        .route("/v1/admin/knowledge/{id}", get(admin_knowledge_detail))
+        .route(
+            "/v1/admin/knowledge/{id}/reject",
+            post(admin_reject_knowledge),
+        )
         .route(
             "/v1/manifests",
             post(manifests::upload_manifest).get(manifests::list_manifests),
@@ -1511,6 +1528,11 @@ async fn propose_learning(
             evidence: req.evidence,
             proposed_by_sub: payload.actor_sub.clone(),
             proposed_by_azp: payload.actor_azp.clone(),
+            // The human/agent propose path carries no canonical form; the
+            // rejection memory then matches on the exact statement. (The
+            // consolidation worker supplies the canonical form for its stronger
+            // match.)
+            canonical_statement: None,
         })
         .await
         .map(Json)
@@ -1523,19 +1545,142 @@ struct ListKnowledgeParams {
     status: Option<KnowledgeStatus>,
 }
 
-/// Review queue (admin/audit plane — bearer-token gated, task 3).
+/// Review queue (admin/audit plane — bearer-token gated, task 3). Each item
+/// carries status, the ADMIN-exact distinct_entities, the bucketed
+/// support_tier, the judge's merge_reason, and the evidence episode/entity list
+/// (knowledge-merge-tuning.md §5). Exact counts and evidence stay behind the
+/// admin token; agents only ever see the tier on recall hits.
 async fn list_knowledge(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<ListKnowledgeParams>,
-) -> HandlerResult<Json<Vec<KnowledgeItem>>> {
+) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
-    state
+    let items = state
         .storage
         .list_knowledge(p.tenant_id, p.status)
         .await
+        .map_err(internal)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let evidence = state
+            .storage
+            .inner()
+            .knowledge_evidence(p.tenant_id, item.id)
+            .await
+            .map_err(internal)?;
+        out.push(knowledge_admin_json(&item, evidence, None));
+    }
+    Ok(Json(serde_json::json!({ "items": out })))
+}
+
+/// Shared admin serialization: the item's review-surface fields plus its
+/// evidence lineage, and optionally a de-identification gate result.
+fn knowledge_admin_json(
+    item: &KnowledgeItem,
+    evidence: Vec<serde_json::Value>,
+    deid_gate: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": item.id,
+        "statement": item.statement,
+        "categories": item.categories,
+        "status": item.status,
+        // ADMIN-exact — never surfaced to an agent.
+        "distinct_entities": item.distinct_entities,
+        // The bucketed disclosure agents would see.
+        "support_tier": item.support_tier,
+        "episode_count": item.episode_count,
+        "writer_count": item.writer_count,
+        "has_tier1_evidence": item.has_tier1_evidence,
+        "merge_reason": item.merge_reason,
+        "quarantine_reason": item.quarantine_reason,
+        "first_seen": item.first_seen,
+        "last_reinforced": item.last_reinforced,
+        "published_at": item.published_at,
+        "evidence": evidence,
+    });
+    if let Some(gate) = deid_gate {
+        v["deid_gate"] = gate;
+    }
+    v
+}
+
+/// GET /v1/admin/knowledge/{id} — the full review detail for one item
+/// (knowledge-merge-tuning.md §5): status, admin-exact support + tier, the
+/// judge's merge_reason, the de-identification gate result, and the complete
+/// evidence episode/entity list. Bearer-gated.
+async fn admin_knowledge_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    axml_tenant: axum::extract::Query<TenantQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let tenant = axml_tenant.0.tenant_id;
+    let item = state
+        .storage
+        .inner()
+        .knowledge_item(tenant, id)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "no such knowledge item".to_string()))?;
+    let evidence = state
+        .storage
+        .inner()
+        .knowledge_evidence(tenant, id)
+        .await
+        .map_err(internal)?;
+    // De-identification gate result: a quarantined item failed it (reason
+    // recorded); anything past the gate passed it. Deterministic, auditable.
+    let deid_gate = serde_json::json!({
+        "passed": item.status != KnowledgeStatus::Quarantined,
+        "reason": item.quarantine_reason,
+    });
+    Ok(Json(knowledge_admin_json(&item, evidence, Some(deid_gate))))
+}
+
+#[derive(Deserialize)]
+struct TenantQuery {
+    tenant_id: TenantId,
+}
+
+#[derive(Deserialize)]
+struct RejectKnowledgeRequest {
+    tenant_id: TenantId,
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST /v1/admin/knowledge/{id}/reject — a reviewer refuses a candidate/
+/// eligible item. REMEMBERED (knowledge-merge-tuning.md §5): status becomes
+/// 'rejected' with the reason, and the same canonical_statement will not
+/// resurrect as a fresh candidate (enforced in propose_knowledge). Rejecting a
+/// published item is refused — retraction is `forget`'s job. Bearer-gated.
+async fn admin_reject_knowledge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<RejectKnowledgeRequest>,
+) -> HandlerResult<Json<KnowledgeItem>> {
+    state.admin.check(&headers)?;
+    let reason = if req.reason.trim().is_empty() {
+        "rejected by reviewer".to_string()
+    } else {
+        req.reason.trim().to_string()
+    };
+    state
+        .storage
+        .inner()
+        .reject_knowledge(req.tenant_id, id, &reason)
+        .await
+        .map_err(internal)?
         .map(Json)
-        .map_err(internal)
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no candidate/eligible knowledge item with that id (already published/rejected?)"
+                .to_string(),
+        ))
 }
 
 #[derive(Deserialize)]

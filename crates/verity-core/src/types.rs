@@ -206,6 +206,11 @@ pub struct RecallHit {
     pub entity_tags: Vec<String>,
     /// "content" (scoped memory) or "knowledge" (published, entity-free — §7g).
     pub kind: String,
+    /// Bucketed cross-customer support, present ONLY on `kind == "knowledge"`
+    /// hits (knowledge-merge-tuning.md §5): a coarse tier the agent can weight
+    /// by, never an exact count. `None` on ordinary content chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_tier: Option<SupportTier>,
     pub acl_provenance: AclProvenance,
     pub trust_tier: TrustTier,
     pub valid_from: DateTime<Utc>,
@@ -287,8 +292,17 @@ pub enum KnowledgeStatus {
     Candidate,
     /// Failed the gate — held for audit, never retrievable outside audit scopes.
     Quarantined,
+    /// Crossed k-support with auto-publish OFF (the default): reviewed-ready,
+    /// waiting on a human/policy publish. Between `Candidate` and `Published`,
+    /// and NEVER retrievable — publishing is the only thing that mints the §7g
+    /// carve-out chunk (knowledge-merge-tuning.md §5: "publishing is never
+    /// automatic").
+    Eligible,
     /// Broad-visibility semantic memory; retrievable via the §7g carve-out.
     Published,
+    /// A reviewer refused it. Remembered so the same canonical_statement does
+    /// not resurrect as a fresh candidate (§5: "rejection is remembered").
+    Rejected,
     Invalidated,
 }
 
@@ -297,8 +311,47 @@ impl KnowledgeStatus {
         match self {
             Self::Candidate => "candidate",
             Self::Quarantined => "quarantined",
+            Self::Eligible => "eligible",
             Self::Published => "published",
+            Self::Rejected => "rejected",
             Self::Invalidated => "invalidated",
+        }
+    }
+}
+
+/// Bucketed support disclosure (knowledge-merge-tuning.md §5, SPEC §2). A
+/// consuming agent sees a COARSE tier so it can weight published knowledge,
+/// never a false-precision exact count — exact `distinct_entities` stays
+/// admin-only, to blunt membership inference. Derived deterministically from
+/// the distinct-entity support; `< 3` never publishes (the k-support floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportTier {
+    /// 3-4 distinct entities.
+    Emerging,
+    /// 5-9 distinct entities.
+    Established,
+    /// 10+ distinct entities.
+    Extensive,
+}
+
+impl SupportTier {
+    /// Bucket a distinct-entity support count. `None` below the k=3 floor —
+    /// nothing that thin is ever published, so it has no tier to disclose.
+    pub fn from_distinct(distinct: i32) -> Option<Self> {
+        match distinct {
+            d if d >= 10 => Some(Self::Extensive),
+            d if d >= 5 => Some(Self::Established),
+            d if d >= 3 => Some(Self::Emerging),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Emerging => "emerging",
+            Self::Established => "established",
+            Self::Extensive => "extensive",
         }
     }
 }
@@ -315,6 +368,13 @@ pub struct KnowledgeProposal {
     pub evidence: Vec<EpisodeId>,
     pub proposed_by_sub: Option<String>,
     pub proposed_by_azp: Option<String>,
+    /// Normalized canonical form of `statement`, when the caller/extractor has
+    /// one. Stored for the exact-match merge fast path AND checked against the
+    /// rejection memory (§5): a canonical form a reviewer already rejected must
+    /// not resurrect as a fresh candidate. `None` = no canonical form supplied;
+    /// the rejection memory then falls back to exact-statement matching.
+    #[serde(default)]
+    pub canonical_statement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,10 +384,19 @@ pub struct KnowledgeItem {
     pub categories: Vec<String>,
     pub status: KnowledgeStatus,
     pub quarantine_reason: Option<String>,
+    /// Exact distinct-entity support. ADMIN-ONLY: this struct is returned by the
+    /// admin/review surfaces (bearer-gated); the read path never exposes it —
+    /// agents see `support_tier` buckets instead (SPEC §2 membership-inference).
     pub distinct_entities: i32,
+    /// Bucketed disclosure of `distinct_entities` (§5). `None` below the k=3
+    /// floor. Mirrors what a consuming agent would see on a recall hit.
+    pub support_tier: Option<SupportTier>,
     pub episode_count: i32,
     pub writer_count: i32,
     pub has_tier1_evidence: bool,
+    /// The judge's recorded rationale for the last judged merge, when any
+    /// (§5: "no merge is authoritative without the judge's recorded reason").
+    pub merge_reason: Option<String>,
     pub first_seen: DateTime<Utc>,
     pub last_reinforced: DateTime<Utc>,
     pub published_at: Option<DateTime<Utc>>,

@@ -75,6 +75,11 @@ pub(crate) const TAU_BLOCK: f32 = 0.45;
 /// Cap on the blocker candidate set handed to the judge, top-N by cosine. Bounds
 /// the worker's per-candidate LLM-call count (§7 cost mitigation).
 const BLOCKER_CANDIDATE_CAP: i64 = 8;
+/// k-distinct-entity support floor (SPEC v1.3 §2, default k=3). Below this an
+/// item never becomes eligible/published: at k=2 either supporting party could
+/// infer the other's interaction (membership inference). The publish gate
+/// clamps its own k_min to this too.
+const K_SUPPORT_MIN: i32 = 3;
 
 /// SPEC §2 L2: supersession is keyed on NORMALIZED (subject, relation).
 /// Normalization is deterministic: lowercase, trim, collapse whitespace.
@@ -563,10 +568,12 @@ async fn propose_or_merge(
         .map_err(internal)?;
         if let Some((knowledge_id,)) = fast {
             merge_evidence(state, tenant, knowledge_id, &cand.evidence).await?;
+            let promotion = promote_if_eligible(state, tenant, knowledge_id).await?;
             return Ok(serde_json::json!({
                 "knowledge_id": knowledge_id,
                 "merged": true,
                 "merge": "canonical_exact",
+                "promotion": promotion,
             }));
         }
     }
@@ -577,7 +584,13 @@ async fn propose_or_merge(
     // existing knowledge_id here. The server does NOT re-run the judge; it
     // VALIDATES the decision and fails closed to a fresh candidate on anything
     // invalid (wrong tenant, nonexistent, or no longer candidate/published).
-    if let Some(target_id) = cand.merge_into {
+    //
+    // Kill switch (VERITY_KNOWLEDGE_AUTO_MERGE=0, §5): when the judged-merge leg
+    // is disabled, the server ignores merge_into ENTIRELY — only the
+    // canonical-exact fast path above merges, everything else queues as a fresh
+    // candidate for human clustering. Consolidation degrades to assisted, never
+    // a silent judged merge.
+    if let (true, Some(target_id)) = (state.knowledge_auto_merge, cand.merge_into) {
         let valid: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM knowledge
              WHERE tenant_id = $1 AND id = $2 AND status IN ('candidate', 'published')",
@@ -607,11 +620,13 @@ async fn propose_or_merge(
                     .await
                     .map_err(internal)?;
                 }
+                let promotion = promote_if_eligible(state, tenant, knowledge_id).await?;
                 return Ok(serde_json::json!({
                     "knowledge_id": knowledge_id,
                     "merged": true,
                     "merge": "judge",
                     "judge_reason": reason,
+                    "promotion": promotion,
                 }));
             }
             None => {
@@ -632,6 +647,10 @@ async fn propose_or_merge(
     let embedding = state.encode(&cand.statement).await.ok().flatten();
     let vector = embedding.map(pgvector::Vector::from);
 
+    // Pass the canonical form INTO propose: it drives the rejection-memory check
+    // (§5 — a rejected canonical form must not resurrect) and is stored for the
+    // exact-match fast path. propose_knowledge returns the remembered rejected
+    // item unchanged if this canonical/statement was already rejected.
     let item = state
         .storage
         .propose_knowledge(KnowledgeProposal {
@@ -641,30 +660,22 @@ async fn propose_or_merge(
             evidence: cand.evidence.clone(),
             proposed_by_sub: None,
             proposed_by_azp: Some("consolidation-worker".into()),
+            canonical_statement: cand.canonical_statement.clone(),
         })
         .await
         .map_err(internal)?;
-    // Store the canonical form for the exact-match fast path AND the statement
-    // embedding for the BLOCKER's candidate-set query on future candidates. Both
-    // are written on the fresh row (propose_knowledge itself stays canonical-
-    // agnostic — the human statement is its input, matching is a consolidation-
-    // plane concern).
-    if let Some(canon) = cand
-        .canonical_statement
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-    {
-        sqlx::query(
-            "UPDATE knowledge SET canonical_statement = $3 WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant)
-        .bind(item.id)
-        .bind(canon)
-        .execute(state.pool())
-        .await
-        .map_err(internal)?;
+    // A rejected canonical form does not resurrect: propose returned the
+    // remembered row untouched. Report it, do not accrue support onto it.
+    if item.status == verity_core::types::KnowledgeStatus::Rejected {
+        return Ok(serde_json::json!({
+            "knowledge_id": item.id,
+            "merged": false,
+            "status": item.status,
+            "rejected_memory": true,
+        }));
     }
+    // Store the statement embedding for the BLOCKER's candidate-set query on
+    // future candidates (canonical_statement is already persisted by propose).
     if let Some(v) = vector {
         sqlx::query(
             "UPDATE knowledge SET statement_embedding = $3 WHERE tenant_id = $1 AND id = $2",
@@ -676,11 +687,156 @@ async fn propose_or_merge(
         .await
         .map_err(internal)?;
     }
+    let promotion = promote_if_eligible(state, tenant, item.id).await?;
     Ok(serde_json::json!({
         "knowledge_id": item.id,
         "merged": false,
         "status": item.status,
+        "promotion": promotion,
     }))
+}
+
+/// Promotion decision after support accrual (knowledge-merge-tuning.md §5, the
+/// load-bearing promise). A `candidate` that has crossed the k-support floor
+/// (distinct_entities >= K_SUPPORT_MIN) and corroboration becomes:
+///   - `eligible` (auto-publish OFF, the default) — reviewed-ready, WAITING for
+///     a human/policy publish call. It is NOT retrievable; publishing is the
+///     only thing that mints the §7g carve-out chunk.
+///   - auto-published (auto-publish ON, per-tenant opt-in) — promoted through
+///     the SAME publish gate on this background/admin path, using the tenant's
+///     configured default visibility. STILL never on the read path.
+///
+/// Anything not a candidate, or below support, is left untouched. Returns a
+/// small JSON describing what happened, for the complete() response + audit.
+async fn promote_if_eligible(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    knowledge_id: Uuid,
+) -> HandlerResult<serde_json::Value> {
+    // Re-read the freshly-recounted item.
+    let Some(item) = state
+        .storage
+        .inner()
+        .knowledge_item(tenant, knowledge_id)
+        .await
+        .map_err(internal)?
+    else {
+        return Ok(serde_json::json!({ "action": "none" }));
+    };
+    use verity_core::types::KnowledgeStatus;
+    // Only a candidate is promotable; published/eligible/rejected are terminal
+    // for this path. Below k-support (or corroboration) it simply stays a
+    // candidate.
+    if item.status != KnowledgeStatus::Candidate {
+        return Ok(serde_json::json!({ "action": "none", "status": item.status }));
+    }
+    let corroborated = item.writer_count >= 2 || item.has_tier1_evidence;
+    if item.distinct_entities < K_SUPPORT_MIN || !corroborated {
+        return Ok(serde_json::json!({ "action": "none", "status": item.status }));
+    }
+
+    let auto_publish = state
+        .storage
+        .inner()
+        .knowledge_auto_publish(tenant)
+        .await
+        .map_err(internal)?;
+
+    if !auto_publish {
+        // The DEFAULT, OSS-conservative path: mark eligible and WAIT. Never
+        // publishes without a human/policy call.
+        let moved = state
+            .storage
+            .inner()
+            .mark_knowledge_eligible(tenant, knowledge_id)
+            .await
+            .map_err(internal)?;
+        return Ok(serde_json::json!({
+            "action": if moved { "marked_eligible" } else { "none" },
+            "auto_publish": false,
+        }));
+    }
+
+    // Auto-publish is opted IN for this tenant. Promote through the SAME publish
+    // gate (k-support, corroboration, de-id already enforced) on this background
+    // path, using the tenant's configured default visibility. If no default
+    // visibility is configured, we cannot publish safely — fall back to
+    // eligible (fail-safe: never publish to an unknown audience).
+    let visibility = default_publish_visibility(state, tenant).await?;
+    let Some(visibility) = visibility else {
+        let moved = state
+            .storage
+            .inner()
+            .mark_knowledge_eligible(tenant, knowledge_id)
+            .await
+            .map_err(internal)?;
+        tracing::warn!(
+            tenant = %tenant, %knowledge_id,
+            "auto-publish ON but no knowledge_auto_publish_visibility configured; \
+             holding item eligible instead of publishing to an unknown audience"
+        );
+        return Ok(serde_json::json!({
+            "action": if moved { "marked_eligible" } else { "none" },
+            "auto_publish": true,
+            "note": "no default visibility configured; held eligible",
+        }));
+    };
+    let embedding = state.encode(&item.statement).await.ok().flatten();
+    match state
+        .storage
+        .publish_knowledge(tenant, knowledge_id, visibility, K_SUPPORT_MIN, embedding)
+        .await
+    {
+        Ok(published) => Ok(serde_json::json!({
+            "action": "auto_published",
+            "auto_publish": true,
+            "status": published.status,
+        })),
+        Err(e) => {
+            // A gate failure on the auto path is not fatal to the whole
+            // complete() — hold the item as a candidate and surface the reason.
+            tracing::warn!(tenant = %tenant, %knowledge_id, error = %e, "auto-publish gate refused");
+            Ok(serde_json::json!({
+                "action": "auto_publish_refused",
+                "auto_publish": true,
+                "reason": e.to_string(),
+            }))
+        }
+    }
+}
+
+/// The tenant's configured default publish visibility for the auto-publish
+/// path, read from the `knowledge_auto_publish_visibility` setting (a
+/// comma-separated principal-token list, e.g. "7,9"). `None` = unconfigured;
+/// the caller then holds the item eligible rather than publish to an unknown
+/// audience.
+async fn default_publish_visibility(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+) -> HandlerResult<Option<Vec<i32>>> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings
+         WHERE key = 'knowledge_auto_publish_visibility'
+           AND (tenant_id = $1 OR tenant_id IS NULL)
+         ORDER BY tenant_id NULLS LAST
+         LIMIT 1",
+    )
+    .bind(tenant)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(internal)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let tokens: Vec<i32> = value
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i32>().ok())
+        .collect();
+    Ok(if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    })
 }
 
 /// Support accrual: add evidence rows (attribution read from the episodes
@@ -731,6 +887,28 @@ async fn merge_evidence(
     )
     .bind(knowledge_id)
     .bind(tenant)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    // If this item is already PUBLISHED, support accrual may have moved its
+    // bucketed tier (emerging -> established -> extensive). Refresh the tier
+    // stamped on the §7g carve-out chunk so recall's disclosure tracks the
+    // current bucket. Derived from the just-recounted distinct_entities; the
+    // CASE mirrors SupportTier::from_distinct (buckets, never exact counts).
+    sqlx::query(
+        "UPDATE chunks c SET support_tier = CASE
+             WHEN k.distinct_entities >= 10 THEN 'extensive'
+             WHEN k.distinct_entities >= 5  THEN 'established'
+             WHEN k.distinct_entities >= 3  THEN 'emerging'
+             ELSE NULL END
+         FROM knowledge k
+         WHERE k.id = $1 AND k.tenant_id = $2 AND k.status = 'published'
+           AND c.tenant_id = $2 AND c.document_id = $3 AND c.valid_to IS NULL
+           AND c.kind = 'knowledge'",
+    )
+    .bind(knowledge_id)
+    .bind(tenant)
+    .bind(format!("knowledge:{knowledge_id}"))
     .execute(&mut *tx)
     .await
     .map_err(internal)?;

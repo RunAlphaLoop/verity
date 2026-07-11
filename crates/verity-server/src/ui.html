@@ -89,6 +89,15 @@
   .b-conf-1 { color: var(--blue);  border-color: rgba(68,147,248,.5); }
   .b-conf-2 { color: var(--amber); border-color: rgba(210,153,34,.5); }
   .b-conf-3 { color: var(--red);   border-color: rgba(248,81,73,.5); }
+  /* knowledge lifecycle: candidate/eligible neutral, published green,
+     quarantined/rejected/invalidated red, tiers dim. */
+  .b-st-candidate   { color: var(--dim);   border-color: var(--border); }
+  .b-st-eligible    { color: var(--amber); border-color: rgba(210,153,34,.5); background: rgba(210,153,34,.08); }
+  .b-st-published   { color: var(--green); border-color: rgba(63,185,80,.5);  background: rgba(63,185,80,.08); }
+  .b-st-quarantined { color: var(--red);   border-color: rgba(248,81,73,.5);  background: rgba(248,81,73,.08); }
+  .b-st-rejected    { color: var(--red);   border-color: rgba(248,81,73,.5);  background: rgba(248,81,73,.06); }
+  .b-st-invalidated { color: var(--dim);   border-color: rgba(248,81,73,.35); }
+  .b-tier { color: var(--accent); border-color: rgba(88,166,255,.4); background: rgba(88,166,255,.06); }
 
   .kv { display: grid; grid-template-columns: 170px 1fr; gap: 4px 14px; margin-top: 12px; }
   .kv dt { color: var(--dim); }
@@ -233,6 +242,29 @@
     <div class="err" id="connErr"></div>
     <div id="connOut"></div>
   </section>
+
+  <!-- ============ 6. Knowledge review ============ -->
+  <section id="knowledge">
+    <h2>Knowledge review <span class="sub">cross-customer generalizations — never auto-published, human-gated — GET /v1/knowledge</span></h2>
+    <div class="row">
+      <div class="tight">
+        <label for="knowStatus">status</label>
+        <select id="knowStatus">
+          <option value="">all</option>
+          <option value="candidate">candidate</option>
+          <option value="eligible">eligible</option>
+          <option value="published">published</option>
+          <option value="quarantined">quarantined</option>
+          <option value="rejected">rejected</option>
+          <option value="invalidated">invalidated</option>
+        </select>
+      </div>
+      <div class="tight"><button id="knowBtn">Load</button></div>
+    </div>
+    <div class="note">Read-only, like the rest of this inspector. Approve (<em>POST /v1/knowledge/{id}/publish</em>) and reject (<em>POST /v1/admin/knowledge/{id}/reject</em>) are API/CLI actions — a publish is never automatic on the read path. Support tiers are buckets (emerging 3–4 · established 5–9 · extensive 10+); exact distinct-entity counts are shown here to admins only.</div>
+    <div class="err" id="knowErr"></div>
+    <div id="knowOut"></div>
+  </section>
 </div>
 
 <script>
@@ -240,7 +272,9 @@
 /* Read-only inspector: the only verbs this page ever calls are
    POST /v1/recall (a scoped read), GET /v1/briefs, GET /v1/activity,
    GET /v1/admin/quarantine, GET /v1/admin/audit, GET /v1/slo/freshness,
-   GET /v1/admin/connector-status. Nothing here mutates state. */
+   GET /v1/admin/connector-status, GET /v1/knowledge. Nothing here mutates
+   state — knowledge approve/reject are documented as API/CLI actions, keeping
+   this page a pure inspector. */
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g,
@@ -548,6 +582,54 @@ $("connBtn").onclick = async () => {
         "</tbody></table></div>"
       : '<div class="empty">no connector heartbeats for this tenant yet</div>';
   } catch (e) { setErr("connErr", e); }
+};
+
+/* ---------- 6. knowledge review ---------- */
+
+const KNOWN_STATUS = ["candidate", "eligible", "published", "quarantined", "rejected", "invalidated"];
+function statusBadge(s) {
+  const name = String(s || "").toLowerCase();
+  const cls = KNOWN_STATUS.includes(name) ? "b-st-" + name : "b-kind";
+  return '<span class="badge ' + cls + '">' + esc(name || "—") + "</span>";
+}
+/* Support tier is a BUCKET (never an exact count to agents); the exact
+   distinct-entity count is admin-only and shown separately here. */
+function tierBadge(t) {
+  if (!t) return '<span class="badge b-trust">no tier</span>';
+  return '<span class="badge b-tier">tier: ' + esc(String(t)) + "</span>";
+}
+
+$("knowBtn").onclick = async () => {
+  clearErr("knowErr"); $("knowOut").innerHTML = "";
+  const tenant = requireTenant("knowErr");
+  if (!tenant) return;
+  const status = $("knowStatus").value;
+  let url = "/v1/knowledge?tenant_id=" + encodeURIComponent(tenant);
+  if (status) url += "&status=" + encodeURIComponent(status);
+  try {
+    const res = await api(url, { headers: adminHeaders() });
+    const items = (res && res.items) || [];
+    $("knowOut").innerHTML = items.length
+      ? '<div class="tablewrap"><table><thead><tr>' +
+        "<th>status</th><th>statement</th><th>support</th><th class=\"num\">entities (admin)</th>" +
+        "<th class=\"num\">writers</th><th>merge reason</th><th class=\"num\">evidence</th>" +
+        "</tr></thead><tbody>" +
+        items.map(it => {
+          const cats = (it.categories || []).map(c => '<span class="badge b-kind">' + esc(c) + "</span>").join("");
+          const evCount = (it.evidence || []).length;
+          return "<tr><td>" + statusBadge(it.status) +
+            "</td><td>" + esc(it.statement || "") + (cats ? "<div style=\"margin-top:4px\">" + cats + "</div>" : "") +
+            "</td><td>" + tierBadge(it.support_tier) +
+              (it.has_tier1_evidence ? ' <span class="badge b-trust">tier-1 evidence</span>' : "") +
+            '</td><td class="num">' + esc(it.distinct_entities ?? "—") +
+            '</td><td class="num">' + esc(it.writer_count ?? "—") +
+            "</td><td>" + (it.merge_reason ? esc(it.merge_reason) :
+                (it.quarantine_reason ? '<span class="badge b-st-quarantined">gate</span> ' + esc(it.quarantine_reason) : "—")) +
+            '</td><td class="num">' + evCount + "</td></tr>";
+        }).join("") +
+        "</tbody></table></div>"
+      : '<div class="empty">no knowledge items for this tenant / status</div>';
+  } catch (e) { setErr("knowErr", e); }
 };
 </script>
 </body>

@@ -264,7 +264,7 @@ async fn poll_chunks(
     since: DateTime<Utc>,
 ) -> HandlerResult<Vec<(RecallHit, DateTime<Utc>)>> {
     let rows = sqlx::query(
-        "SELECT id, document_id, seq, content, entity_tags, kind, acl_provenance, trust_tier,
+        "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier,
                 valid_from, provenance, recorded_at
          FROM chunks
          WHERE tenant_id = $1
@@ -345,6 +345,16 @@ fn row_to_hit(row: &PgRow) -> HandlerResult<RecallHit> {
         score: 0.0,
         entity_tags: row.try_get("entity_tags").map_err(internal)?,
         kind: row.try_get("kind").map_err(internal)?,
+        support_tier: row
+            .try_get::<Option<String>, _>("support_tier")
+            .ok()
+            .flatten()
+            .and_then(|s| match s.as_str() {
+                "emerging" => Some(verity_core::types::SupportTier::Emerging),
+                "established" => Some(verity_core::types::SupportTier::Established),
+                "extensive" => Some(verity_core::types::SupportTier::Extensive),
+                _ => None,
+            }),
         acl_provenance: AclProvenance::from_str_lossy(
             &row.try_get::<String, _>("acl_provenance")
                 .map_err(internal)?,

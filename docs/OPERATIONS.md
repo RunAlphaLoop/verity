@@ -303,11 +303,15 @@ admin token rides `--admin-token` or `$VERITY_ADMIN_TOKEN`.
   that adding a tag WIDENS what entity-bound scopes can retrieve, which is why
   the default posture is human review.
 - **Knowledge candidates** go through the existing propose_knowledge gate,
-  after a similarity-merge check: a statement matching an existing
-  candidate/published item (normalized-exact, or statement-embedding cosine >=
-  `VERITY_KNOWLEDGE_MERGE_THRESHOLD`, default 0.85) accrues its evidence onto
-  that item — support accrual across scoped sessions — instead of minting a
-  duplicate. Publishing still requires the k-support/review gates.
+  after the Phase-2 merge cascade (`knowledge-merge-tuning.md` §2): a candidate
+  accrues its evidence onto an existing item ONLY via (1) the deterministic
+  **canonical-exact** fast path (byte-identical `canonical_statement`, no
+  embedding/LLM cost) or (2) a worker-supplied **judged** `merge_into` the
+  server validates and records (with its reason). The old bare cosine
+  auto-merge (τ=0.85) is **removed** — a false merge fabricates cross-customer
+  support. On crossing k-support the item becomes **eligible** (auto-publish
+  OFF, the default) or is auto-published through the gate (opt-in). See
+  "Knowledge consolidation: trust & controls" below for the full control set.
 
 ### Extractors
 
@@ -318,3 +322,109 @@ marker ("always", "consistently", "customers … tend"). `AnthropicExtractor`
 is the LLM seam behind `ANTHROPIC_API_KEY` (Messages API, strict-JSON
 structured outputs); without the key it refuses to construct and the
 deterministic extractor is the honest fallback.
+
+## Knowledge consolidation: trust & controls (v0.3, Phase 3)
+
+Auto-derived, cross-customer knowledge is the most trust-sensitive thing
+Verity does — the knowledge layer is how the organization *learns across
+customers without one customer's specifics reaching another*. This section is
+the operator/buyer-facing statement of the controls (design:
+`docs/design/knowledge-merge-tuning.md` §5). Everything here is enforced in
+code and covered by DSN-gated tests.
+
+### What is never automatic (the load-bearing promises)
+
+1. **Publishing is never automatic on the read path.** Merging only accrues
+   *candidate* support. Crossing k-support (≥3 distinct entities, default) makes
+   an item **eligible for review** — a new `eligible` status between `candidate`
+   and `published` — not published. Nothing an agent reads is ever the trigger
+   for a publish.
+2. **Auto-publish is opt-in, default OFF.** With the default posture, an
+   eligible item **waits** for a human (or an explicitly configured policy) to
+   call the publish endpoint. `POST /v1/knowledge/{id}/publish` (admin bearer)
+   stays the human gate; it enforces k-support + corroboration + de-id before it
+   mints the retrievable §7g carve-out chunk. **The OSS build ships OFF.**
+3. **No judged merge is authoritative without the judge's recorded reason.**
+   Every worker-judged merge stores the LLM's rationale (`merge_reason`) and is
+   auditable/reversible; the deterministic canonical-exact merge needs no judge.
+
+### Auto-publish opt-in (per tenant)
+
+Auto-publish is a per-tenant setting in the `settings` table (key
+`knowledge_auto_publish`, absent = OFF):
+
+```
+-- opt a tenant in (background/admin path may then auto-publish through the gate)
+INSERT INTO settings (tenant_id, key, value)
+VALUES ('<tenant-uuid>', 'knowledge_auto_publish', 'true')
+ON CONFLICT (COALESCE(tenant_id,'00000000-0000-0000-0000-000000000000'::uuid), key)
+DO UPDATE SET value = 'true';
+
+-- the audience auto-publish uses (required when ON; comma-separated principal tokens)
+INSERT INTO settings (tenant_id, key, value)
+VALUES ('<tenant-uuid>', 'knowledge_auto_publish_visibility', '7,9') ...;
+```
+
+When ON, a candidate that crosses **all** gates (k-support, corroboration,
+de-id) is promoted through the **same** publish gate on the async worker/admin
+path — **still never on the read path**. If no default visibility is configured,
+the item is held `eligible` rather than published to an unknown audience
+(fail-safe). When OFF (the default), it becomes `eligible` and waits.
+
+### Kill switch — `VERITY_KNOWLEDGE_AUTO_MERGE`
+
+Default ON. Set to `0` to disable the worker-judged merge leg entirely: the
+server then **ignores worker-supplied `merge_into`**, and only the deterministic
+canonical-exact fast path can merge. Consolidation degrades to
+assisted/human-clustered — candidates queue for human review — **never a silent
+judged merge**. A false merge fabricates cross-customer support (the governing
+asymmetry: a false merge is far worse than a missed one), so this is the
+emergency stop for the semantic-merge leg. The canonical-exact merge and every
+gate keep working under the kill switch.
+
+### Support-tier disclosure (buckets, never exact counts)
+
+Published/eligible items carry a **bucketed support tier**, derived from the
+distinct-entity count:
+
+| tier | distinct entities |
+|---|---|
+| `emerging` | 3–4 |
+| `established` | 5–9 |
+| `extensive` | 10+ |
+
+A consuming agent sees only the **tier** on `kind=knowledge` recall hits
+(`support_tier`), so it can weight the knowledge without a false precision.
+**Exact `distinct_entities` counts are admin-only** — they appear on the
+admin review surfaces (`GET /v1/knowledge`, `GET /v1/admin/knowledge/{id}`) but
+never on a scoped recall hit, to blunt membership inference (SPEC §2). The tier
+on the carve-out chunk is recomputed as support accrues (emerging → established
+→ extensive).
+
+### Review surfaces (admin bearer-gated)
+
+- `GET /v1/knowledge?tenant_id=&status=` — the review queue. Per item: status,
+  admin-exact `distinct_entities`, bucketed `support_tier`, the judge's
+  `merge_reason`, corroboration signals, and the evidence episode/entity list.
+- `GET /v1/admin/knowledge/{id}?tenant_id=` — full detail for one item: the
+  above plus the **de-identification gate result** (passed + reason).
+- `POST /v1/admin/knowledge/{id}/reject {tenant_id, reason}` — a reviewer
+  refuses a candidate/eligible item. **Rejection is remembered:** status becomes
+  `rejected` and the same `canonical_statement` will not resurface as a fresh
+  candidate — the propose path returns the remembered rejected row unchanged.
+  (Rejecting a *published* item is refused; retraction is `memory.forget`'s job,
+  which runs the k-support recount + auto-invalidation cascade.)
+- The read-only `/ui` "Knowledge review" panel lists candidates/eligible/
+  published with status badge, support tier, merge reason, and evidence count.
+  It is a pure inspector — approve/reject are documented API/CLI actions, never
+  buttons on the page.
+
+### The one-paragraph stance for a security review
+
+*Verity learns patterns across your customers but never lets one customer's
+specifics reach another. Generalizations are de-identified deterministically,
+must be independently supported by ≥3 distinct customers, are judged for
+sameness by a model whose reasoning is recorded and auditable, and are never
+published without human approval — which is off by default. A wrong
+generalization is structurally harder to publish than a real one is, and both
+are fully reversible.*
