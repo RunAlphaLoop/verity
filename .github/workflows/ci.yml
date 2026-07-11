@@ -32,7 +32,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace
       # Integration suite incl. the scope-soundness fuzzer (SPEC §7e): any
-      # cross-scope result on any read path fails the build.
+      # cross-scope result on any read path fails the build. Also the ER
+      # precision gate (design §8/§9E): resolution_precision_fuzz +
+      # resolution_precision_gate (pure, ≥0.99 precision / 0.0 false-merge-rate)
+      # and resolution_scope_fuzz (DSN; a mis-linked entity surfacing across
+      # scope handles fails the build).
       - run: cargo test --workspace
         env:
           VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
