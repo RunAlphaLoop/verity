@@ -6,8 +6,10 @@ mod cache;
 mod crypto;
 mod erasure;
 mod postgres;
+pub mod resolve;
 
 pub use cache::CachedAdapter;
 pub use crypto::Kek;
 pub use erasure::ErasureReport;
 pub use postgres::PostgresAdapter;
+pub use resolve::{fold, refold_incremental, FoldConfig, FoldPlan};

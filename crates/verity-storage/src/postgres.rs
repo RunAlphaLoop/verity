@@ -398,6 +398,369 @@ impl PostgresAdapter {
         Ok(canonical)
     }
 
+    // ---------- entity-resolution evidence ledger + fold output (§4.1) --------
+    //
+    // These are the WORKER-PLANE writers/readers that PRODUCE the rows the §7f
+    // read path (merged_record / load_precedence / the entity_tags pre-filter)
+    // already consumes. The read path is untouched: the fold (S4) reuses
+    // `upsert_entity_alias` (:302) and `resolve_canonical` (:382); these methods
+    // only add the append-only ledger, its config, and the materialized
+    // `entity_link_meta` badge. Invalidate-don't-delete throughout.
+
+    /// Append one piece of evidence to the ledger (§4.1). Stamps a fresh
+    /// `evidence_id` and returns the persisted row. Append-only — this NEVER
+    /// updates or deletes an existing row; retraction is `retract_evidence`.
+    pub async fn insert_evidence(&self, ev: EvidenceWrite) -> Result<EvidenceRow> {
+        let row = sqlx::query(
+            "INSERT INTO entity_evidence
+                 (evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                  key_value, key_namespace, score, evidence_l0_ref, polarity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                       key_value, key_namespace, score, evidence_l0_ref, polarity,
+                       valid_from, valid_to, superseded_by",
+        )
+        .bind(Uuid::now_v7())
+        .bind(ev.tenant_id)
+        .bind(&ev.left_ref)
+        .bind(&ev.right_ref)
+        .bind(ev.tier)
+        .bind(&ev.method)
+        .bind(&ev.key_value)
+        .bind(&ev.key_namespace)
+        .bind(ev.score)
+        .bind(&ev.evidence_l0_ref)
+        .bind(ev.polarity)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row_to_evidence(&row)
+    }
+
+    /// Retract a live evidence row (§3.3 invalidate-don't-delete): stamps
+    /// `valid_to = now()` (and optionally `superseded_by` to chain to a
+    /// replacement row) so the fold stops reading it, WITHOUT deleting — the
+    /// audit trail of "what we once believed and why we stopped" survives.
+    /// Only affects a currently-live row (`valid_to IS NULL`); returns the
+    /// number of rows retracted (0 if already retracted / not found).
+    pub async fn retract_evidence(
+        &self,
+        tenant: TenantId,
+        evidence_id: Uuid,
+        superseded_by: Option<Uuid>,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE entity_evidence
+                SET valid_to = now(), superseded_by = COALESCE($3, superseded_by)
+              WHERE tenant_id = $1 AND evidence_id = $2 AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(evidence_id)
+        .bind(superseded_by)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// All LIVE evidence (`valid_to IS NULL`) touching any of `refs` on either
+    /// side (§4.2 S4 step 1). This is the fold's neighborhood read: pass a
+    /// component's member refs, get back every live positive/anti-link edge that
+    /// bears on it. Ordered deterministically for a reproducible fold.
+    pub async fn live_evidence_for_refs(
+        &self,
+        tenant: TenantId,
+        refs: &[String],
+    ) -> Result<Vec<EvidenceRow>> {
+        let rows = sqlx::query(
+            "SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                    key_value, key_namespace, score, evidence_l0_ref, polarity,
+                    valid_from, valid_to, superseded_by
+               FROM entity_evidence
+              WHERE tenant_id = $1
+                AND valid_to IS NULL
+                AND (left_ref = ANY($2) OR right_ref = ANY($2))
+              ORDER BY valid_from, evidence_id",
+        )
+        .bind(tenant)
+        .bind(refs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_evidence).collect()
+    }
+
+    /// Read the key-quality config for a `(key_kind, key_namespace)`, falling
+    /// back to `EntityResolutionConfig::defaults` when the tenant has no row
+    /// (§4.1). Fail-closed-friendly: producers always get a usable policy.
+    pub async fn read_resolution_config(
+        &self,
+        tenant: TenantId,
+        key_kind: &str,
+        key_namespace: &str,
+    ) -> Result<EntityResolutionConfig> {
+        let row = sqlx::query(
+            "SELECT key_kind, key_namespace, eligible_as_edge, denylist_values,
+                    min_independent_keys, auto_merge_tier1, auto_link_tier3,
+                    tau_nil, margin_delta, component_size_cap
+               FROM entity_resolution_config
+              WHERE tenant_id = $1 AND key_kind = $2 AND key_namespace = $3",
+        )
+        .bind(tenant)
+        .bind(key_kind)
+        .bind(key_namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            None => Ok(EntityResolutionConfig::defaults(
+                tenant,
+                key_kind,
+                key_namespace,
+            )),
+            Some(r) => Ok(EntityResolutionConfig {
+                tenant_id: tenant,
+                key_kind: r.try_get("key_kind").map_err(db_err)?,
+                key_namespace: r.try_get("key_namespace").map_err(db_err)?,
+                eligible_as_edge: r.try_get("eligible_as_edge").map_err(db_err)?,
+                denylist_values: r.try_get("denylist_values").map_err(db_err)?,
+                min_independent_keys: r.try_get("min_independent_keys").map_err(db_err)?,
+                auto_merge_tier1: r.try_get("auto_merge_tier1").map_err(db_err)?,
+                auto_link_tier3: r.try_get("auto_link_tier3").map_err(db_err)?,
+                tau_nil: r.try_get("tau_nil").map_err(db_err)?,
+                margin_delta: r.try_get("margin_delta").map_err(db_err)?,
+                component_size_cap: r.try_get("component_size_cap").map_err(db_err)?,
+            }),
+        }
+    }
+
+    /// Upsert (admin plane) the key-quality config for a `(key_kind,
+    /// key_namespace)` (§4.1). Idempotent on the primary key.
+    pub async fn write_resolution_config(&self, cfg: &EntityResolutionConfig) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO entity_resolution_config
+                 (tenant_id, key_kind, key_namespace, eligible_as_edge,
+                  denylist_values, min_independent_keys, auto_merge_tier1,
+                  auto_link_tier3, tau_nil, margin_delta, component_size_cap)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (tenant_id, key_kind, key_namespace) DO UPDATE SET
+                 eligible_as_edge     = EXCLUDED.eligible_as_edge,
+                 denylist_values      = EXCLUDED.denylist_values,
+                 min_independent_keys = EXCLUDED.min_independent_keys,
+                 auto_merge_tier1     = EXCLUDED.auto_merge_tier1,
+                 auto_link_tier3      = EXCLUDED.auto_link_tier3,
+                 tau_nil              = EXCLUDED.tau_nil,
+                 margin_delta         = EXCLUDED.margin_delta,
+                 component_size_cap   = EXCLUDED.component_size_cap",
+        )
+        .bind(cfg.tenant_id)
+        .bind(&cfg.key_kind)
+        .bind(&cfg.key_namespace)
+        .bind(cfg.eligible_as_edge)
+        .bind(&cfg.denylist_values)
+        .bind(cfg.min_independent_keys)
+        .bind(cfg.auto_merge_tier1)
+        .bind(cfg.auto_link_tier3)
+        .bind(cfg.tau_nil)
+        .bind(cfg.margin_delta)
+        .bind(cfg.component_size_cap)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Upsert one materialized fold-output badge row (§4.1, §4.3). Idempotent on
+    /// `(tenant, subject_kind, subject_ref, canonical_entity)` — re-folding a
+    /// component overwrites the confidence/method/justifying-evidence in place.
+    /// This is a DERIVED view the read path may see; it is never the source of
+    /// truth (that is `entity_evidence`).
+    pub async fn upsert_entity_link_meta(&self, meta: &EntityLinkMeta) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO entity_link_meta
+                 (tenant_id, subject_kind, subject_ref, canonical_entity,
+                  confidence, strongest_method, justifying_evidence,
+                  evidence_count, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+             ON CONFLICT (tenant_id, subject_kind, subject_ref, canonical_entity)
+             DO UPDATE SET
+                 confidence          = EXCLUDED.confidence,
+                 strongest_method    = EXCLUDED.strongest_method,
+                 justifying_evidence = EXCLUDED.justifying_evidence,
+                 evidence_count      = EXCLUDED.evidence_count,
+                 updated_at          = now()",
+        )
+        .bind(meta.tenant_id)
+        .bind(&meta.subject_kind)
+        .bind(&meta.subject_ref)
+        .bind(&meta.canonical_entity)
+        .bind(&meta.confidence)
+        .bind(&meta.strongest_method)
+        .bind(&meta.justifying_evidence)
+        .bind(meta.evidence_count)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Materialize the fold's chunk-tag decision (§4.3 item 2, §5): set the
+    /// current chunk version's `entity_tags` to `tags`. This is the fold's sole
+    /// path from `entity_aliases`/evidence to the read-time `entity_tags`
+    /// pre-filter — closing the documented alias→tag gap (§2.1). It targets the
+    /// LIVE chunk version (`valid_to IS NULL`) by `(source, document_id, seq)`
+    /// and never mutates L0 or history. Returns rows affected. The read-time
+    /// pre-filter (postgres.rs:665) is unchanged; only the stored tag set moves.
+    pub async fn chunk_entity_tags_upsert(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        seq: i32,
+        tags: &[String],
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE chunks SET entity_tags = $5
+              WHERE tenant_id = $1 AND source = $2 AND document_id = $3
+                AND seq = $4 AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .bind(seq)
+        .bind(tags)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // Entity tags are the lineage key for briefs (§2 L3): a tag change marks
+        // the affected entities' briefs stale, same as upsert_chunks does.
+        if res.rows_affected() > 0 {
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+            mark_briefs_stale_tx(&mut tx, tenant, tags).await?;
+            tx.commit().await.map_err(db_err)?;
+        }
+        Ok(res.rows_affected())
+    }
+
+    /// All LIVE evidence (`valid_to IS NULL`) for a tenant (§4.2 S4). The
+    /// materializer's full-fold read: pass to `fold` to re-materialize the whole
+    /// tenant. Deterministically ordered (matches `live_evidence_for_refs`).
+    pub async fn all_live_evidence(&self, tenant: TenantId) -> Result<Vec<EvidenceRow>> {
+        let rows = sqlx::query(
+            "SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                    key_value, key_namespace, score, evidence_l0_ref, polarity,
+                    valid_from, valid_to, superseded_by
+               FROM entity_evidence
+              WHERE tenant_id = $1 AND valid_to IS NULL
+              ORDER BY valid_from, evidence_id",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_evidence).collect()
+    }
+
+    /// Read the `entity_link_meta` badge for a canonical entity's alias-membership
+    /// (§4.3 item 3). Returns the single `subject_kind='alias_member'` row that
+    /// carries the confidence + strongest_method the read path surfaces on the
+    /// merged-entity response. `None` when the canonical has no materialized badge
+    /// (an unmapped / admin-only entity — the read still works, just unbadged).
+    /// This is a DERIVED read, no LLM/ReBAC — read-path safe.
+    pub async fn link_meta_for_canonical(
+        &self,
+        tenant: TenantId,
+        canonical: &str,
+    ) -> Result<Option<EntityLinkMeta>> {
+        let row = sqlx::query(
+            "SELECT subject_kind, subject_ref, canonical_entity, confidence,
+                    strongest_method, justifying_evidence, evidence_count
+               FROM entity_link_meta
+              WHERE tenant_id = $1 AND canonical_entity = $2
+                AND subject_kind = 'alias_member'
+              ORDER BY evidence_count DESC, subject_ref
+              LIMIT 1",
+        )
+        .bind(tenant)
+        .bind(canonical)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(EntityLinkMeta {
+                tenant_id: tenant,
+                subject_kind: r.try_get("subject_kind").map_err(db_err)?,
+                subject_ref: r.try_get("subject_ref").map_err(db_err)?,
+                canonical_entity: r.try_get("canonical_entity").map_err(db_err)?,
+                confidence: r.try_get("confidence").map_err(db_err)?,
+                strongest_method: r.try_get("strongest_method").map_err(db_err)?,
+                justifying_evidence: r.try_get("justifying_evidence").map_err(db_err)?,
+                evidence_count: r.try_get("evidence_count").map_err(db_err)?,
+            })),
+        }
+    }
+
+    /// The review queue (§4.1, §4.3): live Tier-2/Tier-3 evidence that never
+    /// auto-forms an edge (Tier-2 awaits `human_confirmed`; Tier-3 never merges).
+    /// A read-only view over `entity_evidence` — empty in the MVP (no Tier-2/3
+    /// producers ship yet) but fully wired so the admin surface exists. Newest
+    /// first, capped.
+    pub async fn review_queue(&self, tenant: TenantId, limit: i64) -> Result<Vec<EvidenceRow>> {
+        let rows = sqlx::query(
+            "SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                    key_value, key_namespace, score, evidence_l0_ref, polarity,
+                    valid_from, valid_to, superseded_by
+               FROM entity_evidence
+              WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
+              ORDER BY valid_from DESC, evidence_id
+              LIMIT $2",
+        )
+        .bind(tenant)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_evidence).collect()
+    }
+
+    /// List all key-quality config rows for a tenant (admin plane, §4.1). The GET
+    /// side of the config CRUD; `write_resolution_config` is the PUT side.
+    pub async fn list_resolution_config(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<EntityResolutionConfig>> {
+        let rows = sqlx::query(
+            "SELECT key_kind, key_namespace, eligible_as_edge, denylist_values,
+                    min_independent_keys, auto_merge_tier1, auto_link_tier3,
+                    tau_nil, margin_delta, component_size_cap
+               FROM entity_resolution_config
+              WHERE tenant_id = $1
+              ORDER BY key_kind, key_namespace",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(EntityResolutionConfig {
+                    tenant_id: tenant,
+                    key_kind: r.try_get("key_kind").map_err(db_err)?,
+                    key_namespace: r.try_get("key_namespace").map_err(db_err)?,
+                    eligible_as_edge: r.try_get("eligible_as_edge").map_err(db_err)?,
+                    denylist_values: r.try_get("denylist_values").map_err(db_err)?,
+                    min_independent_keys: r.try_get("min_independent_keys").map_err(db_err)?,
+                    auto_merge_tier1: r.try_get("auto_merge_tier1").map_err(db_err)?,
+                    auto_link_tier3: r.try_get("auto_link_tier3").map_err(db_err)?,
+                    tau_nil: r.try_get("tau_nil").map_err(db_err)?,
+                    margin_delta: r.try_get("margin_delta").map_err(db_err)?,
+                    component_size_cap: r.try_get("component_size_cap").map_err(db_err)?,
+                })
+            })
+            .collect()
+    }
+
     /// The cross-source merged entity view (SPEC §7f). Gathers every current
     /// fact (`valid_to IS NULL`) across all (source, entity_id) members aliased
     /// to `canonical`, then resolves each field to the value of the
@@ -2113,6 +2476,25 @@ fn precedence_rank(order: &[String], source: &str) -> usize {
         .iter()
         .position(|s| s == source)
         .unwrap_or(order.len())
+}
+
+fn row_to_evidence(row: &PgRow) -> Result<EvidenceRow> {
+    Ok(EvidenceRow {
+        evidence_id: row.try_get("evidence_id").map_err(db_err)?,
+        tenant_id: row.try_get("tenant_id").map_err(db_err)?,
+        left_ref: row.try_get("left_ref").map_err(db_err)?,
+        right_ref: row.try_get("right_ref").map_err(db_err)?,
+        tier: row.try_get("tier").map_err(db_err)?,
+        method: row.try_get("method").map_err(db_err)?,
+        key_value: row.try_get("key_value").map_err(db_err)?,
+        key_namespace: row.try_get("key_namespace").map_err(db_err)?,
+        score: row.try_get("score").map_err(db_err)?,
+        evidence_l0_ref: row.try_get("evidence_l0_ref").map_err(db_err)?,
+        polarity: row.try_get("polarity").map_err(db_err)?,
+        valid_from: row.try_get("valid_from").map_err(db_err)?,
+        valid_to: row.try_get("valid_to").map_err(db_err)?,
+        superseded_by: row.try_get("superseded_by").map_err(db_err)?,
+    })
 }
 
 fn row_to_fact(row: &PgRow) -> Result<FactRow> {

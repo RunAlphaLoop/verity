@@ -25,6 +25,7 @@ mod media;
 mod media_tests;
 mod purpose;
 mod rebac;
+mod resolver;
 mod revocation;
 mod scope;
 mod slo;
@@ -282,6 +283,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/entities/{canonical}", get(get_merged_entity))
         .route("/v1/admin/entity-aliases", post(admin_entity_aliases))
         .route("/v1/admin/entity-precedence", post(admin_entity_precedence))
+        .route("/v1/admin/entity-evidence", post(admin_evidence_insert))
+        .route(
+            "/v1/admin/entity-evidence/retract",
+            post(admin_evidence_retract),
+        )
+        .route(
+            "/v1/admin/entity-resolution-config",
+            get(admin_resolution_config_get).put(admin_resolution_config_put),
+        )
+        .route("/v1/admin/entity-resolution/fold", post(admin_trigger_fold))
+        .route(
+            "/v1/admin/entity-resolution/review-queue",
+            get(admin_review_queue),
+        )
         .route("/v1/episodes", post(remember))
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
@@ -669,22 +684,73 @@ struct MergedRecordQuery {
     scope_handle: String,
 }
 
+/// The `entity_link_meta` confidence badge (§4.3 item 3) surfaced on the merged
+/// entity response. **Additive metadata only** — it does NOT touch
+/// `merged_record`'s field-resolution logic. The badge is a read-only projection
+/// of the materialized `entity_link_meta` alias-member row: how the canonical was
+/// linked (`deterministic` / `human_confirmed` / `approximated`), by which
+/// strongest method, and how deeply corroborated. Absent when the canonical has
+/// no materialized badge (an admin-only / unmapped entity) — the merged record
+/// still serves, just unbadged.
+#[derive(Debug, serde::Serialize)]
+struct ConfidenceBadge {
+    confidence: String,
+    strongest_method: Option<String>,
+    evidence_count: i16,
+}
+
+/// The merged-entity response: the UNCHANGED `MergedRecord` plus the additive
+/// badge. `merged` is flattened so existing clients that read `.fields` /
+/// `.members` / `.canonical_entity` are byte-for-byte unaffected; `badge` is a
+/// new sibling field they can ignore. `Deref` to `MergedRecord` lets callers
+/// reach the merged fields directly (`resp.canonical_entity`) — the badge is
+/// purely additive, it never shadows or rewrites `merged_record`'s output.
+#[derive(Debug, serde::Serialize)]
+struct MergedEntityResponse {
+    #[serde(flatten)]
+    merged: MergedRecord,
+    /// The confidence badge, or `null` when no `entity_link_meta` row exists.
+    badge: Option<ConfidenceBadge>,
+}
+
+impl std::ops::Deref for MergedEntityResponse {
+    type Target = MergedRecord;
+    fn deref(&self) -> &MergedRecord {
+        &self.merged
+    }
+}
+
 /// GET /v1/entities/{canonical} (scope-handle gated): the merged cross-source
-/// entity view (SPEC §7f). Scoping matches get_record exactly — a tenant-scoped
-/// L1 read gated at the tenant level by the scope handle; fail-closed (401) on
-/// a bad handle. No per-field visibility is invented here (get_record has none).
+/// entity view (SPEC §7f) + the additive §4.3 confidence badge. Scoping matches
+/// get_record exactly — a tenant-scoped L1 read gated at the tenant level by the
+/// scope handle; fail-closed (401) on a bad handle. No per-field visibility is
+/// invented here (get_record has none). ZERO LLM, ZERO live ReBAC, ZERO fold: the
+/// badge is a plain read of the pre-materialized `entity_link_meta` row.
 async fn get_merged_entity(
     State(state): State<Arc<AppState>>,
     Path(canonical): Path<String>,
     axum::extract::Query(q): axum::extract::Query<MergedRecordQuery>,
-) -> HandlerResult<Json<MergedRecord>> {
+) -> HandlerResult<Json<MergedEntityResponse>> {
     let payload = state.verify_scope(&q.scope_handle)?;
+    // Field-resolution is untouched: merged_record runs exactly as before.
     let merged = state
         .storage
         .inner()
         .merged_record(payload.tenant_id, &canonical)
         .await
         .map_err(internal)?;
+    // Additive: read the pre-materialized badge (None => unbadged, still serves).
+    let badge = state
+        .storage
+        .inner()
+        .link_meta_for_canonical(payload.tenant_id, &canonical)
+        .await
+        .map_err(internal)?
+        .map(|m| ConfidenceBadge {
+            confidence: m.confidence,
+            strongest_method: m.strongest_method,
+            evidence_count: m.evidence_count,
+        });
     spawn_audit(
         &state,
         &payload,
@@ -696,7 +762,195 @@ async fn get_merged_entity(
             .map(|f| f.provenance)
             .collect::<Vec<_>>(),
     );
-    Ok(Json(merged))
+    Ok(Json(MergedEntityResponse { merged, badge }))
+}
+
+// ---------- entity-resolution evidence ledger + fold (worker/admin plane, §4,
+// §9 Group D). All admin-token gated, mirroring admin_entity_aliases. These
+// write/read the append-only ledger + config + trigger the materializer; NONE of
+// them is on the read path. ----------
+
+#[derive(Deserialize)]
+struct EvidenceInsertRequest {
+    tenant_id: TenantId,
+    left_ref: String,
+    right_ref: String,
+    tier: i16,
+    method: String,
+    #[serde(default)]
+    key_value: Option<String>,
+    #[serde(default)]
+    key_namespace: Option<String>,
+    #[serde(default)]
+    score: Option<f32>,
+    #[serde(default)]
+    evidence_l0_ref: Option<String>,
+    /// +1 = link (default), -1 = anti-link (a human "these are NOT the same").
+    #[serde(default = "default_polarity")]
+    polarity: i16,
+}
+
+fn default_polarity() -> i16 {
+    1
+}
+
+/// POST /v1/admin/entity-evidence (admin): append one piece of evidence to the
+/// ledger (§4.1). Append-only — never updates/deletes. Returns the persisted row
+/// (with its stamped `evidence_id`). This is how an admin crosswalk, a Tier-1
+/// producer, or a `human_confirmed`/anti-link decision reaches the ledger; the
+/// fold picks it up on the next materialize.
+async fn admin_evidence_insert(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<EvidenceInsertRequest>,
+) -> HandlerResult<Json<EvidenceRow>> {
+    state.admin.check(&headers)?;
+    let row = state
+        .storage
+        .inner()
+        .insert_evidence(EvidenceWrite {
+            tenant_id: req.tenant_id,
+            left_ref: req.left_ref,
+            right_ref: req.right_ref,
+            tier: req.tier,
+            method: req.method,
+            key_value: req.key_value,
+            key_namespace: req.key_namespace,
+            score: req.score,
+            evidence_l0_ref: req.evidence_l0_ref,
+            polarity: req.polarity,
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(row))
+}
+
+#[derive(Deserialize)]
+struct EvidenceRetractRequest {
+    tenant_id: TenantId,
+    evidence_id: uuid::Uuid,
+    /// Optional replacement row to chain to (bi-temporal `superseded_by`).
+    #[serde(default)]
+    superseded_by: Option<uuid::Uuid>,
+}
+
+/// POST /v1/admin/entity-evidence/retract (admin): retract a live evidence row
+/// (§3.3 invalidate-don't-delete) — stamps `valid_to`, never DELETEs, so the fold
+/// stops reading it while the audit trail survives. Retract-a-row + re-fold is
+/// the entire unmerge mechanism. Returns how many rows were retracted (0 if
+/// already retracted / not found).
+async fn admin_evidence_retract(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<EvidenceRetractRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let retracted = state
+        .storage
+        .inner()
+        .retract_evidence(req.tenant_id, req.evidence_id, req.superseded_by)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "evidence_id": req.evidence_id,
+        "retracted": retracted,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ResolutionConfigQuery {
+    tenant_id: TenantId,
+}
+
+/// GET /v1/admin/entity-resolution-config (admin): list the tenant's key-quality
+/// config rows (§4.1 — the over-merge SECURITY control). Empty list => the tenant
+/// runs on `EntityResolutionConfig::defaults` everywhere.
+async fn admin_resolution_config_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ResolutionConfigQuery>,
+) -> HandlerResult<Json<Vec<EntityResolutionConfig>>> {
+    state.admin.check(&headers)?;
+    let rows = state
+        .storage
+        .inner()
+        .list_resolution_config(q.tenant_id)
+        .await
+        .map_err(internal)?;
+    Ok(Json(rows))
+}
+
+/// PUT /v1/admin/entity-resolution-config (admin): upsert one `(key_kind,
+/// key_namespace)` config row (§4.1). Idempotent on the primary key.
+async fn admin_resolution_config_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cfg): Json<EntityResolutionConfig>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .write_resolution_config(&cfg)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": cfg.tenant_id,
+        "key_kind": cfg.key_kind,
+        "key_namespace": cfg.key_namespace,
+    })))
+}
+
+#[derive(Deserialize)]
+struct TriggerFoldRequest {
+    tenant_id: TenantId,
+}
+
+/// POST /v1/admin/entity-resolution/fold (admin): run the fold for a tenant and
+/// MATERIALIZE its plan into `entity_aliases` + chunk `entity_tags` +
+/// `entity_link_meta` (§4.2 S4, §4.3). This is the sole writer of the resolution
+/// rows the read path consumes; it runs in the worker/admin plane, NEVER on the
+/// read path. Returns a per-run report (evidence considered, rows written,
+/// review items, canonicals).
+async fn admin_trigger_fold(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TriggerFoldRequest>,
+) -> HandlerResult<Json<resolver::MaterializeReport>> {
+    state.admin.check(&headers)?;
+    let report = resolver::run_full_fold(&state, req.tenant_id).await?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+struct ReviewQueueQuery {
+    tenant_id: TenantId,
+    #[serde(default = "default_review_limit")]
+    limit: i64,
+}
+
+fn default_review_limit() -> i64 {
+    100
+}
+
+/// GET /v1/admin/entity-resolution/review-queue (admin): live Tier-2/Tier-3
+/// evidence awaiting a human decision (§4.1, §4.3). Tier-2 needs a
+/// `human_confirmed` before it can form an edge; Tier-3 never auto-merges. Empty
+/// in the MVP (no Tier-2/3 producers ship yet) but fully wired so the surface
+/// exists the day they turn on. Newest first, capped.
+async fn admin_review_queue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ReviewQueueQuery>,
+) -> HandlerResult<Json<Vec<EvidenceRow>>> {
+    state.admin.check(&headers)?;
+    let rows = state
+        .storage
+        .inner()
+        .review_queue(q.tenant_id, q.limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(rows))
 }
 
 // ---------- ingest (trusted connector plane — admin-token gated, task 3;

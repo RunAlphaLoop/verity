@@ -59,6 +59,47 @@ pub(crate) fn spawn_audit(
     });
 }
 
+/// Record a fold's justification for one canonical link (§4.3 audit extension):
+/// which live `entity_evidence` rows justified merging `member_ref` into
+/// `canonical`. Lightweight — mirrors how knowledge merges store the judge's
+/// yes/no + rationale, making every worker-folded link auditable and reversible.
+/// Non-blocking, exactly like [`spawn_audit`]; the fold never waits on it.
+///
+/// `verb = "fold_link"`, `query_summary = "<canonical> <= <member_ref>"`,
+/// `result_ids = the justifying evidence uuids`. No scope handle is involved
+/// (this is a worker-plane event), so actor/principals/entity_scope are empty.
+pub(crate) fn spawn_fold_audit(
+    state: &Arc<AppState>,
+    tenant_id: TenantId,
+    canonical: &str,
+    member_ref: &str,
+    justifying_evidence: Vec<Uuid>,
+) {
+    let pool = state.pool().clone();
+    let summary: String = format!("{canonical} <= {member_ref}")
+        .chars()
+        .take(120)
+        .collect();
+    tokio::spawn(async move {
+        let result = sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
+                                    entity_scope, confidentiality, query_summary, result_ids)
+             VALUES ($1, $2, NULL, NULL, 'fold_link', $3, $4, 0, $5, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant_id)
+        .bind(Vec::<i32>::new())
+        .bind(Vec::<String>::new())
+        .bind(&summary)
+        .bind(&justifying_evidence)
+        .execute(&pool)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("fold_link audit insert failed: {e}");
+        }
+    });
+}
+
 #[derive(Deserialize)]
 pub(crate) struct AuditParams {
     tenant_id: TenantId,

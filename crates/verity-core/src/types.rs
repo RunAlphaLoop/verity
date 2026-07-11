@@ -531,6 +531,141 @@ pub struct AliasMember {
     pub entity_id: String,
 }
 
+// ---------- cross-source entity resolution: the evidence ledger (§4.1) ----------
+
+/// One row of the append-only `entity_evidence` ledger — a single piece of
+/// evidence that two canonicalized refs (`left_ref`, `right_ref`) are the same
+/// entity (`polarity=+1`) or are NOT the same (`polarity=-1`, a hard anti-link).
+/// Source of truth for the deterministic fold (S4); everything the read path
+/// sees (`entity_aliases`, chunk `entity_tags`, `entity_link_meta`) is derived.
+/// Invalidate-don't-delete: a retraction stamps `valid_to`, never DELETE. A row
+/// is *live* iff `valid_to IS NULL`; the fold reads only live rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceRow {
+    pub evidence_id: Uuid,
+    pub tenant_id: TenantId,
+    /// Canonicalized ref, e.g. `salesforce:001xACME`.
+    pub left_ref: String,
+    /// Canonicalized ref, e.g. `hubspot:4207`.
+    pub right_ref: String,
+    /// 1 = deterministic strong key, 2 = strong-but-fuzzy, 3 = unstructured mention.
+    pub tier: i16,
+    /// `admin_crosswalk` / `crm_fk` / `email_exact` / `domain_match` /
+    /// `external_id` / `name+domain_fuzzy` / `llm_mention` / `human_confirmed` /
+    /// `human_rejected`.
+    pub method: String,
+    /// The actual matched value (`jane@acme.dev`, `acme.com`) — load-bearing for
+    /// denylist + audit. `None` when the method is refless (e.g. admin crosswalk).
+    pub key_value: Option<String>,
+    /// e.g. `customer_contact` vs `internal_directory` — the actor-email
+    /// population fence (§4.4). An edge may form only within a namespace.
+    pub key_namespace: Option<String>,
+    /// `None` for Tier-1 (deterministic); blocker/judge score for Tier-2/3.
+    pub score: Option<f32>,
+    /// Lineage pointer to the L0 record/chunk that produced this evidence.
+    pub evidence_l0_ref: Option<String>,
+    /// +1 = link, -1 = anti-link (human "these are NOT the same" / must-not-link).
+    pub polarity: i16,
+    pub valid_from: DateTime<Utc>,
+    /// Set on retraction (invalidate-don't-delete). `None` = live.
+    pub valid_to: Option<DateTime<Utc>>,
+    /// Bi-temporal chain pointer (§2 L1).
+    pub superseded_by: Option<Uuid>,
+}
+
+/// A new piece of evidence to append to the ledger. `insert_evidence` stamps the
+/// `evidence_id` and `valid_from`; the caller supplies the linking content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceWrite {
+    pub tenant_id: TenantId,
+    pub left_ref: String,
+    pub right_ref: String,
+    pub tier: i16,
+    pub method: String,
+    pub key_value: Option<String>,
+    pub key_namespace: Option<String>,
+    pub score: Option<f32>,
+    pub evidence_l0_ref: Option<String>,
+    /// +1 = link, -1 = anti-link. Producers default to +1.
+    pub polarity: i16,
+}
+
+/// Per-tenant key-quality allowlist + denylist + merge guards
+/// (`entity_resolution_config`, §4.1). The over-merge control — a SECURITY
+/// control, mandatory even in MVP (a false merge is a scope leak, §3.2). Keyed
+/// per `(key_kind, key_namespace)`: an edge may only form within a namespace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityResolutionConfig {
+    pub tenant_id: TenantId,
+    /// `email` / `domain` / `phone` / `external_id`.
+    pub key_kind: String,
+    /// e.g. `customer_contact`, `internal_directory`.
+    pub key_namespace: String,
+    /// May this key kind ever FORM a merge edge.
+    pub eligible_as_edge: bool,
+    /// Free-mail (`gmail.com`), role locals (`info@`), placeholders
+    /// (`example.com`) — never an edge.
+    pub denylist_values: Vec<String>,
+    /// Default 2 — a single MEDIUM key (shared domain) may not auto-merge alone.
+    pub min_independent_keys: i16,
+    /// OSS default true.
+    pub auto_merge_tier1: bool,
+    /// Default FALSE — the Tier-3 auto-link kill switch.
+    pub auto_link_tier3: bool,
+    /// Tier-3 NIL threshold (§5).
+    pub tau_nil: Option<f32>,
+    /// Tier-3 top1-top2 abstain margin (§5).
+    pub margin_delta: Option<f32>,
+    /// Union-find components exceeding this are quarantined, not merged.
+    pub component_size_cap: Option<i32>,
+}
+
+impl EntityResolutionConfig {
+    /// The sane defaults `read_resolution_config` returns when a tenant has no
+    /// config row for a `(key_kind, key_namespace)`: fail-closed-friendly —
+    /// eligible as an edge, empty denylist, `min_independent_keys=2`, Tier-1
+    /// auto-merge on, Tier-3 auto-link OFF (§4.1).
+    pub fn defaults(tenant: TenantId, key_kind: &str, key_namespace: &str) -> Self {
+        Self {
+            tenant_id: tenant,
+            key_kind: key_kind.to_string(),
+            key_namespace: key_namespace.to_string(),
+            eligible_as_edge: true,
+            denylist_values: Vec::new(),
+            min_independent_keys: 2,
+            auto_merge_tier1: true,
+            auto_link_tier3: false,
+            tau_nil: None,
+            margin_delta: None,
+            component_size_cap: None,
+        }
+    }
+}
+
+/// A row of `entity_link_meta` — materialized fold output the read path is
+/// allowed to see (§4.1, §4.3). One per live canonical link (`subject_kind =
+/// "alias_member"`) or per materialized chunk tag (`subject_kind =
+/// "chunk_tag"`). Carries the confidence badge and the `justifying_evidence`
+/// back-refs that make a surgical per-tag split possible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityLinkMeta {
+    pub tenant_id: TenantId,
+    /// `alias_member` (a `(source,entity_id)`) or `chunk_tag` (a `(chunk_id, tag)`).
+    pub subject_kind: String,
+    /// The member ref or the `chunk_id`.
+    pub subject_ref: String,
+    /// The link target: the canonical entity, or the tag value.
+    pub canonical_entity: String,
+    /// `deterministic` / `human_confirmed` / `approximated`.
+    pub confidence: String,
+    /// Highest-tier method that justified it.
+    pub strongest_method: Option<String>,
+    /// The live `entity_evidence` rows that produced it (surgical split).
+    pub justifying_evidence: Vec<Uuid>,
+    /// Corroboration depth.
+    pub evidence_count: i16,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
