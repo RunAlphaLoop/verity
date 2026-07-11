@@ -791,10 +791,11 @@
         if (!rows.length) {
           // HONEST empty state — never a fabricated candidate row (SPEC §3).
           Verity.$("ent-queue-out").innerHTML =
-            '<div class="empty"><b>No Tier-2/3 candidates awaiting review.</b> The queue holds only live ' +
-            "<b>tier IN (2,3)</b> evidence with no decision yet. An empty queue means the deterministic (Tier-1) fold " +
-            "settled everything, or the Tier-2 producer has not run to populate it — not a hidden merge. Nothing " +
-            "here is auto-decided; that is the point of the human gate.</div>";
+            '<div class="empty"><b>No candidates awaiting review.</b> The queue holds live positive evidence whose ' +
+            "pair is still <b>undecided</b> — not welded into one canonical, not anti-linked: Tier-2 proposals, " +
+            "Tier-3 mention hints, and <b>deferred Tier-1 pairs</b> the fold refused fail-closed (a lone domain or " +
+            "lone email below the measured min-keys bar). An empty queue means the fold settled everything and no " +
+            "pair is deferred — not a hidden merge. Nothing here is auto-decided; that is the point of the human gate.</div>";
           return;
         }
 

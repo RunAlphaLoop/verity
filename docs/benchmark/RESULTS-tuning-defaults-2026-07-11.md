@@ -63,9 +63,10 @@ strictly worse than a miss (a miss is a review-queue entry).
   demotion, the built-in drift-guard bar (`tier1-any` — now only crm_fk /
   external_id / admin_crosswalk, the measured-FMR-0 kinds) is itself leak-free
   at every floor ≤ 8, so no caller-side multi-key enforcement is required by
-  measurement. Residual follow-up: min-keys-suppressed pairs (lone domain, and
-  lone email post-amendment) are dropped fail-closed but not yet persisted to
-  the review queue.
+  measurement. The residual follow-up is CLOSED: the review queue now surfaces
+  every undecided Tier-1 pair (live positive evidence, not welded, not
+  anti-linked), so min-keys-deferred pairs are discoverable and self-heal out
+  of the queue on weld (`deferred_tier1_pair_surfaces_until_decided`).
 - **Floor upper bound by construction:** the double-coincidence scenarios were
   built with sides ≥ 8 members, which upper-bounds the recommendable floor at 8
   by design.

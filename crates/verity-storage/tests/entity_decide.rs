@@ -435,3 +435,130 @@ async fn review_queue_orders_by_priority_and_ages_out_starved_candidates() {
         aged.wait_age_secs
     );
 }
+
+/// Deferred Tier-1 pairs are DISCOVERABLE (closes the flagged follow-up in
+/// RESULTS-tuning-defaults-2026-07-11.md / design §10 Q3): the review queue is
+/// "live positive evidence whose pair is still undecided — not welded, not
+/// anti-linked", so a lone-email Tier-1 pair the fold refuses fail-closed
+/// (per-kind min_independent_keys: email = 2) surfaces for a reviewer instead
+/// of vanishing; the moment a human confirms (weld) it drops out (self-healing);
+/// and an anti-linked pair is excluded wholesale. Also proves the queue no
+/// longer surfaces the human decision rows themselves.
+#[tokio::test]
+async fn deferred_tier1_pair_surfaces_until_decided() {
+    let Some((a, t)) = setup().await else {
+        return;
+    };
+
+    // ── A lone shared email between two contacts: Tier-1 evidence the fold
+    // refuses under the measured default (email min_independent_keys = 2). ──
+    const P_LEFT: &str = "salesforce:003xJANE";
+    const P_RIGHT: &str = "hubspot:9911";
+    let deferred = a
+        .insert_evidence(EvidenceWrite {
+            tenant_id: t,
+            left_ref: P_LEFT.into(),
+            right_ref: P_RIGHT.into(),
+            tier: 1,
+            method: "email_exact".into(),
+            key_value: Some("jane@acme.com".into()),
+            key_namespace: Some("customer_contact".into()),
+            score: None,
+            evidence_l0_ref: None,
+            polarity: 1,
+        })
+        .await
+        .unwrap();
+
+    refold(&a, t).await;
+    // Fail-closed: no weld under the measured default.
+    assert_eq!(
+        a.resolve_canonical(t, "salesforce", "003xJANE")
+            .await
+            .unwrap(),
+        None,
+        "a lone email must not weld (min_independent_keys email=2)"
+    );
+    // …but the deferred pair is DISCOVERABLE in the review queue.
+    let queue = a.review_queue(t, 100).await.unwrap();
+    assert!(
+        queue
+            .iter()
+            .any(|i| i.evidence.evidence_id == deferred.evidence_id),
+        "the deferred Tier-1 pair must surface in the review queue"
+    );
+    assert!(
+        queue
+            .iter()
+            .find(|i| i.evidence.evidence_id == deferred.evidence_id)
+            .map(|i| i.evidence.tier == 1)
+            .unwrap_or(false),
+        "it surfaces AS a Tier-1 row (method email_exact), not disguised"
+    );
+
+    // ── A human confirms → the pair welds → it drops OUT of the queue. ──
+    decide(&a, t, P_LEFT, P_RIGHT, true).await;
+    refold(&a, t).await;
+    let jane = a
+        .resolve_canonical(t, "salesforce", "003xJANE")
+        .await
+        .unwrap()
+        .expect("human confirm welds the pair");
+    assert_eq!(
+        a.resolve_canonical(t, "hubspot", "9911")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(jane.as_str())
+    );
+    let queue = a.review_queue(t, 100).await.unwrap();
+    assert!(
+        !queue
+            .iter()
+            .any(|i| i.evidence.evidence_id == deferred.evidence_id),
+        "a welded pair must drop out of the queue (self-healing)"
+    );
+    assert!(
+        !queue.iter().any(
+            |i| i.evidence.method == "human_confirmed" || i.evidence.method == "human_rejected"
+        ),
+        "human decision rows are verdicts, never candidates"
+    );
+
+    // ── An anti-linked pair is excluded wholesale, whatever live positive
+    // evidence it carries. ──
+    const Q_LEFT: &str = "salesforce:001xOTHER";
+    const Q_RIGHT: &str = "hubspot:7788";
+    let lone_domain = a
+        .insert_evidence(EvidenceWrite {
+            tenant_id: t,
+            left_ref: Q_LEFT.into(),
+            right_ref: Q_RIGHT.into(),
+            tier: 1,
+            method: "domain_match".into(),
+            key_value: Some("sharedparked.com".into()),
+            key_namespace: None,
+            score: None,
+            evidence_l0_ref: None,
+            polarity: 1,
+        })
+        .await
+        .unwrap();
+    // Visible while undecided…
+    let queue = a.review_queue(t, 100).await.unwrap();
+    assert!(
+        queue
+            .iter()
+            .any(|i| i.evidence.evidence_id == lone_domain.evidence_id),
+        "the undecided lone-domain pair surfaces too"
+    );
+    // …gone after a human says NO (permanent anti-link).
+    decide(&a, t, Q_LEFT, Q_RIGHT, false).await;
+    let queue = a.review_queue(t, 100).await.unwrap();
+    assert!(
+        !queue
+            .iter()
+            .any(|i| i.evidence.evidence_id == lone_domain.evidence_id),
+        "an anti-linked pair must never resurface in the queue"
+    );
+}

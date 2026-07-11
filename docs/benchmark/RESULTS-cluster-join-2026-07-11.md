@@ -60,7 +60,7 @@ Config under test: shipped defaults hardened as in `resolution_precision_fuzz.rs
 | 20 | tier1-any | 27 | 176 | 24 | 60 | 37 |
 | 20 | human-only | **0** | 35 | 165 | 60 | 205 |
 
-("legit blocked" = 60 everywhere: the LG-EMAIL-SINGLE family. Under the amended fold a lone shared email is min-keys-suppressed BEFORE the join decision — fail-closed, no leak — but see the honesty note below: min-keys-suppressed pairs are not yet persisted to the review queue.)
+("legit blocked" = 60 everywhere: the LG-EMAIL-SINGLE family. Under the amended fold a lone shared email is min-keys-suppressed BEFORE the join decision — fail-closed, no leak — and discoverable: see the honesty note below, closed same day.)
 
 ## Recommendation — floor **8**, bar **tier1-any** (post-amendment)
 
@@ -76,7 +76,7 @@ Why the axes land there, in the re-measured data:
 
 - The leak column is the load-bearing number; friction rankings are sensitive to family composition. When in doubt, lower the floor — every tier1 cell at floor ≤ 8 is leak-free here.
 - `tier1-any`'s safety rests on the trustworthiness of `external_id`/`crm_fk`/`admin_crosswalk` values. This corpus cannot model a factually WRONG same-namespace crosswalk (the same Q2 caveat); a poisoned crosswalk is anti-link/review territory, not a threshold problem.
-- **Honesty gap (pre-existing, now wider):** min-keys-suppressed direct pairs (lone domain since inception; lone email since the amendment) are dropped fail-closed but are NOT yet persisted to the review queue — `FoldPlan.review` carries fan-out stars, size-cap quarantines, and anti-link splits only, and the live review-queue endpoint reads tier-2/3 evidence. Under-merge, never a leak — but a reviewer cannot currently discover these deferred pairs. Follow-up: persist min-keys-suppressed pairs as review items.
+- **Honesty gap — CLOSED same day:** min-keys-suppressed direct pairs (lone domain; lone email post-amendment) are dropped fail-closed by the fold, and the review queue now surfaces them: it reads *live positive evidence whose pair is still undecided* (not welded into one canonical, not anti-linked), so every deferred Tier-1 pair is discoverable, self-heals out of the queue on weld, and is excluded permanently on anti-link. Derived from state, never by re-duplicating fold logic in SQL. DSN-gated proof: `deferred_tier1_pair_surfaces_until_decided` (crates/verity-storage/tests/entity_decide.rs).
 
 Defense-in-depth confirmed along the way (asserted at **every** grid cell, gate G4): the denylist, lone-MEDIUM-key, Tier-2-without-human, and §4.4 cross-namespace families **never** auto-join under any policy.
 
@@ -96,7 +96,7 @@ Defense-in-depth confirmed along the way (asserted at **every** grid cell, gate 
 | IL-DENYLIST | 0 | 0 | 30 |
 | IL-CROSSNS | 0 | 0 | 30 |
 
-The friction shape after the amendment: single-strong-key legitimate bridges (EXT/FK) now auto-apply when both sides are under the floor and queue when large — while lone-email legitimate bridges pay the full min-keys price (blocked to the not-yet-persisted review channel, above). Human-confirmed joins of large clusters also queue at this floor — as `refold_incremental` implements today; whether a human confirm should override the size floor is a possible follow-up amendment.
+The friction shape after the amendment: single-strong-key legitimate bridges (EXT/FK) now auto-apply when both sides are under the floor and queue when large — while lone-email legitimate bridges pay the full min-keys price (deferred to the review queue, which now surfaces undecided Tier-1 pairs — see the closed honesty note above). Human-confirmed joins of large clusters also queue at this floor — as `refold_incremental` implements today; whether a human confirm should override the size floor is a possible follow-up amendment.
 
 ## Regression gate (runs in CI under plain `cargo test`)
 

@@ -861,17 +861,32 @@ impl PostgresAdapter {
         }
     }
 
-    /// The review queue (§4.1, §4.3): live Tier-2/Tier-3 evidence that never
-    /// auto-forms an edge (Tier-2 awaits `human_confirmed`; Tier-3 never merges).
-    /// A read-only view over `entity_evidence` — empty in the MVP (no Tier-2/3
-    /// producers ship yet) but fully wired so the admin surface exists.
+    /// The review queue (§4.1, §4.3): live positive evidence whose pair is
+    /// still UNDECIDED — not welded into one canonical, not anti-linked. That
+    /// covers three populations in one coherent rule:
+    ///
+    /// - **Tier-2** candidates awaiting `human_confirmed` (the fuzzy producer's
+    ///   proposals);
+    /// - **Tier-3** mentions (never auto-merge; reviewer hints);
+    /// - **Deferred Tier-1 pairs** (extended 2026-07-11, closing the flagged
+    ///   follow-up in RESULTS-tuning-defaults-2026-07-11.md): a live Tier-1
+    ///   pair that did NOT materialize into a shared canonical — min-keys
+    ///   suppression (a lone domain; a lone email post-amendment), key-node
+    ///   fan-out, or size-cap quarantine. Derived from STATE (evidence vs
+    ///   `entity_aliases`), never by re-deriving fold logic in SQL, so it can't
+    ///   drift from the fold; and it self-heals — the moment a pair welds (or
+    ///   a human anti-links it), it drops out of the queue.
+    ///
+    /// Decision rows themselves (`human_confirmed` / `human_rejected`) are
+    /// excluded — they are verdicts, not candidates — and any pair carrying a
+    /// live anti-link (`polarity = -1`) is excluded wholesale: a human already
+    /// said no, and the anti-link is permanent.
     ///
     /// PRIORITIZED (design §8 Later: "review-queue prioritization + SLA —
-    /// starvation risk, surface high-value/high-frequency entities first"). This
-    /// is ORDERING ONLY: the same `tier IN (2,3) AND valid_to IS NULL` candidate
-    /// set as before, no fold/merge behaviour touched, read path untouched. We
-    /// compute a `priority` per candidate from ledger-visible signals and order
-    /// by it DESC so the reviewer's finite attention lands on the candidates that
+    /// starvation risk, surface high-value/high-frequency entities first").
+    /// No fold/merge behaviour touched, read path untouched. We compute a
+    /// `priority` per candidate from ledger-visible signals and order by it
+    /// DESC so the reviewer's finite attention lands on the candidates that
     /// matter most — while an aging term guarantees no candidate can be buried
     /// forever (anti-starvation / SLA).
     ///
@@ -894,8 +909,10 @@ impl PostgresAdapter {
     ///   refs already belong to (via `entity_aliases`). Bigger clusters = more
     ///   facts/members downstream = higher blast radius, so a merge/split
     ///   decision there is worth more.
-    /// - `tier_weight` — 1.0 for Tier-2 (a confirm can FORM an edge — actionable),
-    ///   0.4 for Tier-3 (never auto-merges; corroboration only).
+    /// - `tier_weight` — 1.2 for a deferred Tier-1 pair (the strongest signal
+    ///   the fold refused fail-closed; a confirm welds it), 1.0 for Tier-2
+    ///   (a confirm can FORM an edge — actionable), 0.4 for Tier-3 (never
+    ///   auto-merges; corroboration only).
     /// - `recency_decay` — `exp(-age_days / RECENCY_TAU)`: a freshly-produced
     ///   candidate is likelier to reflect a live workflow the reviewer cares
     ///   about right now; decays smoothly, never dominates aging.
@@ -927,22 +944,51 @@ impl PostgresAdapter {
                         0.20::float8 AS age_weight,      -- SLA slope (per day)
                         14.0::float8 AS recency_tau      -- recency half-life-ish (days)
              ),
-             -- The candidate set: EXACTLY the old query's rows (ordering only).
+             -- The candidate set: live POSITIVE evidence (any tier) whose pair
+             -- is still UNDECIDED — not welded into one canonical, not
+             -- anti-linked, and not itself a human verdict. Tier-1 rows here
+             -- are exactly the DEFERRED pairs (min-keys / fan-out / size-cap
+             -- suppressed) the fold refused fail-closed.
              cand AS (
-                 SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
-                        key_value, key_namespace, score, evidence_l0_ref, polarity,
-                        valid_from, valid_to, superseded_by
-                   FROM entity_evidence
-                  WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
+                 SELECT e.evidence_id, e.tenant_id, e.left_ref, e.right_ref,
+                        e.tier, e.method, e.key_value, e.key_namespace, e.score,
+                        e.evidence_l0_ref, e.polarity, e.valid_from, e.valid_to,
+                        e.superseded_by
+                   FROM entity_evidence e
+                  WHERE e.tenant_id = $1 AND e.valid_to IS NULL
+                    AND e.polarity = 1
+                    AND e.method NOT IN ('human_confirmed', 'human_rejected')
+                    -- undecided: no live anti-link on this unordered pair …
+                    AND NOT EXISTS (
+                        SELECT 1 FROM entity_evidence al
+                         WHERE al.tenant_id = $1 AND al.valid_to IS NULL
+                           AND al.polarity = -1
+                           AND least(al.left_ref, al.right_ref)
+                               = least(e.left_ref, e.right_ref)
+                           AND greatest(al.left_ref, al.right_ref)
+                               = greatest(e.left_ref, e.right_ref)
+                    )
+                    -- … and the two refs do not already share a canonical.
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM entity_aliases l
+                          JOIN entity_aliases r
+                            ON r.tenant_id = l.tenant_id
+                           AND r.canonical_entity = l.canonical_entity
+                         WHERE l.tenant_id = $1
+                           AND l.source || ':' || l.entity_id = e.left_ref
+                           AND r.source || ':' || r.entity_id = e.right_ref
+                    )
              ),
              -- FREQUENCY: how often this same unordered ref-pair recurs across
-             -- LIVE evidence. least/greatest makes {a,b} == {b,a}.
+             -- LIVE positive evidence (any tier). least/greatest makes
+             -- {a,b} == {b,a}.
              freq AS (
                  SELECT least(left_ref, right_ref)    AS a,
                         greatest(left_ref, right_ref) AS b,
                         count(*)                       AS n
                    FROM entity_evidence
-                  WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
+                  WHERE tenant_id = $1 AND valid_to IS NULL AND polarity = 1
                   GROUP BY 1, 2
              ),
              -- ENTITY VALUE: distinct alias members in each ref's existing
@@ -968,7 +1014,9 @@ impl PostgresAdapter {
                       p.freq_weight    * ln(1 + COALESCE(f.n, 1))
                     + p.value_weight   * ln(1 + COALESCE(ls.members, 0)
                                                  + COALESCE(rs.members, 0))
-                    + p.tier_weight    * (CASE c.tier WHEN 2 THEN 1.0 ELSE 0.4 END)
+                    + p.tier_weight    * (CASE c.tier WHEN 1 THEN 1.2
+                                                      WHEN 2 THEN 1.0
+                                                      ELSE 0.4 END)
                     + p.recency_weight * exp(
                           - (EXTRACT(EPOCH FROM (now() - c.valid_from)) / 86400.0)
                             / p.recency_tau)
