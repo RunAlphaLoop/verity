@@ -1,0 +1,40 @@
+<!-- ==========================================================================
+     panel_erasure.html — Screen 4 · Erasure & DSAR  [v0.2]
+     --------------------------------------------------------------------------
+     The irreversible admin verb, STRUCTURALLY quarantined from agent scope
+     (SPEC §5 Screen 4 / §8f). This panel's live surface only instantiates when
+     an admin token is present — a scope-handle session can NEVER reach the
+     destructive controls. When no admin token is set the mount renders an
+     honest "admin-token required" state instead of the tools (see
+     panel_erasure.js).
+
+     Backing endpoints (verified in crates/verity-server/src/main.rs + compliance.rs
+     + media.rs):
+       • POST /v1/admin/erasure           — crypto-shred / lineage hard-purge (admin)
+       • GET  /v1/admin/dsar/export       — audited DSAR bundle (admin)
+       • GET  /v1/admin/media             — list a tenant's named blobs (admin)
+       • POST /v1/forget                  — item-level invalidation (scope-token)
+
+     HONEST SEAMS surfaced here (designed, never faked):
+       • There is NO dedicated erasure-PREVIEW endpoint. The preview is a
+         READ-ONLY proxy built from GET /v1/admin/dsar/export (same subject
+         lineage), explicitly labeled an approximation of the destructive walk,
+         not a byte-exact dry run.
+       • The server returns UNSIGNED per-table purge counts (+ a surviving
+         sha256 audit row). There is no server-issued cryptographic signature on
+         the report, so the downloadable "purge report" is labeled an
+         attestation assembled client-side from the returned counts + context,
+         NOT a server signature. The signed-report seam is disclosed.
+       • Coverage gaps are disclosed, never papered over: operator-named media
+         (no automatic subject attribution), exact-string subject/entity match,
+         and the backup-retention window. "Disclose the window, don't claim
+         perfection" (SPEC §8b).
+
+     Owns ONLY this file + panel_erasure.js. Reuses frozen theme/core classes and
+     the Verity.* helpers; never edits them. Mounts into #erasure-mount.
+     ========================================================================== -->
+<section class="panel" id="panel-erasure">
+  <h1>Erasure &amp; DSAR</h1>
+  <div class="subtitle"><b>The irreversible admin verb.</b> Right-to-be-forgotten crypto-shred and subject export &mdash; physically behind the admin token, structurally unreachable from any scope handle (SPEC &sect;8f).</div>
+  <div id="erasure-mount"></div>
+</section>

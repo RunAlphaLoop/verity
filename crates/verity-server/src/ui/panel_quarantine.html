@@ -1,0 +1,24 @@
+<!-- ==========================================================================
+     panel_quarantine.html — Screen 6 · Quarantine  [v0.2]
+     --------------------------------------------------------------------------
+     The fail-closed queue made visible and explained. Unmappable-ACL /
+     unrecognized-shape webhook payloads that were REFUSED at ingest and now sit
+     invisible to recall by design. Backed by GET /v1/admin/quarantine (admin
+     token): each row carries id, webhook_id, payload (FULL json, never
+     truncated), reason, at.
+
+     This is a READ/EXPORT panel. It honestly states there is NO re-ingest /
+     dismiss endpoint yet — that action is rendered as a DISABLED SEAM we design
+     but never fake, never a phantom button. There is, and will be, NO
+     "index it anyway" affordance: re-ingest can only ever route through a
+     corrected mapping, and that write surface does not exist yet (SPEC §5
+     Screen 6, §7b, §3 non-negotiables).
+
+     OWNS: this file + panel_quarantine.js. Reuses frozen theme/core classes and
+     the Verity.* helpers only; never edits them. Mounts into #quarantine-mount.
+     ========================================================================== -->
+<section class="panel" id="panel-quarantine">
+  <h1>Quarantine</h1>
+  <div class="subtitle"><b>Fail-closed, visible, and explained.</b> Webhook payloads whose ACL could not be mapped, or whose shape was unrecognized, were refused at ingest &mdash; they sit here, invisible to recall, never indexed permissively.</div>
+  <div id="quarantine-mount"></div>
+</section>
