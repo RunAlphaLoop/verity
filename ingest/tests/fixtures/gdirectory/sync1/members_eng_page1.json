@@ -1,0 +1,8 @@
+{
+  "kind": "admin#directory#members",
+  "members": [
+    {"kind": "admin#directory#member", "id": "01g3", "email": "eng-leads@corp.example", "role": "MEMBER", "type": "GROUP", "status": "ACTIVE"},
+    {"kind": "admin#directory#member", "id": "100000000000000000002", "email": "Bob@corp.example", "role": "MEMBER", "type": "USER", "status": "ACTIVE"}
+  ],
+  "nextPageToken": "eng-p2"
+}

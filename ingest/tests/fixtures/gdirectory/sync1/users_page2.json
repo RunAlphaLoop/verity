@@ -1,0 +1,6 @@
+{
+  "kind": "admin#directory#users",
+  "users": [
+    {"id": "100000000000000000004", "primaryEmail": "carol@corp.example", "suspended": false, "archived": false}
+  ]
+}

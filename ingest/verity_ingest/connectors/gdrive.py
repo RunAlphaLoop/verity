@@ -38,13 +38,15 @@ renewal before the 7-day expiry (§5). Poll is the truth lane and always
 sufficient; the watch lane is a later optimization. ``push_events`` is a
 documented no-op here.
 
-Server contracts coded against (both endpoints are being built in a parallel
-task; fixture tests pin the request bodies, integration lands later):
+Server contracts coded against (principals endpoint verified against the
+server as built; the documents endpoint's fixture tests pin the request
+bodies, integration lands later):
 
-- ``POST /v1/admin/principals``  body ``{"principals": ["user:a@x", ...]}``
-  → response ``{"user:a@x": 101, "group:g@x": 202, ...}`` — a flat JSON
-  object mapping each principal string to its int visibility token, or
-  ``null`` (or the key absent) when the crosswalk cannot resolve it.
+- ``POST /v1/admin/principals``  body ``{"tenant_id": "<uuid>",
+  "principals": ["user:a@x", ...]}`` → response ``{"mappings": {"user:a@x":
+  101, "group:g@x": 202, ...}}`` — tokens nested under ``mappings``; a
+  ``null``/absent/non-int token means the crosswalk cannot resolve the
+  principal (fail-closed: it confers nothing).
 - ``POST /v1/ingest/documents``  body::
 
       {
@@ -95,10 +97,7 @@ DOCUMENTS_PATH = "/v1/ingest/documents"
 CONNECTOR_STATUS_PATH = "/v1/admin/connector-status"
 
 # Field masks: ask Google for exactly what we consume, nothing more.
-_CHANGES_FIELDS = (
-    "kind,nextPageToken,newStartPageToken,"
-    "changes(changeType,time,removed,fileId)"
-)
+_CHANGES_FIELDS = "kind,nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId)"
 _FILE_FIELDS = "id,name,mimeType,modifiedTime,parents,trashed,version"
 _PERMISSIONS_FIELDS = "nextPageToken,permissions(id,type,emailAddress,domain,role,deleted)"
 
@@ -219,31 +218,36 @@ class StaticRegistry:
 class HttpRegistry:
     """Resolves via the Verity server's admin principals endpoint.
 
-    Contract (endpoint under construction in a parallel task):
-    ``POST {base}/v1/admin/principals`` with ``{"principals": [...]}`` →
-    ``{"<principal>": <int token> | null, ...}``. Null/absent → unresolved.
+    Contract (server as built — ``admin_principals`` in verity-server):
+    ``POST {base}/v1/admin/principals`` with ``{"tenant_id": "<uuid>",
+    "principals": [...]}`` → ``{"mappings": {"<principal>": <int token>,
+    ...}}``. Null/absent/non-int → unresolved (fail-closed). The upsert is
+    idempotent server-side; existing principals keep their token forever.
     """
 
     def __init__(
         self,
         base_url: str,
+        tenant_id: str,
         client: httpx.Client | None = None,
         api_key: str | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._client = client or httpx.Client(timeout=30.0, headers=headers)
         self._base_url = base_url.rstrip("/")
+        self._tenant_id = tenant_id
 
     def resolve(self, principals: Sequence[str]) -> dict[str, int]:
         if not principals:
             return {}
         response = self._client.post(
-            f"{self._base_url}{PRINCIPALS_PATH}", json={"principals": list(principals)}
+            f"{self._base_url}{PRINCIPALS_PATH}",
+            json={"tenant_id": self._tenant_id, "principals": list(principals)},
         )
         response.raise_for_status()
         return {
             principal: token
-            for principal, token in response.json().items()
+            for principal, token in response.json().get("mappings", {}).items()
             if isinstance(token, int)
         }
 
@@ -276,8 +280,7 @@ def load_service_account_credentials(
         from google.oauth2 import service_account  # noqa: PLC0415 (lazy by design)
     except ImportError as exc:  # pragma: no cover - environment-dependent
         raise RuntimeError(
-            "google-auth is required for live Drive access: "
-            "pip install 'verity-ingest[gdrive]'"
+            "google-auth is required for live Drive access: pip install 'verity-ingest[gdrive]'"
         ) from exc
 
     key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -372,9 +375,7 @@ class GDriveConnector(Connector):
 
     # -- truth lane ---------------------------------------------------------
 
-    async def poll(
-        self, cursor: str | None
-    ) -> tuple[list[FactEvent | DocumentEvent], str]:
+    async def poll(self, cursor: str | None) -> tuple[list[FactEvent | DocumentEvent], str]:
         """Incremental changes.list from `cursor`.
 
         First run (cursor None): fetch a start page token and return it with
@@ -382,9 +383,7 @@ class GDriveConnector(Connector):
         (backfill protocol, §5a), not the change feed.
         """
         if cursor is None:
-            data = self._transport.get_json(
-                "changes/startPageToken", {"supportsAllDrives": "true"}
-            )
+            data = self._transport.get_json("changes/startPageToken", {"supportsAllDrives": "true"})
             return [], data["startPageToken"]
 
         events: list[FactEvent | DocumentEvent] = []
@@ -752,9 +751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path(os.environ.get("GDRIVE_STATE_FILE", ".verity/gdrive_cursor.json")),
         help="JSON cursor checkpoint file",
     )
-    parser.add_argument(
-        "--tenant-id", default=os.environ.get("VERITY_TENANT_ID", "default")
-    )
+    parser.add_argument("--tenant-id", default=os.environ.get("VERITY_TENANT_ID", "default"))
     parser.add_argument(
         "--verity-url",
         default=os.environ.get("VERITY_URL", "http://localhost:8080"),
@@ -795,7 +792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.principal_map:
         registry = StaticRegistry(json.loads(args.principal_map.read_text()))
     else:
-        registry = HttpRegistry(args.verity_url, api_key=api_key)
+        registry = HttpRegistry(args.verity_url, tenant_id=config.tenant_id, api_key=api_key)
     sink: DocumentSink = (
         DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
     )

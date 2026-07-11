@@ -43,7 +43,7 @@ into v0.2/v0.3.
 
 **Scope plane completion (Milestone B):**
 - [x] SpiceDB integration (HTTP gateway seam): schema, nested groups, subject-resolved `open_scope` (422 on self-asserted principals when live). *As built: resolution at mint + windowed re-read subtraction; Watch-driven index materialization is v0.2.*
-- [x] Identity: canonical principal registry (`/v1/admin/principals`), group management API, Drive connector principal crosswalk. *As built: Google Admin SDK directory sync not yet — groups arrive via API/connectors.*
+- [x] Identity: canonical principal registry (`/v1/admin/principals`), group management API, Drive connector principal crosswalk. *As built: Google Admin SDK directory sync ships as `verity_ingest.connectors.gdirectory` — full users/groups/members reconcile diffed against a local snapshot, direct (nested) membership edges into the group API, removals one tuple at a time via the tombstoning DELETE; fixture-verified per §6c (no live Google org). The Directory API has no incremental sync token, so group-membership freshness = the reconcile interval; `users.watch` push is v0.2.*
 - [x] Revocation tombstones: durable-before-delete, windowed subtraction at mint AND read time (cold-start safe by durability). *Replica fan-out is v0.2 with the changelog.*
 - [x] Restricted-class live recheck against fresh membership; restricted DROPPED when ReBAC off (fail closed, env override for dev)
 - [x] Purpose packs (YAML): confidentiality clamp + entity-scope requirements at mint

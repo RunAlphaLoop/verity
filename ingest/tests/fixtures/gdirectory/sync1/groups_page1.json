@@ -1,0 +1,10 @@
+{
+  "kind": "admin#directory#groups",
+  "groups": [
+    {"id": "01g1", "email": "all@corp.example", "name": "Everyone", "directMembersCount": "3"},
+    {"id": "01g2", "email": "eng@corp.example", "name": "Engineering", "directMembersCount": "4"},
+    {"id": "01g3", "email": "eng-leads@corp.example", "name": "Engineering Leads", "directMembersCount": "1"},
+    {"id": "01g4", "email": "loop-a@corp.example", "name": "Loop A", "directMembersCount": "1"},
+    {"id": "01g5", "email": "loop-b@corp.example", "name": "Loop B", "directMembersCount": "2"}
+  ]
+}
