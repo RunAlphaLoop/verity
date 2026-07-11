@@ -1,27 +1,46 @@
 "use strict";
 /* ==========================================================================
-   panel_quarantine.js — Screen 6 · Quarantine  [v0.2]
+   panel_quarantine.js — Screen 6 · Quarantine  [v0.3]
    --------------------------------------------------------------------------
-   Backing: GET /v1/admin/quarantine?tenant_id=&limit= (admin token). The
-   endpoint returns, newest-first, an array of rows:
+   Backing (read): GET /v1/admin/quarantine?tenant_id=&limit= (admin token).
+   The endpoint returns, newest-first, an array of rows:
      { id, webhook_id, payload (full JSON — NOT truncated), reason, at }
    No server-side reason/time filtering is offered, so grouping, the reason
    filter, and the time-range filter all run CLIENT-SIDE over the fetched
    window — exactly like the audit panel. The window size is stated so the
    reviewer knows precisely what set the filters, groups, and export cover.
 
+   Backing (write — the two ONLY exits from quarantine, both admin-gated and
+   audited; migration 0023):
+     POST /v1/admin/quarantine/{id}/reingest — re-admit a payload THROUGH a
+       corrected, admin-supplied ACL mapping. `visibility` + `confidentiality`
+       are REQUIRED and explicit (no default, no "inherit whatever the webhook
+       had"); the result is stamped acl_provenance = admin-assigned and the
+       ORIGINAL payload is preserved verbatim as the episode body so the
+       admin's mapping is auditable. 409 if already resolved (atomic
+       OPEN→reingested claim); 422 if the payload carries nothing ingestible —
+       re-ingest never fabricates content. Audited: verb quarantine_reingest.
+     POST /v1/admin/quarantine/{id}/dismiss — acknowledge WITHOUT indexing
+       anything. Audited: verb quarantine_dismiss. 409 if already resolved.
+   The quarantine row survives either exit (invalidate-don't-delete).
+
    THESIS (SPEC §5 Screen 6, §3): these events are invisible to recall BY
    DESIGN. An unmappable ACL → quarantine, never permissive indexing. This
    panel therefore offers NO permissive-fallback affordance and NO
-   "index it anyway" shortcut — that shortcut must not exist.
+   "index it anyway" shortcut — that shortcut must not exist, and the server
+   gives it no request shape to exist through: there is no way to omit or
+   inherit the ACL on re-ingest.
 
-   HONEST SEAM (SPEC §5 Screen 6 'Actions'): there is NO re-ingest / dismiss /
-   acknowledge endpoint yet. That needs a new server WRITE surface the spec must
-   add first, and re-ingest can only ever route through a CORRECTED mapping. We
-   render it as a DISABLED seam — designed, never faked as a working button.
+   HONEST LIMIT: GET /v1/admin/quarantine does not yet return the 0023
+   resolution/resolved_at/resolution_note columns, so a previously resolved
+   row can still appear in a freshly loaded window. The server's atomic claim
+   is the authority — an action on such a row gets a 409 naming the prior
+   disposition, and this panel marks the row the moment it learns it.
+   Dispositions learned in THIS SESSION are badged locally.
 
-   READ-PATH PURITY: pure reads only. No LLM calls, no live-ReBAC calls. Filter,
-   group, and export are all local transforms over the fetched window.
+   READ-PATH PURITY: reads are pure (no LLM calls, no live-ReBAC calls);
+   filter, group, and export are local transforms over the fetched window.
+   The two writes are worker/admin-plane calls — recall/get never run them.
    ========================================================================== */
 (function () {
 
@@ -89,8 +108,11 @@
       window_rows: rows.length,
       note: "Quarantined webhook payloads from GET /v1/admin/quarantine. " +
             "These are invisible to recall by design; nothing ambiguous was indexed " +
-            "permissively. There is no re-ingest endpoint — re-ingest can only route " +
-            "through a corrected mapping (SPEC §5 Screen 6, §7b).",
+            "permissively. The only exits are POST …/{id}/reingest through a corrected " +
+            "admin-supplied ACL mapping (stamped admin-assigned) and POST …/{id}/dismiss " +
+            "(indexes nothing) — both audited; the row survives either way " +
+            "(SPEC §5 Screen 6, §7b). The listing does not yet carry resolution status, " +
+            "so resolved rows may be present in this export.",
       events: rows.map(function (r) {
         return {
           id: r.id,
@@ -104,13 +126,46 @@
     }, null, 2);
   }
 
+  // ---- corrected-mapping input parsing -----------------------------------
+  // Principal tokens are i32s on the wire. We accept comma/space-separated
+  // integers, de-duplicated; anything non-integer is a hard error (never
+  // silently dropped — a typo must not shrink or widen visibility unnoticed).
+  function parseTokens(raw) {
+    var parts = String(raw || "").split(/[\s,]+/).filter(function (s) { return s.length; });
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < parts.length; i++) {
+      if (!/^-?\d+$/.test(parts[i])) {
+        throw new Error('visibility token "' + parts[i] + '" is not an integer principal token');
+      }
+      var n = parseInt(parts[i], 10);
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+    }
+    return out;
+  }
+  function parseTags(raw) {
+    return String(raw || "").split(/[\s,]+/).filter(function (s) { return s.length; });
+  }
+  // "… HTTP 409: quarantine item already resolved (dismissed)" → "dismissed".
+  function priorDisposition(message) {
+    var m = /already resolved(?:\s*\(([^)]+)\))?/.exec(String(message || ""));
+    if (!m) return null;
+    return m[1] || "resolved";
+  }
+
   Verity.register({
     id: "quarantine",
     mount: function (section) {
       var el = Verity.$("quarantine-mount");
       if (!el) return;
 
-      var LAST = [];   // last fetched raw window (newest first)
+      var LAST = [];       // last fetched raw window (newest first)
+      var BY_ID = {};      // id → row, for the per-row action dialogs
+      var RESOLVED = {};   // id → disposition learned THIS SESSION (from our own
+                           // 200s or a 409 naming the prior disposition). The
+                           // listing doesn't carry resolution yet, so this is
+                           // honest local knowledge, labeled as such.
+      var ACTIVE = null;   // row a dialog is currently open for
 
       /* -- THESIS BANNER: the fail-closed non-negotiable is the panel's
             identity (SPEC §5 Screen 6). Rendered as a card so it reads as a
@@ -165,27 +220,102 @@
         '<div id="q-out"></div>';
       el.appendChild(controls);
 
-      /* -- HONEST SEAM: no re-ingest / dismiss endpoint exists yet. We design
-            the affordance and render it DISABLED — never a phantom button, and
-            crucially never an "index it anyway" shortcut (SPEC §5 Screen 6). */
-      var seam = document.createElement("div");
-      seam.className = "card";
-      seam.innerHTML =
-        '<h2>Re-ingest &amp; dismiss <span class="sub">no write surface yet — honest seam, not a fake button</span></h2>' +
+      /* -- THE TWO EXITS: the write surface exists now (migration 0023). The
+            v0.2 disabled seam is replaced by the real actions — and the shape
+            of the real actions keeps the promise the seam made: there is no
+            "index it anyway" affordance, and the server gives it no request
+            shape to exist through. */
+      var exits = document.createElement("div");
+      exits.className = "card";
+      exits.innerHTML =
+        '<h2>Two exits &mdash; both audited <span class="sub">POST /v1/admin/quarantine/{id}/reingest &middot; &hellip;/{id}/dismiss &middot; admin token</span></h2>' +
         '<div class="note" style="font-size:13px">' +
-          'Correcting a mapping and re-ingesting a quarantined payload, or dismissing/acknowledging one, ' +
-          'needs a server WRITE surface that <b>does not exist yet</b> — the spec must add it first ' +
-          '(SPEC §5 Screen 6, Later). We render the action as a <b>disabled seam we design but never fake</b>. ' +
-          '<em>There is no "index it anyway" affordance, and there never will be:</em> re-ingest can only ' +
-          'ever route through a <b>corrected mapping</b>, so a quarantined payload is never indexed on a ' +
-          'permissive fallback (SPEC §3, §7b).</div>' +
-        '<div class="actions">' +
-          '<button disabled title="No re-ingest endpoint. Re-ingest can only route through a corrected ACL mapping — that write surface does not exist yet (SPEC §5 Screen 6, Later). Seam is designed, not faked.">' +
-            'Re-map ACL &amp; re-ingest (seam — needs new write surface)</button>' +
-          '<button disabled title="No dismiss/acknowledge endpoint yet — quarantined rows are invalidate-don\'t-delete and never silently cleared (SPEC §5 Screen 6, Later). Seam is designed, not faked.">' +
-            'Dismiss / acknowledge (seam — needs new write surface)</button>' +
+          'A quarantined payload leaves triage in exactly two ways, via the per-row buttons below: ' +
+          '<b>re-map ACL &amp; re-ingest</b> re-admits it <em>through a corrected, admin-supplied mapping</em> ' +
+          '(visibility + confidentiality are <b>required and explicit</b> — no default, no "inherit whatever ' +
+          'the webhook had" — and the result is stamped ' + Verity.provenanceBadge("admin-assigned") +
+          ' with the original payload preserved verbatim as the episode body, so the mapping is auditable); ' +
+          '<b>dismiss / acknowledge</b> records the disposition and indexes <em>nothing</em>. ' +
+          '<em>There is still no "index it anyway" affordance, and there never will be:</em> no request shape ' +
+          'exists that indexes a payload under its original unmappable ACL or any permissive fallback, and ' +
+          'unparseable facts are skipped fail-closed, never guessed into L1. The quarantine row survives ' +
+          'either exit (invalidate-don&#39;t-delete); both are audit-logged ' +
+          '(<span class="sub">quarantine_reingest / quarantine_dismiss</span>) (SPEC §3, §5 Screen 6, §7b).</div>' +
+        '<div class="note"><em>Resolution status is session-local for now.</em> The listing endpoint does not ' +
+          'yet return the resolution columns, so an already-resolved row can still appear in a freshly loaded ' +
+          'window. The server&#39;s atomic claim is the authority: acting on such a row returns ' +
+          '<b>409 naming the prior disposition</b>, and this panel badges the row the moment it learns it.</div>';
+      el.appendChild(exits);
+
+      /* -- RE-INGEST dialog: the corrected-mapping form. Confidentiality has
+            a blank placeholder (a choice is forced, never defaulted) and an
+            EMPTY visibility set needs an explicit fail-closed acknowledgement
+            — it is accepted by the server but writes memory nobody can read. */
+      var qrEl = document.createElement("div");
+      qrEl.className = "dialog-backdrop";
+      qrEl.id = "q-reingest-dialog";
+      qrEl.innerHTML =
+        '<div class="dialog" style="max-width:640px">' +
+          '<h3>Re-map ACL &amp; re-ingest</h3>' +
+          '<div class="note" id="qr-ctx"></div>' +
+          '<div class="note" style="margin-top:10px;border-left:3px solid var(--red,#f85149);padding-left:10px">' +
+            '<b>This is not "index it anyway".</b> You are supplying the corrected mapping yourself; the ' +
+            'chunk (and any parseable native facts) will carry <em>exactly</em> the visibility, ' +
+            'confidentiality, and tags below, stamped ' + Verity.provenanceBadge("admin-assigned") +
+            ' — never the original unmappable ACL, never a default. The original payload is preserved ' +
+            'verbatim as the episode body and the action is audit-logged.' +
+          '</div>' +
+          '<div style="margin-top:12px"><label>visibility — principal tokens (required, explicit)</label>' +
+            '<input type="text" id="qr-vis" placeholder="e.g. 7, 9"></div>' +
+          '<label class="checkline" style="margin-top:6px"><input type="checkbox" id="qr-vis-empty">' +
+            'I mean an EMPTY visibility set &mdash; fail-closed: this writes memory nobody can read</label>' +
+          '<div style="margin-top:10px"><label>confidentiality (required — choose explicitly)</label>' +
+            '<select class="field" id="qr-conf">' +
+              '<option value="">— choose —</option>' +
+              '<option value="Public">public</option>' +
+              '<option value="Internal">internal</option>' +
+              '<option value="Confidential">confidential</option>' +
+              '<option value="Restricted">restricted</option>' +
+            '</select></div>' +
+          '<div style="margin-top:10px"><label>entity tags (optional, comma-separated)</label>' +
+            '<input type="text" id="qr-tags" placeholder="account:acme, deal:renewal-2026"></div>' +
+          '<div style="margin-top:10px"><label>corrected text extraction (optional)</label>' +
+            '<textarea id="qr-content" placeholder="Only for payloads whose text lives under a field the native parser doesn\'t know. Leave blank to use the payload\'s own content/observation/raw text. Re-ingest never fabricates content — a payload with nothing ingestible is refused (422)."></textarea></div>' +
+          '<div style="margin-top:10px"><label>audit note (optional)</label>' +
+            '<input type="text" id="qr-note" placeholder="why this mapping is correct"></div>' +
+          '<div class="err" id="qr-dlg-err"></div>' +
+          '<div id="qr-dlg-result"></div>' +
+          '<div class="actions">' +
+            '<button class="primary" id="qr-go">Re-ingest through corrected mapping</button>' +
+            '<button id="qr-cancel">Cancel</button>' +
+          '</div>' +
         '</div>';
-      el.appendChild(seam);
+      el.appendChild(qrEl);
+      var qrDlg = Verity.dialog("q-reingest-dialog");
+
+      /* -- DISMISS dialog: acknowledge without indexing anything. ---------- */
+      var qdEl = document.createElement("div");
+      qdEl.className = "dialog-backdrop";
+      qdEl.id = "q-dismiss-dialog";
+      qdEl.innerHTML =
+        '<div class="dialog" style="max-width:560px">' +
+          '<h3>Dismiss / acknowledge</h3>' +
+          '<div class="note" id="qd-ctx"></div>' +
+          '<div class="note" style="margin-top:10px">' +
+            'Dismissing records the disposition and <b>indexes nothing</b> — the payload stays invisible ' +
+            'to recall, and the quarantine row survives for audit (invalidate-don&#39;t-delete). ' +
+            'The action is audit-logged (<span class="sub">quarantine_dismiss</span>).' +
+          '</div>' +
+          '<div style="margin-top:10px"><label>audit note (optional)</label>' +
+            '<input type="text" id="qd-note" placeholder="e.g. duplicate delivery; fixed at the source"></div>' +
+          '<div class="err" id="qd-dlg-err"></div>' +
+          '<div class="actions">' +
+            '<button class="primary" id="qd-go">Dismiss (indexes nothing)</button>' +
+            '<button id="qd-cancel">Cancel</button>' +
+          '</div>' +
+        '</div>';
+      el.appendChild(qdEl);
+      var qdDlg = Verity.dialog("q-dismiss-dialog");
 
       // prefill tenant from shared state / decoded handle
       var tenantInput = Verity.$("q-tenant");
@@ -253,6 +383,20 @@
           '<div style="margin-top:6px">' + chips + "</div>";
       }
 
+      // ---- resolution bookkeeping (session-local; see honesty note) -------
+      function markResolved(id, disposition) {
+        RESOLVED[id] = disposition;
+        renderTable(filtered());
+      }
+      function resolutionCell(id) {
+        var d = RESOLVED[id];
+        if (!d) return null;
+        var cls = d === "reingested" ? "b-admin-assigned" : "b-kind";
+        return Verity.badge(d, cls) +
+          '<div class="note" style="margin-top:4px">resolved &mdash; learned this session; ' +
+          'row survives for audit</div>';
+      }
+
       // ---- rendering -----------------------------------------------------
       function renderTable(rows) {
         if (!rows.length) {
@@ -265,6 +409,7 @@
         }
         var head = '<div class="tablewrap"><table><thead><tr>' +
           '<th>at</th><th>webhook_id</th><th>reason</th><th>payload <span class="sub">(full — not truncated)</span></th>' +
+          '<th>actions <span class="sub">(the only two exits)</span></th>' +
           '</tr></thead><tbody>';
         var body = rows.map(function (r) {
           // Every quarantine row is a fail-closed refusal → flag styling + a
@@ -274,11 +419,20 @@
             Verity.badge("quarantined", "b-quarantined") + " " +
             Verity.badge(g, "b-quarantined", true) +
             '<div class="note" style="margin-top:4px">' + Verity.esc(r.reason || "—") + "</div>";
+          var actions = resolutionCell(r.id) ||
+            ('<button data-act="reingest" data-id="' + Verity.esc(r.id) + '" ' +
+               'title="Re-admit THROUGH a corrected admin-supplied ACL mapping (visibility + confidentiality required, stamped admin-assigned). Never the original unmappable ACL, never a default.">' +
+               'Re-map ACL &amp; re-ingest&hellip;</button>' +
+             '<div style="height:4px"></div>' +
+             '<button data-act="dismiss" data-id="' + Verity.esc(r.id) + '" ' +
+               'title="Acknowledge without indexing anything. The row survives for audit (invalidate-don\'t-delete).">' +
+               'Dismiss / acknowledge&hellip;</button>');
           return '<tr class="flag">' +
             '<td>' + Verity.esc(Verity.fmtTime(r.at)) + '</td>' +
             '<td>' + Verity.esc(r.webhook_id || "—") + '</td>' +
             '<td>' + reasonCell + '</td>' +
             '<td>' + payloadBlock(r.payload) + '</td>' +
+            '<td style="white-space:nowrap">' + actions + '</td>' +
           '</tr>';
         }).join("");
         Verity.$("q-out").innerHTML = head + body + '</tbody></table></div>';
@@ -305,11 +459,152 @@
             "/v1/admin/quarantine?tenant_id=" + encodeURIComponent(tenant) + "&limit=" + limit,
             { admin: true });
           LAST = Array.isArray(rows) ? rows : [];
+          BY_ID = {};
+          LAST.forEach(function (r) { BY_ID[r.id] = r; });
           Verity.$("q-stamp").textContent =
             "loaded " + Verity.fmtTime(Date.now()) + " · window " + LAST.length + " row(s)";
           rerender();
         } catch (e) {
           Verity.err("q-err", e);
+        }
+      }
+
+      // ---- action dialogs --------------------------------------------------
+      function requireTenantForAction() {
+        var t = tenantInput.value.trim();
+        if (!t) throw new Error("no tenant_id — the action must name the tenant that owns the row");
+        return t;
+      }
+      function ctxLine(r) {
+        return Verity.badge("quarantined", "b-quarantined") + " " +
+          Verity.badge(reasonGroup(r.reason), "b-quarantined", true) +
+          ' <b>' + Verity.esc(r.id) + '</b> &middot; ' + Verity.esc(Verity.fmtTime(r.at)) +
+          '<div class="note" style="margin-top:4px">' + Verity.esc(r.reason || "—") + '</div>';
+      }
+
+      function openReingest(r) {
+        ACTIVE = r;
+        Verity.$("qr-ctx").innerHTML = ctxLine(r);
+        Verity.$("qr-vis").value = "";
+        Verity.$("qr-vis-empty").checked = false;
+        Verity.$("qr-conf").value = "";
+        Verity.$("qr-tags").value = "";
+        Verity.$("qr-content").value = "";
+        Verity.$("qr-note").value = "";
+        Verity.$("qr-dlg-result").innerHTML = "";
+        Verity.clearErr("qr-dlg-err");
+        Verity.$("qr-go").disabled = false;
+        Verity.$("qr-cancel").textContent = "Cancel";
+        qrDlg.open();
+      }
+
+      async function doReingest() {
+        if (!ACTIVE) return;
+        Verity.clearErr("qr-dlg-err");
+        Verity.$("qr-dlg-result").innerHTML = "";
+        var tenant, tokens;
+        try {
+          tenant = requireTenantForAction();
+          tokens = parseTokens(Verity.$("qr-vis").value);
+          if (!tokens.length && !Verity.$("qr-vis-empty").checked) {
+            throw new Error("visibility is empty — supply principal tokens, or tick the explicit " +
+              "empty-set acknowledgement (fail-closed: it writes memory nobody can read)");
+          }
+          if (tokens.length && Verity.$("qr-vis-empty").checked) {
+            throw new Error("the empty-set acknowledgement is ticked but tokens were supplied — " +
+              "untick it or clear the tokens so the intent is unambiguous");
+          }
+          if (!Verity.$("qr-conf").value) {
+            throw new Error("choose a confidentiality — it is required and explicit; there is no default");
+          }
+        } catch (e) { Verity.err("qr-dlg-err", e); return; }
+
+        var body = {
+          tenant_id: tenant,
+          visibility: tokens,
+          confidentiality: Verity.$("qr-conf").value,
+        };
+        var tags = parseTags(Verity.$("qr-tags").value);
+        if (tags.length) body.entity_tags = tags;
+        var content = Verity.$("qr-content").value.trim();
+        if (content) body.content = content;
+        var note = Verity.$("qr-note").value.trim();
+        if (note) body.note = note;
+
+        var go = Verity.$("qr-go");
+        go.disabled = true;
+        try {
+          var res = await Verity.api(
+            "/v1/admin/quarantine/" + encodeURIComponent(ACTIVE.id) + "/reingest",
+            { admin: true, json: body });
+          markResolved(ACTIVE.id, "reingested");
+          // Result summary INCLUDING the server's honesty flags — what the
+          // re-ingest could not carry over is disclosed, not glossed.
+          var flags = [];
+          if (res && res.facts_unparseable_skipped) {
+            flags.push("<em>facts skipped:</em> the payload's `facts` did not parse as the native " +
+              "shape and were NOT written to L1 (fail-closed, never guessed)");
+          }
+          if (res && res.raw_text_truncated_at_capture) {
+            flags.push("<em>raw text was truncated at capture</em> (4096 chars) — the indexed chunk " +
+              "came from that preserved prefix; supply a corrected extraction if the full text matters");
+          }
+          Verity.$("qr-dlg-result").innerHTML =
+            '<div class="note" style="margin-top:10px;border-left:3px solid var(--green,#3fb950);padding-left:10px">' +
+              '<b>Re-ingested</b> through the corrected mapping ' + Verity.provenanceBadge("admin-assigned") +
+              '<div class="kv">' +
+                '<dt>episode</dt><dd>' + Verity.esc(res.episode_id || "—") + '</dd>' +
+                '<dt>chunks indexed</dt><dd>' + Verity.esc(String(res.chunks_indexed != null ? res.chunks_indexed : "—")) + '</dd>' +
+                '<dt>facts written</dt><dd>' + Verity.esc(String(res.facts_written != null ? res.facts_written : "—")) + '</dd>' +
+              '</div>' +
+              (flags.length ? '<div class="note" style="margin-top:6px">' + flags.join("<br>") + '</div>' : "") +
+              '<div class="note" style="margin-top:6px">Audited as <span class="sub">quarantine_reingest</span>; ' +
+              'the quarantine row survives for audit. Original payload preserved verbatim as the episode body.</div>' +
+            '</div>';
+        } catch (e) {
+          var prior = priorDisposition(e.message);
+          if (prior) markResolved(ACTIVE.id, prior);
+          // Keep the dialog open so the error is read in context (a 422
+          // "nothing ingestible" points at the corrected-extraction field).
+          Verity.err("qr-dlg-err", e);
+          go.disabled = false;
+          return;
+        }
+        go.disabled = true; // resolved — no double-submit; Cancel now reads as Close
+        Verity.$("qr-cancel").textContent = "Close";
+      }
+
+      function openDismiss(r) {
+        ACTIVE = r;
+        Verity.$("qd-ctx").innerHTML = ctxLine(r);
+        Verity.$("qd-note").value = "";
+        Verity.clearErr("qd-dlg-err");
+        Verity.$("qd-go").disabled = false;
+        qdDlg.open();
+      }
+
+      async function doDismiss() {
+        if (!ACTIVE) return;
+        Verity.clearErr("qd-dlg-err");
+        var tenant;
+        try { tenant = requireTenantForAction(); }
+        catch (e) { Verity.err("qd-dlg-err", e); return; }
+        var body = { tenant_id: tenant };
+        var note = Verity.$("qd-note").value.trim();
+        if (note) body.note = note;
+        var go = Verity.$("qd-go");
+        go.disabled = true;
+        try {
+          await Verity.api(
+            "/v1/admin/quarantine/" + encodeURIComponent(ACTIVE.id) + "/dismiss",
+            { admin: true, json: body });
+          markResolved(ACTIVE.id, "dismissed");
+          qdDlg.close();
+        } catch (e) {
+          var prior = priorDisposition(e.message);
+          if (prior) markResolved(ACTIVE.id, prior);
+          Verity.err("qd-dlg-err", e);
+          go.disabled = false;
         }
       }
 
@@ -331,6 +626,19 @@
         download("verity-quarantine-" + Date.now() + ".json", "application/json",
           toJsonExport(rows, { tenant: tenantInput.value.trim() }));
       };
+      // Per-row action buttons (event delegation — rows re-render freely).
+      Verity.$("q-out").addEventListener("click", function (ev) {
+        var btn = ev.target.closest ? ev.target.closest("button[data-act]") : null;
+        if (!btn) return;
+        var row = BY_ID[btn.getAttribute("data-id")];
+        if (!row) return;
+        if (btn.getAttribute("data-act") === "reingest") openReingest(row);
+        else openDismiss(row);
+      });
+      Verity.$("qr-go").onclick = doReingest;
+      Verity.$("qr-cancel").onclick = function () { qrDlg.close(); Verity.$("qr-cancel").textContent = "Cancel"; };
+      Verity.$("qd-go").onclick = doDismiss;
+      Verity.$("qd-cancel").onclick = function () { qdDlg.close(); };
     },
   });
 })();

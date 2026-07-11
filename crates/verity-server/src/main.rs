@@ -9,6 +9,8 @@ mod audit;
 mod backfill;
 mod compliance;
 mod connectors;
+#[cfg(test)]
+mod console_later_tests;
 mod consolidation;
 #[cfg(test)]
 mod consolidation_tests;
