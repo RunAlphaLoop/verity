@@ -5,7 +5,8 @@
     {
       "subject": "Verity",
       "relation": "is",
-      "object": "an open-source memory plane"
+      "object": "an open-source memory plane",
+      "canonical_predicate": "is"
     }
   ],
   "tag_suggestions": [],
@@ -13,7 +14,8 @@
     {
       "statement": "Support tickets always mention the renewal date.",
       "categories": [],
-      "evidence": ["018f6b7a-0000-7000-8000-000000000002"]
+      "evidence": ["018f6b7a-0000-7000-8000-000000000002"],
+      "canonical_statement": "date mention renewal support tickets"
     }
   ]
 }

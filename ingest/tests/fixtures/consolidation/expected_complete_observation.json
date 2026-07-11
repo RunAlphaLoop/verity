@@ -5,12 +5,14 @@
     {
       "subject": "Acme Corp",
       "relation": "is",
-      "object": "evaluating the enterprise tier"
+      "object": "evaluating the enterprise tier",
+      "canonical_predicate": "is"
     },
     {
       "subject": "account:acme",
       "relation": "Renewal Stage",
-      "object": "negotiation"
+      "object": "negotiation",
+      "canonical_predicate": "renewal_stage"
     }
   ],
   "tag_suggestions": [
@@ -24,7 +26,8 @@
     {
       "statement": "Healthcare customers consistently require DPA redlines before security review.",
       "categories": [],
-      "evidence": ["018f6b7a-0000-7000-8000-000000000001"]
+      "evidence": ["018f6b7a-0000-7000-8000-000000000001"],
+      "canonical_statement": "segment_buyer requires healthcare redlines signed_dpa before security_review"
     }
   ]
 }

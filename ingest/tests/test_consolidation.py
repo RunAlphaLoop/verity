@@ -30,6 +30,8 @@ from verity_ingest.consolidation import (
     LeasedEpisode,
     TagSuggestion,
     build_extractor,
+    canonical_predicate,
+    canonical_statement,
     run_once,
 )
 
@@ -220,12 +222,91 @@ def test_complete_body_shapes() -> None:
         knowledge_candidates=[KnowledgeCandidate("stmt", ["cat"], ["ep"])],
     )
     body = extraction.to_complete_body("t", "e")
-    assert body["l2_facts"][0] == {"subject": "s", "relation": "r", "object": "o"}
+    assert body["l2_facts"][0] == {
+        "subject": "s",
+        "relation": "r",
+        "object": "o",
+        "canonical_predicate": "r",
+    }
     assert body["l2_facts"][1]["valid_from"] == "2026-01-01T00:00:00Z"
+    assert body["l2_facts"][1]["canonical_predicate"] == "r"
     assert body["tag_suggestions"] == [{"chunk_id": "c", "tag": "t", "confidence": 0.5}]
     assert body["knowledge_candidates"] == [
-        {"statement": "stmt", "categories": ["cat"], "evidence": ["ep"]}
+        {
+            "statement": "stmt",
+            "categories": ["cat"],
+            "evidence": ["ep"],
+            "canonical_statement": "stmt",
+        }
     ]
+
+
+# ---------- canonicalization (knowledge-merge-tuning.md §3) ----------
+
+# The DPA trio from the live-smoke finding: three paraphrases of ONE
+# generalization (DPA-before-security-review) that MiniLM cosine could not
+# merge (A·B 0.62, A·C 0.68, B·C 0.49). Canonicalization must collapse them.
+DPA_TRIO = [
+    "Enterprise security teams always require a signed DPA before they will begin a security review.",
+    "Enterprise accounts consistently require a Data Processing Agreement to be signed before any security assessment can proceed.",
+    "Procurement teams consistently block the security review until the data processing agreement (DPA) is executed.",
+]
+
+
+def test_dpa_trio_collapses_to_one_canonical_form() -> None:
+    forms = {canonical_statement(s) for s in DPA_TRIO}
+    assert len(forms) == 1, f"DPA paraphrases must share a canonical form, got {forms}"
+    (form,) = forms
+    # Sanity: the collapsed form is the expected stable predication.
+    assert form == "segment_buyer requires signed_dpa before security_review"
+
+
+def test_distinct_generalizations_do_not_over_normalize() -> None:
+    """DON'T fuse "requires DPA" and "requires SOC 2" — a false merge is the
+    failure the design forbids (knowledge-merge-tuning.md §1)."""
+    dpa = canonical_statement("Enterprise customers always require a DPA before security review.")
+    soc2 = canonical_statement(
+        "Enterprise customers always require a SOC 2 report before security review."
+    )
+    assert dpa != soc2, "distinct required artifacts must stay distinct"
+    assert "signed_dpa" in dpa
+    assert "soc" in soc2
+
+
+def test_canonical_statement_is_deterministic_and_order_insensitive() -> None:
+    a = canonical_statement("Enterprise buyers require a signed DPA before security review.")
+    b = canonical_statement("Enterprise buyers require a signed DPA before security review.")
+    assert a == b
+    # Whitespace/case/article variants collapse identically.
+    c = canonical_statement("enterprise   buyers require   the signed dpa before   the security review")
+    assert a == c
+
+
+def test_canonical_predicate_aligns_requires_variants() -> None:
+    """The finding: "requires" and "requires_before_security_assessment" must
+    both key to the SAME canonical predicate so L2 supersession aligns."""
+    assert canonical_predicate("requires") == "requires"
+    assert canonical_predicate("requires_before_security_assessment") == "requires_before"
+    assert canonical_predicate("require a DPA before the security review") == "requires_before"
+    assert canonical_predicate("blocks until") == "blocks_until"
+    assert canonical_predicate("is") == "is"
+
+
+def test_canonical_predicate_slugs_unknown_relations_deterministically() -> None:
+    assert canonical_predicate("Renewal Stage") == "renewal_stage"
+    # Never lost: an unmappable relation still produces a stable key.
+    assert canonical_predicate("!!!") == "relates_to"
+
+
+def test_dataclasses_autofill_canonical_fields() -> None:
+    """Constructing without canonical fields derives them deterministically."""
+    fact = L2Fact("Acme", "requires a DPA before security review", "yes")
+    assert fact.canonical_predicate == "requires_before"
+    cand = KnowledgeCandidate("Enterprise buyers always require a DPA before security review.")
+    assert cand.canonical_statement == "segment_buyer requires signed_dpa before security_review"
+    # Explicit values are respected (the model's own canonical form wins).
+    fact2 = L2Fact("Acme", "stage", "renewal", canonical_predicate="is")
+    assert fact2.canonical_predicate == "is"
 
 
 # ---------- AnthropicExtractor (seam; live call only when the key exists) ----------
@@ -242,14 +323,25 @@ def test_anthropic_extractor_requires_key(monkeypatch: pytest.MonkeyPatch) -> No
 @respx.mock
 def test_anthropic_extractor_request_shape_and_mapping() -> None:
     structured = {
-        "l2_facts": [{"subject": "Acme Corp", "relation": "stage", "object": "renewal"}],
+        "l2_facts": [
+            {
+                "subject": "Acme Corp",
+                "relation": "stage",
+                "object": "renewal",
+                "canonical_predicate": "is",
+            }
+        ],
         "tag_suggestions": [
             {"chunk_id": "018f6b7a-0000-7000-8000-00000000000a", "tag": "account:acme", "confidence": 0.9},
             # An invented chunk id must be dropped, never forwarded.
             {"chunk_id": "made-up", "tag": "account:acme", "confidence": 0.9},
         ],
         "knowledge_candidates": [
-            {"statement": "Healthcare customers consistently need DPAs.", "categories": ["industry:healthcare"]}
+            {
+                "statement": "Healthcare customers consistently need DPAs.",
+                "categories": ["industry:healthcare"],
+                "canonical_statement": "segment_buyer requires signed_dpa",
+            }
         ],
     }
     route = respx.post(ANTHROPIC_API_URL).mock(
@@ -273,15 +365,26 @@ def test_anthropic_extractor_request_shape_and_mapping() -> None:
     assert body["model"] == ANTHROPIC_MODEL
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert body["messages"][0]["role"] == "user"
+    # The schema ALSO requires the canonical fields — assert the request shape.
+    schema = body["output_config"]["format"]["schema"]
+    l2_props = schema["properties"]["l2_facts"]["items"]
+    assert "canonical_predicate" in l2_props["properties"]
+    assert "canonical_predicate" in l2_props["required"]
+    kc_props = schema["properties"]["knowledge_candidates"]["items"]
+    assert "canonical_statement" in kc_props["properties"]
+    assert "canonical_statement" in kc_props["required"]
 
     assert [(f.subject, f.relation, f.object) for f in extraction.l2_facts] == [
         ("Acme Corp", "stage", "renewal")
     ]
+    # The model's canonical_predicate rides through unchanged.
+    assert extraction.l2_facts[0].canonical_predicate == "is"
     assert [t.chunk_id for t in extraction.tag_suggestions] == [
         "018f6b7a-0000-7000-8000-00000000000a"
     ]
     cand = extraction.knowledge_candidates[0]
     assert cand.evidence == [episode.episode_id], "evidence is attributed client-side"
+    assert cand.canonical_statement == "segment_buyer requires signed_dpa"
 
 
 @respx.mock

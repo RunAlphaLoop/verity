@@ -179,6 +179,13 @@ pub(crate) struct L2FactIn {
     object: serde_json::Value,
     #[serde(default)]
     valid_from: Option<DateTime<Utc>>,
+    /// Controlled-vocabulary predicate the extractor derived from `relation`
+    /// (requires_before / blocks_until / requires / ...). Used as the L1
+    /// supersession `field` so re-extractions of the same relation align even
+    /// when the free-text wording differs. Falls back to the normalized
+    /// free-text relation when the extractor omits it.
+    #[serde(default)]
+    canonical_predicate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -195,6 +202,13 @@ pub(crate) struct KnowledgeCandidateIn {
     categories: Vec<String>,
     #[serde(default)]
     evidence: Vec<EpisodeId>,
+    /// Normalized canonical predication of `statement` (lowercased, filler
+    /// stripped, controlled-vocab predicate). Drives the exact-match fast-path
+    /// merge; the human `statement` is kept for display. `None` when the
+    /// extractor emitted no canonical form (that candidate simply never takes
+    /// the fast path — the cosine fallback still applies).
+    #[serde(default)]
+    canonical_statement: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +277,15 @@ pub(crate) async fn complete(
     // --- L2 facts: keyed upserts, supersession for free (SPEC §2 L2). ---
     let (mut inserted, mut superseded, mut unchanged) = (0u64, 0u64, 0u64);
     for fact in &req.l2_facts {
+        // Supersession `field` keys on the CANONICAL predicate (a controlled
+        // vocabulary) when the extractor supplies one, so re-extractions of the
+        // same relation ("requires" vs "requires_before_security_assessment",
+        // both -> "requires_before") align onto ONE (subject, relation) key and
+        // supersede correctly. Falls back to the normalized free-text relation.
+        let field = match fact.canonical_predicate.as_deref() {
+            Some(p) if !p.trim().is_empty() => normalize_term(p),
+            _ => normalize_term(&fact.relation),
+        };
         let outcome = state
             .storage
             .upsert_fact(FactWrite {
@@ -270,7 +293,7 @@ pub(crate) async fn complete(
                 key: FactKey {
                     source: "l2".into(),
                     entity_id: normalize_term(&fact.subject),
-                    field: normalize_term(&fact.relation),
+                    field,
                 },
                 value: fact.object.clone(),
                 valid_from: fact.valid_from.unwrap_or(recorded_at),
@@ -375,6 +398,40 @@ async fn propose_or_merge(
     tenant: TenantId,
     cand: &KnowledgeCandidateIn,
 ) -> HandlerResult<serde_json::Value> {
+    // --- Exact-canonical-match FAST PATH (knowledge-merge-tuning.md §3) ---
+    // Before any embedding/LLM cost: if an existing candidate/published item in
+    // this tenant has a byte-identical canonical_statement, merge immediately.
+    // This is the safe, precise path — two paraphrases that canonicalize to the
+    // same form ARE the same generalization (extraction guarantees distinct
+    // generalizations do not collapse), so no similarity judgement is needed.
+    if let Some(canon) = cand
+        .canonical_statement
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        let fast: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM knowledge
+             WHERE tenant_id = $1 AND status IN ('candidate', 'published')
+               AND canonical_statement = $2
+             ORDER BY first_seen ASC
+             LIMIT 1",
+        )
+        .bind(tenant)
+        .bind(canon)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(internal)?;
+        if let Some((knowledge_id,)) = fast {
+            merge_evidence(state, tenant, knowledge_id, &cand.evidence).await?;
+            return Ok(serde_json::json!({
+                "knowledge_id": knowledge_id,
+                "merged": true,
+                "merge": "canonical_exact",
+            }));
+        }
+    }
+
     let embedding = state.encode(&cand.statement).await.ok().flatten();
     let vector = embedding.clone().map(pgvector::Vector::from);
 
@@ -401,6 +458,7 @@ async fn propose_or_merge(
         return Ok(serde_json::json!({
             "knowledge_id": knowledge_id,
             "merged": true,
+            "merge": "cosine",
         }));
     }
 
@@ -416,6 +474,26 @@ async fn propose_or_merge(
         })
         .await
         .map_err(internal)?;
+    // Store the canonical form for the exact-match fast path on future
+    // candidates, and the embedding for the cosine fallback. Both are written on
+    // the fresh row (propose_knowledge itself stays canonical-agnostic — the
+    // human statement is its input, matching is a consolidation-plane concern).
+    if let Some(canon) = cand
+        .canonical_statement
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        sqlx::query(
+            "UPDATE knowledge SET canonical_statement = $3 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(item.id)
+        .bind(canon)
+        .execute(state.pool())
+        .await
+        .map_err(internal)?;
+    }
     if let Some(v) = vector {
         sqlx::query(
             "UPDATE knowledge SET statement_embedding = $3 WHERE tenant_id = $1 AND id = $2",

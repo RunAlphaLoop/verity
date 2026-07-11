@@ -295,6 +295,202 @@ async fn similar_statement_merges_and_accrues_support() {
     assert!(item.last_reinforced >= item.first_seen);
 }
 
+// ---------- exact-canonical-match fast path (Phase 1) ----------
+
+#[tokio::test]
+async fn identical_canonical_statement_merges_via_fast_path() {
+    // Two candidates with DIFFERENT human statements (paraphrases) but an
+    // IDENTICAL canonical_statement must merge via the no-embedding fast path,
+    // accruing distinct-entity support 1 -> 2. The test state has NO encoder, so
+    // a merge here can ONLY be the canonical fast path (the cosine leg is dead).
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    assert!(
+        state.encoder.is_none(),
+        "no encoder: fast path is the only merge"
+    );
+    let obs1 = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    lease_ids(&state, tenant).await;
+
+    let canon = "segment_buyer requires signed_dpa before security_review";
+    let body1 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs1,
+            "knowledge_candidates": [{
+                "statement": "Enterprise security teams require a signed DPA before a security review.",
+                "canonical_statement": canon,
+                "evidence": [obs1],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 1");
+    assert_eq!(body1["knowledge"][0]["merged"], json!(false));
+    let kid = body1["knowledge"][0]["knowledge_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A DIFFERENT paraphrase (cosine would NOT catch it) but same canonical form.
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "knowledge_candidates": [{
+                "statement": "Procurement blocks the security review until the data processing agreement is executed.",
+                "canonical_statement": canon,
+                "evidence": [obs2],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+    assert_eq!(body2["knowledge"][0]["merged"], json!(true));
+    assert_eq!(body2["knowledge"][0]["merge"], json!("canonical_exact"));
+    assert_eq!(
+        body2["knowledge"][0]["knowledge_id"].as_str().unwrap(),
+        kid,
+        "identical canonical form must accrue on the existing item"
+    );
+
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(items.len(), 1, "no duplicate knowledge item");
+    assert_eq!(
+        items[0].distinct_entities, 2,
+        "canonical fast path accrued distinct-entity support 1 -> 2"
+    );
+}
+
+#[tokio::test]
+async fn distinct_canonical_statements_do_not_fast_path_merge() {
+    // The precision guard: two DIFFERENT canonical forms must NOT merge, even
+    // with no encoder (fast path only fires on byte-identical canonical forms).
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let obs1 = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    lease_ids(&state, tenant).await;
+
+    complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs1,
+            "knowledge_candidates": [{
+                "statement": "Enterprise buyers require a DPA before security review.",
+                "canonical_statement": "segment_buyer requires signed_dpa before security_review",
+                "evidence": [obs1],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 1");
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "knowledge_candidates": [{
+                "statement": "Enterprise buyers require a SOC 2 report before security review.",
+                "canonical_statement": "segment_buyer requires 2 report soc before security_review",
+                "evidence": [obs2],
+            }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+    assert_eq!(
+        body2["knowledge"][0]["merged"],
+        json!(false),
+        "distinct forms stay distinct"
+    );
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(items.len(), 2, "two distinct generalizations, two items");
+}
+
+// ---------- L2 supersession aligns on canonical_predicate (Phase 1) ----------
+
+#[tokio::test]
+async fn l2_canonical_predicate_aligns_supersession_across_relations() {
+    // The finding: "requires" and "requires_before_security_assessment" must key
+    // to the SAME (subject, relation) fact so the later extraction supersedes.
+    // Both carry canonical_predicate "requires_before"; the free-text relations
+    // differ. Exactly one current fact must survive.
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let obs1 = append(&state, tenant, EpisodeKind::Observation, "acct-1", "one").await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "acct-1", "two").await;
+    lease_ids(&state, tenant).await;
+
+    complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs1,
+            "l2_facts": [{
+                "subject": "Acme Corp", "relation": "requires",
+                "object": "dpa", "canonical_predicate": "requires_before",
+            }],
+        }),
+    )
+    .await
+    .expect("complete 1");
+    complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "l2_facts": [{
+                "subject": "Acme Corp", "relation": "requires_before_security_assessment",
+                "object": "signed_dpa", "canonical_predicate": "requires_before",
+            }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+
+    // Both keyed (l2, "acme corp", "requires_before") — the second supersedes.
+    let key = FactKey {
+        source: "l2".into(),
+        entity_id: "acme corp".into(),
+        field: "requires_before".into(),
+    };
+    let current = state
+        .storage
+        .current_fact(tenant, &key)
+        .await
+        .expect("read")
+        .expect("current fact");
+    assert_eq!(current.value, json!("signed_dpa"));
+
+    let current_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM facts
+         WHERE tenant_id = $1 AND source = 'l2' AND entity_id = 'acme corp'
+           AND field = 'requires_before' AND valid_to IS NULL",
+    )
+    .bind(tenant)
+    .fetch_one(state.pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        current_rows, 1,
+        "canonical predicate aligns supersession to one row"
+    );
+}
+
 // ---------- tag suggestions: suggest-only default, opt-in auto-apply ----------
 
 async fn episode_with_chunk(

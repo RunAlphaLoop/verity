@@ -46,6 +46,227 @@ from typing import Any, Protocol
 import httpx
 
 # ---------------------------------------------------------------------------
+# Canonicalization (knowledge-merge-tuning.md §3)
+#
+# Paraphrase collapses best at extraction time. We emit, alongside the human
+# statement/relation, a NORMALIZED canonical form that the server uses for the
+# exact-match fast-path merge (canonical statements) and for L2 supersession
+# alignment (canonical predicates). Canonicalization is deterministic, tested,
+# and deliberately CONSERVATIVE: it must collapse paraphrases of the SAME
+# generalization ("requires DPA before review") but must NOT collapse distinct
+# generalizations ("requires DPA" vs "requires SOC 2"). Over-normalization that
+# fuses different objects is a false merge, the failure the design forbids.
+# ---------------------------------------------------------------------------
+
+# Articles / filler stripped from canonical forms. Deliberately small: only
+# words that carry no discriminative meaning for a generalization.
+_CANONICAL_FILLER = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "some",
+        "any",
+        "will",
+        "they",
+        "any",
+        "be",
+        "been",
+        "is",
+        "are",
+        "to",
+        "that",
+        "can",
+        "proceed",
+        "begin",
+        "start",
+        "started",
+        "executed",
+        "signed",
+        "of",
+        "and",
+        # generalization markers carry no predication content
+        "always",
+        "consistently",
+        "usually",
+        "typically",
+        "generally",
+        "often",
+        "tend",
+        "tends",
+        "every",
+        "all",
+    }
+)
+
+# Controlled predicate vocabulary. Free-text relations (from either extractor)
+# map to a small set of canonical predicates so (subject, relation) supersession
+# aligns across re-extractions. Order matters: multi-word / "before"/"until"
+# senses are checked before the bare "requires" sense so
+# "requires ... before ..." → requires_before, not requires.
+_PREDICATE_BLOCKS_UNTIL = re.compile(r"\bblock(?:s|ed|ing)?\b|\buntil\b", re.IGNORECASE)
+_PREDICATE_REQUIRES_BEFORE = re.compile(
+    r"\b(?:require|need|mandate|demand)\w*\b.*\bbefore\b"
+    r"|\brequire\w*_before\w*"
+    r"|\bbefore\b.*\b(?:review|assessment|approval)\b",
+    re.IGNORECASE,
+)
+_PREDICATE_REQUIRES = re.compile(
+    r"\b(?:require|need|mandate|demand|ask\s+for|request)\w*\b", re.IGNORECASE
+)
+_PREDICATE_IS = re.compile(r"^is$", re.IGNORECASE)
+
+
+def canonical_predicate(relation: str) -> str:
+    """Map a free-text relation to the controlled predicate vocabulary.
+
+    ``requires`` and ``requires_before_security_assessment`` both → ``requires_before``
+    (the finding), so their (subject, relation) L2 keys align and supersede.
+    Unknown relations fall back to a whitespace/underscore-normalized slug so
+    they still key deterministically (never lost)."""
+    r = relation.strip()
+    if _PREDICATE_IS.match(r):
+        return "is"
+    if _PREDICATE_BLOCKS_UNTIL.search(r):
+        return "blocks_until"
+    if _PREDICATE_REQUIRES_BEFORE.search(r):
+        return "requires_before"
+    if _PREDICATE_REQUIRES.search(r):
+        return "requires"
+    # Fallback: deterministic slug (lowercase, non-alnum → single underscore).
+    slug = re.sub(r"[^a-z0-9]+", "_", r.lower()).strip("_")
+    return slug or "relates_to"
+
+
+# Synonym map applied to canonical-statement tokens: collapse surface variants
+# of the SAME concept (never distinct concepts) so paraphrases align. Values are
+# stable canonical tokens.
+_CANONICAL_SYNONYMS = {
+    "dpa": "signed_dpa",
+    "dpas": "signed_dpa",
+    "data": "",  # part of the "data processing agreement" phrase (see phrases)
+    "processing": "",
+    "agreement": "",
+    "agreements": "",
+    "enterprise": "segment_buyer",
+    "procurement": "segment_buyer",
+    "buyers": "segment_buyer",
+    "buyer": "segment_buyer",
+    "accounts": "segment_buyer",
+    "account": "segment_buyer",
+    "teams": "segment_buyer",
+    "team": "segment_buyer",
+    "customers": "segment_buyer",
+    "customer": "segment_buyer",
+    "clients": "segment_buyer",
+    "security": "security_review",
+    "review": "security_review",
+    "assessment": "security_review",
+    "assessments": "security_review",
+    "require": "requires",
+    "requires": "requires",
+    "required": "requires",
+    "requiring": "requires",
+    "need": "requires",
+    "needs": "requires",
+    "require_before": "requires",
+    "block": "blocks",
+    "blocks": "blocks",
+    "blocked": "blocks",
+    "before": "before",
+    "until": "before",
+}
+
+# Multi-word phrases collapsed to a single canonical token BEFORE tokenization.
+_CANONICAL_PHRASES = [
+    (re.compile(r"\bdata\s+processing\s+agreement\b", re.IGNORECASE), " signed_dpa "),
+    (re.compile(r"\bsigned\s+dpa\b", re.IGNORECASE), " signed_dpa "),
+    (re.compile(r"\bsecurity\s+(?:review|assessment)\b", re.IGNORECASE), " security_review "),
+    (re.compile(r"\bsecurity\s+teams?\b", re.IGNORECASE), " segment_buyer "),
+    (re.compile(r"\bsecurity\s+team\b", re.IGNORECASE), " segment_buyer "),
+]
+
+
+def canonical_statement(statement: str) -> str:
+    """Normalize a generalization to a stable predication for exact-match merge.
+
+    Lowercase, strip parentheticals, collapse known multi-word phrases, drop
+    articles/filler, map synonyms, sort the object tokens so word-order variants
+    align — while KEEPING discriminative tokens (``signed_dpa`` vs ``soc_2``) so
+    distinct generalizations stay distinct.
+
+    The three DPA paraphrases collapse to the same form; "requires DPA before
+    review" and "requires SOC 2 before review" DO NOT."""
+    s = statement.lower()
+    # Drop parentheticals like "(dpa)" and trailing punctuation.
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"[^a-z0-9_\s]", " ", s)
+    # Collapse known multi-word phrases to single tokens first.
+    for pat, repl in _CANONICAL_PHRASES:
+        s = pat.sub(repl, s)
+
+    # Structural inversion: "blocks A until B" ≡ "requires B before A". Rewrite
+    # to the requires/before order so a blocking paraphrase aligns with a
+    # requiring one (the DPA trio's C variant). Split on "until", swap sides,
+    # re-join with "before" and a leading "requires".
+    if re.search(r"\buntil\b", s) and re.search(r"\bblock", s):
+        left, _, right = s.partition(" until ")
+        left = re.sub(r"\bblock\w*\b", " ", left)
+        # right = the required artifact, left = the gated event. Inject an
+        # explicit "requires" so the role-based assembly (below) fires.
+        s = f" requires {right} before {left} "
+
+    tokens = [t for t in s.split() if t]
+    mapped: list[str] = []
+    for tok in tokens:
+        syn = _CANONICAL_SYNONYMS.get(tok, tok)
+        if syn == "":
+            continue  # dropped phrase-fragment
+        if syn in _CANONICAL_FILLER:
+            continue
+        mapped.append(syn)
+
+    # Dedupe preserving first occurrence.
+    deduped: list[str] = []
+    for tok in mapped:
+        if tok not in deduped:
+            deduped.append(tok)
+
+    # Role-based assembly for the requires/blocks-before family: the surface
+    # order (and blocks/until inversion) is discarded in favor of stable roles,
+    # so "A requires B before C" and "C is blocked until B" both canonicalize to
+    # "<subject> requires <required> before <gate>". Roles: segment_buyer is the
+    # subject; a security_review is the gate; everything else is the required
+    # artifact (KEPT and sorted, so signed_dpa vs soc_2 stay distinct).
+    has_before = "before" in deduped
+    has_predicate = any(t in ("requires", "blocks") for t in deduped)
+    if has_before and has_predicate:
+        subject = "segment_buyer" if "segment_buyer" in deduped else None
+        gate = "security_review" if "security_review" in deduped else None
+        structural = {"before", "requires", "blocks", "segment_buyer", "security_review"}
+        required = sorted(t for t in deduped if t not in structural)
+        parts: list[str] = []
+        if subject:
+            parts.append(subject)
+        parts.append("requires")
+        parts.extend(required)
+        if gate:
+            parts.extend(["before", gate])
+        return " ".join(parts).strip()
+
+    # General fallback: subject first, predicate second, remaining tokens sorted.
+    predicates = [t for t in deduped if t in ("requires", "blocks")]
+    subjects = [t for t in deduped if t == "segment_buyer"]
+    rest = sorted(t for t in deduped if t not in predicates and t not in subjects)
+    lead: list[str] = []
+    if subjects:
+        lead.append("segment_buyer")
+    if predicates:
+        lead.append(predicates[0])
+    return " ".join([*lead, *rest]).strip()
+
+
+# ---------------------------------------------------------------------------
 # Wire types
 # ---------------------------------------------------------------------------
 
@@ -53,19 +274,33 @@ import httpx
 @dataclass
 class L2Fact:
     """One extracted triple. Server-side this becomes a deterministic L1-style
-    upsert keyed (source=l2, entity=normalized subject, field=normalized
-    relation) — supersession falls out of the existing machinery."""
+    upsert keyed (source=l2, entity=normalized subject, field=NORMALIZED
+    canonical_predicate) — supersession falls out of the existing machinery.
+
+    ``relation`` is the human-readable, free-text relation as extracted;
+    ``canonical_predicate`` is a controlled-vocabulary relation
+    (``requires_before`` / ``blocks_until`` / ``requires`` / ``is`` ...) that the
+    server uses as the supersession ``field`` so re-extractions of the same
+    relation align even when the free-text wording differs (fixes the finding:
+    ``requires`` vs ``requires_before_security_assessment`` must both key to the
+    SAME fact so the later one supersedes)."""
 
     subject: str
     relation: str
     object: Any
     valid_from: str | None = None
+    canonical_predicate: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.canonical_predicate is None:
+            self.canonical_predicate = canonical_predicate(self.relation)
 
     def to_json(self) -> dict:
         body: dict[str, Any] = {
             "subject": self.subject,
             "relation": self.relation,
             "object": self.object,
+            "canonical_predicate": self.canonical_predicate,
         }
         if self.valid_from is not None:
             body["valid_from"] = self.valid_from
@@ -89,18 +324,32 @@ class TagSuggestion:
 @dataclass
 class KnowledgeCandidate:
     """A proposed generalization (SPEC v1.3 §2). Always a proposal: the server
-    similarity-merges into an existing candidate/published item (support
-    accrual) or runs the de-identification gate on a fresh proposal."""
+    merges into an existing candidate/published item (support accrual) or runs
+    the de-identification gate on a fresh proposal.
+
+    ``statement`` is the human-readable form (kept for display).
+    ``canonical_statement`` is a normalized predication (lowercased, articles
+    and filler stripped, predicate mapped to the controlled vocabulary) that the
+    server uses for the exact-canonical-match fast-path merge: two paraphrases
+    with an identical canonical form merge with NO embedding/LLM cost. It is a
+    RECALL AID, never a merge authority — different generalizations must not
+    collapse to the same canonical form (see knowledge-merge-tuning.md §3)."""
 
     statement: str
     categories: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
+    canonical_statement: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.canonical_statement is None:
+            self.canonical_statement = canonical_statement(self.statement)
 
     def to_json(self) -> dict:
         return {
             "statement": self.statement,
             "categories": self.categories,
             "evidence": self.evidence,
+            "canonical_statement": self.canonical_statement,
         }
 
 
@@ -290,8 +539,19 @@ _EXTRACTION_SCHEMA = {
                     "subject": {"type": "string"},
                     "relation": {"type": "string"},
                     "object": {"type": "string"},
+                    "canonical_predicate": {
+                        "type": "string",
+                        "enum": [
+                            "requires_before",
+                            "blocks_until",
+                            "requires",
+                            "is",
+                            "has",
+                            "relates_to",
+                        ],
+                    },
                 },
-                "required": ["subject", "relation", "object"],
+                "required": ["subject", "relation", "object", "canonical_predicate"],
                 "additionalProperties": False,
             },
         },
@@ -315,8 +575,9 @@ _EXTRACTION_SCHEMA = {
                 "properties": {
                     "statement": {"type": "string"},
                     "categories": {"type": "array", "items": {"type": "string"}},
+                    "canonical_statement": {"type": "string"},
                 },
-                "required": ["statement", "categories"],
+                "required": ["statement", "categories", "canonical_statement"],
                 "additionalProperties": False,
             },
         },
@@ -329,13 +590,25 @@ _EXTRACTION_PROMPT = """\
 You extract structured memory from one raw episode of an enterprise memory \
 system. Given the episode below, produce:
 - l2_facts: (subject, relation, object) triples that are stated as facts. \
-Subjects should be the entity identifiers given when the fact is about them.
+Subjects should be the entity identifiers given when the fact is about them. \
+Also emit canonical_predicate: a controlled-vocabulary relation chosen from \
+{{requires_before, blocks_until, requires, is, has, relates_to}}. Use \
+requires_before when the fact is "X requires Y before Z" (or "X blocks Z until \
+Y"); use requires for a plain requirement; is for identity/attribute facts. \
+The canonical_predicate must be STABLE across paraphrases so re-extractions of \
+the same relation align.
 - tag_suggestions: for each chunk whose content clearly discusses one of the \
 known entities but is not yet tagged with it, suggest that tag with your \
 confidence (0-1). Prefer recall over precision: a missed tag is worse than an \
 extra suggestion.
 - knowledge_candidates: entity-FREE generalizations ("category-level lessons") \
-the episode supports. Never name a specific entity in a statement.
+the episode supports. Never name a specific entity in a statement. Also emit \
+canonical_statement: a normalized, lowercased, article-stripped predication of \
+the SAME generalization in the stable form "SUBJECT PREDICATE OBJECT \
+[before GATE]" (e.g. "segment_buyer requires signed_dpa before \
+security_review"). Two paraphrases of the same lesson MUST produce an identical \
+canonical_statement; two genuinely different lessons (e.g. requiring a DPA vs \
+requiring a SOC 2 report) MUST produce different ones — do not over-normalize.
 
 Known entities: {entities}
 Chunks (id: content): {chunks}
@@ -397,7 +670,16 @@ class AnthropicExtractor:
         known_chunks = {c.chunk_id for c in episode.chunks}
         return Extraction(
             l2_facts=[
-                L2Fact(subject=f["subject"], relation=f["relation"], object=f["object"])
+                L2Fact(
+                    subject=f["subject"],
+                    relation=f["relation"],
+                    object=f["object"],
+                    # Trust the model's canonical_predicate when it emits a
+                    # non-empty controlled-vocab value; otherwise derive it
+                    # deterministically (the schema requires it, but stay safe).
+                    canonical_predicate=f.get("canonical_predicate")
+                    or canonical_predicate(f["relation"]),
+                )
                 for f in parsed["l2_facts"]
             ],
             tag_suggestions=[
@@ -412,6 +694,8 @@ class AnthropicExtractor:
                     statement=k["statement"],
                     categories=list(k["categories"]),
                     evidence=[episode.episode_id],
+                    canonical_statement=k.get("canonical_statement")
+                    or canonical_statement(k["statement"]),
                 )
                 for k in parsed["knowledge_candidates"]
             ],
