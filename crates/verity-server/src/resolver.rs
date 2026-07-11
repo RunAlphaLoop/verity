@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use verity_core::types::{EntityLinkMeta, TenantId};
-use verity_storage::resolve::{self, fold, FoldConfig};
+use verity_storage::resolve::{self, fold_with_known_canonicals, FoldConfig, KnownCanonicals};
 
 use crate::audit::spawn_fold_audit;
 use crate::AppState;
@@ -103,8 +103,33 @@ pub(crate) async fn run_full_fold(
     let fallback = verity_core::types::EntityResolutionConfig::defaults(tenant, "*", "*");
     let config = FoldConfig::new(tenant, cfg_rows, fallback);
 
-    // 2. The PURE fold. No I/O in here.
-    let plan = fold(&live, &config);
+    // 1b. §5 precondition (a): the set of canonicals ALREADY FOLDED — present in
+    //     `entity_aliases` from a PRIOR fold or an admin crosswalk POST. The pure
+    //     fold cannot read the DB, so we read the pre-existing canonical set here
+    //     in the worker plane (reusing the existing `list_canonical_entities`
+    //     read — no new storage method, `postgres.rs` untouched) and hand it in.
+    //     A Tier-3 mention may then tag a chunk with a canonical that exists in
+    //     `entity_aliases` even if THIS run did not re-merge it. This read is
+    //     worker-plane only; the recall/`get` read path never runs it.
+    //
+    //     Cap note: `list_canonical_entities` is bounded (≤1000). For tenants
+    //     whose folded-canonical count exceeds that, this under-includes prior
+    //     canonicals — a fail-closed under-tag (never a wrong tag), and the
+    //     freshly-folded set is always included. A future paginated/DISTINCT-only
+    //     read would lift the cap without touching the read path (TODO).
+    let preexisting: Vec<String> = storage
+        .list_canonical_entities(tenant, 1000)
+        .await
+        .map_err(crate::internal)?
+        .into_iter()
+        .map(|c| c.canonical_entity)
+        .collect();
+    let known = KnownCanonicals::new(preexisting.iter().map(String::as_str), std::iter::empty());
+
+    // 2. The PURE fold. No I/O in here. The known-canonical set only satisfies
+    //    §5 precondition (a) for Tier-3 chunk tagging — it never forms an edge,
+    //    never widens a scope, and does not change alias/component output.
+    let plan = fold_with_known_canonicals(&live, &config, &known);
 
     let mut report = MaterializeReport {
         evidence_considered: live.len(),
