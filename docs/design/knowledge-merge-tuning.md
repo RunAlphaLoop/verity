@@ -140,6 +140,11 @@ security review. Add **Scoped Recall Benchmark metric #6 — consolidation preci
   reporting whatever recall that buys. The number we publish is "at ≥99% precision we catch
   X% of true paraphrase merges" — recall is a capability disclosure, precision is the
   guarantee.
+  **Measured (2026-07-10, [RESULTS-anthropic-judge](../benchmark/RESULTS-anthropic-judge-2026-07-10.md)):**
+  the AnthropicJudge (opus-4-8) cascade holds **precision 1.000 with 0 false merges across
+  112 negatives** and reaches **recall 0.862** on the 206-pair set — vs the DeterministicJudge's
+  0.298 and the cosine baseline's 0.000. The LLM judge is the instrument; precision held, recall
+  tripled.
 - **Harness:** `verity-bench srb` gains the metric; the cascade (blocker+judge) is evaluated
   end-to-end, so the reported precision is of the *shipped* decision, not the bi-encoder in
   isolation. Self-labels model + threshold used, per the honesty policy.
