@@ -325,7 +325,7 @@ pub(crate) async fn dsar_export(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scope::{ScopeMinter, ScopeError};
+    use crate::scope::{ScopeError, ScopeMinter};
 
     /// A representative purge-facts object, shaped exactly like `admin_erasure`
     /// builds it: hashed identifiers only, per-table counts, timestamps.
@@ -400,7 +400,10 @@ mod tests {
         );
         // The facts and metadata are still present and honest.
         assert_eq!(report["algorithm"], serde_json::json!("HMAC-SHA256"));
-        assert_eq!(report["facts"]["kind"], serde_json::json!("verity.erasure.purge-report"));
+        assert_eq!(
+            report["facts"]["kind"],
+            serde_json::json!("verity.erasure.purge-report")
+        );
     }
 
     /// (c) Tampering with the signed facts breaks verification: a holder who
@@ -451,6 +454,9 @@ mod tests {
         assert_eq!(report["facts"]["subject_sha256"], serde_json::json!(hashed));
         // The plaintext subject appears nowhere in the signed report.
         let blob = serde_json::to_string(&report).unwrap();
-        assert!(!blob.contains(subject), "plaintext PII leaked into purge report");
+        assert!(
+            !blob.contains(subject),
+            "plaintext PII leaked into purge report"
+        );
     }
 }
