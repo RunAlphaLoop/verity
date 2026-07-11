@@ -82,6 +82,7 @@ from typing import Any, AsyncIterator, Iterable, Mapping, Protocol, Sequence
 import httpx
 
 from verity_ingest.connector import AclEnvelope, Connector, DocumentEvent, FactEvent
+from verity_ingest.connectors.backfill import BackfillReporter
 
 DRIVE_BASE_URL = "https://www.googleapis.com/drive/v3"
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
@@ -680,12 +681,68 @@ def run_once(
     return delivered
 
 
+def run_backfill(
+    connector: GDriveConnector,
+    registry: PrincipalRegistry,
+    sink: DocumentSink,
+    reporter: BackfillReporter | None = None,
+    *,
+    flush_every: int = 20,
+) -> int:
+    """§5a reconciliation backfill: drive :meth:`GDriveConnector.full_crawl`
+    (``files.list`` over every non-trashed file) into the sink, reporting
+    progress to the backfill dashboard.
+
+    ``files.list`` gives no cheap up-front count, so the run is opened with an
+    indeterminate total (``total=None``) and a live processed count — honest
+    about what Drive can and can't tell us in advance. Progress is flushed every
+    ``flush_every`` deliveries so the bar moves without a post per item. A crash
+    mid-crawl is reported as a ``failed`` run (with the error) and then
+    re-raised; a clean finish marks the run ``completed``. Returns the number of
+    delivered requests."""
+    if reporter is not None:
+        reporter.start(total=None)
+    delivered = 0
+    pending = 0
+
+    async def _drive() -> None:
+        nonlocal delivered, pending
+        async for event in connector.full_crawl():
+            assert isinstance(event, GDriveDocumentEvent)
+            sink.deliver(build_document_request(event, registry, connector.config.tenant_id))
+            delivered += 1
+            pending += 1
+            if reporter is not None and pending >= flush_every:
+                reporter.advance(pending)
+                pending = 0
+
+    try:
+        asyncio.run(_drive())
+    except Exception as exc:  # noqa: BLE001 — surface as a failed run, then re-raise
+        if reporter is not None:
+            if pending:
+                reporter.advance(pending)
+            reporter.fail(exc)
+        raise
+    if reporter is not None:
+        if pending:
+            reporter.advance(pending)
+        reporter.finish()
+    return delivered
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m verity_ingest.connectors.gdrive",
         description="Verity Google Drive connector (truth lane, Tier-A ACL mirroring).",
     )
     parser.add_argument("--once", action="store_true", help="run a single poll cycle and exit")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="run the §5a full reconciliation crawl (files.list) once, reporting "
+        "progress to the backfill dashboard, then exit",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="print request bodies instead of POSTing"
     )
@@ -742,6 +799,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     sink: DocumentSink = (
         DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
     )
+
+    if args.backfill:
+        # A backfill is a one-shot job, not a loop. Dry runs have no server to
+        # report to, so the reporter is omitted (its posts would no-op anyway).
+        reporter = (
+            None
+            if args.dry_run
+            else BackfillReporter(
+                args.verity_url, config.tenant_id, connector.name, api_key=api_key
+            )
+        )
+        delivered = run_backfill(connector, registry, sink, reporter)
+        print(f"gdrive: backfill delivered {delivered} request(s)")
+        return 0
 
     while True:
         delivered = run_once(connector, registry, sink, args.state_file)

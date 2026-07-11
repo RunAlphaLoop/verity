@@ -6,6 +6,7 @@
 //! that seam is documented in scope.rs and POST /v1/scopes.
 
 mod audit;
+mod backfill;
 mod compliance;
 mod connectors;
 mod consolidation;
@@ -302,6 +303,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connector-status",
             post(connectors::post_status).get(connectors::get_status),
+        )
+        .route(
+            "/v1/admin/backfill",
+            post(backfill::post_progress).get(backfill::get_runs),
         )
         .route("/v1/admin/consolidation/lease", post(consolidation::lease))
         .route(
