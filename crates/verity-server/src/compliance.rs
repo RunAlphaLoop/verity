@@ -14,9 +14,9 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use verity_core::types::{StorageError, TenantId};
+use verity_core::types::TenantId;
 
-use crate::{internal, AppState, HandlerResult};
+use crate::{internal, storage_status, AppState, HandlerResult};
 
 /// Domain-separation tag for purge-report HMACs — keeps a purge signature from
 /// ever being replayable as a scope handle or a media URI (they share the key).
@@ -61,6 +61,12 @@ pub(crate) async fn admin_erasure_preview(
     Json(req): Json<ErasureRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let preview = state
         .storage
         .inner()
@@ -71,10 +77,7 @@ pub(crate) async fn admin_erasure_preview(
             &req.media_ids,
         )
         .await
-        .map_err(|e| match e {
-            StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
-            other => internal(other),
-        })?;
+        .map_err(storage_status)?;
     // Honest ReBAC signal, mirroring the erasure response: on a REAL erasure of
     // a `user:` subject with SpiceDB configured, tuples would be deleted first.
     let rebac_would_delete = state.rebac.is_some()
@@ -111,6 +114,12 @@ pub(crate) async fn admin_erasure(
     Json(req): Json<ErasureRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let mut rebac_tuples_deleted = false;
     if let (Some(rebac), Some(subject)) = (&state.rebac, req.subject.as_deref()) {
         if let Some((crate::rebac::PrincipalKind::User, name)) =
@@ -161,10 +170,7 @@ pub(crate) async fn admin_erasure(
             &req.media_ids,
         )
         .await
-        .map_err(|e| match e {
-            StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
-            other => internal(other),
-        })?;
+        .map_err(storage_status)?;
 
     // Rows are gone; now purge their objects. Best-effort per object (a
     // missing object is a no-op); a hard object-store failure surfaces as 502

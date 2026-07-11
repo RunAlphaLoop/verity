@@ -57,7 +57,7 @@ use uuid::Uuid;
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 
-use crate::{internal, AppState, HandlerResult};
+use crate::{internal, storage_status, AppState, HandlerResult};
 
 /// Lease duration for one worker pass over an episode.
 const LEASE_MINUTES: i32 = 5;
@@ -115,6 +115,12 @@ pub(crate) async fn lease(
     Json(req): Json<LeaseRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let limit = req.limit.clamp(1, 256);
     let worker = req.worker.unwrap_or_else(|| "worker".into());
 
@@ -277,6 +283,12 @@ pub(crate) async fn complete(
     Json(req): Json<CompleteRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
 
     // Terminal-state transition first: exactly one completer wins.
     let marked = sqlx::query(
@@ -973,6 +985,12 @@ pub(crate) async fn approve_tag_suggestion(
     Json(req): Json<ApproveTagRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let row = sqlx::query(
         "UPDATE tag_suggestions SET status = 'approved'
          WHERE tenant_id = $1 AND id = $2 AND status = 'suggested'

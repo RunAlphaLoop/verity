@@ -151,6 +151,23 @@ impl PostgresAdapter {
         &self.pool
     }
 
+    /// Cheap PK existence check for a tenant. Admin write handlers call this
+    /// before any tenant-scoped mutation so a nonexistent tenant surfaces as a
+    /// clean `UnknownTenant` (→ 404) instead of a raw foreign-key violation
+    /// bubbling up as `Database` (→ 500).
+    pub async fn ensure_tenant(&self, tenant: TenantId) -> Result<()> {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = $1)")
+            .bind(tenant)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if exists {
+            Ok(())
+        } else {
+            Err(StorageError::UnknownTenant(tenant))
+        }
+    }
+
     async fn get_knowledge(&self, tenant: TenantId, id: Uuid) -> Result<KnowledgeItem> {
         let row = sqlx::query("SELECT * FROM knowledge WHERE tenant_id = $1 AND id = $2")
             .bind(tenant)

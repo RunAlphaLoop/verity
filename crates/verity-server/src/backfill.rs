@@ -26,7 +26,7 @@ use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::{internal, AppState, HandlerResult};
+use crate::{internal, storage_status, AppState, HandlerResult};
 
 /// The lifecycle states a backfill run may report. Kept in sync with the CHECK
 /// constraint in migrations/0021_backfill_runs.sql; validated here so a bad
@@ -108,6 +108,12 @@ pub(crate) async fn post_progress(
             ));
         }
     }
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     record_progress(state.pool(), &req)
         .await
         .map_err(internal)?;

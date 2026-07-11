@@ -502,3 +502,145 @@ async fn merged_entity_bad_handle_fails_closed() {
     .expect_err("must reject");
     assert_eq!(err.0, StatusCode::UNAUTHORIZED);
 }
+
+/// Admin WRITE endpoints must fail CLEANLY (404) — not 500 — when handed a
+/// nonexistent tenant_id. Before the `ensure_tenant` guard, the raw Postgres
+/// foreign-key violation on the tenant-scoped INSERT bubbled up as
+/// `StorageError::Database` → `internal()` → 500. This drives a representative
+/// sample of those handlers with a freshly-random tenant that was never
+/// created and asserts each returns 404 (the guard fired before the mutating
+/// storage call), proving the FK-500 class of bug is closed.
+#[tokio::test]
+async fn admin_writes_reject_unknown_tenant_with_404_not_500() {
+    let Some((state, _real_tenant)) = test_state().await else {
+        return;
+    };
+    // A tenant id that was never created — every guarded write must 404 on it.
+    let ghost: TenantId = uuid::Uuid::now_v7();
+
+    // 1. entity-resolution/decide
+    let err = crate::admin_entity_decide(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(
+            serde_json::from_value(json!({
+                "tenant_id": ghost,
+                "left_ref": "salesforce:001",
+                "right_ref": "hubspot:42",
+                "decision": "confirm"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("decide must reject unknown tenant");
+    assert_eq!(err.0, StatusCode::NOT_FOUND, "decide: {}", err.1);
+
+    // 2. entity-evidence (insert)
+    let err = crate::admin_evidence_insert(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(
+            serde_json::from_value(json!({
+                "tenant_id": ghost,
+                "left_ref": "salesforce:001",
+                "right_ref": "hubspot:42",
+                "tier": 1,
+                "method": "external_id"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("evidence insert must reject unknown tenant");
+    assert_eq!(err.0, StatusCode::NOT_FOUND, "evidence: {}", err.1);
+
+    // 3. entity-aliases
+    let err = crate::admin_entity_aliases(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(
+            serde_json::from_value(json!({
+                "tenant_id": ghost,
+                "canonical": "account:acme",
+                "members": [{"source": "hubspot", "entity_id": "hs-1"}]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("aliases must reject unknown tenant");
+    assert_eq!(err.0, StatusCode::NOT_FOUND, "aliases: {}", err.1);
+
+    // 4. principals
+    let err = crate::admin_principals(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(
+            serde_json::from_value(json!({
+                "tenant_id": ghost,
+                "principals": ["user:alice@corp.example"]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("principals must reject unknown tenant");
+    assert_eq!(err.0, StatusCode::NOT_FOUND, "principals: {}", err.1);
+
+    // 5. knowledge publish (random id is fine — the tenant guard fires first)
+    let err = crate::publish_knowledge(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Path(uuid::Uuid::now_v7()),
+        Json(
+            serde_json::from_value(json!({
+                "tenant_id": ghost,
+                "visibility": [7]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("knowledge publish must reject unknown tenant");
+    assert_eq!(err.0, StatusCode::NOT_FOUND, "publish: {}", err.1);
+}
+
+/// Unit-level proof of the two building blocks the guard rests on:
+/// `ensure_tenant` produces `UnknownTenant` for an absent id (and `Ok` for a
+/// real one), and `storage_status` maps that variant to 404.
+#[tokio::test]
+async fn ensure_tenant_and_storage_status_map_unknown_tenant_to_404() {
+    // storage_status is a pure mapper — assert it independent of the DB.
+    let ghost: TenantId = uuid::Uuid::now_v7();
+    assert_eq!(
+        crate::storage_status(StorageError::UnknownTenant(ghost)).0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        crate::storage_status(StorageError::InvalidInput("x".into())).0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        crate::storage_status(StorageError::Database("boom".into())).0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let Some((state, real_tenant)) = test_state().await else {
+        return;
+    };
+    // A real tenant resolves Ok; a random one is UnknownTenant.
+    state
+        .storage
+        .inner()
+        .ensure_tenant(real_tenant)
+        .await
+        .expect("real tenant exists");
+    let err = state
+        .storage
+        .inner()
+        .ensure_tenant(ghost)
+        .await
+        .expect_err("ghost tenant must be unknown");
+    assert!(matches!(err, StorageError::UnknownTenant(_)));
+}

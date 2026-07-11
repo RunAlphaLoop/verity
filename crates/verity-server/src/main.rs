@@ -640,6 +640,12 @@ async fn admin_entity_aliases(
     Json(req): Json<EntityAliasesRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     for m in &req.members {
         state
             .storage
@@ -715,6 +721,12 @@ async fn admin_entity_precedence(
     Json(req): Json<EntityPrecedenceRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     state
         .storage
         .inner()
@@ -854,6 +866,12 @@ async fn admin_evidence_insert(
     Json(req): Json<EvidenceInsertRequest>,
 ) -> HandlerResult<Json<EvidenceRow>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let row = state
         .storage
         .inner()
@@ -894,6 +912,12 @@ async fn admin_evidence_retract(
     Json(req): Json<EvidenceRetractRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let retracted = state
         .storage
         .inner()
@@ -940,6 +964,12 @@ async fn admin_resolution_config_put(
     state
         .storage
         .inner()
+        .ensure_tenant(cfg.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    state
+        .storage
+        .inner()
         .write_resolution_config(&cfg)
         .await
         .map_err(internal)?;
@@ -967,6 +997,12 @@ async fn admin_trigger_fold(
     Json(req): Json<TriggerFoldRequest>,
 ) -> HandlerResult<Json<resolver::MaterializeReport>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let report = resolver::run_full_fold(&state, req.tenant_id).await?;
     Ok(Json(report))
 }
@@ -985,6 +1021,12 @@ async fn admin_run_resolution(
     Json(req): Json<TriggerFoldRequest>,
 ) -> HandlerResult<Json<resolver::RunReport>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let report = resolver::run_resolution(&state, req.tenant_id).await?;
     Ok(Json(report))
 }
@@ -1043,6 +1085,12 @@ async fn admin_entity_decide(
     Json(req): Json<EntityDecisionRequest>,
 ) -> HandlerResult<Json<EntityDecisionResponse>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let (method, polarity) = match req.decision {
         EntityDecision::Confirm => ("human_confirmed", 1i16),
         EntityDecision::Reject => ("human_rejected", -1i16),
@@ -1675,6 +1723,12 @@ async fn admin_principals(
     Json(req): Json<PrincipalsRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let mappings: serde_json::Map<String, serde_json::Value> =
         upsert_principal_tokens(state.pool(), req.tenant_id, &req.principals)
             .await?
@@ -1737,6 +1791,12 @@ async fn admin_group_add(
     Json(req): Json<GroupMembershipRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let rebac = require_rebac(&state)?;
     let (group_name, member_kind, member_name) = parse_membership(&req)?;
     let mappings = upsert_principal_tokens(
@@ -1777,6 +1837,12 @@ async fn admin_group_remove(
     Json(req): Json<GroupMembershipRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let rebac = require_rebac(&state)?;
     let (group_name, member_kind, member_name) = parse_membership(&req)?;
     let gateway = |e: rebac::RebacError| (StatusCode::BAD_GATEWAY, format!("spicedb: {e}"));
@@ -1992,6 +2058,12 @@ async fn admin_refresh_briefs(
     axum::extract::Query(p): axum::extract::Query<AdminTenantParam>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(p.tenant)
+        .await
+        .map_err(storage_status)?;
     let refreshed = state
         .storage
         .refresh_stale_briefs(p.tenant)
@@ -2034,6 +2106,14 @@ async fn admin_reembed_batch(
             StatusCode::SERVICE_UNAVAILABLE,
             "reembed requires the local encoder; this server is sparse-only".into(),
         ));
+    }
+    if let Some(tenant) = req.tenant {
+        state
+            .storage
+            .inner()
+            .ensure_tenant(tenant)
+            .await
+            .map_err(storage_status)?;
     }
     // Dims match today (both 384); register the target so the registry + the
     // per-chunk model marker are honest. A true dim change needs a wider
@@ -2105,6 +2185,14 @@ async fn admin_reembed_cutover(
     Json(req): Json<CutoverRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
+    if let Some(tenant) = req.tenant {
+        state
+            .storage
+            .inner()
+            .ensure_tenant(tenant)
+            .await
+            .map_err(storage_status)?;
+    }
     let coverage = state
         .storage
         .embedding_v2_coverage(req.tenant)
@@ -2298,6 +2386,12 @@ async fn admin_reject_knowledge(
     Json(req): Json<RejectKnowledgeRequest>,
 ) -> HandlerResult<Json<KnowledgeItem>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     let reason = if req.reason.trim().is_empty() {
         "rejected by reviewer".to_string()
     } else {
@@ -2337,6 +2431,12 @@ async fn publish_knowledge(
     Json(req): Json<PublishKnowledgeRequest>,
 ) -> HandlerResult<Json<KnowledgeItem>> {
     state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
     // k_min is clamped server-side: k=2 lets either supporting party infer
     // the other's interaction (SPEC v1.3 §2).
     let k_min = req.k_min.max(3);
@@ -2359,12 +2459,21 @@ async fn publish_knowledge(
         .publish_knowledge(req.tenant_id, id, req.visibility, k_min, embedding)
         .await
         .map(Json)
-        .map_err(|e| match e {
-            StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
-            other => internal(other),
-        })
+        .map_err(storage_status)
 }
 
 pub(crate) fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// Central `StorageError` → HTTP mapper for write handlers. Client-caused
+/// errors get clean 4xx; only genuine `Database` failures are 500. Notably an
+/// unknown tenant (which would otherwise bubble up as a raw FK violation →
+/// `Database` → 500) becomes a 404.
+pub(crate) fn storage_status(e: StorageError) -> (StatusCode, String) {
+    match e {
+        StorageError::UnknownTenant(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+        StorageError::Database(_) => internal(e),
+    }
 }
