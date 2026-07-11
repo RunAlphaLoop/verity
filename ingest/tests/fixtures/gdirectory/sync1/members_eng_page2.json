@@ -1,0 +1,7 @@
+{
+  "kind": "admin#directory#members",
+  "members": [
+    {"kind": "admin#directory#member", "id": "100000000000000000003", "email": "mallory@corp.example", "role": "MEMBER", "type": "USER", "status": "SUSPENDED"},
+    {"kind": "admin#directory#member", "id": "300000000000000000001", "email": "partner@outside.example", "role": "MEMBER", "type": "EXTERNAL", "status": "ACTIVE"}
+  ]
+}

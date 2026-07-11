@@ -1,0 +1,6 @@
+{
+  "kind": "admin#directory#members",
+  "members": [
+    {"kind": "admin#directory#member", "id": "01g5", "email": "loop-b@corp.example", "role": "MEMBER", "type": "GROUP", "status": "ACTIVE"}
+  ]
+}

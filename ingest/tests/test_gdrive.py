@@ -243,7 +243,8 @@ def test_static_registry_resolves_known_and_skips_unknown():
 
 
 def test_http_registry_contract():
-    """POST /v1/admin/principals {"principals": [...]} -> {principal: token}."""
+    """POST /v1/admin/principals {"tenant_id", "principals"} — server as
+    built returns tokens nested under "mappings"."""
     seen: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -253,14 +254,20 @@ def test_http_registry_contract():
         return httpx.Response(
             200,
             json={
-                "user:alice@corp.example": 101,
-                "group:eng-leads@corp.example": 202,
-                "user:nobody@corp.example": None,
+                "mappings": {
+                    "user:alice@corp.example": 101,
+                    "group:eng-leads@corp.example": 202,
+                    "user:nobody@corp.example": None,
+                }
             },
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    registry = HttpRegistry("http://verity.local:8080", client=client)
+    registry = HttpRegistry(
+        "http://verity.local:8080",
+        tenant_id="8b1c8d7e-0a63-4a1a-9d1e-000000000001",
+        client=client,
+    )
     resolved = registry.resolve(
         ["user:alice@corp.example", "group:eng-leads@corp.example", "user:nobody@corp.example"]
     )
@@ -268,11 +275,12 @@ def test_http_registry_contract():
         "method": "POST",
         "path": PRINCIPALS_PATH,
         "body": {
+            "tenant_id": "8b1c8d7e-0a63-4a1a-9d1e-000000000001",
             "principals": [
                 "user:alice@corp.example",
                 "group:eng-leads@corp.example",
                 "user:nobody@corp.example",
-            ]
+            ],
         },
     }
     # Null token = unresolved: contributes no visibility (fail-closed).
