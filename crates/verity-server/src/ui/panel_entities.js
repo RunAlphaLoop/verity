@@ -36,6 +36,21 @@
     return i < 0 ? s : s.slice(0, i);
   }
 
+  // Wait-age (SLA read-out): seconds → a compact "3d 4h" / "12m" / "45s" string.
+  // The queue is ordered by a priority score with an UNBOUNDED aging term, so a
+  // large wait age is the operator's cue that the anti-starvation term is (or
+  // soon will be) floating this candidate up regardless of its intrinsic value.
+  function fmtAge(secs) {
+    secs = Math.max(0, Math.floor(Number(secs) || 0));
+    var d = Math.floor(secs / 86400);
+    var h = Math.floor((secs % 86400) / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return d + "d " + h + "h";
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m";
+    return secs + "s";
+  }
+
   // Confidence → badge. The frozen encoding: deterministic / human_confirmed are
   // GUARANTEED links (solid); approximated is a PROBABILISTIC link (dashed via
   // the b-inferred modifier). Unknown confidence falls back to a neutral chip.
@@ -125,7 +140,11 @@
             '<div class="tight"><button id="ent-load-queue">Load review queue</button></div>' +
             '<div class="note" style="flex:1">The live <b>Tier-2 / Tier-3</b> candidates the deterministic fold ' +
               'cannot decide alone — a human confirms the merge or rejects it (a <b>permanent</b> anti-link). ' +
-              'Newest first.</div>' +
+              '<b>Ranked</b> by <b>priority</b> (frequency · entity value · tier · recency) — each card shows its ' +
+              '<b>#rank</b>, priority score, and wait-age. An <b>aging / SLA</b> term keeps the oldest-waiting ' +
+              'candidate from ever being buried; the longest-waiting card not yet at the top is flagged ' +
+              '<span class="badge b-st-eligible">⚠ SLA risk</span> (amber rail) so a reviewer clears it. ' +
+              'This is a read-out of the server ordering — no client-side re-sort.</div>' +
           "</div>" +
           '<div class="err" id="ent-queue-err"></div>' +
           '<div id="ent-queue-refreshed"></div>' +
@@ -511,7 +530,36 @@
             "here is auto-decided; that is the point of the human gate.</div>";
           return;
         }
-        Verity.$("ent-queue-out").innerHTML = rows.map(candidateCard).join("");
+
+        // ---- starvation context (design §8 aging / SLA) --------------------
+        // The server ORDERs by `priority` DESC (the unbounded aging term is one
+        // signal inside it, not the sort key), so the row that has WAITED the
+        // longest is not necessarily at the top — it may be sitting far down the
+        // ranked list while its aging term slowly floats it up. We surface that
+        // gap honestly: find the max wait-age across the loaded page and flag the
+        // oldest-waiting candidate(s) that are NOT already near the top of the
+        // queue, so a reviewer can clear an SLA risk before it starves. This is a
+        // read-out over the server's own numbers — no re-ordering, no new policy.
+        var maxWait = 0;
+        for (var wi = 0; wi < rows.length; wi++) {
+          var w = Number(rows[wi].wait_age_secs);
+          if (isFinite(w) && w > maxWait) maxWait = w;
+        }
+        // Only meaningful once something has actually waited a while (≥1h) AND
+        // the queue is deep enough that the oldest could be buried behind others.
+        var STARVE_MIN_SECS = 3600;
+        var starveActive = maxWait >= STARVE_MIN_SECS && rows.length > 1;
+
+        Verity.$("ent-queue-out").innerHTML = rows.map(function (c, i) {
+          // rank is 1-based over the server's priority DESC order.
+          var oldest = starveActive &&
+            c.wait_age_secs != null && Number(c.wait_age_secs) === maxWait;
+          // A starvation RISK is the oldest-waiting card that the priority sort
+          // has NOT already surfaced at the very top (rank 1). If the oldest also
+          // ranks #1 the SLA term already won — no risk to flag.
+          var starving = oldest && i > 0;
+          return candidateCard(c, i + 1, rows.length, starving, oldest);
+        }).join("");
 
         // Wire per-candidate confirm/reject.
         var host = Verity.$("ent-queue-out");
@@ -529,7 +577,11 @@
       }
 
       // One Tier-2/3 candidate → a side-by-side diff card.
-      function candidateCard(c) {
+      //   rank      : 1-based position in the server's priority DESC order
+      //   total     : queue depth (for the "#3 / 12" read-out)
+      //   starving  : oldest-waiting card that priority has NOT floated to #1
+      //   oldest    : this card carries the max wait-age in the loaded page
+      function candidateCard(c, rank, total, starving, oldest) {
         var polarity = Number(c.polarity);
         var polChip = polarity < 0
           ? Verity.badge("anti-link (−1)", "b-quarantined")
@@ -546,12 +598,55 @@
         var tierChip = Verity.badge("tier " + Verity.esc(c.tier), "b-kind");
         var methodChip = Verity.badge(Verity.esc(c.method), "b-inferred", true);
 
+        // Prioritization chips (design §8 Later). The server orders the queue by
+        // `priority` DESC; we surface the RANK (position in that order), the
+        // score, the wait-age (SLA read-out), and the frequency / entity-value
+        // signals that fed it so the ordering is legible, not magic.
+        //
+        // Rank chip — the visible PRIORITY indicator: "#1 / 12". Solid entity
+        // accent for #1 (the top call), neutral for the rest.
+        var rankChip = '<span class="badge ' + (rank === 1 ? "b-entity" : "b-kind") +
+          '" title="rank in the server\'s priority-DESC order (1 = highest priority)" ' +
+          'style="font-variant-numeric:tabular-nums">#' + rank + " / " + total + "</span>";
+        var prioChip = c.priority == null
+          ? ""
+          : Verity.badge("priority " + Number(c.priority).toFixed(2), "b-entity");
+        // Wait-age. When this card is the oldest-waiting in the page we mark the
+        // chip amber (via the frozen --amber token) so the SLA read-out is not
+        // lost in the neutral run of chips.
+        var ageChip = c.wait_age_secs == null
+          ? ""
+          : ' <span class="badge b-kind" ' +
+            (oldest ? 'style="color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)" ' : "") +
+            'title="wait age = now() − valid_from; the SLA / anti-starvation aging term floats this up as it grows">waited ' +
+            Verity.esc(fmtAge(c.wait_age_secs)) + "</span>";
+        // Starvation-risk flag — the oldest-waiting candidate that priority has
+        // NOT yet floated to the top. An amber "SLA RISK" chip tells the reviewer
+        // to clear this one so it can never be indefinitely buried.
+        var starveChip = starving
+          ? ' <span class="badge b-st-eligible" title="STARVATION RISK: the longest-waiting candidate in the queue, not yet at the top — clear it so the SLA aging term never has to bury it further. This is a read-out over the server ordering, not a re-sort.">⚠ SLA risk · oldest waiting</span>'
+          : "";
+        var freqChip = (c.frequency == null || Number(c.frequency) <= 1)
+          ? ""
+          : ' <span class="badge b-kind" title="FREQUENCY: live evidence rows recurring on this ref-pair">freq ' +
+            Verity.esc(c.frequency) + "</span>";
+        var valChip = (c.entity_value == null || Number(c.entity_value) <= 0)
+          ? ""
+          : ' <span class="badge b-kind" title="ENTITY VALUE: distinct alias members in the two refs\' clusters — bigger = higher blast radius">value ' +
+            Verity.esc(c.entity_value) + "</span>";
+
         var lEsc = Verity.esc(c.left_ref);
         var rEsc = Verity.esc(c.right_ref);
 
-        return '<div class="card" style="margin-bottom:12px">' +
+        // Starving rows get an amber left rail (frozen --amber token) so the
+        // SLA-risk card is scannable in a long queue without re-ordering it.
+        var cardStyle = "margin-bottom:12px" +
+          (starving ? ";border-left:3px solid var(--amber)" : "");
+
+        return '<div class="card" style="' + cardStyle + '">' +
           '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">' +
-            methodChip + tierChip + polChip + scoreChip + keyChip + nsChip +
+            rankChip + prioChip + starveChip + methodChip + tierChip + polChip + scoreChip + keyChip + nsChip +
+            ageChip + freqChip + valChip +
             ' <span class="note">valid_from ' + Verity.esc(Verity.fmtTime(c.valid_from)) + "</span>" +
           "</div>" +
           '<div class="row" style="align-items:stretch">' +

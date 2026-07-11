@@ -176,7 +176,9 @@ async fn tier2_appears_in_review_queue_and_does_not_auto_merge() {
     // It appears in the review queue (newest first, tier IN (2,3)).
     let queue = a.review_queue(t, 100).await.unwrap();
     assert!(
-        queue.iter().any(|e| e.evidence_id == emitted.evidence_id),
+        queue
+            .iter()
+            .any(|e| e.evidence.evidence_id == emitted.evidence_id),
         "tier-2 evidence must surface in the review queue"
     );
 
@@ -273,5 +275,163 @@ async fn decide_reject_writes_anti_link_and_keeps_split() {
     assert!(
         l2.is_none() || r2.is_none() || l2 != r2,
         "an anti-link is permanent: no positive evidence may re-merge the pair; got {l2:?} == {r2:?}"
+    );
+}
+
+/// Emit one Tier-3 (never-auto-merge) evidence row on a pair. Distinct method
+/// per call so a caller can seed several independent low-value candidates.
+async fn emit_tier3(
+    adapter: &PostgresAdapter,
+    tenant: TenantId,
+    left: &str,
+    right: &str,
+    method: &str,
+) -> EvidenceRow {
+    adapter
+        .insert_evidence(EvidenceWrite {
+            tenant_id: tenant,
+            left_ref: left.into(),
+            right_ref: right.into(),
+            tier: 3,
+            method: method.into(),
+            key_value: None,
+            key_namespace: None,
+            score: Some(0.5),
+            evidence_l0_ref: None,
+            polarity: 1,
+        })
+        .await
+        .unwrap()
+}
+
+/// Backdate a live evidence row's `valid_from` by `days` — simulates a
+/// candidate that has been WAITING in the queue that long. Uses the public pool
+/// (no new adapter API); touches only the bi-temporal `valid_from`, which is the
+/// SLA clock the priority formula's aging term reads.
+async fn age_evidence(adapter: &PostgresAdapter, evidence_id: uuid::Uuid, days: i64) {
+    sqlx::query(
+        "UPDATE entity_evidence
+            SET valid_from = now() - ($2 || ' days')::interval
+          WHERE evidence_id = $1",
+    )
+    .bind(evidence_id)
+    .bind(days.to_string())
+    .execute(adapter.pool())
+    .await
+    .unwrap();
+}
+
+/// Prioritization + anti-starvation (design §8 Later — review-queue
+/// prioritization + SLA). Two properties the queue MUST hold:
+///
+///   (A) ORDERING: the returned queue is sorted by `priority` DESC — every item's
+///       priority is >= the next item's. This is the contract the UI relies on.
+///
+///   (B) ANTI-STARVATION / AGING FLOOR: a LOW-value candidate that has waited a
+///       long time is NOT buried at the bottom beneath a FRESH low-value one. The
+///       unbounded linear aging term lifts the aged candidate above its
+///       fresh-but-otherwise-identical peer, so nothing starves indefinitely.
+#[tokio::test]
+async fn review_queue_orders_by_priority_and_ages_out_starved_candidates() {
+    let Some((a, t)) = setup().await else {
+        return;
+    };
+
+    // A FRESH, HIGH-value Tier-2 candidate: it belongs to real clusters (large
+    // entity_value) and the pair recurs (frequency), so its INTRINSIC score is
+    // high even with zero wait age.
+    a.upsert_entity_alias(t, "salesforce", "001HI", "canon-hi-left")
+        .await
+        .unwrap();
+    a.upsert_entity_alias(t, "salesforce", "001HI2", "canon-hi-left")
+        .await
+        .unwrap();
+    a.upsert_entity_alias(t, "hubspot", "HI", "canon-hi-right")
+        .await
+        .unwrap();
+    a.upsert_entity_alias(t, "hubspot", "HI2", "canon-hi-right")
+        .await
+        .unwrap();
+    let hi_left = "salesforce:001HI";
+    let hi_right = "hubspot:HI";
+    // Recurring pair → frequency > 1 (distinct evidence_ids, same unordered pair).
+    emit_tier2(&a, t, hi_left, hi_right).await;
+    let high = a
+        .insert_evidence(EvidenceWrite {
+            tenant_id: t,
+            left_ref: hi_left.into(),
+            right_ref: hi_right.into(),
+            tier: 2,
+            method: "email_exact".into(),
+            key_value: Some("ceo@acme.com".into()),
+            key_namespace: Some("email".into()),
+            score: Some(0.99),
+            evidence_l0_ref: None,
+            polarity: 1,
+        })
+        .await
+        .unwrap();
+
+    // A FRESH, LOW-value Tier-3 candidate: no clusters, single evidence, tier 3.
+    let fresh_low = emit_tier3(&a, t, "x:fresh1", "y:fresh2", "cooccur_fresh").await;
+
+    // An AGED, LOW-value Tier-3 candidate: same shape as `fresh_low` but it has
+    // been waiting ~400 days. The aging floor must lift it above `fresh_low`.
+    let aged_low = emit_tier3(&a, t, "x:aged1", "y:aged2", "cooccur_aged").await;
+    age_evidence(&a, aged_low.evidence_id, 400).await;
+
+    let queue = a.review_queue(t, 100).await.unwrap();
+    assert!(
+        queue.len() >= 3,
+        "expected the three seeded candidates in the queue, got {}",
+        queue.len()
+    );
+
+    // (A) ORDERING: priority is non-increasing down the queue.
+    for w in queue.windows(2) {
+        assert!(
+            w[0].priority >= w[1].priority,
+            "queue must be ordered by priority DESC: {} then {}",
+            w[0].priority,
+            w[1].priority
+        );
+    }
+
+    let pos = |id: uuid::Uuid| queue.iter().position(|e| e.evidence.evidence_id == id);
+    let high_pos = pos(high.evidence_id).expect("high candidate present");
+    let fresh_pos = pos(fresh_low.evidence_id).expect("fresh-low candidate present");
+    let aged_pos = pos(aged_low.evidence_id).expect("aged-low candidate present");
+
+    // The high-value fresh candidate outranks a low-value fresh one (the whole
+    // point of prioritizing at all).
+    assert!(
+        high_pos < fresh_pos,
+        "high-value candidate should rank above a fresh low-value one"
+    );
+
+    // (B) ANTI-STARVATION: the AGED low-value candidate is NOT buried below the
+    // FRESH low-value candidate — the linear aging term floats it up. Its wait
+    // age is reflected in the SLA read-out too.
+    let aged = &queue[aged_pos];
+    let fresh = &queue[fresh_pos];
+    assert!(
+        aged.priority > fresh.priority,
+        "aged low-value candidate (priority {}) must out-prioritize the fresh \
+         low-value one (priority {}) — aging floor / anti-starvation",
+        aged.priority,
+        fresh.priority
+    );
+    assert!(
+        aged_pos < fresh_pos,
+        "aged candidate must sit ABOVE the fresh peer in queue order"
+    );
+    assert!(
+        aged.wait_age_secs > fresh.wait_age_secs,
+        "aged candidate's SLA wait-age read-out must exceed the fresh peer's"
+    );
+    assert!(
+        aged.wait_age_secs > 300.0 * 86400.0,
+        "aged candidate should report ~400d of wait, got {}s",
+        aged.wait_age_secs
     );
 }
