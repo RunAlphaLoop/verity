@@ -73,8 +73,11 @@
           </div>
         </div>
 
-        <!-- Panel <section>s are appended here by the assembler, after this
-             fragment. Each is a <section class="panel" id="panel-<id>">. -->
+        <!-- Panel <section>s are SPLICED here by the assembler (mod.rs
+             replaces the marker below with every panel fragment) so panels
+             live INSIDE .content-inner — a body-level panel sits below the
+             100vh rail and paints off-screen. Do not remove the marker. -->
+        <!-- __PANEL_SECTIONS__ -->
 
       </div>
     </main>
