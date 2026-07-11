@@ -46,6 +46,7 @@ async fn test_state(max_conns: usize) -> Option<(Arc<AppState>, TenantId)> {
         },
         rebac: None,
         revocations: RevocationPlane::new(300),
+        watch: std::sync::Arc::new(crate::rebac_watch::WatchStatus::new()),
         allow_restricted_without_rebac: false,
         subscribers: Subscribers::new(max_conns),
         auto_tag: false,

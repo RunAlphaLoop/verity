@@ -115,6 +115,17 @@ fn parse_object_id(tenant: TenantId, oid: &str) -> Option<String> {
     unescape_id(rest)
 }
 
+/// Split a tenant-prefixed object id (`<uuid>_<escaped-name>`) WITHOUT
+/// knowing the tenant in advance — the Watch stream (rebac_watch.rs) sees
+/// object ids from every tenant. Foreign or malformed ids resolve to None
+/// (fail closed, same posture as [`parse_object_id`]).
+pub(crate) fn parse_any_object_id(oid: &str) -> Option<(TenantId, String)> {
+    // `object_id` always emits the 36-char hyphenated uuid form.
+    let tenant: TenantId = oid.get(..36)?.parse().ok()?;
+    let rest = oid.get(36..)?.strip_prefix('_')?;
+    Some((tenant, unescape_id(rest)?))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RebacError {
     #[error("spicedb transport error: {0}")]
@@ -187,6 +198,71 @@ impl Rebac {
             }
         }
         Ok(results)
+    }
+
+    /// Open the SpiceDB Watch stream (`POST /v1/watch`, infinite NDJSON over
+    /// the same HTTP gateway + bearer key). Unlike [`Self::post_stream`] —
+    /// which buffers the ENTIRE body and is only sound for finite
+    /// LookupResources/LookupSubjects streams — this returns the raw
+    /// streaming response for incremental line framing (rebac_watch.rs).
+    /// `cursor` is the last fully-processed ZedToken
+    /// (`changesThrough.token`); None starts at head.
+    pub(crate) async fn watch_connect(
+        &self,
+        cursor: Option<&str>,
+    ) -> RebacResult<reqwest::Response> {
+        let mut body = json!({});
+        if let Some(token) = cursor {
+            body["optionalStartCursor"] = json!({ "token": token });
+        }
+        let resp = self
+            .http
+            .post(format!("{}/v1/watch", self.base))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RebacError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RebacError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp)
+    }
+
+    /// Startup liveness probe for the watch endpoint (verified live against
+    /// authzed/spicedb): a healthy but IDLE watch sends no bytes at all —
+    /// not even response headers — until the first event, so probing with an
+    /// empty request would block startup forever. Instead we send a
+    /// deliberately undecodable start cursor: a usable watch endpoint
+    /// answers IMMEDIATELY with an INVALID_ARGUMENT "error decoding
+    /// zedtoken" frame (auth and routing failures surface as fast, distinct
+    /// errors). The expected decode error IS the success signal.
+    pub(crate) async fn watch_probe(&self) -> RebacResult<()> {
+        let mut resp = match self.watch_connect(Some("!verity-watch-probe!")).await {
+            Ok(resp) => resp,
+            // Some transports surface the cursor rejection at the HTTP
+            // level rather than in-stream — still proof the endpoint works.
+            Err(RebacError::Api { body, .. }) if body.contains("decod") => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .map_err(|_| RebacError::Transport("watch probe: no frame within 5s".into()))?
+            .map_err(|e| RebacError::Transport(format!("watch probe read: {e}")))?
+            .ok_or_else(|| RebacError::Malformed("watch probe: stream closed empty".into()))?;
+        let text = String::from_utf8_lossy(&first);
+        if text.contains("decod") {
+            Ok(())
+        } else {
+            Err(RebacError::Malformed(format!(
+                "watch probe: unexpected first frame: {text}"
+            )))
+        }
     }
 
     async fn post_text(&self, path: &str, body: Value) -> RebacResult<String> {
@@ -502,6 +578,25 @@ mod tests {
         );
         // A foreign tenant's id resolves to nothing (fail closed).
         assert_eq!(parse_object_id(other, &oid), None);
+    }
+
+    #[test]
+    fn any_object_id_recovers_tenant_and_name() {
+        let t = uuid::Uuid::now_v7();
+        // Names containing '_' must not confuse the uuid/name split.
+        for name in ["alice@corp.example", "sales_west", "a=b"] {
+            let oid = object_id(t, name);
+            assert_eq!(
+                parse_any_object_id(&oid),
+                Some((t, name.to_string())),
+                "roundtrip {name:?}"
+            );
+        }
+        // Foreign (un-prefixed) and malformed ids resolve to nothing.
+        assert_eq!(parse_any_object_id("watchprobe_g"), None);
+        assert_eq!(parse_any_object_id(""), None);
+        assert_eq!(parse_any_object_id(&format!("{t}")), None); // no `_name`
+        assert_eq!(parse_any_object_id(&format!("{t}_=G1")), None); // bad escape
     }
 
     /// Gated on VERITY_SPICEDB_URL (skips when absent, like VERITY_TEST_DSN):
