@@ -299,6 +299,7 @@ async fn publish_knowledge_episode_is_encrypted_with_kek() {
             evidence: vec![e1, e2, e3],
             proposed_by_sub: None,
             proposed_by_azp: Some("agent:proposer".into()),
+            canonical_statement: None,
         })
         .await
         .unwrap();
@@ -357,6 +358,7 @@ async fn subject_erasure_hard_deletes_and_cascades_knowledge() {
             evidence: vec![e1, e2, e3],
             proposed_by_sub: None,
             proposed_by_azp: Some("agent:proposer".into()),
+            canonical_statement: None,
         })
         .await
         .unwrap();
@@ -677,6 +679,7 @@ async fn dsar_bundle_contains_expected_rows_with_decrypted_payloads() {
             evidence: vec![],
             proposed_by_sub: Some(subject.into()),
             proposed_by_azp: None,
+            canonical_statement: None,
         })
         .await
         .unwrap();

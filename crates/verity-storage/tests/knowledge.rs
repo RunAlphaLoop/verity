@@ -72,6 +72,7 @@ fn proposal(tenant: TenantId, statement: &str, evidence: Vec<EpisodeId>) -> Know
         evidence,
         proposed_by_sub: Some("user:test".into()),
         proposed_by_azp: Some("agent:proposer".into()),
+        canonical_statement: None,
     }
 }
 

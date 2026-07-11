@@ -171,6 +171,7 @@ async fn episode_forget_cascades_published_knowledge() {
             evidence: vec![e1, e2, e3],
             proposed_by_sub: None,
             proposed_by_azp: Some("agent:proposer".into()),
+            canonical_statement: None,
         })
         .await
         .unwrap();
