@@ -1,0 +1,11 @@
+[
+  {
+    "entity_type": "comment",
+    "entity_id": "c7a91b20-8e4d-4f3a-b6c5-444444444444",
+    "valid_from": "2026-07-02T08:15:30.500Z",
+    "fields": {
+      "author": "Jane Doe",
+      "issue": "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21"
+    }
+  }
+]

@@ -1,0 +1,7 @@
+[
+  {
+    "entity_type": "comment",
+    "entity_id": "c7a91b20-8e4d-4f3a-b6c5-444444444444",
+    "content": "Repro confirmed: the handler blocks on the encoder, so Linear's 5s delivery timeout fires. Moving encode off the hot path fixes it."
+  }
+]

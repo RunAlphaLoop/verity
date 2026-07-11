@@ -1,0 +1,91 @@
+# Linear source manifest (SPEC §5e.3 example) — connectors are config.
+#
+# BYOT: the service key and the webhook signing secret are YOUR credentials,
+# referenced by secret://, never inline. v0 secret store is process env:
+# secret://linear-webhook-secret → VERITY_SECRET_LINEAR_WEBHOOK_SECRET.
+#
+# Verify offline with:  cargo run -p verity-manifest --bin manifest-test -- examples/linear.yaml
+
+manifest_version: 1
+source:
+  name: linear
+  # Linear is Tier B in the July 2026 coverage survey: webhooks + API under a
+  # personal key, but no per-issue ACL API — container approximation only.
+  tier: B
+  auth:
+    ref: secret://linear-service-key
+    shape: static_key
+  webhook:
+    signature:
+      scheme: hmac_sha256          # hex HMAC-SHA256 of the raw request body
+      header: Linear-Signature
+      secret_ref: secret://linear-webhook-secret
+
+entities:
+  - type: issue
+    route:
+      when: "type = 'Issue' and action in ['create','update']"
+      operation: upsert
+    primary_key: "data.id"         # deterministic PK → idempotent replays
+    valid_from: "data.updatedAt"   # bi-temporal event time
+    map:
+      identifier: "data.identifier"
+      title: "data.title"
+      state: "data.state.name"
+      team: "data.team.key"
+      priority: "data.priority"
+      url: "url"
+
+  - type: comment
+    route:
+      when: "type = 'Comment' and action = 'create'"
+      operation: upsert
+    primary_key: "data.id"
+    valid_from: "data.createdAt"
+    map:
+      issue: "data.issue.id"
+      author: "data.user.name"
+    content: "data.body"           # comment text becomes a retrieval chunk
+
+# Reconciliation backstop for lost deliveries. Parse-and-store only in v0 —
+# no poll executor runs yet (SPEC §5e.7 schedules it); webhook is the lane.
+poll:
+  endpoint: "https://api.linear.app/graphql"
+  interval: 15m
+  cursor: opaque
+
+# The human-gated block. LLM authoring flows are forbidden from emitting it;
+# an admin reviews exactly this and approves at POST /v1/manifests/{id}/activate.
+acl_policy:
+  mode: map
+  identity_namespace: source_native_id
+  # Workspace (organization) membership is the finest container present on
+  # EVERY routed payload — Comment payloads carry no team object, and one
+  # principals expression covers the whole source. Tier B honesty: this is an
+  # approximation, and the note below surfaces in the admin approval UI.
+  principals: "organizationId"
+  approximation: true
+  note: >-
+    Linear exposes no per-issue ACL API (Tier B). Workspace membership
+    (organizationId) approximates visibility for issues and comments;
+    private-team boundaries are NOT reconstructed — use the native connector
+    lane when team-level fidelity matters.
+
+# Conformance fixtures ship with the format: `manifest-test` (or the server's
+# validation) replays these under a pinned clock and asserts the exact writes.
+fixtures:
+  - input: fixtures/issue_update.json
+    expect:
+      facts: fixtures/issue_update.facts.json
+      chunks: fixtures/issue_update.chunks.json
+      acl_envelopes: fixtures/issue_update.acl.json
+  - input: fixtures/comment_create.json
+    expect:
+      facts: fixtures/comment_create.facts.json
+      chunks: fixtures/comment_create.chunks.json
+      acl_envelopes: fixtures/comment_create.acl.json
+  # Fail-closed is a first-class assertion: an unrouted payload quarantines.
+  - input: fixtures/project_create.json
+    expect:
+      quarantined: true
+      reason_contains: "no entity route matched"

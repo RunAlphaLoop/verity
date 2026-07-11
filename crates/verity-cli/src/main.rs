@@ -14,6 +14,7 @@ mod backup;
 mod config;
 mod connect;
 mod dev;
+mod manifest;
 mod mcp;
 mod query;
 mod reembed;
@@ -105,6 +106,18 @@ tokens (POST /v1/scopes, actor cli:add) and uploads under that handle."
     Connect {
         #[command(subcommand)]
         command: ConnectCommand,
+    },
+    /// Community manifest registry (SPEC §5e.3): list/show/verify/fetch/install
+    /// signed source manifests. Reads a local registry root (default ./registry,
+    /// or --registry / VERITY_MANIFEST_REGISTRY); a git/HTTP fetch is next.
+    Manifest {
+        /// Registry root: a local directory holding index.json (default
+        /// ./registry). Overrides $VERITY_MANIFEST_REGISTRY. A git/HTTP URL is
+        /// the documented next step (rejected today).
+        #[arg(long, global = true, env = "VERITY_MANIFEST_REGISTRY")]
+        registry: Option<String>,
+        #[command(subcommand)]
+        command: ManifestCommand,
     },
     /// Watch the quarantine: payloads Verity refused to index permissively.
     Tail {
@@ -201,6 +214,38 @@ enum ConnectCommand {
         /// WOULD be sent instead of sending it (no PAT asked for).
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManifestCommand {
+    /// List the manifests in the registry catalog (index.json).
+    List,
+    /// Show a manifest's catalog metadata and its YAML.
+    Show {
+        /// The manifest's source.name (see `manifest list`).
+        name: String,
+    },
+    /// Verify a manifest: sha256 integrity + detached signature → pass/fail.
+    Verify { name: String },
+    /// Verify + run conformance fixtures, then copy the manifest locally.
+    /// Refuses (fail closed) if verify or any fixture fails.
+    Fetch {
+        name: String,
+        /// Output directory (default ./<name>).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Verify + run fixtures, then upload to the server as a DRAFT
+    /// (POST /v1/manifests). Activation stays a separate human-gated admin call.
+    Install {
+        name: String,
+        /// Tenant to upload into (uuid).
+        #[arg(long)]
+        tenant: String,
+        /// Admin bearer token for the upload surface.
+        #[arg(long)]
+        admin_token: String,
     },
 }
 
@@ -311,6 +356,22 @@ async fn run() -> Result<()> {
                 .await
             }
         },
+        Command::Manifest { registry, command } => {
+            let registry = registry.as_deref();
+            match command {
+                ManifestCommand::List => manifest::list(registry),
+                ManifestCommand::Show { name } => manifest::show(&name, registry),
+                ManifestCommand::Verify { name } => manifest::verify(&name, registry),
+                ManifestCommand::Fetch { name, out } => {
+                    manifest::fetch(&name, out.as_deref(), registry)
+                }
+                ManifestCommand::Install {
+                    name,
+                    tenant,
+                    admin_token,
+                } => manifest::install(&ctx, &name, &tenant, &admin_token, registry).await,
+            }
+        }
         Command::Tail { once } => tail::run(&ctx, once).await,
         Command::Mcp { command } => match command {
             McpCommand::Install { run, repo } => mcp::install(&ctx, repo, run).await,

@@ -1,0 +1,13 @@
+{
+  "registry_version": 1,
+  "entries": [
+    {
+      "name": "linear",
+      "version": "1",
+      "description": "Linear issues + comments via webhook (Tier B, container-approximated ACLs).",
+      "tier": "community",
+      "path": "manifests/linear.yaml",
+      "sha256": "6e7ea06b35dec628f907078bd81af85f7ce7db41ae8fa80b9d47bb06d7e38b2f"
+    }
+  ]
+}

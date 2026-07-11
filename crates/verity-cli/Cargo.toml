@@ -12,6 +12,7 @@ name = "verity-cli"
 path = "src/main.rs"
 
 [dependencies]
+verity-manifest = { path = "../verity-manifest" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -1,0 +1,25 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "createdAt": "2026-07-02T08:15:30.500Z",
+  "organizationId": "0a2f6c4e-9d31-4b8a-b7e2-5c1d8f6a3e90",
+  "webhookTimestamp": 1751444130500,
+  "url": "https://linear.app/acme/issue/ENG-42/fix-webhook-handler-timeout#comment-c7a9",
+  "data": {
+    "id": "c7a91b20-8e4d-4f3a-b6c5-444444444444",
+    "body": "Repro confirmed: the handler blocks on the encoder, so Linear's 5s delivery timeout fires. Moving encode off the hot path fixes it.",
+    "createdAt": "2026-07-02T08:15:30.500Z",
+    "updatedAt": "2026-07-02T08:15:30.500Z",
+    "issueId": "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21",
+    "userId": "usr-3c4d5e6f-0002-4abc-9def-333333333333",
+    "issue": {
+      "id": "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21",
+      "title": "Fix webhook handler timeout"
+    },
+    "user": {
+      "id": "usr-3c4d5e6f-0002-4abc-9def-333333333333",
+      "name": "Jane Doe",
+      "email": "jane@acme.dev"
+    }
+  }
+}

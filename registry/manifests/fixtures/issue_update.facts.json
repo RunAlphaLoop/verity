@@ -1,0 +1,15 @@
+[
+  {
+    "entity_type": "issue",
+    "entity_id": "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21",
+    "valid_from": "2026-07-01T12:34:56.789Z",
+    "fields": {
+      "identifier": "ENG-42",
+      "priority": 2,
+      "state": "In Progress",
+      "team": "ENG",
+      "title": "Fix webhook handler timeout",
+      "url": "https://linear.app/acme/issue/ENG-42/fix-webhook-handler-timeout"
+    }
+  }
+]

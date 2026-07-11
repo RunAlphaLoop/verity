@@ -206,6 +206,95 @@ Verity-native payload shape (`content`/`observation`/`facts[]`) with zero
 mapping — the 5-minute path stays: mint URL, curl payload, fact queryable.
 Manifests are the graduation step for real vendor payload shapes.
 
+## Community registry
+
+SPEC §5e.3 defers a registry to "a git repo of signed YAML files at v0.1
+(near-zero cost)," with certification tiers and fetch machinery waiting until
+≥10 community manifests exist. That minimal first cut ships as the top-level
+[`registry/`](../registry/) directory and the `verity-cli manifest`
+subcommand.
+
+### Layout
+
+```
+registry/
+  index.json                 # catalog: [{name, version, description, tier, path, sha256, signature_ref?}]
+  manifests/<name>.yaml       # one manifest per source (seeded: linear, community tier)
+  manifests/fixtures/…        # conformance fixtures, resolved relative to the manifest
+  signatures/<name>.sig       # detached signature — verified tier only
+  README.md                   # layout, contributing, tier policy
+```
+
+`index.json` is a versioned catalog; each entry carries the manifest's
+`source.name`, a one-line description, a tier, the registry-relative `path`,
+the lowercase-hex `sha256` of the manifest bytes (the integrity anchor), and an
+optional `signature_ref`.
+
+### Tiers
+
+| tier | meaning | signature |
+|---|---|---|
+| `community` | **Self-attested** — unsigned-by-us. Integrity (sha256) is guaranteed; maintainers have not vouched for the ACL semantics. Anyone may contribute one. | optional (contributor-attested if present) |
+| `verified` | **Maintainer-vouched** — signed by a Verity maintainer key after review of the `acl_policy` block. | required |
+
+`verified` is documented, not yet operated: no manifest ships `verified` until
+the maintainer key process is real. We do not build a CA — the maintainer key
+location is documented, not a hierarchy.
+
+### Signing / integrity — the honest v0 limit
+
+Manifest-file signatures **reuse verity-manifest's HMAC-SHA256 primitive** (the
+same one the webhook lane uses), signing the manifest bytes; the `.sig` file
+holds the hex digest. The maintainer key resolves from
+`VERITY_REGISTRY_SIGNING_KEY` (mirroring `secret://` → `VERITY_SECRET_*`). This
+is deliberate — it adds **zero new supply-chain dependencies** to a crate whose
+whole premise is "no supply-chain code execution."
+
+The limit, stated plainly:
+
+- **`sha256` in `index.json` is *integrity*, not authenticity** — it proves the
+  bytes match the catalog, not who authored them.
+- **HMAC is a *symmetric* MAC** — a valid signature proves the signer held the
+  shared maintainer key, but because verify and sign use the same key, anyone
+  who can verify can also forge. The key stays maintainer-only and is never
+  shipped to verify-only clients. Real non-repudiation for the `verified` tier
+  wants a **public-key (ed25519)** signature so verifiers hold only a public
+  key — that is the documented next step, gated on ≥10 manifests existing.
+
+### The verify → fixtures → activation chain (fail closed at every hop)
+
+```
+verify (sha256 + signature)  →  fixtures gate (conformance runner)  →  human activation
+```
+
+- `manifest verify <name>` — sha256 integrity + signature, clear pass/fail.
+- `manifest fetch <name> [--out <dir>]` — verify, **then run the manifest's own
+  fixtures** (`run_manifest_fixtures`), then copy the manifest + fixtures
+  locally. A verify failure OR any fixture failure **refuses the copy** — no
+  bytes are written (fail closed). Connectors-as-config with a test gate: a
+  manifest that declares no fixture cannot pass.
+- `manifest install <name> --tenant <id> --admin-token <t>` — verify + fixtures,
+  then `POST /v1/manifests` as a **draft**. Activation — the point where ACL
+  semantics go live — remains the separate, human-gated admin call
+  (`POST /v1/manifests/{id}/activate` with an `approved_by`). The registry never
+  lowers that bar.
+
+### The CLI surface
+
+```console
+$ verity-cli manifest list                       # read index.json
+$ verity-cli manifest show <name>                # metadata + yaml
+$ verity-cli manifest verify <name>              # sha256 + signature → pass/fail
+$ verity-cli manifest fetch <name> --out ./dir   # verify + fixtures → copy (fail closed)
+$ verity-cli manifest install <name> --tenant <id> --admin-token <t>
+```
+
+The registry root defaults to `./registry`; override with `--registry <dir>` or
+`VERITY_MANIFEST_REGISTRY`. Only a **local directory** is read today; a git/HTTP
+URL is rejected with a next-step message and is the documented next hop.
+Contributing is a PR of a signed (or self-attested) manifest — see
+[`registry/README.md`](../registry/README.md).
+
 ## What manifests do not do (v0)
 
 - Execute `poll` blocks (stored for the future reconciliation loop).

@@ -52,11 +52,16 @@
 pub mod conformance;
 pub mod path;
 pub mod predicate;
+pub mod registry;
 pub mod runtime;
 pub mod schema;
 pub mod signature;
 
 pub use conformance::{run_manifest_fixtures, FixtureOutcome};
+pub use registry::{
+    sha256_hex, sign_manifest, verify_entry, verify_manifest_signature, RegistryEntry,
+    RegistryIndex, RegistryTier, SignatureState, VerifyReport,
+};
 pub use runtime::{AclEnvelope, Applied, EntityWrites, RuntimeOptions};
 pub use schema::{AclMode, IdentityNamespace, Manifest, ManifestError, Tier};
 pub use signature::{resolve_secret_ref, verify_hmac_sha256_hex};
