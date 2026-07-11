@@ -24,6 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 use verity_core::types::*;
 
+use crate::resolve::tier3::KnownCanonicals;
+
 // ---------------------------------------------------------------------------
 // Public API — the plan the server/materializer executes.
 // ---------------------------------------------------------------------------
@@ -266,7 +268,29 @@ pub fn parse_chunk_ref(reff: &str) -> Option<(String, String, i32)> {
 ///    with `justifying_evidence`. Chunk mentions → tags under §5's rule.
 ///
 /// Pure: no I/O, no clock, no randomness. `fold(x, c) == fold(x, c)` always.
+///
+/// This is the plain entry point: Tier-3 mentions may only tag canonicals this
+/// run just folded (the strictest fail-closed known-set — see §5 precondition
+/// (a) in [`crate::resolve::tier3`]). Use [`fold_with_known_canonicals`] to also
+/// admit canonicals already materialized in `entity_aliases` from a prior run.
 pub fn fold(live_evidence: &[EvidenceRow], config: &FoldConfig) -> FoldPlan {
+    fold_with_known_canonicals(live_evidence, config, &KnownCanonicals::empty())
+}
+
+/// [`fold`], plus an explicit set of canonicals **already folded** (present in
+/// `entity_aliases`), read in the worker plane by the impure materializer.
+///
+/// The known set is used ONLY to satisfy §5 precondition (a) — "the mentioned
+/// canonical is already folded" — for Tier-3 chunk tagging. It NEVER forms a
+/// merge edge, NEVER widens a scope, and does not affect alias/component output;
+/// it only lets a mention tag a chunk with a canonical that a *prior* fold (or
+/// admin crosswalk) already materialized, in addition to those this run
+/// produced. Still fully deterministic given its three inputs.
+pub fn fold_with_known_canonicals(
+    live_evidence: &[EvidenceRow],
+    config: &FoldConfig,
+    known_canonicals: &KnownCanonicals,
+) -> FoldPlan {
     debug_assert!(
         live_evidence.iter().all(|e| e.valid_to.is_none()),
         "fold must be given only LIVE evidence (valid_to IS NULL)"
@@ -548,8 +572,13 @@ pub fn fold(live_evidence: &[EvidenceRow], config: &FoldConfig) -> FoldPlan {
     // deterministic co-signal on the same chunk, OR a human confirmation. A tag
     // NARROWS retrievability (intersection semantics), and Tier-3 NEVER forms an
     // edge — so tagging cannot create/merge a canonical, only annotate a chunk. -
-    let folded_canonicals = plan.canonicals.clone();
-    materialize_chunk_tags(&evidence, config, &folded_canonicals, &mut plan);
+    // §5 precondition (a): a mention may tag a canonical only if it is ALREADY
+    // FOLDED — present in `entity_aliases`. That is this run's freshly-folded
+    // canonicals UNIONED with the pre-existing set the caller read from
+    // `entity_aliases` (a prior fold / admin crosswalk). The pure fold cannot
+    // read the DB, so the pre-existing half arrives as `known_canonicals`.
+    let eligible = known_canonicals.with_this_run(plan.canonicals.iter().map(String::as_str));
+    materialize_chunk_tags(&evidence, config, &eligible, &mut plan);
 
     // ---- Determinism: sort every output vector by a total key. ----
     plan.aliases.sort();
@@ -923,11 +952,9 @@ fn component_badge(
 fn materialize_chunk_tags(
     evidence: &[&EvidenceRow],
     config: &FoldConfig,
-    folded_canonicals: &[String],
+    folded: &KnownCanonicals,
     plan: &mut FoldPlan,
 ) {
-    let folded: BTreeSet<&String> = folded_canonicals.iter().collect();
-
     // Gather, per chunk ref, the candidate (canonical, tier, method, ev) mentions
     // and any deterministic co-signals present on that same chunk.
     let mut chunk_candidates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -981,21 +1008,27 @@ fn materialize_chunk_tags(
             continue; // reviewer-hint only; chunk stays as-is.
         }
 
-        // Only tag with canonicals that were actually folded (never invent a
-        // merge from a mention). A mentioned ref that is a folded canonical, or a
-        // member ref whose canonical was folded, is eligible.
+        // §5 precondition (a), enforced fail-closed: only tag with canonicals
+        // that are ALREADY FOLDED — present in `entity_aliases` (pre-existing or
+        // produced this run). A mention NEVER invents a canonical or a merge.
+        //   - `folded.contains(cand)`: the mention names a real canonical key
+        //     that exists in `entity_aliases`.
+        //   - a member ref (`source:entity_id`) whose OWN implicit singleton
+        //     canonical is already materialized: eligible ONLY when a
+        //     deterministic co-signal anchors it on this chunk (§5's "a real
+        //     singleton canonical referenced by a member").
+        // A bare `canon:*` the caller never folded is dropped (rule (a)).
         let mut tags: BTreeSet<String> = BTreeSet::new();
         for cand in candidates {
             if folded.contains(cand) {
                 tags.insert(cand.clone());
             } else if let Some(m) = split_member_ref(cand) {
-                // Its own-canonical (singleton) tag is allowed only when a
-                // co-signal is present (deterministic anchor).
-                if cosignal {
-                    tags.insert(format!("canon:{}:{}", m.source, m.entity_id));
+                let own = format!("canon:{}:{}", m.source, m.entity_id);
+                // Own-canonical tag: allowed only when that singleton canonical
+                // is already folded AND a deterministic co-signal is present.
+                if cosignal && folded.contains(&own) {
+                    tags.insert(own);
                 }
-            } else if cand.starts_with("canon:") && cosignal {
-                tags.insert(cand.clone());
             }
         }
         if tags.is_empty() {
@@ -1480,6 +1513,61 @@ mod tests {
         assert!(
             p.chunk_tags.is_empty(),
             "no co-signal + auto_link off → abstain (reviewer-hint only, no tag)"
+        );
+    }
+
+    // ---- §5 precondition (a): a co-signalled mention of a canonical that is NOT
+    // already folded (absent from entity_aliases + not merged this run) must NOT
+    // tag — until the caller supplies it as a known/pre-existing canonical. ----
+    #[test]
+    fn tier3_mention_requires_already_folded_canonical() {
+        // A chunk carries BOTH a deterministic co-signal (tier-1 ACL edge) and a
+        // Tier-3 mention, all pointing at `canon:hubspot:B` — but nothing folds
+        // `canon:hubspot:B` this run (no member↔member merge produces it) and it
+        // is not pre-existing. Co-signal alone must not conjure the tag.
+        let evs = vec![
+            ev(
+                1,
+                "chunk:gdrive:D9:0",
+                "canon:hubspot:B",
+                1,
+                "domain_match",
+                Some("acme.com"),
+                Some("customer_contact"),
+                1,
+            ),
+            ev(
+                2,
+                "chunk:gdrive:D9:0",
+                "canon:hubspot:B",
+                3,
+                "llm_mention",
+                Some("Acme"),
+                Some("customer_contact"),
+                1,
+            ),
+        ];
+        let cfg = cfg_with(None, 1, false);
+
+        // Plain fold: `canon:hubspot:B` is not folded this run and not known →
+        // precondition (a) fails → no tag, even with the co-signal.
+        let p = fold(&evs, &cfg);
+        assert!(
+            p.chunk_tags.is_empty(),
+            "co-signal without an already-folded canonical must NOT tag (rule a)"
+        );
+
+        // Same evidence, but the caller supplies `canon:hubspot:B` as an
+        // ALREADY-FOLDED canonical (read from entity_aliases in the worker) →
+        // both preconditions met → tag materializes.
+        let known = KnownCanonicals::new(["canon:hubspot:B"], std::iter::empty());
+        let p2 = fold_with_known_canonicals(&evs, &cfg, &known);
+        assert!(
+            p2.chunk_tags
+                .iter()
+                .any(|t| t.subject_ref == "chunk:gdrive:D9:0"
+                    && t.tags.contains(&"canon:hubspot:B".to_string())),
+            "already-folded (known) canonical + co-signal → tag materializes"
         );
     }
 

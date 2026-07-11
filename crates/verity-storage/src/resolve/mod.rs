@@ -32,6 +32,7 @@
 pub mod canon;
 pub mod fold;
 pub mod producers;
+pub mod tier3;
 
 pub use canon::{
     canonicalize_domain, canonicalize_email, canonicalize_name, canonicalize_phone,
@@ -46,6 +47,10 @@ pub use producers::{
 // S4 — the pure deterministic fold (§4.2). Consumes live evidence produced by
 // S0/S1 above, materializes canonical membership + chunk tags + badges.
 pub use fold::{
-    fold, parse_chunk_ref, refold_incremental, split_member_ref, AliasWrite, ChunkTagWrite,
-    FoldConfig, FoldPlan, MemberRef, ReviewItem, ReviewReason,
+    fold, fold_with_known_canonicals, parse_chunk_ref, refold_incremental, split_member_ref,
+    AliasWrite, ChunkTagWrite, FoldConfig, FoldPlan, MemberRef, ReviewItem, ReviewReason,
 };
+
+// §5 Tier-3 mention → chunk-tag eligibility: the "already folded (exists in
+// entity_aliases) AND co-signal/human" precondition, threaded into the fold.
+pub use tier3::KnownCanonicals;

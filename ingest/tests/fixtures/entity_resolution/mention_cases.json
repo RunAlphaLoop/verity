@@ -1,0 +1,158 @@
+{
+  "_about": "Labeled Tier-3 unstructured-MENTION eval set for resolve_tier3 (cross-source-entity-resolution.md §5). MIRRORS entity_pairs.json in spirit, but each case is one UNSTRUCTURED CHUNK (a Drive/Linear body) plus the gazetteer context needed to resolve its mentions, and the EXPECTED Tier-3 outcome per mention. The load-bearing property is precision-of-DECISION-B (which entity): an ambiguous 'Acme' with two candidates must resolve to NIL/abstain (never a guess), and a mention may only become a TAG when a deterministic co-signal (or human) corroborates an already-folded canonical. A free-text mention with NO co-signal and auto_link off is a REVIEWER_HINT only (non-authoritative). 'expect' per mention is one of: nil, abstain_margin, reviewer_hint, tag. The gazetteer is shared per case via 'catalog'. 'config' overrides Tier3Config defaults (tau_nil/margin_delta/auto_link_tier3) when a case needs a specific operating point.",
+  "cases": [
+    {
+      "id": "m-0001-drive-cosignal-confident",
+      "kind": "tag_with_cosignal",
+      "catalog": [
+        {"canonical": "account:acme", "name": "Acme, Inc.", "aliases": ["Acme"], "domains": ["acme.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D9:0",
+        "text": "Repro confirmed for Acme's timeout on the pricing export.",
+        "chunk_domains": [],
+        "acl_domains": ["acme.com"]
+      },
+      "expect": {"account:acme": "tag"},
+      "rationale": "Single confident candidate (exact surface 'Acme' -> account:acme), wide margin, and an ACL domain co-signal (acme.com == the folded canonical's verified domain) on the SAME chunk. Decision B resolves AND the §5 tag gate clears -> TAG. The tag NARROWS D9 to Acme-scope (safe under intersection); the ACL co-signal only permits it, it never grants visibility."
+    },
+    {
+      "id": "m-0002-ambiguous-two-acmes-nil",
+      "kind": "margin_abstain",
+      "catalog": [
+        {"canonical": "account:acme-corp", "name": "Acme", "aliases": ["Acme Corp"], "domains": ["acmecorp.com"], "is_canonical": true},
+        {"canonical": "account:acme-freight", "name": "Acme", "aliases": ["Acme Freight"], "domains": ["acmefreight.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D10:0",
+        "text": "Kickoff call with Acme went well; follow up next week.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "expect": {"account:acme-corp": "abstain_margin", "account:acme-freight": "abstain_margin"},
+      "rationale": "TWO catalog entities share the surface form 'Acme' (acme-corp vs acme-freight). No co-signal separates them, so top1-top2 = 0 < margin_delta -> ABSTAIN_MARGIN. The load-bearing abstain gate: guessing which Acme would mis-file content into a real customer's scope. Quarantine, NEVER a guess, NEVER the zero-tag bucket."
+    },
+    {
+      "id": "m-0003-freetext-no-cosignal-reviewer-hint",
+      "kind": "reviewer_hint",
+      "catalog": [
+        {"canonical": "account:acme", "name": "Acme, Inc.", "aliases": ["Acme"], "domains": ["acme.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:ENG-42:0",
+        "text": "Repro confirmed for Acme's timeout.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "expect": {"account:acme": "reviewer_hint"},
+      "rationale": "Single confident candidate but NO deterministic co-signal (the Linear org id is your workspace, the actor email is the wrong population) and auto_link_tier3 is off (default). So the mention is a REVIEWER HINT only: non-authoritative tier=3 evidence surfaces in the review queue ('ENG-42 possibly concerns account:acme, unconfirmed') but the chunk is NOT tagged and NOT dumped into zero-tag. A human confirm would flip it to a tag; a reject would anti-link it."
+    },
+    {
+      "id": "m-0004-chunk-body-domain-cosignal-tag",
+      "kind": "tag_with_cosignal",
+      "catalog": [
+        {"canonical": "account:globex", "name": "Globex Corporation", "aliases": ["Globex"], "domains": ["globex.io"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D11:0",
+        "text": "Renewal notes for Globex — see the SOW at globex.io/contract for terms.",
+        "chunk_domains": ["globex.io"],
+        "acl_domains": []
+      },
+      "expect": {"account:globex": "tag"},
+      "rationale": "The co-signal is in the BODY (globex.io), not the ACL — a domain in the chunk text matching the candidate's verified domain is deterministic corroboration. Confident, unambiguous, co-signed, already-folded canonical -> TAG."
+    },
+    {
+      "id": "m-0005-mention-of-noncanonical-reviewer-hint",
+      "kind": "reviewer_hint",
+      "catalog": [
+        {"canonical": "account:initech", "name": "Initech", "aliases": [], "domains": ["initech.com"], "is_canonical": false}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D12:0",
+        "text": "Initech asked about the initech.com SSO integration timeline.",
+        "chunk_domains": ["initech.com"],
+        "acl_domains": []
+      },
+      "expect": {"account:initech": "reviewer_hint"},
+      "rationale": "Confident, co-signed mention BUT the target is NOT yet a folded canonical (is_canonical=false). The §5 tag gate requires an already-folded canonical, so even with a co-signal this is a REVIEWER_HINT, never a tag. Tier-3 never forms the canonical itself."
+    },
+    {
+      "id": "m-0006-unknown-org-nil",
+      "kind": "nil_no_candidate",
+      "catalog": [
+        {"canonical": "account:acme", "name": "Acme, Inc.", "aliases": ["Acme"], "domains": ["acme.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D13:0",
+        "text": "Notes from the Zorp Robotics onboarding — unrelated to any account.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "expect": {},
+      "rationale": "The only org named ('Zorp Robotics') is not in the gazetteer, so detection finds no gazetteer mention (and the deterministic default detector adds none). No mentions -> nothing to disambiguate -> no evidence. The safe default: an unknown org is never force-fit to a catalog entity."
+    },
+    {
+      "id": "m-0007-human-confirmed-overrides-killswitch-tag",
+      "kind": "tag_human",
+      "catalog": [
+        {"canonical": "account:acme", "name": "Acme, Inc.", "aliases": ["Acme"], "domains": ["acme.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:ENG-42:0",
+        "text": "Repro confirmed for Acme's timeout.",
+        "chunk_domains": [],
+        "acl_domains": [],
+        "human_confirmed_canonicals": ["account:acme"]
+      },
+      "expect": {"account:acme": "tag"},
+      "rationale": "Same free-text mention as m-0003 (no co-signal, auto_link off) BUT a human already confirmed account:acme for this chunk. A human confirmation is the §5 'or a human approves' branch AND overrides the auto-off kill switch -> TAG. Proves the human backstop, not a threshold, is what turns a hint into a tag here."
+    },
+    {
+      "id": "m-0008-auto-link-on-single-confident-tag",
+      "kind": "tag_autolink",
+      "catalog": [
+        {"canonical": "account:hooli", "name": "Hooli", "aliases": [], "domains": ["hooli.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D14:0",
+        "text": "Hooli expansion plan for Q3 — see attached deck.",
+        "chunk_domains": ["hooli.com"],
+        "acl_domains": []
+      },
+      "config": {"auto_link_tier3": true},
+      "expect": {"account:hooli": "tag"},
+      "rationale": "When a tenant opts INTO auto_link_tier3 (a public spec amendment, §8), a confident + co-signed + already-folded mention TAGs without a human. Exercises the kill-switch ON path. Still non-authoritative at the fold: raises confidence / materializes a narrowing tag, never forms an edge."
+    },
+    {
+      "id": "m-0009-weak-fuzzy-below-tau-nil",
+      "kind": "nil_below_tau",
+      "catalog": [
+        {"canonical": "account:massive-dynamic", "name": "Massive Dynamic", "aliases": [], "domains": ["massivedynamic.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D15:0",
+        "text": "Massive quarterly dynamic pricing review across all regions.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "expect": {},
+      "rationale": "'Massive' and 'dynamic' appear as separate common words, not the company name 'Massive Dynamic' as a contiguous span. The word-boundary window pass finds no exact surface form, and no co-signal exists, so any weak fuzzy candidate falls below tau_nil -> NIL / no mention emitted. Guards against generic-word false positives."
+    },
+    {
+      "id": "m-0010-multiword-surface-form-tag",
+      "kind": "tag_with_cosignal",
+      "catalog": [
+        {"canonical": "account:lph", "name": "Los Pollos Hermanos", "aliases": ["LPH"], "domains": ["lospolloshermanos.com"], "is_canonical": true}
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:D16:0",
+        "text": "Catering contract with Los Pollos Hermanos finalized; invoices to lospolloshermanos.com.",
+        "chunk_domains": ["lospolloshermanos.com"],
+        "acl_domains": []
+      },
+      "expect": {"account:lph": "tag"},
+      "rationale": "Multi-word surface form 'Los Pollos Hermanos' must be detected as one contiguous span (the window pass), then co-signed by the body domain -> confident + co-signed + folded canonical -> TAG. Exercises multi-token detection."
+    }
+  ]
+}
