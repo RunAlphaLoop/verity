@@ -85,3 +85,34 @@ jobs:
         run: bash integrations/run_e2e.sh
         env:
           VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
+
+  # SRB metric 6 — consolidation precision/recall regression gate
+  # (docs/design/knowledge-merge-tuning.md §4, Phase 0). Scores the labeled
+  # statement-pair eval set (docs/benchmark/consolidation-pairs.jsonl) with the
+  # CURRENT merge decision and fails if the false-merge rate FP/(FP+TN) at the
+  # operating threshold exceeds the target. A false merge fabricates
+  # cross-customer support (§1's governing asymmetry: a false merge is far worse
+  # than a missed one), so any tuning that raises this rate must fail the build.
+  # Needs no database — the merge decision is encoder + cosine only; the job
+  # downloads the MiniLM-L6 ONNX model (~90MB) on first run. Runs standalone
+  # (no `needs:`) so it parallelizes with the other jobs.
+  #
+  # Phase-0 baseline (2026-07-10, docs/benchmark/RESULTS-consolidation-2026-07-10):
+  # at the shipped 0.85 threshold the decision merges 0/94 true paraphrase pairs
+  # (recall 0.0, precision 1.0, false-merge rate 0.0). Target here is <= 1%
+  # false-merge rate, matching §4's precision >= 0.99 contract; the current
+  # cosine-only decision passes with a 0% margin. Bump the threshold argument in
+  # lockstep with VERITY_KNOWLEDGE_MERGE_THRESHOLD when the cascade lands so the
+  # gate always measures the shipped operating point.
+  consolidation-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p verity-bench
+      - name: consolidation false-merge-rate gate (<= 1%)
+        run: |
+          ./target/release/verity-bench consolidation-gate \
+            --threshold 0.85 \
+            --max-false-merge-rate 0.01

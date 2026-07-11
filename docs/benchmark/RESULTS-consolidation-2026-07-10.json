@@ -1,0 +1,233 @@
+{
+  "ci_gate": {
+    "measured_false_merge_rate": 0.0,
+    "target_false_merge_rate": 0.01
+  },
+  "date": "2026-07-10",
+  "machine": {
+    "cpu": "Apple M3 Pro",
+    "mem": "36 GB",
+    "os": "Darwin 23.6.0 arm64"
+  },
+  "metric": "6",
+  "result": {
+    "corpus": {
+      "easy_negatives": 22,
+      "hard_negatives": 90,
+      "negatives": 112,
+      "positives": 94,
+      "total_pairs": 206
+    },
+    "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+    "encoder_dim": 384,
+    "eval_set": "docs/benchmark/consolidation-pairs.jsonl",
+    "hardest_true_paraphrase": {
+      "a": "SMB accounts are the first to leave after a rate hike",
+      "b": "small businesses cancel quickly when prices are raised",
+      "note": "lowest-cosine same-generalization pair — the paraphrase recall the 0.85 threshold misses",
+      "score": 0.2396133691072464
+    },
+    "metric": "consolidation_precision_recall",
+    "mirrors": "crates/verity-server/src/consolidation.rs propose_or_merge (lines 373-405), merge predicate lines 381-397; normalize_term lines 56-61; threshold DEFAULT_MERGE_THRESHOLD line 52",
+    "operating_point": {
+      "confusion": {
+        "fn": 94,
+        "fp": 0,
+        "tn": 112,
+        "tp": 0
+      },
+      "f1": 0.0,
+      "false_merge_rate": 0.0,
+      "precision": 1.0,
+      "recall": 0.0,
+      "threshold": 0.8500000238418579
+    },
+    "operating_threshold": 0.8500000238418579,
+    "pr_curve": [
+      {
+        "f1": 0.7200000000000001,
+        "false_merge_rate": 0.5892857142857143,
+        "fn": 4,
+        "fp": 66,
+        "precision": 0.5769230769230769,
+        "recall": 0.9574468085106383,
+        "threshold": 0.30000001192092896,
+        "tn": 46,
+        "tp": 90
+      },
+      {
+        "f1": 0.773913043478261,
+        "false_merge_rate": 0.41964285714285715,
+        "fn": 5,
+        "fp": 47,
+        "precision": 0.6544117647058824,
+        "recall": 0.9468085106382979,
+        "threshold": 0.3499999940395355,
+        "tn": 65,
+        "tp": 89
+      },
+      {
+        "f1": 0.7830188679245284,
+        "false_merge_rate": 0.3125,
+        "fn": 11,
+        "fp": 35,
+        "precision": 0.7033898305084746,
+        "recall": 0.8829787234042553,
+        "threshold": 0.4000000059604645,
+        "tn": 77,
+        "tp": 83
+      },
+      {
+        "f1": 0.7593582887700534,
+        "false_merge_rate": 0.19642857142857142,
+        "fn": 23,
+        "fp": 22,
+        "precision": 0.7634408602150538,
+        "recall": 0.7553191489361702,
+        "threshold": 0.45000001788139343,
+        "tn": 90,
+        "tp": 71
+      },
+      {
+        "f1": 0.7251461988304093,
+        "false_merge_rate": 0.13392857142857142,
+        "fn": 32,
+        "fp": 15,
+        "precision": 0.8051948051948052,
+        "recall": 0.6595744680851063,
+        "threshold": 0.5,
+        "tn": 97,
+        "tp": 62
+      },
+      {
+        "f1": 0.6174496644295302,
+        "false_merge_rate": 0.08035714285714286,
+        "fn": 48,
+        "fp": 9,
+        "precision": 0.8363636363636363,
+        "recall": 0.48936170212765956,
+        "threshold": 0.550000011920929,
+        "tn": 103,
+        "tp": 46
+      },
+      {
+        "f1": 0.5,
+        "false_merge_rate": 0.07142857142857142,
+        "fn": 60,
+        "fp": 8,
+        "precision": 0.8095238095238095,
+        "recall": 0.3617021276595745,
+        "threshold": 0.6000000238418579,
+        "tn": 104,
+        "tp": 34
+      },
+      {
+        "f1": 0.3770491803278688,
+        "false_merge_rate": 0.044642857142857144,
+        "fn": 71,
+        "fp": 5,
+        "precision": 0.8214285714285714,
+        "recall": 0.24468085106382978,
+        "threshold": 0.6500000357627869,
+        "tn": 107,
+        "tp": 23
+      },
+      {
+        "f1": 0.2702702702702703,
+        "false_merge_rate": 0.017857142857142856,
+        "fn": 79,
+        "fp": 2,
+        "precision": 0.8823529411764706,
+        "recall": 0.1595744680851064,
+        "threshold": 0.699999988079071,
+        "tn": 110,
+        "tp": 15
+      },
+      {
+        "f1": 0.1923076923076923,
+        "false_merge_rate": 0.0,
+        "fn": 84,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.10638297872340426,
+        "threshold": 0.75,
+        "tn": 112,
+        "tp": 10
+      },
+      {
+        "f1": 0.08163265306122448,
+        "false_merge_rate": 0.0,
+        "fn": 90,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.0425531914893617,
+        "threshold": 0.800000011920929,
+        "tn": 112,
+        "tp": 4
+      },
+      {
+        "f1": 0.0,
+        "false_merge_rate": 0.0,
+        "fn": 94,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "threshold": 0.8500000238418579,
+        "tn": 112,
+        "tp": 0
+      },
+      {
+        "f1": 0.0,
+        "false_merge_rate": 0.0,
+        "fn": 94,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "threshold": 0.9000000357627869,
+        "tn": 112,
+        "tp": 0
+      },
+      {
+        "f1": 0.0,
+        "false_merge_rate": 0.0,
+        "fn": 94,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "threshold": 0.949999988079071,
+        "tn": 112,
+        "tp": 0
+      },
+      {
+        "f1": 0.0,
+        "false_merge_rate": 0.0,
+        "fn": 94,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "threshold": 1.0,
+        "tn": 112,
+        "tp": 0
+      }
+    ],
+    "precision_99_frontier": {
+      "false_merge_rate": 0.0,
+      "fn": 84,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 0.10638297872340426,
+      "threshold": 0.7299999594688416,
+      "tn": 112,
+      "tp": 10
+    },
+    "spec": "docs/design/knowledge-merge-tuning.md §4",
+    "threshold_source": "VERITY_KNOWLEDGE_MERGE_THRESHOLD (default 0.85)",
+    "worst_hard_negative": {
+      "a": "the deepest discounts are offered at the end of the quarter",
+      "b": "the deepest discounts are offered for large volume commitments",
+      "note": "highest-cosine genuinely-DISTINCT pair — the false merge risk the threshold must stay above",
+      "score": 0.7248652577400208
+    }
+  },
+  "srb_version": "srb-v0"
+}

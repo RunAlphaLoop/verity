@@ -44,6 +44,10 @@ pub(crate) struct SrbArgs {
     pub cycles: usize,
     pub queries: usize,
     pub load_secs: u64,
+    /// Metric #6 labeled pair eval set (docs/benchmark/consolidation-pairs.jsonl).
+    pub consolidation_pairs: String,
+    /// Metric #6 operating threshold (mirrors VERITY_KNOWLEDGE_MERGE_THRESHOLD).
+    pub merge_threshold: f32,
 }
 
 pub(crate) async fn run_srb(adapter: Arc<PostgresAdapter>, args: SrbArgs) -> Result<()> {
@@ -66,6 +70,9 @@ pub(crate) async fn run_srb(adapter: Arc<PostgresAdapter>, args: SrbArgs) -> Res
     );
     let latency = latency_suite(&adapter, &args).await?;
 
+    println!("\n== metric 6: consolidation precision/recall ==");
+    let consolidation = crate::consolidation::run(&args.consolidation_pairs, args.merge_threshold)?;
+
     let report = json!({
         "srb_version": SRB_VERSION,
         "date": date,
@@ -83,6 +90,7 @@ pub(crate) async fn run_srb(adapter: Arc<PostgresAdapter>, args: SrbArgs) -> Res
                 "status": "defined_not_reported",
                 "reason": "requires the labeled multi-entity document corpus; ships with probabilistic entity tagging (SPEC §13, v0.3)",
             },
+            "consolidation_precision_recall": consolidation,
         },
     });
 
@@ -1000,7 +1008,7 @@ fn cmd_out(c: &str, args: &[&str]) -> Option<String> {
 
 /// Machine disclosure (docs/BENCHMARKS.md policy): every published number
 /// carries the hardware it was measured on.
-fn machine_info() -> Value {
+pub(crate) fn machine_info() -> Value {
     #[cfg(target_os = "macos")]
     let (cpu, mem_bytes) = (
         cmd_out("sysctl", &["-n", "machdep.cpu.brand_string"]),
@@ -1214,6 +1222,11 @@ fn render_markdown(r: &Value) -> String {
                 cols.join(" | ")
             );
         }
+    }
+
+    // Metric 6 — consolidation precision/recall
+    if let Some(m6) = m.get("consolidation_precision_recall") {
+        md.push_str(&crate::consolidation::render_markdown(m6));
     }
 
     // Metrics 3 & 5

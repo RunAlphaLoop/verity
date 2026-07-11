@@ -24,6 +24,7 @@ use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::PostgresAdapter;
 
+mod consolidation;
 mod srb;
 
 const DIM: usize = 384;
@@ -143,6 +144,32 @@ enum Command {
         /// Seconds per load-sweep level (metric 4 runs N=4 and N=16).
         #[arg(long, default_value_t = 20)]
         load_secs: u64,
+        /// Metric 6 labeled statement-pair eval set.
+        #[arg(long, default_value = consolidation::DEFAULT_PAIRS_PATH)]
+        consolidation_pairs: String,
+        /// Metric 6 merge threshold (mirrors VERITY_KNOWLEDGE_MERGE_THRESHOLD).
+        #[arg(long, default_value_t = consolidation::DEFAULT_MERGE_THRESHOLD)]
+        merge_threshold: f32,
+    },
+    /// SRB metric 6 CI gate (docs/design/knowledge-merge-tuning.md §4): score
+    /// the labeled consolidation-pair eval set with the CURRENT merge decision
+    /// and fail (nonzero exit) if the false-merge rate FP/(FP+TN) at the
+    /// operating threshold exceeds the target. Needs no database — the merge
+    /// decision is encoder+cosine only. Wire into CI to block any tuning that
+    /// raises the false-merge rate.
+    ConsolidationGate {
+        /// Labeled statement-pair eval set.
+        #[arg(long, default_value = consolidation::DEFAULT_PAIRS_PATH)]
+        pairs: String,
+        /// Merge threshold under test (mirrors VERITY_KNOWLEDGE_MERGE_THRESHOLD).
+        #[arg(long, default_value_t = consolidation::DEFAULT_MERGE_THRESHOLD)]
+        threshold: f32,
+        /// Maximum tolerated false-merge rate FP/(FP+TN).
+        #[arg(long, default_value_t = 0.01)]
+        max_false_merge_rate: f64,
+        /// If set, also write a standalone dated RESULTS-consolidation-<date>.{json,md}.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -151,6 +178,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Encode { queries } = cli.command {
         return encode(queries);
+    }
+    // The consolidation gate is encoder+cosine only — no database.
+    if let Command::ConsolidationGate {
+        pairs,
+        threshold,
+        max_false_merge_rate,
+        out,
+    } = &cli.command
+    {
+        return consolidation::gate(pairs, *threshold, *max_false_merge_rate, out.as_deref());
     }
 
     let adapter = PostgresAdapter::connect(&cli.dsn)
@@ -180,6 +217,8 @@ async fn main() -> Result<()> {
             cycles,
             queries,
             load_secs,
+            consolidation_pairs,
+            merge_threshold,
         } => {
             srb::run_srb(
                 Arc::new(adapter),
@@ -190,11 +229,15 @@ async fn main() -> Result<()> {
                     cycles,
                     queries,
                     load_secs,
+                    consolidation_pairs,
+                    merge_threshold,
                 },
             )
             .await
         }
-        Command::Encode { .. } => unreachable!("handled above"),
+        Command::Encode { .. } | Command::ConsolidationGate { .. } => {
+            unreachable!("handled above")
+        }
     }
 }
 
