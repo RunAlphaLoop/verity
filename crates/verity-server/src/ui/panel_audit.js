@@ -19,6 +19,21 @@
      only tenant_id + limit); the window size is stated so the reviewer knows
      exactly what set the filters and the CSV/JSON export cover.
    • Auto-refresh is a pure re-GET on a ~5s timer; no LLM, no live-ReBAC.
+
+   v0.2 — DRILL INTO A ROW (SPEC §5 Screen 2 Actions v0.2):
+   • Clicking a row expands it in place to show the exact `result_ids` the row
+     carries (opaque record/chunk ids — rendered read-only, NEVER as a recall
+     affordance; the audit is a record, not a query surface) plus the actor's
+     scope claims RECONSTRUCTED from the row (tenant, actor sub·azp, principals,
+     entity_scope, confidentiality ceiling, policy version, verb).
+   • "Jump to Scope Inspector" switches panels via the Verity router and seeds
+     the ONE shared cross-panel channel we legitimately own — Verity.setTenant.
+     HONEST SEAM: an audit row does NOT carry a signed `vs_…` handle, and the
+     Scope Inspector runs its live probes only from a decoded handle. So this
+     is a read-only reconstruction, not a live decode: we pre-fill the tenant,
+     surface the reconstructed claims for the operator to compare, and say so
+     plainly. We never fabricate a handle, never imply the probes will run
+     unassisted, and only render claims the row actually carries.
    ========================================================================== */
 (function () {
   var COMPLIANCE_VERBS = { forget: 1, erasure: 1, dsar_export: 1 };
@@ -51,6 +66,32 @@
   function confName(v) {
     var n = Verity.CONF_NAMES;
     return typeof v === "number" && n[v] ? n[v] : String(v);
+  }
+  function resultIds(r) {
+    return Array.isArray(r.result_ids) ? r.result_ids : [];
+  }
+
+  // ---- reconstructed scope claims (drill-down) --------------------------
+  // Built ONLY from fields the audit row actually carries. Anything the row
+  // omits is shown as an honest "not recorded on this row", never invented.
+
+  // A principal that is an email string is an email-mapped identity — a TRUST
+  // DOWNGRADE (SPEC §6b). Flagged distinctly, consistent with Scope Inspector.
+  function principalChips(r) {
+    var ps = r.principals || [];
+    if (!ps.length) {
+      return '<span class="refreshed" title="empty principal set — such a scope sees nothing (fail closed)">&#8709; — empty (this scope sees nothing, fail closed)</span>';
+    }
+    return ps.map(function (t) {
+      var chip = Verity.badge("#" + t, "b-kind");
+      if (typeof t === "string" && /@/.test(t)) {
+        chip += ' ' + Verity.badge("trust downgrade", "b-downgrade");
+      }
+      return chip;
+    }).join(" ");
+  }
+  function claimVal(present, html) {
+    return present ? html : '<span class="refreshed">not recorded on this row</span>';
   }
 
   // ---- CSV / JSON (SIEM-shaped) export ----------------------------------
@@ -288,7 +329,18 @@
           : Verity.esc(v);
       }
 
+      // The row set currently painted into the table, indexed by data-idx so a
+      // delegated click resolves the exact row object (survives re-filtering
+      // because we repaint SHOWN and clear it on every render).
+      var SHOWN = [];
+      var OPEN = -1;   // data-idx of the currently expanded row (-1 = none)
+
+      // Total columns incl. the leading expander — drill row spans all of them.
+      var TABLE_COLS = 10;
+
       function renderTable(rows) {
+        SHOWN = rows;
+        OPEN = -1;
         if (!rows.length) {
           Verity.$("au-out").innerHTML =
             '<div class="empty">no audit rows match — empty is a valid, on-the-record answer ' +
@@ -296,18 +348,22 @@
           return;
         }
         var head = '<div class="tablewrap"><table><thead><tr>' +
+          '<th aria-label="expand"></th>' +
           '<th>at</th><th>verb</th><th>actor (sub · azp)</th><th>principals</th>' +
           '<th>entity scope</th><th>conf</th><th>policy ver</th><th>query summary</th>' +
           '<th class="num">results</th></tr></thead><tbody>';
-        var body = rows.map(function (r) {
-          var flag = (COMPLIANCE_VERBS[r.verb] || isBlocked(r)) ? ' class="flag"' : "";
+        var body = rows.map(function (r, i) {
+          var flag = (COMPLIANCE_VERBS[r.verb] || isBlocked(r)) ? " flag" : "";
           var principals = (r.principals || []).length
             ? (r.principals || []).map(function (t) { return "#" + Verity.esc(t); }).join(" ")
             : '<span class="refreshed">∅</span>';
           var ents = (r.entity_scope || []).length
             ? Verity.entityBadges(r.entity_scope)
             : '<span class="refreshed">—</span>';
-          return '<tr' + flag + '>' +
+          return '<tr class="au-row' + flag + '" data-idx="' + i + '" ' +
+              'title="click to drill into this read — result_ids + reconstructed scope claims" ' +
+              'style="cursor:pointer">' +
+            '<td class="au-caret" aria-hidden="true">&#9656;</td>' +
             '<td>' + Verity.esc(Verity.fmtTime(r.at)) + '</td>' +
             '<td>' + verbCell(r) + '</td>' +
             '<td>' + Verity.esc(actorStr(r)) + '</td>' +
@@ -317,10 +373,118 @@
             '<td>' + policyCell(r) + '</td>' +
             '<td>' + Verity.esc(r.query_summary || "—") + '</td>' +
             '<td class="num">' + resultCount(r) + '</td>' +
+          '</tr>' +
+          '<tr class="au-drill" data-drill="' + i + '" style="display:none">' +
+            '<td colspan="' + TABLE_COLS + '"></td>' +
           '</tr>';
         }).join("");
         Verity.$("au-out").innerHTML = head + body + '</tbody></table></div>';
       }
+
+      // ---- drill-down (v0.2) --------------------------------------------
+
+      // Toggle the expansion under row `i`, lazily rendering its body once.
+      function toggleDrill(i) {
+        var drill = document.querySelector('#au-out tr.au-drill[data-drill="' + i + '"]');
+        var mainRow = document.querySelector('#au-out tr.au-row[data-idx="' + i + '"]');
+        if (!drill || !mainRow) return;
+        var caret = mainRow.querySelector(".au-caret");
+        var isOpen = drill.style.display !== "none";
+        if (isOpen) {
+          drill.style.display = "none";
+          if (caret) caret.innerHTML = "&#9656;";
+          OPEN = -1;
+          return;
+        }
+        // Accordion: close any other open drill first.
+        if (OPEN >= 0 && OPEN !== i) {
+          var prev = document.querySelector('#au-out tr.au-drill[data-drill="' + OPEN + '"]');
+          var prevRow = document.querySelector('#au-out tr.au-row[data-idx="' + OPEN + '"]');
+          if (prev) prev.style.display = "none";
+          if (prevRow) { var pc = prevRow.querySelector(".au-caret"); if (pc) pc.innerHTML = "&#9656;"; }
+        }
+        var cell = drill.querySelector("td");
+        if (cell && !cell.getAttribute("data-rendered")) {
+          cell.innerHTML = drillBody(SHOWN[i]);
+          cell.setAttribute("data-rendered", "1");
+          var jump = cell.querySelector(".au-jump");
+          if (jump) jump.onclick = function () { jumpToInspector(SHOWN[i]); };
+        }
+        drill.style.display = "";
+        if (caret) caret.innerHTML = "&#9662;";
+        OPEN = i;
+      }
+
+      // The expansion body: exactly what THIS row carries — result_ids +
+      // reconstructed scope claims — plus the honest jump-to-Inspector seam.
+      function drillBody(r) {
+        var ids = resultIds(r);
+        // A row MAY carry a separate count without enumerating ids. Only then do
+        // we say "counted but not enumerated" — otherwise 0 ids means 0 results.
+        var sepCount = (typeof r.result_count === "number") ? r.result_count : null;
+        var idsHtml = ids.length
+          ? '<div style="display:flex;flex-wrap:wrap;gap:4px">' +
+              ids.map(function (id) { return Verity.badge(id, "b-kind"); }).join("") +
+            '</div>'
+          : (sepCount != null && sepCount > 0
+              ? '<span class="refreshed">' + sepCount + ' result(s) counted, but this row does not enumerate their ids (result_ids not recorded on this row)</span>'
+              : '<span class="refreshed">&#8709; — 0 results (nothing was returned under this scope; fail-closed empty is on the record)</span>');
+
+        var pv = policyVersion(r);
+        var hasEnts = (r.entity_scope || []).length > 0;
+        var claims =
+          '<dl class="kv">' +
+            '<dt>tenant_id</dt><dd>' + claimVal(!!r.tenant_id, Verity.esc(r.tenant_id || "")) + '</dd>' +
+            '<dt>actor (sub · azp)</dt><dd>' + Verity.esc(actorStr(r)) + '</dd>' +
+            '<dt>verb</dt><dd>' + verbCell(r) + '</dd>' +
+            '<dt>principals (tokens)</dt><dd>' + principalChips(r) + '</dd>' +
+            '<dt>entity_scope</dt><dd>' +
+              (hasEnts ? Verity.entityBadges(r.entity_scope)
+                       : '<span class="refreshed">unbound on this row (no entity restriction recorded)</span>') + '</dd>' +
+            '<dt>confidentiality ceiling</dt><dd>' + Verity.confBadge(r.confidentiality) + '</dd>' +
+            '<dt>purpose-policy version</dt><dd>' + claimVal(pv != null, Verity.esc(String(pv))) + '</dd>' +
+          '</dl>';
+
+        return '<div class="card" style="margin:6px 0">' +
+            '<h2>result_ids <span class="sub">' + ids.length + ' returned id(s) &middot; read-only — this is the audited record, not a recall surface</span></h2>' +
+            '<div class="note" style="margin-bottom:6px"><em>What this read returned.</em> These are opaque record/chunk ids exactly as the audit row stored them. ' +
+              'They are shown for the record only — the audit panel never re-issues the read (no recall affordance here; SPEC §3 read-path purity).</div>' +
+            idsHtml +
+
+            '<h2 style="margin-top:14px">reconstructed scope claims <span class="sub">derived only from this row</span></h2>' +
+            '<div class="note" style="margin-bottom:6px"><em>Reconstruction, not a decode.</em> These claims are read straight off the audit row. ' +
+              'The row does <b>not</b> carry the actor\'s signed <code>vs_&hellip;</code> handle, so this is not the same as decoding one on the Scope Inspector — ' +
+              'fields the row omits are marked <span class="refreshed">not recorded on this row</span>, never guessed.</div>' +
+            claims +
+
+            '<div class="actions" style="margin-top:12px">' +
+              '<button class="au-jump" title="Switch to the Scope Inspector and pre-fill the shared tenant. The row has no signed handle to decode, so live probes still require you to paste the actor\'s vs_… handle there.">' +
+                'Jump to Scope Inspector &rarr;</button>' +
+            '</div>' +
+            '<div class="note" style="margin-top:6px"><em>Honest seam.</em> The jump switches panels and seeds the shared <b>tenant_id</b> (the one cross-panel value we can carry). ' +
+              'It cannot run the Inspector\'s live probes for you: those decode a signed <code>vs_&hellip;</code> handle, and an audit row does not store one. ' +
+              'Compare the reconstructed claims above against a handle you paste there — we do not fabricate a handle to make the button look live.</div>' +
+          '</div>';
+      }
+
+      // Jump to Screen 1 via the router; seed ONLY the shared tenant (the sole
+      // legitimate cross-panel channel — no fabricated handle, no claim inject).
+      function jumpToInspector(r) {
+        if (r && r.tenant_id) Verity.setTenant(r.tenant_id);
+        Verity.show("scope");
+      }
+
+      // Delegated row-click → toggle drill. Ignore clicks on the jump button
+      // (its own handler runs) and on text selections.
+      Verity.$("au-out").addEventListener("click", function (ev) {
+        var t = ev.target;
+        if (t && t.closest && t.closest(".au-jump")) return;        // button handles itself
+        if (t && t.closest && t.closest("tr.au-drill")) return;     // inside an expansion
+        var row = t && t.closest ? t.closest("tr.au-row") : null;
+        if (!row) return;
+        var idx = parseInt(row.getAttribute("data-idx"), 10);
+        if (!isNaN(idx)) toggleDrill(idx);
+      });
 
       function rerender() {
         var rows = filtered();

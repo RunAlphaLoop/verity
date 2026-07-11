@@ -98,6 +98,81 @@
           '<div class="tight"><button class="primary" id="sc-export">Export boundary as evidence</button></div>' +
           '<div class="note" style="flex:1">A self-contained snapshot &mdash; decoded claims + probe results + boundary trace + timestamp + build hash &mdash; with no external references. <em>This is the reviewer\'s deliverable.</em></div>' +
         '</div>' +
+
+        // ---- v0.2: derive a NEW handle from this one (narrow-only) --------
+        '<h3 style="margin-top:18px;font-size:12px">&#9656; derive a handle <span class="refreshed">POST /v1/scopes</span></h3>' +
+        '<div class="note">Minting only ever <em>narrows</em>. You cannot raise the confidentiality ceiling or add an entity or a principal this handle does not already carry &mdash; the controls simply do not offer it. Purpose may clamp further; the server is the final authority.</div>' +
+        '<div class="row" style="margin-top:8px">' +
+          '<div class="tight"><button id="sc-open">Open narrower scope&hellip;</button></div>' +
+          '<div class="tight"><button id="sc-renew" disabled title="Renew re-mints the same claims with a fresh TTL — only offered once the current handle is EXPIRED.">Renew (re-mint identical claims)</button></div>' +
+          '<div class="note" id="sc-mint-hint" style="flex:1"></div>' +
+        '</div>' +
+        '<div class="err" id="sc-mint-err"></div>' +
+        '<div id="sc-mint-out"></div>' +
+      '</div>' +
+
+      // ---- v0.2 mint dialog (narrow-only, no widen affordance) ------------
+      mintDialogHtml()
+    );
+  }
+
+  /* --------------------------------------------- v0.2 mint dialog markup */
+  // The dialog is rendered ONCE; its option sets are (re)built from the
+  // current decoded handle each time it opens, so no control can ever offer a
+  // value broader than the source handle. There is no "widen" affordance by
+  // construction — not a disabled one, simply absent.
+  function mintDialogHtml() {
+    return (
+      '<div class="dialog-backdrop" id="sc-mint-dialog">' +
+        '<div class="dialog" style="max-width:640px">' +
+          '<h3>Open a narrower scope</h3>' +
+          '<div class="note">Derives a fresh <code>vs_&hellip;</code> handle from the one you decoded. Every field below can only <b>tighten</b> the source handle. Principals are carried verbatim (you cannot grant powers this handle lacks); to widen anything you would mint from a broader source handle you already hold.</div>' +
+
+          // principals — read-only, carried verbatim
+          '<div class="card" style="margin-top:10px">' +
+            '<div class="note" style="margin-bottom:6px"><b>principals</b> &mdash; carried verbatim from the source handle (not editable; minting cannot add a principal):</div>' +
+            '<div id="sc-mint-principals"></div>' +
+          '</div>' +
+
+          // confidentiality ceiling — options capped at the source ceiling
+          '<div class="tight" style="margin-top:10px">' +
+            '<label for="sc-mint-conf">confidentiality ceiling <span class="note">(cannot exceed the source handle\'s ceiling)</span></label>' +
+            '<select class="field" id="sc-mint-conf"></select>' +
+          '</div>' +
+
+          // entity scope — subset of the source entity_scope (or narrow an
+          // unbound handle by binding it to specific entities)
+          '<div class="card" style="margin-top:10px">' +
+            '<div class="note" style="margin-bottom:6px"><b>entity_scope</b> &mdash; <span id="sc-mint-entity-note"></span></div>' +
+            '<div id="sc-mint-entities"></div>' +
+          '</div>' +
+
+          // purpose — optional; further clamps server-side
+          '<div class="tight" style="margin-top:10px">' +
+            '<label for="sc-mint-purpose">purpose <span class="note">(optional &mdash; may clamp the ceiling and/or require an entity binding; unknown purposes are rejected by the server)</span></label>' +
+            '<input type="text" id="sc-mint-purpose" class="field" list="sc-mint-purpose-list" placeholder="e.g. support_conversation" autocomplete="off">' +
+            '<datalist id="sc-mint-purpose-list">' +
+              '<option value="support_conversation">' +
+              '<option value="sales_negotiation">' +
+              '<option value="marketing">' +
+              '<option value="analytics">' +
+              '<option value="audit">' +
+            '</datalist>' +
+            '<div class="note" style="margin-top:4px">Suggestions are the shipped default pack; a deployment may configure others. The purpose ceiling is <em>min</em>&rsquo;d with your selection &mdash; it can only lower it.</div>' +
+          '</div>' +
+
+          // TTL
+          '<div class="tight" style="margin-top:10px">' +
+            '<label for="sc-mint-ttl">TTL <span class="note">(seconds until the new handle expires)</span></label>' +
+            '<input type="number" id="sc-mint-ttl" class="field" min="1" step="1" value="3600">' +
+          '</div>' +
+
+          '<div class="err" id="sc-mint-dlg-err"></div>' +
+          '<div class="actions">' +
+            '<button class="primary" id="sc-mint-confirm">Mint narrower handle</button>' +
+            '<button id="sc-mint-cancel">Cancel</button>' +
+          '</div>' +
+        '</div>' +
       '</div>'
     );
   }
@@ -112,6 +187,12 @@
     Verity.$("sc-brief").onclick = onBrief;
     Verity.$("sc-act").onclick = onActivity;
     Verity.$("sc-export").onclick = onExport;
+    // v0.2 — derive-a-handle actions
+    Verity.$("sc-open").onclick = openMintDialog;
+    Verity.$("sc-renew").onclick = onRenew;
+    var mintDlg = Verity.dialog("sc-mint-dialog");
+    Verity.$("sc-mint-cancel").onclick = function () { mintDlg.close(); };
+    Verity.$("sc-mint-confirm").onclick = onMintConfirm;
   }
 
   /* --------------------------------------------------- 1. decode + claims */
@@ -125,10 +206,12 @@
       S.probes = { recall: null, brief: null, activity: null };
       S.lat = [];
       renderClaims(p);
-      // reset probe outputs on a fresh decode
-      ["sc-lat", "sc-recall-out", "sc-trace", "sc-brief-out", "sc-act-out"].forEach(function (id) {
+      // reset probe + mint outputs on a fresh decode
+      ["sc-lat", "sc-recall-out", "sc-trace", "sc-brief-out", "sc-act-out", "sc-mint-out"].forEach(function (id) {
         var n = Verity.$(id); if (n) n.innerHTML = "";
       });
+      Verity.clearErr("sc-mint-err");
+      updateDeriveControls(p);
       Verity.$("sc-copy-handle").disabled = false;
       // Probes render even for an empty-principal handle so a reviewer can DEMONSTRATE
       // fail-closed (a recall through it returns 0 hits with the Explain-zero reason).
@@ -146,6 +229,7 @@
       Verity.$("sc-claims").style.display = "none";
       Verity.$("sc-probes").style.display = "none";
       Verity.$("sc-copy-handle").disabled = true;
+      updateDeriveControls(null);
       Verity.err("sc-decode-err", e);
     }
   }
@@ -549,6 +633,265 @@
     document.body.appendChild(a); a.click();
     document.body.removeChild(a);
     setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  /* ====================================================================
+     v0.2 — DERIVE A HANDLE (narrow-only)  ·  POST /v1/scopes
+     --------------------------------------------------------------------
+     Two actions off a decoded handle:
+       • Open narrower scope — a mint dialog whose controls, by construction,
+         cannot select anything BROADER than the source handle: the ceiling
+         <select> is capped at the source ceiling; the entity checkboxes are
+         drawn from the source entity_scope (a subset), or bind an unbound
+         handle to specific entities. Principals are carried verbatim — you
+         cannot add a principal the source lacks. There is no widen control.
+       • Renew — re-mints the SAME claims (identical principals, entity_scope,
+         ceiling, purpose, actor) with a fresh TTL. Offered only once the
+         source handle is EXPIRED (re-minting a live handle is pointless).
+     /v1/scopes is a PUBLIC route (not admin-gated), so no admin bearer is
+     attached — this is a scope-derivation seam, not an admin surface.
+     ==================================================================== */
+
+  // Enable/disable the derive buttons + Renew (expired-only) from claims.
+  function updateDeriveControls(p) {
+    var openBtn = Verity.$("sc-open");
+    var renewBtn = Verity.$("sc-renew");
+    var hint = Verity.$("sc-mint-hint");
+    if (!openBtn || !renewBtn) return;
+    if (!p) {
+      openBtn.disabled = true;
+      renewBtn.disabled = true;
+      if (hint) hint.innerHTML = "";
+      return;
+    }
+    openBtn.disabled = false;
+    var expired = isExpired(p);
+    renewBtn.disabled = !expired;
+    if (hint) {
+      hint.innerHTML = expired
+        ? 'This handle is <span class="expired">EXPIRED</span> &mdash; <b>Renew</b> re-mints its identical claims with a fresh TTL.'
+        : 'This handle is <span class="live">live</span> &mdash; Renew is offered only after it expires. Use <b>Open narrower scope</b> to derive a tighter handle now.';
+    }
+  }
+
+  function isExpired(p) {
+    if (!p || !p.expires_at) return false;
+    return new Date(p.expires_at).getTime() - Date.now() <= 0;
+  }
+
+  // The server's Confidentiality enum has NO serde rename, so the wire form is
+  // the PascalCase variant name ("Internal", "Restricted", …) — verified by
+  // identity_tests.rs. CONF_NAMES is lowercase (for badges), so map 0-3 → the
+  // exact wire token the request body must carry.
+  var CONF_WIRE = ["Public", "Internal", "Confidential", "Restricted"];
+  function confWire(idx) { return CONF_WIRE[idx] || "Internal"; }
+
+  // The source handle's confidentiality ceiling as a 0-3 index (default
+  // internal=1 when the payload omits it, matching the server default).
+  function ceilingIndex(p) {
+    var v = p && p.max_confidentiality;
+    if (typeof v === "number") return v;
+    if (typeof v === "string") {
+      var i = Verity.CONF_NAMES.indexOf(v.toLowerCase());
+      if (i >= 0) return i;
+    }
+    return 1; // server default_confidentiality() = Internal
+  }
+
+  /* ------------------------------------------------- open the mint dialog */
+  function openMintDialog() {
+    if (!S.claims) return;
+    var p = S.claims;
+    Verity.clearErr("sc-mint-dlg-err");
+    Verity.clearErr("sc-mint-err");
+
+    // principals — verbatim, read-only. Empty set is shown as fail-closed.
+    // Honest seam: if this handle was identity-resolved (carries a `subject`),
+    // deriving from a bare handle re-supplies its already-resolved principal
+    // TOKENS (the dev-mode mint path), not a live subject re-resolution. The
+    // server still runs revocation-tombstone subtraction at mint, but a group
+    // membership that changed AFTER the source handle was minted will not be
+    // re-resolved here. Disclose it rather than imply a fresh identity pull.
+    var subjNote = (typeof p.subject === "string" && p.subject)
+      ? '<div class="note" style="margin-top:6px"><em>This handle was identity-resolved from subject <b>' +
+        esc(p.subject) + "</b>.</em> Deriving here carries its resolved principal tokens verbatim; " +
+        "it does <b>not</b> re-resolve the subject against the live group graph. For a fresh identity " +
+        "pull, mint server-side from the subject. (Revocation tombstones are still applied at mint.)</div>"
+      : "";
+    Verity.$("sc-mint-principals").innerHTML = principalsHtml(p) + subjNote;
+
+    // confidentiality ceiling — options 0..ceiling ONLY (no widen).
+    var ceil = ceilingIndex(p);
+    var sel = Verity.$("sc-mint-conf");
+    var opts = "";
+    for (var i = 0; i <= ceil; i++) {
+      var nm = Verity.CONF_NAMES[i] || String(i);
+      opts += '<option value="' + i + '"' + (i === ceil ? " selected" : "") + ">" +
+        esc(nm) + (i === ceil ? " (source ceiling)" : "") + "</option>";
+    }
+    sel.innerHTML = opts;
+
+    // entity_scope — subset checkboxes (bound) or free bind (unbound).
+    var eWrap = Verity.$("sc-mint-entities");
+    var eNote = Verity.$("sc-mint-entity-note");
+    if (p.entity_scope && p.entity_scope.length) {
+      eNote.textContent =
+        "check a subset to narrow further (unchecking removes an entity; you cannot add one outside this set). Leave all checked to keep the source binding.";
+      eWrap.innerHTML = p.entity_scope.map(function (e) {
+        return '<label class="checkline" style="display:block;margin:3px 0">' +
+          '<input type="checkbox" class="sc-mint-ent" value="' + esc(e) + '" checked> ' +
+          Verity.entityBadges([e]) + "</label>";
+      }).join("");
+    } else {
+      eNote.textContent =
+        "the source handle is entity-UNBOUND. Binding it to specific entities is a narrowing; leave blank to keep it unbound.";
+      eWrap.innerHTML =
+        '<input type="text" id="sc-mint-ent-free" class="field" ' +
+        'placeholder="account:acme, account:globex (comma/space separated — optional)" autocomplete="off">';
+    }
+
+    Verity.$("sc-mint-purpose").value = (typeof p.purpose === "string") ? p.purpose : "";
+    Verity.$("sc-mint-ttl").value = "3600";
+    Verity.dialog("sc-mint-dialog").open();
+  }
+
+  /* ---------------------------------------- collect the narrowed entity set */
+  // Returns { entities, error }. Enforces the subset rule client-side so no
+  // widen can be submitted; the server re-enforces regardless.
+  function collectNarrowedEntities(p) {
+    if (p.entity_scope && p.entity_scope.length) {
+      var checked = Array.prototype.slice
+        .call(document.querySelectorAll(".sc-mint-ent:checked"))
+        .map(function (n) { return n.value; });
+      // subset guarantee (defensive — the checkboxes are already a subset)
+      for (var i = 0; i < checked.length; i++) {
+        if (p.entity_scope.indexOf(checked[i]) < 0) {
+          return { entities: null, error: "refusing to widen: " + checked[i] + " is not in the source entity_scope" };
+        }
+      }
+      return { entities: checked, error: null };
+    }
+    var free = Verity.$("sc-mint-ent-free");
+    var parts = String(free && free.value || "").split(/[\s,]+/).filter(function (s) { return s.length; });
+    return { entities: parts, error: null }; // unbound → bind (narrows) or stay unbound
+  }
+
+  /* ---------------------------------------------------- mint (narrow) */
+  async function onMintConfirm() {
+    Verity.clearErr("sc-mint-dlg-err");
+    var p = S.claims;
+    if (!p) return Verity.err("sc-mint-dlg-err", "decode a scope handle first");
+
+    var ceil = ceilingIndex(p);
+    var wantConf = clampInt(Verity.$("sc-mint-conf").value, 0, ceil, ceil);
+    if (wantConf > ceil) {
+      // Unreachable via the UI (options are capped), but fail closed anyway.
+      return Verity.err("sc-mint-dlg-err", "refusing to widen the confidentiality ceiling");
+    }
+    var ents = collectNarrowedEntities(p);
+    if (ents.error) return Verity.err("sc-mint-dlg-err", ents.error);
+
+    var ttl = clampInt(Verity.$("sc-mint-ttl").value, 1, 2147483647, 3600);
+    var purpose = (Verity.$("sc-mint-purpose").value || "").trim();
+
+    var body = {
+      tenant_id: p.tenant_id,
+      // Carry principals verbatim — minting never adds a principal.
+      principals: p.principals || [],
+      entity_scope: ents.entities,
+      // Server takes the PascalCase Confidentiality variant name.
+      max_confidentiality: confWire(wantConf),
+      actor_sub: p.actor_sub != null ? p.actor_sub : undefined,
+      actor_azp: p.actor_azp != null ? p.actor_azp : undefined,
+      ttl_seconds: ttl,
+    };
+    if (purpose) body.purpose = purpose;
+    stripUndefined(body);
+
+    var btn = Verity.$("sc-mint-confirm");
+    btn.disabled = true;
+    try {
+      var res = await Verity.api("/v1/scopes", { json: body });
+      Verity.dialog("sc-mint-dialog").close();
+      renderMintResult(res, "Opened a narrower scope", body);
+    } catch (e) {
+      Verity.err("sc-mint-dlg-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  /* ---------------------------------------------------- renew (re-mint) */
+  async function onRenew() {
+    Verity.clearErr("sc-mint-err");
+    var p = S.claims;
+    if (!p) return Verity.err("sc-mint-err", "decode a scope handle first");
+    // Re-mint the SAME claims — no narrowing, no widening — with a fresh TTL.
+    var body = {
+      tenant_id: p.tenant_id,
+      principals: p.principals || [],
+      entity_scope: (p.entity_scope || []).slice(),
+      max_confidentiality: confWire(ceilingIndex(p)),
+      actor_sub: p.actor_sub != null ? p.actor_sub : undefined,
+      actor_azp: p.actor_azp != null ? p.actor_azp : undefined,
+      ttl_seconds: 3600,
+    };
+    if (typeof p.purpose === "string" && p.purpose) body.purpose = p.purpose;
+    stripUndefined(body);
+
+    var btn = Verity.$("sc-renew");
+    btn.disabled = true;
+    try {
+      var res = await Verity.api("/v1/scopes", { json: body });
+      renderMintResult(res, "Renewed — identical claims, fresh TTL", body);
+    } catch (e) {
+      Verity.err("sc-mint-err", e);
+    } finally {
+      btn.disabled = !isExpired(p); // re-lock unless still expired
+    }
+  }
+
+  /* ------------------------------------------------ render a minted handle */
+  function renderMintResult(res, title, body) {
+    var handle = res && res.scope_handle;
+    var expires = res && res.expires_at;
+    if (!handle) {
+      Verity.err("sc-mint-err", "server returned no scope_handle");
+      return;
+    }
+    var out = Verity.$("sc-mint-out");
+    out.innerHTML =
+      '<div class="card" style="margin-top:10px">' +
+        '<div class="note"><b>' + esc(title) + ".</b> A fresh signed handle was minted by the server " +
+          "(POST /v1/scopes). It is <em>signed, not secret</em> — the claims below are readable by anyone holding it.</div>" +
+        '<dl class="kv" style="margin-top:8px">' +
+          "<dt>ceiling</dt><dd>" + Verity.confBadge(body.max_confidentiality) + "</dd>" +
+          "<dt>entity_scope</dt><dd>" +
+            (body.entity_scope && body.entity_scope.length
+              ? Verity.entityBadges(body.entity_scope)
+              : '<span style="color:var(--dim)">unbound</span>') + "</dd>" +
+          (body.purpose ? "<dt>purpose</dt><dd>" + Verity.kindBadge(body.purpose) + "</dd>" : "") +
+          "<dt>expires_at</dt><dd>" + esc(Verity.fmtTime(expires)) + "</dd>" +
+        "</dl>" +
+        '<div style="margin-top:8px"><textarea readonly spellcheck="false" ' +
+          'style="min-height:60px" id="sc-mint-handle">' + esc(handle) + "</textarea></div>" +
+        '<div class="row" style="margin-top:8px">' +
+          '<div class="tight"><button class="primary" id="sc-mint-copy">Copy new handle</button></div>' +
+          '<div class="tight"><button id="sc-mint-load">Load into intake &amp; decode</button></div>' +
+        "</div>" +
+      "</div>";
+    Verity.$("sc-mint-copy").onclick = function () { copy(handle, this, "Copy new handle"); };
+    Verity.$("sc-mint-load").onclick = function () {
+      Verity.$("sc-handle").value = handle;
+      onDecode();
+      Verity.$("sc-handle").scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+  }
+
+  // Drop keys whose value is `undefined` so they serialize to `#[serde(default)]`
+  // on the server (actor fields are optional).
+  function stripUndefined(o) {
+    Object.keys(o).forEach(function (k) { if (o[k] === undefined) delete o[k]; });
   }
 
   /* ------------------------------------------------------------- utils */
