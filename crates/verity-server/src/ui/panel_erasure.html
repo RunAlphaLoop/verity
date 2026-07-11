@@ -10,25 +10,27 @@
 
      Backing endpoints (verified in crates/verity-server/src/main.rs + compliance.rs
      + media.rs):
+       • POST /v1/admin/erasure/preview   — TRUE dry run (rolls back, purges nothing) (admin)
        • POST /v1/admin/erasure           — crypto-shred / lineage hard-purge (admin)
        • GET  /v1/admin/dsar/export       — audited DSAR bundle (admin)
        • GET  /v1/admin/media             — list a tenant's named blobs (admin)
        • POST /v1/forget                  — item-level invalidation (scope-token)
 
-     HONEST SEAMS surfaced here (designed, never faked):
-       • There is NO dedicated erasure-PREVIEW endpoint. The preview is a
-         READ-ONLY proxy built from GET /v1/admin/dsar/export (same subject
-         lineage), explicitly labeled an approximation of the destructive walk,
-         not a byte-exact dry run.
-       • The server returns UNSIGNED per-table purge counts (+ a surviving
-         sha256 audit row). There is no server-issued cryptographic signature on
-         the report, so the downloadable "purge report" is labeled an
-         attestation assembled client-side from the returned counts + context,
-         NOT a server signature. The signed-report seam is disclosed.
-       • Coverage gaps are disclosed, never papered over: operator-named media
-         (no automatic subject attribution), exact-string subject/entity match,
-         and the backup-retention window. "Disclose the window, don't claim
-         perfection" (SPEC §8b).
+     SEAMS NOW CLOSED (were designed seams; now backed by real endpoints):
+       • Erasure PREVIEW is a REAL dry run against POST /v1/admin/erasure/preview.
+         It runs the same lineage walk as the destructive erasure inside a
+         transaction it rolls back — nothing is purged — and returns the exact
+         would-purge counts (one shared walk_lineage feeds preview and erase, so
+         they cannot drift). Covers subject-, entity- AND media-only erasures.
+       • The purge report is SERVER-SIGNED (HMAC-SHA256, domain-separated). The
+         console DISPLAYS the server's signature; it no longer assembles one.
+         When the server runs on an ephemeral/dev key (signed=false), that is
+         surfaced honestly as process-scoped, not a durable attestation.
+
+     STILL DISCLOSED (real coverage gaps, returned by the server in the preview
+     response): operator-named media (no automatic subject attribution),
+     exact-string subject/entity match, and the backup-retention window.
+     "Disclose the window, don't claim perfection" (SPEC §8b).
 
      Owns ONLY this file + panel_erasure.js. Reuses frozen theme/core classes and
      the Verity.* helpers; never edits them. Mounts into #erasure-mount.

@@ -18,6 +18,10 @@ use verity_core::types::{StorageError, TenantId};
 
 use crate::{internal, AppState, HandlerResult};
 
+/// Domain-separation tag for purge-report HMACs — keeps a purge signature from
+/// ever being replayable as a scope handle or a media URI (they share the key).
+const PURGE_REPORT_DOMAIN: &str = "verity.erasure.purge-report.v1";
+
 #[derive(Deserialize)]
 pub(crate) struct ErasureRequest {
     tenant_id: TenantId,
@@ -36,6 +40,56 @@ pub(crate) struct ErasureRequest {
     /// operator names them — GET /v1/admin/media lists the candidates.
     #[serde(default)]
     media_ids: Vec<Uuid>,
+}
+
+/// POST /v1/admin/erasure/preview (admin) — the erasure DRY RUN. Walks the
+/// EXACT same lineage as `admin_erasure` (via the shared `erase_preview` →
+/// `walk_lineage` in verity-storage, inside a transaction that is rolled back),
+/// so it PURGES NOTHING but returns the per-table counts a real erasure WOULD
+/// delete, plus the honest coverage-gap disclosure (operator-named media,
+/// exact-string matching, backup-retention window). Because preview and erase
+/// share the walk code, the numbers cannot drift from what erasure does.
+///
+/// Note the deliberate asymmetry vs `admin_erasure`: the preview does NOT touch
+/// SpiceDB (no tuple delete on a dry run) and does NOT enumerate object-store
+/// blobs — it reports the DB-row counts a purge would produce. Object-store
+/// blob deletion is a side effect of naming `media_ids`, surfaced as the
+/// `media` count and the coverage-gap note, not previewed byte-for-byte.
+pub(crate) async fn admin_erasure_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ErasureRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let preview = state
+        .storage
+        .inner()
+        .erase_preview(
+            req.tenant_id,
+            req.subject.as_deref(),
+            req.entity.as_deref(),
+            &req.media_ids,
+        )
+        .await
+        .map_err(|e| match e {
+            StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            other => internal(other),
+        })?;
+    // Honest ReBAC signal, mirroring the erasure response: on a REAL erasure of
+    // a `user:` subject with SpiceDB configured, tuples would be deleted first.
+    let rebac_would_delete = state.rebac.is_some()
+        && req
+            .subject
+            .as_deref()
+            .and_then(crate::rebac::parse_principal)
+            .map(|(kind, _)| matches!(kind, crate::rebac::PrincipalKind::User))
+            .unwrap_or(false);
+    Ok(Json(serde_json::json!({
+        "dry_run": true,
+        "would_erase": preview.would_erase,
+        "coverage_gaps": preview.coverage_gaps,
+        "rebac_tuples_would_delete": rebac_would_delete,
+    })))
 }
 
 /// POST /v1/admin/erasure (admin) — the GDPR hard-purge path (SPEC §8b),
@@ -129,13 +183,69 @@ pub(crate) async fn admin_erasure(
     }
     // Facts were hard-deleted underneath the L1 current-truth cache.
     state.storage.flush_facts();
+
+    // SERVER-SIGNED PURGE REPORT (replaces the old client-assembled
+    // attestation). We sign the *purge facts* — the refs purged (per-table
+    // counts), keys destroyed (facts + media are the crypto-shredded rows),
+    // timestamps, and the retention window — with an HMAC under the server
+    // signing key (same key/minter as scope handles + media URIs, domain-
+    // separated). The console now shows a signature the SERVER produced, not
+    // one the browser assembled from returned numbers.
+    //
+    // Honest dev-mode disclosure: when the key is ephemeral (no
+    // VERITY_SIGNING_KEY/VERITY_SCOPE_KEY), the signature verifies only within
+    // this one process lifetime — `signed=false` says so plainly rather than
+    // presenting a process-scoped tag as a durable attestation.
+    let signed_at = chrono::Utc::now();
+    let facts = serde_json::json!({
+        "kind": "verity.erasure.purge-report",
+        "tenant_id": req.tenant_id,
+        // Identifiers are hashed, never plaintext PII — mirrors the surviving
+        // audit row so a holder of the report can cross-check it against audit.
+        "subject_sha256": req.subject.as_deref().map(sha256_hex),
+        "entity_sha256": req.entity.as_deref().map(sha256_hex),
+        "media_ids": req.media_ids,
+        // The purge facts being attested: refs purged + keys destroyed.
+        "erased": report,
+        "rebac_tuples_deleted": rebac_tuples_deleted,
+        "signed_at": signed_at,
+        // The disclosed window during which physical backups may still hold
+        // now-purged rows until they age out and are crypto-shredded.
+        "retention_window": "Physical backups taken before this purge persist until they age out \
+                             of the backup-retention window and are then crypto-shredded; live \
+                             rows and keys are destroyed now.",
+    });
+    // Canonical bytes = compact serialization of the facts object. The console
+    // recomputes the HMAC over exactly these bytes to verify.
+    let canonical = serde_json::to_vec(&facts).map_err(internal)?;
+    let signature = state.minter.sign_bytes(PURGE_REPORT_DOMAIN, &canonical);
+    let signed = state.minter.has_persistent_key();
+
     Ok(Json(serde_json::json!({
         "erased": report,
         // Honest signal for the operator runbook: false means either ReBAC
         // is not configured (delete tuples via SpiceDB directly) or the
         // subject was not a `user:` principal (no tuples exist for it).
         "rebac_tuples_deleted": rebac_tuples_deleted,
+        // The server-signed purge report. `facts` is the exact signed object;
+        // `signature` is HMAC-SHA256 over its compact JSON under the server key
+        // with the domain tag `verity.erasure.purge-report.v1`.
+        "purge_report": {
+            "facts": facts,
+            "algorithm": "HMAC-SHA256",
+            "domain": PURGE_REPORT_DOMAIN,
+            "signature": signature,
+            // false => ephemeral key: the signature is process-scoped (dev
+            // mode), not a durable attestation. Set VERITY_SIGNING_KEY to sign
+            // durably.
+            "signed": signed,
+        },
     })))
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
 }
 
 #[derive(Deserialize)]

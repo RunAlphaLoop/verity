@@ -10,6 +10,6 @@ pub mod resolve;
 
 pub use cache::CachedAdapter;
 pub use crypto::Kek;
-pub use erasure::ErasureReport;
+pub use erasure::{CoverageGaps, ErasurePreview, ErasureReport};
 pub use postgres::PostgresAdapter;
 pub use resolve::{fold, refold_incremental, FoldConfig, FoldPlan};
