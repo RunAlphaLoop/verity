@@ -27,6 +27,7 @@ mod purpose;
 mod rebac;
 mod resolver;
 mod revocation;
+mod scheduler;
 mod scope;
 mod slo;
 #[cfg(test)]
@@ -157,6 +158,15 @@ pub(crate) struct AppState {
     /// (§1's governing asymmetry), so this is the emergency stop for the
     /// judged-merge leg.
     pub(crate) knowledge_auto_merge: bool,
+    /// Server-side debounced auto-resolve (scheduler.rs). Every successful
+    /// L1-mutating ingest marks its tenant dirty here; a background loop
+    /// resolves dirty tenants past the `VERITY_RESOLVE_DEBOUNCE` window. This
+    /// closes the gap where DIRECT ingest paths never auto-fired resolution
+    /// (only the Temporal Python hook did). Because connector sinks also POST to
+    /// `/v1/ingest/*`, this now covers the direct paths AND the connector sinks;
+    /// it and the Temporal hook are belt-and-suspenders, deduped by the shared
+    /// debounce + idempotent evidence.
+    pub(crate) resolution: scheduler::ResolutionScheduler,
 }
 
 impl AppState {
@@ -271,6 +281,9 @@ async fn main() -> anyhow::Result<()> {
         knowledge_auto_merge: std::env::var("VERITY_KNOWLEDGE_AUTO_MERGE")
             .map(|v| v != "0")
             .unwrap_or(true),
+        // Reads VERITY_RESOLVE_DEBOUNCE (same env var as the Python hook,
+        // default 900s, 0 disables). See scheduler.rs.
+        resolution: scheduler::ResolutionScheduler::from_env(),
     });
 
     let app = Router::new()
@@ -381,12 +394,60 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/media/{id}/sign", post(media::sign_media))
         // Media uploads need more than axum's 2MB default.
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .with_state(state);
+        .with_state(Arc::clone(&state));
+
+    // Server-side auto-resolve loop (scheduler.rs): resolve dirty tenants past
+    // the debounce window. Skipped entirely when VERITY_RESOLVE_DEBOUNCE=0.
+    if state.resolution.enabled() {
+        let debounce = state.resolution.debounce().unwrap_or_default();
+        tracing::info!(
+            debounce_secs = debounce.as_secs(),
+            "server-side auto-resolve loop enabled (covers direct ingest AND connector sinks; belt-and-suspenders with the Temporal hook, deduped by debounce + idempotent evidence)"
+        );
+        let sched_state = Arc::clone(&state);
+        tokio::spawn(auto_resolve_loop(sched_state));
+    } else {
+        tracing::info!(
+            "server-side auto-resolve DISABLED (VERITY_RESOLVE_DEBOUNCE=0) — resolution stays manual / Temporal-hook-only"
+        );
+    }
 
     tracing::info!("verity listening on {}", cli.listen);
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The background auto-resolve loop. Every tick, resolve each tenant that is
+/// dirty AND past the debounce window (best-effort: log failures, but clear
+/// dirty + stamp last-resolve REGARDLESS so a persistently-failing tenant can't
+/// hot-loop). Mirrors the Temporal Python hook's semantics.
+async fn auto_resolve_loop(state: Arc<AppState>) {
+    // Tick faster than the debounce window; the window (not the tick) governs
+    // how often a given tenant actually resolves.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+    loop {
+        ticker.tick().await;
+        let due = state.resolution.due_tenants(std::time::Instant::now());
+        for tenant in due {
+            match resolver::run_resolution(&state, tenant).await {
+                Ok(report) => tracing::info!(
+                    %tenant,
+                    evidence_produced = report.evidence_produced,
+                    aliases_written = report.materialize.aliases_written,
+                    "auto-resolve ran"
+                ),
+                Err((status, msg)) => tracing::warn!(
+                    %tenant, %status, %msg,
+                    "auto-resolve failed (dirty cleared + last-resolve stamped anyway to avoid hot-loop)"
+                ),
+            }
+            // Stamp regardless of outcome — see doc comment.
+            state
+                .resolution
+                .stamp_resolved(tenant, std::time::Instant::now());
+        }
+    }
 }
 
 // ---------- open_scope ----------
@@ -1333,6 +1394,13 @@ async fn ingest_debezium(
         slo::record_sample(state.pool(), p.tenant_id, &ev.source, ev.occurred_at).await;
     }
 
+    // Auto-resolve trigger: mark the tenant dirty only if L1 actually changed
+    // (a batch of purely-unchanged upserts is a no-op — nothing to re-resolve).
+    // Never affects the response; the background loop does the work.
+    if written + superseded + retired > 0 {
+        state.resolution.mark_dirty(p.tenant_id);
+    }
+
     Ok(Json(serde_json::json!({
         "facts_inserted": written,
         "facts_superseded": superseded,
@@ -1428,6 +1496,9 @@ async fn ingest_documents(
         .upsert_chunks(writes)
         .await
         .map_err(internal)?;
+    // Auto-resolve trigger: a document version wrote an L0 episode + chunks
+    // (new entity_tags/aliases can feed resolution). Never affects the response.
+    state.resolution.mark_dirty(req.tenant_id);
     Ok(Json(serde_json::json!({
         "episode_id": episode_id,
         "chunks_indexed": chunks_indexed,

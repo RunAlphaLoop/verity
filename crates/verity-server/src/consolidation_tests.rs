@@ -54,6 +54,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         auto_tag,
         knowledge_auto_merge: auto_merge,
         media_store: None,
+        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
     });
     Some((state, tenant))
 }
@@ -95,6 +96,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             auto_tag,
             knowledge_auto_merge,
             media_store: None,
+            resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         }),
         tenant,
     ))

@@ -43,6 +43,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
         knowledge_auto_merge: true,
+        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         media_store: None,
     });
     Some((state, tenant))
@@ -643,4 +644,57 @@ async fn ensure_tenant_and_storage_status_map_unknown_tenant_to_404() {
         .await
         .expect_err("ghost tenant must be unknown");
     assert!(matches!(err, StorageError::UnknownTenant(_)));
+}
+
+/// DSN-gated: mark a tenant dirty and drive ONE scheduler pass (the body of
+/// `auto_resolve_loop`, minus the timer), asserting `run_resolution` actually
+/// ran for that tenant. Uses a tiny debounce so a never-resolved dirty tenant
+/// is immediately due. Mirrors the loop's stamp-regardless semantics.
+#[tokio::test]
+async fn scheduler_pass_runs_resolution_for_dirty_tenant() {
+    let Some((state, tenant)) = test_state().await else {
+        return;
+    };
+    // A resolvable cross-source pair: same email under two sources → Tier-1
+    // evidence the fold links. This gives run_resolution real work to do.
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-1",
+        "email",
+        json!("a@x.com"),
+    )
+    .await;
+    fact(&state, tenant, "hubspot", "hs-1", "email", json!("a@x.com")).await;
+
+    // Build an ENABLED scheduler (test_state's is disabled) and mark dirty.
+    let sched = crate::scheduler::ResolutionScheduler::with_debounce_seconds(900.0);
+    assert!(sched.enabled());
+    // Not dirty yet → nothing due.
+    let now = std::time::Instant::now();
+    assert!(sched.due_tenants(now).is_empty());
+    sched.mark_dirty(tenant);
+    // Dirty & never resolved → immediately due.
+    assert_eq!(sched.due_tenants(now), vec![tenant]);
+
+    // Drive one pass over the due set (the loop body).
+    let mut ran = false;
+    for due_tenant in sched.due_tenants(now) {
+        let report = crate::resolver::run_resolution(&state, due_tenant)
+            .await
+            .expect("run_resolution");
+        // The pair shares an email → the fold produced ≥1 evidence row and at
+        // least one canonical, proving resolution actually executed.
+        assert!(report.evidence_produced >= 1, "expected Tier-1 evidence");
+        assert!(report.materialize.canonicals >= 1);
+        sched.stamp_resolved(due_tenant, std::time::Instant::now());
+        ran = true;
+    }
+    assert!(ran, "scheduler pass must have resolved the dirty tenant");
+
+    // After stamping, the tenant is no longer due (dirty cleared) even past the
+    // window — no hot-loop.
+    let later = now + std::time::Duration::from_secs(10_000);
+    assert!(sched.due_tenants(later).is_empty());
 }

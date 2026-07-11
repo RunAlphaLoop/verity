@@ -359,6 +359,11 @@ pub(crate) async fn webhook_post(
     // queryable, so they carry no freshness signal.
     crate::slo::record_sample(state.pool(), hook.tenant_id, &source, received_at).await;
 
+    // Auto-resolve trigger: an accepted payload wrote L1 (facts and/or a
+    // chunk). Quarantine paths returned 202 above and never reach here. Never
+    // affects the response; the background loop does the work.
+    state.resolution.mark_dirty(hook.tenant_id);
+
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({

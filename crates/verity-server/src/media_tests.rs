@@ -66,6 +66,7 @@ async fn test_state(with_s3: bool) -> Option<(Arc<AppState>, TenantId)> {
         subscribers: Subscribers::new(64),
         auto_tag: false,
         knowledge_auto_merge: true,
+        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         media_store,
     });
     Some((state, tenant))

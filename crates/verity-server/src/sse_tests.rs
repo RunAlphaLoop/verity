@@ -50,6 +50,7 @@ async fn test_state(max_conns: usize) -> Option<(Arc<AppState>, TenantId)> {
         subscribers: Subscribers::new(max_conns),
         auto_tag: false,
         knowledge_auto_merge: true,
+        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         media_store: None,
     });
     Some((state, tenant))
