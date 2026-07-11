@@ -12,6 +12,8 @@ mod consolidation;
 #[cfg(test)]
 mod consolidation_tests;
 #[cfg(test)]
+mod entity_resolution_tests;
+#[cfg(test)]
 mod identity_tests;
 mod ingest;
 #[cfg(test)]
@@ -276,6 +278,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/scopes", post(open_scope))
         .route("/v1/recall", post(recall))
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
+        .route("/v1/entities/{canonical}", get(get_merged_entity))
+        .route("/v1/admin/entity-aliases", post(admin_entity_aliases))
+        .route("/v1/admin/entity-precedence", post(admin_entity_precedence))
         .route("/v1/episodes", post(remember))
         .route("/v1/actions", post(record_action))
         .route("/v1/activity", get(activity))
@@ -572,6 +577,121 @@ async fn get_record(
         Ok(None) => Err((StatusCode::NOT_FOUND, "no value for that key/time".into())),
         Err(e) => Err(internal(e)),
     }
+}
+
+// ---------- cross-source entity resolution & precedence (SPEC §7f, task 50)
+// mapping/config is admin-gated; the merged read is scope-handle gated (a
+// tenant-scoped L1 read, exactly like get_record) ----------
+
+#[derive(Deserialize)]
+struct EntityAliasesRequest {
+    tenant_id: TenantId,
+    /// The canonical entity key, e.g. "account:acme".
+    canonical: String,
+    /// The (source, entity_id) pairs that resolve to `canonical`.
+    members: Vec<AliasMemberReq>,
+}
+
+#[derive(Deserialize)]
+struct AliasMemberReq {
+    source: String,
+    entity_id: String,
+}
+
+/// POST /v1/admin/entity-aliases (admin): upsert the alias set for a canonical
+/// entity (SPEC §7f resolution). Each member is repointed to `canonical`;
+/// idempotent.
+async fn admin_entity_aliases(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<EntityAliasesRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    for m in &req.members {
+        state
+            .storage
+            .inner()
+            .upsert_entity_alias(req.tenant_id, &m.source, &m.entity_id, &req.canonical)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(Json(serde_json::json!({
+        "canonical": req.canonical,
+        "members": req.members.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct EntityPrecedenceRequest {
+    tenant_id: TenantId,
+    /// Defaults to "*" (the global/entity default across all entities).
+    #[serde(default = "star")]
+    canonical: String,
+    /// Defaults to "*" (the default across all fields for `canonical`).
+    #[serde(default = "star")]
+    field: String,
+    /// Ordered source names, highest precedence first.
+    source_order: Vec<String>,
+}
+
+fn star() -> String {
+    "*".into()
+}
+
+/// POST /v1/admin/entity-precedence (admin): set the per-field source order
+/// (SPEC §7f). `canonical`/`field` default to "*" (the fallbacks).
+async fn admin_entity_precedence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<EntityPrecedenceRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    state
+        .storage
+        .inner()
+        .set_entity_precedence(req.tenant_id, &req.canonical, &req.field, &req.source_order)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "canonical": req.canonical,
+        "field": req.field,
+        "source_order": req.source_order,
+    })))
+}
+
+#[derive(Deserialize)]
+struct MergedRecordQuery {
+    scope_handle: String,
+}
+
+/// GET /v1/entities/{canonical} (scope-handle gated): the merged cross-source
+/// entity view (SPEC §7f). Scoping matches get_record exactly — a tenant-scoped
+/// L1 read gated at the tenant level by the scope handle; fail-closed (401) on
+/// a bad handle. No per-field visibility is invented here (get_record has none).
+async fn get_merged_entity(
+    State(state): State<Arc<AppState>>,
+    Path(canonical): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<MergedRecordQuery>,
+) -> HandlerResult<Json<MergedRecord>> {
+    let payload = state.verify_scope(&q.scope_handle)?;
+    let merged = state
+        .storage
+        .inner()
+        .merged_record(payload.tenant_id, &canonical)
+        .await
+        .map_err(internal)?;
+    spawn_audit(
+        &state,
+        &payload,
+        "merged_entity",
+        Some(&canonical),
+        merged
+            .fields
+            .values()
+            .map(|f| f.provenance)
+            .collect::<Vec<_>>(),
+    );
+    Ok(Json(merged))
 }
 
 // ---------- ingest (trusted connector plane — admin-token gated, task 3;

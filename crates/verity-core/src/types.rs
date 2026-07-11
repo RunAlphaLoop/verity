@@ -480,6 +480,57 @@ impl EmbeddingCoverage {
     }
 }
 
+/// One source's losing value for a field in the merged view (SPEC §7f:
+/// "conflict made visible beats conflict resolved wrong"). Every field that
+/// had a current value in more than one source carries its alternatives so the
+/// provenance of the picked value — and what it beat — is inspectable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedAlternative {
+    pub source: String,
+    pub value: serde_json::Value,
+    pub entity_id: String,
+    pub valid_from: DateTime<Utc>,
+    pub provenance: EpisodeId,
+}
+
+/// The resolved value for one field of a merged entity (SPEC §7f). The value is
+/// the highest-precedence source's current fact; `superseded_alternatives`
+/// carries every other source's current value for the same field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedField {
+    pub value: serde_json::Value,
+    /// The source whose fact won under the precedence rule.
+    pub winning_source: String,
+    /// The source-native entity_id the winning fact came from.
+    pub winning_entity_id: String,
+    pub valid_from: DateTime<Utc>,
+    pub provenance: EpisodeId,
+    /// The (source, value) pairs that lost — order-preserving, precedence-ranked.
+    pub superseded_alternatives: Vec<MergedAlternative>,
+}
+
+/// The cross-source merged entity view (SPEC §7f). A deterministic, view-time
+/// projection over the current facts of every (source, entity_id) aliased to
+/// `canonical`; L1 rows are never merged or mutated. `members` is the resolved
+/// alias set (a single self-member when the entity is unmapped). `fields` is
+/// keyed by field name, each resolved to its precedence-winning source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergedRecord {
+    pub tenant_id: TenantId,
+    pub canonical_entity: String,
+    /// The (source, entity_id) pairs that contributed, in stable order.
+    pub members: Vec<AliasMember>,
+    /// Resolved fields, keyed by field name.
+    pub fields: std::collections::BTreeMap<String, MergedField>,
+}
+
+/// One (source, entity_id) member of a canonical entity (SPEC §7f resolution).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasMember {
+    pub source: String,
+    pub entity_id: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]

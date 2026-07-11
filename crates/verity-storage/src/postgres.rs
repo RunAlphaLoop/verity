@@ -294,6 +294,246 @@ impl PostgresAdapter {
             .collect()
     }
 
+    // ---------- cross-source entity resolution & precedence (SPEC §7f) ----------
+
+    /// Map a source-native `(source, entity_id)` to a canonical entity key
+    /// (SPEC §7f resolution). Idempotent upsert: re-linking a member to a
+    /// different canonical just repoints it. Admin plane.
+    pub async fn upsert_entity_alias(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        entity_id: &str,
+        canonical: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO entity_aliases (tenant_id, source, entity_id, canonical_entity)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id, source, entity_id)
+             DO UPDATE SET canonical_entity = EXCLUDED.canonical_entity",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(entity_id)
+        .bind(canonical)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Set the per-field source precedence for a canonical entity (SPEC §7f).
+    /// `canonical` / `field` of `"*"` set the defaults. Highest precedence
+    /// first; a source absent from `source_order` ranks last at merge time.
+    /// Admin plane.
+    pub async fn set_entity_precedence(
+        &self,
+        tenant: TenantId,
+        canonical: &str,
+        field: &str,
+        source_order: &[String],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO entity_precedence (tenant_id, canonical_entity, field, source_order, updated_at)
+             VALUES ($1, $2, $3, $4, now())
+             ON CONFLICT (tenant_id, canonical_entity, field)
+             DO UPDATE SET source_order = EXCLUDED.source_order, updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(canonical)
+        .bind(field)
+        .bind(source_order)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The (source, entity_id) members aliased to `canonical` (SPEC §7f), in
+    /// stable order. Empty when nothing is linked to that key.
+    pub async fn list_entity_aliases(
+        &self,
+        tenant: TenantId,
+        canonical: &str,
+    ) -> Result<Vec<AliasMember>> {
+        let rows = sqlx::query(
+            "SELECT source, entity_id FROM entity_aliases
+             WHERE tenant_id = $1 AND canonical_entity = $2
+             ORDER BY source, entity_id",
+        )
+        .bind(tenant)
+        .bind(canonical)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(AliasMember {
+                    source: r.try_get("source").map_err(db_err)?,
+                    entity_id: r.try_get("entity_id").map_err(db_err)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Reverse lookup: the canonical entity a `(source, entity_id)` resolves to
+    /// (SPEC §7f). `None` when the pair has no alias — it is then its own
+    /// canonical entity (unmapped entities merge over just their own facts).
+    pub async fn resolve_canonical(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        entity_id: &str,
+    ) -> Result<Option<String>> {
+        let canonical: Option<String> = sqlx::query_scalar(
+            "SELECT canonical_entity FROM entity_aliases
+             WHERE tenant_id = $1 AND source = $2 AND entity_id = $3",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(canonical)
+    }
+
+    /// The cross-source merged entity view (SPEC §7f). Gathers every current
+    /// fact (`valid_to IS NULL`) across all (source, entity_id) members aliased
+    /// to `canonical`, then resolves each field to the value of the
+    /// highest-precedence source that has a current fact for it. When
+    /// `canonical` has no aliases at all, it is treated as its own single
+    /// member `(source=?, entity_id=canonical)` — but since we cannot know the
+    /// source of an unmapped key, the unmapped case is served over any facts
+    /// whose `entity_id == canonical` directly (annoying-never-wrong: an
+    /// unmapped entity merges over just its own source rows).
+    ///
+    /// Precedence resolution per field is most-specific-wins:
+    ///   (canonical, field)  →  (canonical, '*')  →  ('*', '*')  →  none.
+    /// A source absent from the resolved order ranks after all listed sources;
+    /// ties (including the no-precedence-config case) break by most-recent
+    /// `valid_from`, then by source name — fully deterministic.
+    pub async fn merged_record(&self, tenant: TenantId, canonical: &str) -> Result<MergedRecord> {
+        // 1. Resolve members. Explicit aliases win; else the unmapped fallback
+        //    (any facts keyed directly on `canonical` as entity_id).
+        let members = self.list_entity_aliases(tenant, canonical).await?;
+
+        // 2. Gather current facts for those members (or the unmapped fallback).
+        let fact_rows: Vec<FactRow> = if members.is_empty() {
+            let rows = sqlx::query(
+                "SELECT * FROM facts
+                 WHERE tenant_id = $1 AND entity_id = $2 AND valid_to IS NULL",
+            )
+            .bind(tenant)
+            .bind(canonical)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            rows.iter().map(row_to_fact).collect::<Result<_>>()?
+        } else {
+            let sources: Vec<String> = members.iter().map(|m| m.source.clone()).collect();
+            let entity_ids: Vec<String> = members.iter().map(|m| m.entity_id.clone()).collect();
+            // Match on the (source, entity_id) pairs via UNNEST-zipped arrays so
+            // a member of source A / entity X never picks up source B / entity X.
+            let rows = sqlx::query(
+                "SELECT f.* FROM facts f
+                 JOIN unnest($2::text[], $3::text[]) AS m(source, entity_id)
+                   ON f.source = m.source AND f.entity_id = m.entity_id
+                 WHERE f.tenant_id = $1 AND f.valid_to IS NULL",
+            )
+            .bind(tenant)
+            .bind(&sources)
+            .bind(&entity_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            rows.iter().map(row_to_fact).collect::<Result<_>>()?
+        };
+
+        // 3. Load precedence config for this canonical + the defaults.
+        let prec = self.load_precedence(tenant, canonical).await?;
+
+        // 4. Group facts by field, resolve each independently.
+        let mut by_field: HashMap<String, Vec<FactRow>> = HashMap::new();
+        for f in fact_rows {
+            by_field.entry(f.key.field.clone()).or_default().push(f);
+        }
+
+        let mut fields: std::collections::BTreeMap<String, MergedField> =
+            std::collections::BTreeMap::new();
+        for (field, mut facts) in by_field {
+            let order = prec.resolve(&field);
+            // Deterministic ranking: precedence index (lower wins), then
+            // most-recent valid_from, then source name.
+            facts.sort_by(|a, b| {
+                let ra = precedence_rank(&order, &a.key.source);
+                let rb = precedence_rank(&order, &b.key.source);
+                ra.cmp(&rb)
+                    .then_with(|| b.valid_from.cmp(&a.valid_from))
+                    .then_with(|| a.key.source.cmp(&b.key.source))
+                    .then_with(|| a.key.entity_id.cmp(&b.key.entity_id))
+            });
+            let winner = &facts[0];
+            let superseded_alternatives = facts[1..]
+                .iter()
+                .map(|f| MergedAlternative {
+                    source: f.key.source.clone(),
+                    value: f.value.clone(),
+                    entity_id: f.key.entity_id.clone(),
+                    valid_from: f.valid_from,
+                    provenance: f.provenance,
+                })
+                .collect();
+            fields.insert(
+                field,
+                MergedField {
+                    value: winner.value.clone(),
+                    winning_source: winner.key.source.clone(),
+                    winning_entity_id: winner.key.entity_id.clone(),
+                    valid_from: winner.valid_from,
+                    provenance: winner.provenance,
+                    superseded_alternatives,
+                },
+            );
+        }
+
+        // Members for the response: the alias set, or the unmapped self-member.
+        let out_members = if members.is_empty() {
+            Vec::new()
+        } else {
+            members
+        };
+
+        Ok(MergedRecord {
+            tenant_id: tenant,
+            canonical_entity: canonical.to_string(),
+            members: out_members,
+            fields,
+        })
+    }
+
+    /// Load the precedence rows relevant to `canonical` (its specific rows plus
+    /// the '*' defaults) into a resolver. One round trip.
+    async fn load_precedence(&self, tenant: TenantId, canonical: &str) -> Result<PrecedenceConfig> {
+        let rows = sqlx::query(
+            "SELECT canonical_entity, field, source_order FROM entity_precedence
+             WHERE tenant_id = $1 AND canonical_entity IN ($2, '*')",
+        )
+        .bind(tenant)
+        .bind(canonical)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut cfg = PrecedenceConfig::default();
+        for r in &rows {
+            let c: String = r.try_get("canonical_entity").map_err(db_err)?;
+            let field: String = r.try_get("field").map_err(db_err)?;
+            let order: Vec<String> = r.try_get("source_order").map_err(db_err)?;
+            cfg.insert(&c, &field, canonical, order);
+        }
+        Ok(cfg)
+    }
+
     /// Below this many matching rows, brute-force distance over the filtered
     /// subset beats HNSW iterative traversal (measured at 1M chunks: exact
     /// 11ms vs HNSW 72ms p50 at 1% selectivity — docs/BENCHMARKS.md). The
@@ -1814,6 +2054,65 @@ fn row_to_action(row: &PgRow) -> Result<ActionRecord> {
         recorded_at: row.try_get("recorded_at").map_err(db_err)?,
         provenance: row.try_get("provenance").map_err(db_err)?,
     })
+}
+
+/// Resolved per-field source precedence for one canonical entity (SPEC §7f).
+/// Holds the most-specific `(canonical, field)` orders, the `(canonical, '*')`
+/// entity default, and the global `('*', '*')` default; `resolve` picks the
+/// most specific applicable one for a field.
+#[derive(Default)]
+struct PrecedenceConfig {
+    /// field -> order, for rows scoped to THIS canonical entity specifically.
+    per_field: HashMap<String, Vec<String>>,
+    /// (canonical, '*') — the entity-level default.
+    entity_default: Option<Vec<String>>,
+    /// ('*', '*') — the global default.
+    global_default: Option<Vec<String>>,
+}
+
+impl PrecedenceConfig {
+    /// Route one DB row into the right slot. `canonical` is the target entity
+    /// being resolved (used to tell an entity-specific row from the '*' one).
+    fn insert(&mut self, row_canonical: &str, field: &str, canonical: &str, order: Vec<String>) {
+        match (row_canonical == canonical, field) {
+            (true, "*") => self.entity_default = Some(order),
+            (true, _) => {
+                self.per_field.insert(field.to_string(), order);
+            }
+            (false, "*") => self.global_default = Some(order),
+            // ('*', specific-field) is a legal, if unusual, global per-field
+            // default; keep it only when no entity-specific row overrides.
+            (false, _) => {
+                self.per_field
+                    .entry(field.to_string())
+                    .or_insert_with(|| order.clone());
+            }
+        }
+    }
+
+    /// Most-specific-wins: (canonical, field) → (canonical, '*') → ('*', '*') →
+    /// empty (no config: every source ties, valid_from breaks it).
+    fn resolve(&self, field: &str) -> Vec<String> {
+        if let Some(o) = self.per_field.get(field) {
+            return o.clone();
+        }
+        if let Some(o) = &self.entity_default {
+            return o.clone();
+        }
+        if let Some(o) = &self.global_default {
+            return o.clone();
+        }
+        Vec::new()
+    }
+}
+
+/// Rank of `source` in a precedence order: its index if listed, else a value
+/// past the end (every unlisted source ties last, SPEC §7f). Lower wins.
+fn precedence_rank(order: &[String], source: &str) -> usize {
+    order
+        .iter()
+        .position(|s| s == source)
+        .unwrap_or(order.len())
 }
 
 fn row_to_fact(row: &PgRow) -> Result<FactRow> {
