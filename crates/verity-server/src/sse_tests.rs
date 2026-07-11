@@ -49,6 +49,8 @@ async fn test_state(max_conns: usize) -> Option<(Arc<AppState>, TenantId)> {
         allow_restricted_without_rebac: false,
         subscribers: Subscribers::new(max_conns),
         auto_tag: false,
+        knowledge_auto_merge: true,
+        media_store: None,
     });
     Some((state, tenant))
 }

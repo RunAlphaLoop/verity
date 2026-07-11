@@ -35,6 +35,9 @@ tracing-subscriber = { workspace = true }
 # ReBAC plane (task 10): SpiceDB HTTP-gateway client + revocation cache.
 reqwest = { workspace = true }
 moka = { workspace = true }
+# Media object-store seam (task 47): S3/MinIO blob tier behind object_store.
+object_store = { workspace = true }
+bytes = "1"
 # SSE subscriptions (task 21): poll-loop event streams.
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

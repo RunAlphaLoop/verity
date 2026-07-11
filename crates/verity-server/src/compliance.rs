@@ -76,6 +76,27 @@ pub(crate) async fn admin_erasure(
         // Non-`user:` subjects have no SpiceDB object by construction
         // (rebac.rs models users and groups only) — nothing to delete.
     }
+    // Object-store purge (task 47, SPEC §8): the DB `erase()` DELETEs media
+    // rows in one transaction inside verity-storage, but the physical blobs of
+    // storage_ref-backed rows live in object storage and must be purged too.
+    // Capture the storage_refs of the named media_ids BEFORE the DB delete,
+    // then delete the objects AFTER the row purge commits — so a failed DB
+    // erasure never orphans a live row from its deleted blob. bytea rows have
+    // NULL storage_ref and are purged with the transaction, nothing to do.
+    let storage_refs: Vec<String> = if state.media_store.is_some() && !req.media_ids.is_empty() {
+        sqlx::query_scalar(
+            "SELECT storage_ref FROM media
+             WHERE tenant_id = $1 AND id = ANY($2) AND storage_ref IS NOT NULL",
+        )
+        .bind(req.tenant_id)
+        .bind(&req.media_ids)
+        .fetch_all(state.pool())
+        .await
+        .map_err(internal)?
+    } else {
+        Vec::new()
+    };
+
     let report = state
         .storage
         .inner()
@@ -90,6 +111,22 @@ pub(crate) async fn admin_erasure(
             StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             other => internal(other),
         })?;
+
+    // Rows are gone; now purge their objects. Best-effort per object (a
+    // missing object is a no-op); a hard object-store failure surfaces as 502
+    // so the operator knows a blob may survive in the bucket and can retry the
+    // named media_ids (the DB rows are already gone — re-running erasure with
+    // the same ids is a safe no-op on the DB side).
+    if let Some(ms) = &state.media_store {
+        for key in &storage_refs {
+            ms.delete(key).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("media row purged but object storage delete failed for {key}: {e}"),
+                )
+            })?;
+        }
+    }
     // Facts were hard-deleted underneath the L1 current-truth cache.
     state.storage.flush_facts();
     Ok(Json(serde_json::json!({

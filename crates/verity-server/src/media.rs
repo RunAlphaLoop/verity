@@ -7,6 +7,17 @@
 //! (and the sign step enforces the tenant match), but per-principal media
 //! visibility is not modeled yet — whoever holds an unexpired signed URL can
 //! fetch the bytes. Scoped media ACLs land in v0.2.
+//!
+//! Storage tier (task 47, SPEC §10): blobs live in Postgres `bytea` by
+//! default (dev-grade — captured by pg_dump, but bloats the transactional
+//! store). When an object store is configured (`VERITY_MEDIA_S3_ENDPOINT` +
+//! `VERITY_MEDIA_BUCKET` + access/secret keys), POST /v1/files streams the
+//! blob to S3-compatible storage under key `media/<tenant>/<sha256>` and the
+//! media row stores that key in `storage_ref` with NULL `bytes`; GET streams
+//! it back from object storage. The two backings are mutually exclusive per
+//! row (migration 0019 CHECK). The signed-URL scheme is UNCHANGED — URLs stay
+//! Verity-HMAC-signed, never S3-presigned, so scoping/expiry/audit stay inside
+//! Verity (S3 presigned URLs are a future option; see docs/OPERATIONS.md).
 
 use std::sync::Arc;
 
@@ -15,6 +26,8 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
+use object_store::aws::AmazonS3Builder;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -25,6 +38,88 @@ use verity_core::types::*;
 
 use crate::audit::spawn_audit;
 use crate::{internal, resolve_entities, AppState, HandlerResult};
+
+/// Object-store seam for media blobs (task 47). `Some` when the S3 env is
+/// configured; `None` falls back to the Postgres `bytea` path unchanged.
+#[derive(Clone)]
+pub(crate) struct MediaStore {
+    store: Arc<dyn ObjectStore>,
+    /// For operator diagnostics/logging only — the bucket is baked into `store`.
+    pub(crate) bucket: String,
+}
+
+impl MediaStore {
+    /// Build from env, mirroring the SpiceDB/ReBAC seam. Enabled only when both
+    /// `VERITY_MEDIA_S3_ENDPOINT` and `VERITY_MEDIA_BUCKET` are set; returns
+    /// `Ok(None)` (bytea fallback) when they are not. Credentials come from
+    /// `VERITY_MEDIA_ACCESS_KEY` / `VERITY_MEDIA_SECRET_KEY` (falling back to
+    /// the standard AWS_* names); region defaults to `us-east-1` (MinIO
+    /// ignores it). `allow_http` is enabled for `http://` endpoints (MinIO in
+    /// dev) — real S3/GCS/R2 use https and this is a no-op.
+    pub(crate) fn from_env() -> anyhow::Result<Option<Self>> {
+        let (Ok(endpoint), Ok(bucket)) = (
+            std::env::var("VERITY_MEDIA_S3_ENDPOINT"),
+            std::env::var("VERITY_MEDIA_BUCKET"),
+        ) else {
+            return Ok(None);
+        };
+        let access = std::env::var("VERITY_MEDIA_ACCESS_KEY")
+            .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+            .map_err(|_| anyhow::anyhow!("VERITY_MEDIA_ACCESS_KEY not set"))?;
+        let secret = std::env::var("VERITY_MEDIA_SECRET_KEY")
+            .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+            .map_err(|_| anyhow::anyhow!("VERITY_MEDIA_SECRET_KEY not set"))?;
+        let region =
+            std::env::var("VERITY_MEDIA_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let allow_http = endpoint.starts_with("http://");
+        let store = AmazonS3Builder::new()
+            .with_endpoint(&endpoint)
+            .with_bucket_name(&bucket)
+            .with_access_key_id(access)
+            .with_secret_access_key(secret)
+            .with_region(region)
+            .with_allow_http(allow_http)
+            // MinIO speaks path-style; virtual-hosted needs bucket DNS.
+            .with_virtual_hosted_style_request(false)
+            .build()?;
+        tracing::info!(bucket = %bucket, endpoint = %endpoint, "media object store enabled");
+        Ok(Some(Self {
+            store: Arc::new(store),
+            bucket,
+        }))
+    }
+
+    /// Deterministic object key: `media/<tenant>/<sha256>`. Content-addressed,
+    /// so identical bytes under a tenant collapse to one object.
+    fn key(tenant: Uuid, sha256: &str) -> object_store::path::Path {
+        object_store::path::Path::from(format!("media/{tenant}/{sha256}"))
+    }
+
+    async fn put(&self, tenant: Uuid, sha256: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+        let path = Self::key(tenant, sha256);
+        self.store
+            .put(&path, bytes::Bytes::from(bytes).into())
+            .await?;
+        tracing::debug!(bucket = %self.bucket, key = %path, "media blob written to object store");
+        Ok(path.to_string())
+    }
+
+    async fn get(&self, storage_ref: &str) -> anyhow::Result<Vec<u8>> {
+        let path = object_store::path::Path::from(storage_ref);
+        let got = self.store.get(&path).await?;
+        Ok(got.bytes().await?.to_vec())
+    }
+
+    /// Best-effort object delete for erasure (§8). A missing object is not an
+    /// error — the DB row is the source of truth for what erasure must remove.
+    pub(crate) async fn delete(&self, storage_ref: &str) -> anyhow::Result<()> {
+        let path = object_store::path::Path::from(storage_ref);
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
 
 /// Target chunk size for text media, in chars (~500 tokens).
 pub(crate) const CHUNK_CHARS: usize = 2000;
@@ -125,17 +220,34 @@ pub(crate) async fn upload_file(
 
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let media_id = Uuid::now_v7();
+    let size_bytes = bytes.len() as i64;
+    // Object-store tier when configured, else inline bytea. Exactly one of
+    // (bytes, storage_ref) is non-NULL per row (migration 0019). The blob is
+    // written to object storage BEFORE the row so a crash never leaves a row
+    // pointing at an absent object; a rare orphaned object (row insert fails)
+    // is harmless dead weight, garbage-collectable by key.
+    let (stored_bytes, storage_ref): (Option<Vec<u8>>, Option<String>) =
+        if let Some(ms) = &state.media_store {
+            let key = ms
+                .put(payload.tenant_id, &sha256, bytes.clone())
+                .await
+                .map_err(internal)?;
+            (None, Some(key))
+        } else {
+            (Some(bytes.clone()), None)
+        };
     sqlx::query(
-        "INSERT INTO media (id, tenant_id, sha256, mime, filename, bytes, size_bytes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO media (id, tenant_id, sha256, mime, filename, bytes, size_bytes, storage_ref)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(media_id)
     .bind(payload.tenant_id)
     .bind(&sha256)
     .bind(&mime)
     .bind(&filename)
-    .bind(&bytes)
-    .bind(bytes.len() as i64)
+    .bind(&stored_bytes)
+    .bind(size_bytes)
+    .bind(&storage_ref)
     .execute(state.pool())
     .await
     .map_err(internal)?;
@@ -266,14 +378,27 @@ pub(crate) async fn get_media(
         .minter
         .verify_media(id, p.exp, &p.sig)
         .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
-    let row = sqlx::query("SELECT mime, bytes FROM media WHERE id = $1")
+    let row = sqlx::query("SELECT mime, bytes, storage_ref FROM media WHERE id = $1")
         .bind(id)
         .fetch_optional(state.pool())
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "unknown media".to_string()))?;
     let mime: String = row.try_get("mime").map_err(internal)?;
-    let bytes: Vec<u8> = row.try_get("bytes").map_err(internal)?;
+    let storage_ref: Option<String> = row.try_get("storage_ref").map_err(internal)?;
+    // storage_ref => object store; else inline bytea (migration 0019 CHECK
+    // guarantees exactly one is set). A storage_ref row on a server with no
+    // media store configured is an operator misconfiguration, reported 500.
+    let bytes = match storage_ref {
+        Some(key) => {
+            let ms = state.media_store.as_ref().ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "media row references object storage but no media store is configured".to_string(),
+            ))?;
+            ms.get(&key).await.map_err(internal)?
+        }
+        None => row.try_get("bytes").map_err(internal)?,
+    };
     Ok(([(header::CONTENT_TYPE, mime)], bytes))
 }
 

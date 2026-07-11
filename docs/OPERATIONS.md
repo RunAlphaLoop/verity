@@ -28,8 +28,11 @@ What it does **not** capture (v0):
 - **SpiceDB state** (group tuples). Back up SpiceDB's datastore separately;
   SPEC §11b's consistent-ordering protocol (SpiceDB snapshot first, then
   Postgres) is a documented procedure here, not yet tooling-enforced.
-- Anything outside Postgres — there is no Lance/S3 tier yet; media blobs
-  live in the `media` table and ARE captured by the dump.
+- Anything outside Postgres. Media blobs on the **bytea tier** live in the
+  `media` table and ARE captured by the dump. Media blobs on the **object-
+  storage tier** (task 47 — `VERITY_MEDIA_S3_ENDPOINT` set) are NOT: only the
+  `media` rows (metadata + `storage_ref`) ride in the dump; the objects
+  themselves must be backed up at the bucket (see "Media storage" below).
 
 Key-table caveat (SPEC §8a): `tenant_deks` rides inside the same dump. The
 spec's requirement that key-table backups have a *shorter retention lag* than
@@ -80,7 +83,12 @@ verity-cli restore <file>
   `publish_knowledge` (the publish provenance episode). NOT yet encrypted:
   chunk/fact plaintext projections (they are hard-purged by lineage instead),
   `media.bytes`, and `quarantine_preview.payload`. DEK granularity is
-  per-tenant, not yet per-data-subject/per-source.
+  per-tenant, not yet per-data-subject/per-source. Media on the object-storage
+  tier (task 47) is likewise **not** Verity-side encrypted — objects are
+  written in the clear and rely on the bucket's server-side encryption (S3
+  SSE / GCS default encryption); SPEC §8a's per-Lance-blob DEK encryption is
+  future work. Erasure of object-tier media is a hard object delete (below),
+  not crypto-shredding.
 
 ### KEK rotation (v0 stance: offline re-wrap, documented not automated)
 
@@ -96,6 +104,74 @@ Turning encryption ON for an existing deployment encrypts **new** episodes
 only; historical plaintext rows keep their plaintext payload (re-encryption
 backfill is future work). Plaintext-stored DEKs from a KEK-less era remain
 plaintext until rotated by the same offline procedure.
+
+## Media storage (SPEC §10, task 47) — bytea (dev) vs object storage (prod)
+
+Media blobs (`POST /v1/files`) live in one of two tiers, chosen at server
+startup by environment. A media row is **either** inline Postgres `bytea`
+**or** an object in S3-compatible storage referenced by `storage_ref`
+(migration 0019 enforces exactly-one-of with a CHECK). Addressing and
+authorization are identical in both tiers — only where the bytes physically
+live differs.
+
+**Dev-grade default — Postgres `bytea` (env UNSET):** blobs are stored inline
+in `media.bytes`. Zero extra infrastructure, captured by `pg_dump`, but every
+blob bloats the transactional store and rides inside backups. Fine for dev and
+small deployments; not the production path.
+
+**Production — S3-compatible object storage (env SET):** set all of
+
+```
+VERITY_MEDIA_S3_ENDPOINT   e.g. http://localhost:9000 (MinIO) or https://s3.us-east-1.amazonaws.com
+VERITY_MEDIA_BUCKET        e.g. verity-media
+VERITY_MEDIA_ACCESS_KEY    (falls back to AWS_ACCESS_KEY_ID)
+VERITY_MEDIA_SECRET_KEY    (falls back to AWS_SECRET_ACCESS_KEY)
+VERITY_MEDIA_REGION        optional, default us-east-1 (MinIO ignores it)
+```
+
+With these set, `POST /v1/files` streams the blob to object storage under key
+`media/<tenant>/<sha256>` (content-addressed — identical bytes under a tenant
+collapse to one object) and stores that key in `storage_ref` with NULL
+`bytes`; `GET /v1/media` streams it back from object storage. **Both envs
+must be present to enable the tier**; a configured-but-unbuildable store is a
+**hard startup failure** (a deployment that pointed at S3 must never silently
+fall back to bytea). Real deployments use **AWS S3 / GCS (S3-compat) /
+Cloudflare R2** with real credentials and TLS; MinIO
+(`deploy/docker-compose.yml`) is the local stand-in. The client is the
+`object_store` crate (Apache Arrow) over its S3 backend.
+
+Bucket setup (MinIO dev): `deploy/docker-compose.yml` runs a one-shot
+`minio-init` container that creates `verity-media`. Manual equivalent:
+
+```
+mc alias set local http://localhost:9000 minioadmin minioadmin
+mc mb --ignore-existing local/verity-media
+```
+
+**Signed-URL scheme is unchanged — Verity-signed, not S3-presigned.** URLs are
+minted by `POST /v1/media/{id}/sign` and carry a Verity HMAC over
+`media:<id>:<exp>` under the server key; `GET /v1/media/{id}?sig=&exp=` verifies
+signature + expiry, then streams. This holds in **both** tiers. The rationale
+for keeping URLs Verity-signed rather than switching to S3 presigned URLs when
+the object tier is active: **scoping, expiry, tenant-match, and audit stay
+inside Verity** (the sign step tenant-checks; §7e's scope-soundness invariant
+covers signed-media redemption). An S3 presigned URL would hand redemption to
+the object store, bypassing Verity's authorization surface. S3 presigned URLs
+are a **future option** (e.g. for very large blobs to offload egress), gated
+behind re-establishing the equivalent scoping guarantee.
+
+**Backups:** the bytea tier rides inside `pg_dump` (see Backup above). The
+object tier does **not** — object-storage buckets must be backed up separately
+(S3 versioning / cross-region replication / your provider's snapshotting). The
+Postgres dump still captures the `media` rows (metadata + `storage_ref`), so a
+Postgres restore against a surviving bucket is consistent; a restore against a
+lost bucket leaves rows pointing at absent objects (a `GET` then 500s with
+"media row references object storage but no media store is configured" or an
+object-not-found).
+
+**Erasure purges object keys too (§8):** see the Erasure section below — when a
+named media_id carries a `storage_ref`, the erasure path deletes the S3 object
+after the DB row purge commits. This is **wired, not a gap**.
 
 ## Erasure (`POST /v1/admin/erasure`) — the GDPR path
 
@@ -141,6 +217,16 @@ metadata only) and pass the subject-attributable ids as `media_ids` on the
 erasure request. Named blobs are hard-deleted in the same transaction,
 tenant-checked (a foreign or unknown id deletes nothing and shows up as a
 shortfall in the returned `media` count).
+
+On the **object-storage tier** (task 47), erasure also purges the physical
+object: the server captures the `storage_ref` of each named media_id BEFORE
+the DB purge, then deletes those objects from the bucket AFTER the row-delete
+transaction commits (so a failed DB erasure never orphans a live row from a
+deleted blob). A missing object is a no-op; a hard object-store delete failure
+returns **502 with the offending key** — the DB rows are already gone, so
+re-running erasure with the same media_ids is a safe DB no-op and retries the
+object delete. Bytea-tier blobs have NULL `storage_ref` and are fully removed
+by the transaction alone.
 
 One audit row survives per erasure: `verb = 'erasure'`, the per-table counts,
 and sha256 hashes of the subject/entity — no plaintext identifiers.

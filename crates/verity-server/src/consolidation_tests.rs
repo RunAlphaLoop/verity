@@ -53,6 +53,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag,
         knowledge_auto_merge: auto_merge,
+        media_store: None,
     });
     Some((state, tenant))
 }
@@ -93,6 +94,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             subscribers,
             auto_tag,
             knowledge_auto_merge,
+            media_store: None,
         }),
         tenant,
     ))

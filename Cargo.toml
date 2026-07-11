@@ -42,6 +42,9 @@ rand = "0.9"
 rand_distr = "0.5"
 hdrhistogram = "7"
 moka = { version = "0.12", features = ["sync"] }
+# Media object-store seam (task 47): S3/MinIO/GCS/local behind one async trait.
+# Chosen over aws-sdk-s3 for the lighter dep tree and multi-backend support.
+object_store = { version = "0.14", features = ["aws"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"

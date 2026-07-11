@@ -83,6 +83,56 @@ services:
       timeout: 3s
       retries: 20
 
+  # Media blob object store (SPEC §10, task 47): MinIO, an S3-compatible
+  # server, is the DEV/v0.3 tier for media blobs — the alternative to the
+  # dev-grade Postgres `bytea` path. The server writes blobs here when
+  # VERITY_MEDIA_S3_ENDPOINT + VERITY_MEDIA_BUCKET are set; unset, it falls
+  # back to bytea (see docs/OPERATIONS.md "Media storage").
+  #   API   :9000 (S3 protocol — VERITY_MEDIA_S3_ENDPOINT=http://localhost:9000)
+  #   Console :9001 (web UI — http://localhost:9001, login minioadmin/minioadmin)
+  # PRODUCTION NOTE: real deployments point VERITY_MEDIA_S3_ENDPOINT at
+  # AWS S3 / GCS (S3-compat) / Cloudflare R2 with real credentials and TLS —
+  # MinIO here is a local stand-in only. Credentials below are dev defaults;
+  # never reuse them in production.
+  minio:
+    image: minio/minio
+    container_name: verity-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Console UI
+    volumes:
+      - verity-minio:/data
+    healthcheck:
+      # MinIO ships a /minio/health/live liveness endpoint; the image includes
+      # `mc`, but curl is absent, so probe via mc's own ready check.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot bucket bootstrap: waits for MinIO, then creates the default
+  # `verity-media` bucket (idempotent — re-running is a no-op). Exits 0.
+  # Manual equivalent (if you skip this container):
+  #   mc alias set local http://localhost:9000 minioadmin minioadmin
+  #   mc mb --ignore-existing local/verity-media
+  minio-init:
+    image: minio/mc
+    container_name: verity-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/verity-media &&
+      echo 'bucket verity-media ready'
+      "
+
 volumes:
   verity-pgdata:
   verity-qdrant:
+  verity-minio:

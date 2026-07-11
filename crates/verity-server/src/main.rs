@@ -18,6 +18,8 @@ mod ingest;
 mod manifest_tests;
 mod manifests;
 mod media;
+#[cfg(test)]
+mod media_tests;
 mod purpose;
 mod rebac;
 mod revocation;
@@ -138,6 +140,11 @@ pub(crate) struct AppState {
     /// widen retrieval scope for entity-bound scopes (SPEC §7d), so the
     /// default posture is suggest-only with human approval.
     pub(crate) auto_tag: bool,
+    /// Media blob object-store seam (task 47, SPEC §10). `Some` when
+    /// `VERITY_MEDIA_S3_ENDPOINT` + `VERITY_MEDIA_BUCKET` are configured:
+    /// blobs live in S3-compatible storage with a `storage_ref` in the media
+    /// row. `None` = the Postgres `bytea` dev-grade path, unchanged.
+    pub(crate) media_store: Option<media::MediaStore>,
     /// `VERITY_KNOWLEDGE_AUTO_MERGE` kill switch (knowledge-merge-tuning.md §5).
     /// Default ON. When set to `0`, the server IGNORES worker-supplied
     /// `merge_into` entirely: only the deterministic canonical-exact fast path
@@ -251,6 +258,10 @@ async fn main() -> anyhow::Result<()> {
         allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
+        // Media blobs to object storage when configured; else the bytea path.
+        // A configured-but-unbuildable store is a hard startup failure (a
+        // deployment that pointed at S3 must not silently fall back to bytea).
+        media_store: media::MediaStore::from_env()?,
         auto_tag: std::env::var("VERITY_AUTO_TAG").is_ok_and(|v| v == "1"),
         // Default ON: absent or anything but "0" leaves judged merges enabled.
         knowledge_auto_merge: std::env::var("VERITY_KNOWLEDGE_AUTO_MERGE")
