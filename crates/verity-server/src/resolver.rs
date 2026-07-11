@@ -106,24 +106,21 @@ pub(crate) async fn run_full_fold(
     // 1b. §5 precondition (a): the set of canonicals ALREADY FOLDED — present in
     //     `entity_aliases` from a PRIOR fold or an admin crosswalk POST. The pure
     //     fold cannot read the DB, so we read the pre-existing canonical set here
-    //     in the worker plane (reusing the existing `list_canonical_entities`
-    //     read — no new storage method, `postgres.rs` untouched) and hand it in.
-    //     A Tier-3 mention may then tag a chunk with a canonical that exists in
-    //     `entity_aliases` even if THIS run did not re-merge it. This read is
-    //     worker-plane only; the recall/`get` read path never runs it.
+    //     in the worker plane and hand it in. A Tier-3 mention may then tag a
+    //     chunk with a canonical that exists in `entity_aliases` even if THIS run
+    //     did not re-merge it. This read is worker-plane only; the recall/`get`
+    //     read path never runs it.
     //
-    //     Cap note: `list_canonical_entities` is bounded (≤1000). For tenants
-    //     whose folded-canonical count exceeds that, this under-includes prior
-    //     canonicals — a fail-closed under-tag (never a wrong tag), and the
-    //     freshly-folded set is always included. A future paginated/DISTINCT-only
-    //     read would lift the cap without touching the read path (TODO).
+    //     Uses the PAGINATED, DISTINCT-only `all_canonical_keys` read (not the
+    //     display-capped `list_canonical_entities`): it pages through EVERY
+    //     folded canonical for the tenant, so Tier-3 no longer under-tags large
+    //     tenants whose folded-canonical count exceeds the old ≤1000 browser cap.
+    //     It projects only the DISTINCT keys (no members/summaries/badges), so it
+    //     stays cheap at scale. This lifts the cap without touching the read path.
     let preexisting: Vec<String> = storage
-        .list_canonical_entities(tenant, 1000)
+        .all_canonical_keys(tenant)
         .await
-        .map_err(crate::internal)?
-        .into_iter()
-        .map(|c| c.canonical_entity)
-        .collect();
+        .map_err(crate::internal)?;
     let known = KnownCanonicals::new(preexisting.iter().map(String::as_str), std::iter::empty());
 
     // 2. The PURE fold. No I/O in here. The known-canonical set only satisfies

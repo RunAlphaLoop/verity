@@ -340,6 +340,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/dsar/export", get(compliance::dsar_export))
         .route("/v1/admin/audit", get(audit::admin_audit))
         .route("/v1/admin/quarantine", get(webhooks::admin_quarantine))
+        .route(
+            "/v1/admin/quarantine/{id}/reingest",
+            post(admin_quarantine_reingest),
+        )
+        .route(
+            "/v1/admin/quarantine/{id}/dismiss",
+            post(admin_quarantine_dismiss),
+        )
+        .route("/v1/admin/debug/recall", post(admin_debug_recall))
         .route("/v1/admin/media", get(media::admin_list_media))
         .route(
             "/v1/admin/connector-status",
@@ -2544,6 +2553,554 @@ async fn publish_knowledge(
         .await
         .map(Json)
         .map_err(storage_status)
+}
+
+// ---------- admin debug-recall "why-out" trace (UI-SPEC §6 Later; §5 Screen 1
+// boundary-trace honesty note). OFF the hot path by construction: a separate
+// admin-token-gated endpoint that does the extra per-candidate work the pure
+// read path refuses. recall/get are untouched. ----------
+
+#[derive(Deserialize)]
+struct DebugRecallRequest {
+    /// The scope being debugged — a real, unexpired handle. The trace explains
+    /// what THIS boundary admits/drops; an expired or tampered handle fails
+    /// closed (401) exactly like the read path.
+    scope_handle: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+    /// How many tenant-wide top-similarity candidates to trace (default 50,
+    /// clamped to 500).
+    #[serde(default = "default_debug_candidates")]
+    candidates: usize,
+}
+
+fn default_debug_candidates() -> usize {
+    50
+}
+
+fn confidentiality_name(v: i16) -> &'static str {
+    match v {
+        0 => "public",
+        1 => "internal",
+        2 => "confidential",
+        _ => "restricted",
+    }
+}
+
+/// POST /v1/admin/debug/recall — per-candidate DROP REASONS for a scope+query.
+///
+/// Re-runs the query over the tenant's chunks with ONLY the tenant filter,
+/// then evaluates each mandatory pre-filter (visibility tokens, entity scope,
+/// confidentiality ceiling, staleness) per candidate in the admin plane and
+/// names why each near-miss was excluded. Requires BOTH the admin bearer token
+/// AND a valid scope handle; every invocation is audited (`verb =
+/// "debug_recall"`, result_ids = every chunk id the trace disclosed).
+///
+/// Honest limits (also returned in the response's `honesty` array):
+/// - Filters are evaluated against the index AS OF NOW — this cannot
+///   reconstruct why a PAST recall dropped a candidate if visibility/tags/
+///   validity changed since.
+/// - The candidate set is a similarity top-N under a tenant-only ordering;
+///   a chunk outside that top-N (including ANN traversal misses) is not
+///   enumerable.
+/// - The live restricted-class ReBAC recheck is NOT executed here; restricted
+///   candidates are flagged with the recheck outcome the read path WOULD
+///   apply structurally (fail-closed drop when ReBAC is off), never re-resolved.
+async fn admin_debug_recall(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DebugRecallRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let payload = state.verify_scope(&req.scope_handle)?;
+    if req.text.is_none() && req.embedding.is_none() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "debug recall needs text or an embedding".into(),
+        ));
+    }
+    // Same effective principal set as the real read: the handle's tokens minus
+    // in-window revocation tombstones.
+    let scope = state.scope_for(&payload).await?;
+    let revoked: Vec<PrincipalToken> = payload
+        .principals
+        .iter()
+        .copied()
+        .filter(|t| !scope.principals.contains(t))
+        .collect();
+
+    let embedding = match (req.embedding, &req.text) {
+        (Some(e), _) => Some(e),
+        (None, Some(text)) => state.encode(text).await?,
+        (None, None) => None,
+    };
+    let leg = if embedding.is_some() { "dense" } else { "bm25" };
+    let limit = req.candidates.clamp(1, 500) as i64;
+    let candidates = state
+        .storage
+        .inner()
+        .debug_recall_candidates(
+            scope.tenant_id,
+            embedding.as_deref(),
+            req.text.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(storage_status)?;
+
+    let ceiling = scope.max_confidentiality as i16;
+    let mut traced = Vec::with_capacity(candidates.len());
+    let mut all_ids = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        all_ids.push(c.chunk_id);
+        let mut drop_reasons: Vec<&'static str> = Vec::new();
+        let mut notes: Vec<&'static str> = Vec::new();
+        // Staleness: superseded/invalidated rows never enter recall.
+        if c.valid_to.is_some() {
+            drop_reasons.push("stale_superseded");
+        }
+        // Visibility tokens: empty = invisible (fail closed); otherwise the
+        // effective principal set must overlap.
+        if c.visibility.is_empty() {
+            drop_reasons.push("visibility_empty");
+        } else if !c.visibility.iter().any(|t| scope.principals.contains(t)) {
+            drop_reasons.push("visibility_no_overlap");
+        }
+        // Confidentiality ceiling.
+        if c.confidentiality > ceiling {
+            drop_reasons.push("confidentiality_above_ceiling");
+        }
+        // Entity scope (deny-by-default subset semantics, §7d; knowledge
+        // carve-out §7g).
+        if !scope.entity_scope.is_empty() && c.kind != "knowledge" {
+            if c.entity_tags.is_empty() {
+                drop_reasons.push("entity_scope_untagged");
+            } else if !c.entity_tags.iter().all(|t| scope.entity_scope.contains(t)) {
+                drop_reasons.push("entity_scope_outside");
+            }
+        }
+        // Restricted-class recheck (SPEC §7b rule 4): mirror the read path's
+        // STRUCTURAL behavior without calling ReBAC.
+        if c.confidentiality >= Confidentiality::Restricted as i16 && drop_reasons.is_empty() {
+            match &state.rebac {
+                None if !state.allow_restricted_without_rebac => {
+                    drop_reasons.push("restricted_dropped_no_rebac")
+                }
+                None => notes.push("restricted_served_without_rebac_by_explicit_override"),
+                Some(_) => notes.push("restricted_subject_to_live_recheck_not_reproduced_here"),
+            }
+        }
+        let preview: String = c.content.chars().take(240).collect();
+        traced.push(serde_json::json!({
+            "chunk_id": c.chunk_id,
+            "document_id": c.document_id,
+            "seq": c.seq,
+            "score": c.score,
+            "kind": c.kind,
+            "entity_tags": c.entity_tags,
+            "visibility_token_count": c.visibility.len(),
+            "confidentiality": confidentiality_name(c.confidentiality),
+            "acl_provenance": c.acl_provenance,
+            "trust_tier": if c.trust_tier == 1 { "authoritative" } else { "observation" },
+            "valid_from": c.valid_from,
+            "valid_to": c.valid_to,
+            "provenance": c.provenance,
+            "admitted": drop_reasons.is_empty(),
+            "drop_reasons": drop_reasons,
+            "notes": notes,
+            "content_preview": preview,
+        }));
+    }
+
+    // Audited like every scoped read — but under its own verb so a reviewer can
+    // find every time this widened trace was invoked, by whom, over what.
+    spawn_audit(
+        &state,
+        &payload,
+        "debug_recall",
+        req.text.as_deref().or(Some("<embedding-only>")),
+        all_ids,
+    );
+
+    Ok(Json(serde_json::json!({
+        "query": {
+            "text": req.text,
+            "leg": leg,
+            "candidates_requested": limit,
+            "candidates_traced": traced.len(),
+        },
+        "scope": {
+            "tenant_id": scope.tenant_id,
+            "entity_scope": scope.entity_scope,
+            "max_confidentiality": confidentiality_name(ceiling),
+            "principals_effective": scope.principals,
+            "principals_revoked": revoked,
+        },
+        "candidates": traced,
+        "honesty": [
+            "Filters are evaluated against the index AS OF NOW; a past recall's drops are not reconstructable if visibility/tags/validity changed since.",
+            "Candidate set = top-N by similarity under a tenant-only ordering; chunks outside that top-N (including ANN traversal misses) are not enumerable.",
+            "The live restricted-class ReBAC recheck is not executed here; restricted candidates are flagged structurally, never re-resolved.",
+            "This endpoint is admin-gated, audited, and OFF the read path — recall/get never do this work.",
+        ],
+    })))
+}
+
+// ---------- quarantine lifecycle write surface (UI-SPEC §5 Screen 6 — the
+// formerly-disabled seam). Re-ingest routes ONLY through an admin-supplied
+// corrected ACL mapping; there is deliberately NO "index it anyway" path — no
+// request shape exists that indexes a quarantined payload under its original
+// (unmappable) ACL or under any default. ----------
+
+/// Audit an admin quarantine disposition (worker/admin-plane event — no scope
+/// handle involved, so actor is the admin surface itself). Non-blocking,
+/// mirroring `audit::spawn_audit`.
+fn spawn_quarantine_audit(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    verb: &'static str,
+    summary: String,
+    result_ids: Vec<uuid::Uuid>,
+) {
+    let pool = state.pool().clone();
+    let summary: String = summary.chars().take(120).collect();
+    tokio::spawn(async move {
+        let result = sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
+                                    entity_scope, confidentiality, query_summary, result_ids)
+             VALUES ($1, $2, NULL, 'admin', $3, $4, $5, 0, $6, $7)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant)
+        .bind(verb)
+        .bind(Vec::<PrincipalToken>::new())
+        .bind(Vec::<String>::new())
+        .bind(&summary)
+        .bind(&result_ids)
+        .execute(&pool)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(verb, "quarantine audit insert failed: {e}");
+        }
+    });
+}
+
+/// The corrected ACL mapping an admin supplies to re-admit a quarantined
+/// payload. `visibility` and `confidentiality` are REQUIRED and explicit —
+/// there is no default, no "inherit whatever the webhook had", and no shape
+/// that indexes without them.
+#[derive(Deserialize)]
+struct QuarantineReingestRequest {
+    tenant_id: TenantId,
+    /// Explicit principal tokens. An empty set is accepted and fail-closed:
+    /// it writes memory nobody can read (never a permissive default).
+    visibility: Vec<PrincipalToken>,
+    confidentiality: Confidentiality,
+    #[serde(default)]
+    entity_tags: Vec<String>,
+    /// Optional corrected text extraction — for `unrecognized shape` payloads
+    /// whose text lives under a field the native parser doesn't know. The
+    /// ORIGINAL payload is preserved verbatim as the episode body, so the
+    /// admin's extraction is itself auditable against the source.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The subset of the native fact shape re-ingest will honor from the stored
+/// payload (mirrors webhooks::NativeFact).
+#[derive(Deserialize)]
+struct ReingestFact {
+    source: String,
+    entity_id: String,
+    field: String,
+    value: serde_json::Value,
+    #[serde(default)]
+    valid_from: Option<DateTime<Utc>>,
+}
+
+/// POST /v1/admin/quarantine/{id}/reingest — re-admit a quarantined payload
+/// THROUGH a corrected, admin-supplied ACL mapping (visibility +
+/// confidentiality + entity tags), stamped `acl_provenance = admin-assigned`.
+///
+/// What it ingests: the payload's own `content`/`observation` (or its
+/// preserved `raw` text for invalid-JSON quarantines, or the admin's explicit
+/// `content` extraction) as an L0 episode + chunk, plus any parseable native
+/// `facts` as deterministic L1 upserts. A payload that still carries nothing
+/// ingestible is refused (422) — re-ingest never fabricates content and there
+/// is no path that indexes a payload under its original unmappable ACL.
+///
+/// Lifecycle: the row is atomically claimed (`resolution = 'reingested'`,
+/// only from OPEN — concurrent double-claims lose with 409); if ingestion then
+/// fails the claim is reverted so the item returns to triage. The quarantine
+/// row itself survives for audit (invalidate-don't-delete). Audited under
+/// `verb = "quarantine_reingest"`.
+async fn admin_quarantine_reingest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<QuarantineReingestRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let item = state
+        .storage
+        .inner()
+        .quarantine_item(req.tenant_id, id)
+        .await
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "no such quarantined item".to_string(),
+        ))?;
+    if let Some(res) = &item.resolution {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("quarantine item already resolved ({res})"),
+        ));
+    }
+
+    // Extract what the payload can honestly yield BEFORE claiming the row.
+    let content: Option<String> = req
+        .content
+        .clone()
+        .or_else(|| {
+            item.payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            item.payload
+                .get("observation")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            // Invalid-JSON quarantines preserved the raw text (truncated at
+            // 4096 chars at capture time — disclosed below).
+            item.payload
+                .get("raw")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    // Native-shaped facts, if present AND parseable. Unparseable facts are
+    // skipped fail-closed (never guessed into L1) and disclosed in the reply.
+    let (facts, facts_unparseable) = match item.payload.get("facts") {
+        None => (Vec::new(), false),
+        Some(v) => match serde_json::from_value::<Vec<ReingestFact>>(v.clone()) {
+            Ok(f) => (f, false),
+            Err(_) => (Vec::new(), true),
+        },
+    };
+    if content.is_none() && facts.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "payload carries nothing ingestible (no content/observation/raw text, no parseable facts); \
+             re-ingest never fabricates content — supply a corrected `content` extraction or fix at the source"
+                .to_string(),
+        ));
+    }
+
+    // Claim the row first: the OPEN->reingested stamp is the concurrency gate
+    // (a parallel re-ingest of the same item loses here with 409).
+    let claimed = state
+        .storage
+        .inner()
+        .resolve_quarantine(req.tenant_id, id, "reingested", req.note.as_deref())
+        .await
+        .map_err(storage_status)?;
+    if !claimed {
+        return Err((
+            StatusCode::CONFLICT,
+            "quarantine item already resolved".to_string(),
+        ));
+    }
+
+    // Ingest through the SAME write paths as an accepted webhook payload —
+    // only the ACL mapping differs (admin-supplied, admin-assigned).
+    let ingest = async {
+        let source =
+            match sqlx::query_scalar::<_, String>("SELECT name FROM webhooks WHERE id = $1")
+                .bind(item.webhook_id)
+                .fetch_optional(state.pool())
+                .await
+                .map_err(internal)?
+            {
+                Some(name) => format!("webhook:{name}"),
+                None => format!("webhook:{}", item.webhook_id),
+            };
+        let episode_id = state
+            .storage
+            .append_episode(NewEpisode {
+                tenant_id: req.tenant_id,
+                source: source.clone(),
+                source_entity: req.entity_tags.first().cloned(),
+                kind: EpisodeKind::Webhook,
+                content_hash: format!("{:x}", md5ish(&item.payload.to_string())),
+                // The ORIGINAL quarantined payload, verbatim — provenance for
+                // the admin's mapping/extraction.
+                payload: item.payload.clone(),
+                trust_tier: TrustTier::Authoritative,
+                writer_sub: None,
+                writer_azp: Some(format!("admin-reingest:{id}")),
+            })
+            .await
+            .map_err(internal)?;
+        let mut chunks_indexed = 0usize;
+        if let Some(text) = &content {
+            let embedding = state.encode(text).await.ok().flatten();
+            chunks_indexed = state
+                .storage
+                .upsert_chunks(vec![ChunkWrite {
+                    tenant_id: req.tenant_id,
+                    source: source.clone(),
+                    document_id: format!("qr:{episode_id}"),
+                    seq: 0,
+                    content: text.clone(),
+                    content_hash: format!("qr-{episode_id}"),
+                    embedding,
+                    visibility: req.visibility.clone(),
+                    entity_tags: req.entity_tags.clone(),
+                    confidentiality: req.confidentiality,
+                    trust_tier: TrustTier::Authoritative,
+                    valid_from: Utc::now(),
+                    provenance: episode_id,
+                    // The whole point: explicit admin policy, never a mirrored
+                    // or approximated (unmappable) source ACL.
+                    acl_provenance: AclProvenance::AdminAssigned,
+                }])
+                .await
+                .map_err(internal)?;
+        }
+        let mut facts_written = 0u64;
+        for fact in &facts {
+            state
+                .storage
+                .upsert_fact(FactWrite {
+                    tenant_id: req.tenant_id,
+                    key: FactKey {
+                        source: fact.source.clone(),
+                        entity_id: fact.entity_id.clone(),
+                        field: fact.field.clone(),
+                    },
+                    value: fact.value.clone(),
+                    valid_from: fact.valid_from.unwrap_or_else(Utc::now),
+                    provenance: episode_id,
+                    acl_provenance: AclProvenance::AdminAssigned,
+                })
+                .await
+                .map_err(internal)?;
+            facts_written += 1;
+        }
+        Ok::<(uuid::Uuid, usize, u64), (StatusCode, String)>((
+            episode_id,
+            chunks_indexed,
+            facts_written,
+        ))
+    };
+    let (episode_id, chunks_indexed, facts_written) = match ingest.await {
+        Ok(v) => v,
+        Err(e) => {
+            // Compensation: put the item back in the triage queue (best-effort;
+            // a failure here is logged, and the item shows as claimed-but-
+            // unresolved evidence in the audit trail either way).
+            if let Err(re) = state
+                .storage
+                .inner()
+                .reopen_quarantine(req.tenant_id, id)
+                .await
+            {
+                tracing::warn!(%id, "re-ingest failed AND reopen failed: {re}");
+            }
+            return Err(e);
+        }
+    };
+
+    state.resolution.mark_dirty(req.tenant_id);
+    spawn_quarantine_audit(
+        &state,
+        req.tenant_id,
+        "quarantine_reingest",
+        format!(
+            "quarantine {id} -> episode {episode_id} (vis={} tokens, conf={})",
+            req.visibility.len(),
+            confidentiality_name(req.confidentiality as i16),
+        ),
+        vec![id, episode_id],
+    );
+    Ok(Json(serde_json::json!({
+        "reingested": true,
+        "quarantine_id": id,
+        "episode_id": episode_id,
+        "chunks_indexed": chunks_indexed,
+        "facts_written": facts_written,
+        // Honesty flags: what the re-ingest could NOT carry over.
+        "facts_unparseable_skipped": facts_unparseable,
+        "raw_text_truncated_at_capture": req.content.is_none()
+            && item.payload.get("content").and_then(|v| v.as_str()).is_none()
+            && item.payload.get("observation").and_then(|v| v.as_str()).is_none()
+            && item.payload.get("raw").is_some(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct QuarantineDismissRequest {
+    tenant_id: TenantId,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /v1/admin/quarantine/{id}/dismiss — acknowledge a quarantined payload
+/// WITHOUT indexing anything. Stamps `resolution = 'dismissed'` (only from
+/// OPEN; 409 if already resolved); the row survives for audit. Audited under
+/// `verb = "quarantine_dismiss"`. This and re-ingest-through-corrected-mapping
+/// are the ONLY two exits from quarantine.
+async fn admin_quarantine_dismiss(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<QuarantineDismissRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let dismissed = state
+        .storage
+        .inner()
+        .resolve_quarantine(req.tenant_id, id, "dismissed", req.note.as_deref())
+        .await
+        .map_err(storage_status)?;
+    if !dismissed {
+        // Distinguish "never existed" from "already resolved" for the console.
+        return match state
+            .storage
+            .inner()
+            .quarantine_item(req.tenant_id, id)
+            .await
+            .map_err(internal)?
+        {
+            None => Err((StatusCode::NOT_FOUND, "no such quarantined item".into())),
+            Some(item) => Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "quarantine item already resolved ({})",
+                    item.resolution.as_deref().unwrap_or("unknown")
+                ),
+            )),
+        };
+    }
+    spawn_quarantine_audit(
+        &state,
+        req.tenant_id,
+        "quarantine_dismiss",
+        format!("quarantine {id} dismissed"),
+        vec![id],
+    );
+    Ok(Json(serde_json::json!({
+        "dismissed": true,
+        "quarantine_id": id,
+    })))
 }
 
 pub(crate) fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
