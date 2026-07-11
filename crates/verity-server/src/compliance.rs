@@ -197,11 +197,6 @@ pub(crate) async fn admin_erasure(
     // signing key (same key/minter as scope handles + media URIs, domain-
     // separated). The console now shows a signature the SERVER produced, not
     // one the browser assembled from returned numbers.
-    //
-    // Honest dev-mode disclosure: when the key is ephemeral (no
-    // VERITY_SIGNING_KEY/VERITY_SCOPE_KEY), the signature verifies only within
-    // this one process lifetime — `signed=false` says so plainly rather than
-    // presenting a process-scoped tag as a durable attestation.
     let signed_at = chrono::Utc::now();
     let facts = serde_json::json!({
         "kind": "verity.erasure.purge-report",
@@ -221,11 +216,8 @@ pub(crate) async fn admin_erasure(
                              of the backup-retention window and are then crypto-shredded; live \
                              rows and keys are destroyed now.",
     });
-    // Canonical bytes = compact serialization of the facts object. The console
-    // recomputes the HMAC over exactly these bytes to verify.
-    let canonical = serde_json::to_vec(&facts).map_err(internal)?;
-    let signature = state.minter.sign_bytes(PURGE_REPORT_DOMAIN, &canonical);
-    let signed = state.minter.has_persistent_key();
+
+    let purge_report = sign_purge_report(&state.minter, facts).map_err(internal)?;
 
     Ok(Json(serde_json::json!({
         "erased": report,
@@ -233,20 +225,52 @@ pub(crate) async fn admin_erasure(
         // is not configured (delete tuples via SpiceDB directly) or the
         // subject was not a `user:` principal (no tuples exist for it).
         "rebac_tuples_deleted": rebac_tuples_deleted,
-        // The server-signed purge report. `facts` is the exact signed object;
-        // `signature` is HMAC-SHA256 over its compact JSON under the server key
-        // with the domain tag `verity.erasure.purge-report.v1`.
-        "purge_report": {
-            "facts": facts,
-            "algorithm": "HMAC-SHA256",
-            "domain": PURGE_REPORT_DOMAIN,
-            "signature": signature,
-            // false => ephemeral key: the signature is process-scoped (dev
-            // mode), not a durable attestation. Set VERITY_SIGNING_KEY to sign
-            // durably.
-            "signed": signed,
-        },
+        "purge_report": purge_report,
     })))
+}
+
+/// Build the server-signed purge report envelope over a `facts` object.
+///
+/// The signature is an HMAC-SHA256 over the *compact* canonical serialization
+/// of `facts`, domain-separated under `PURGE_REPORT_DOMAIN` so a purge-report
+/// tag can never be replayed as a scope handle or media URI (they share the
+/// key). The console recomputes the HMAC over exactly these bytes to verify.
+///
+/// Honest dev-mode seam: a DURABLE attestation requires a persistent signing
+/// key (`VERITY_SIGNING_KEY`, or the scope key). Under an ephemeral per-process
+/// key we deliberately emit `signed: false` and NO `signature` — presenting a
+/// process-scoped tag (verifiable only within this one process lifetime) as if
+/// it were a durable attestation would be a fabricated guarantee. The operator
+/// sees `signature: null` and knows to set a persistent key to sign durably.
+fn sign_purge_report(
+    minter: &crate::scope::ScopeMinter,
+    facts: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Error> {
+    // Canonical bytes = compact serialization of the facts object.
+    let canonical = serde_json::to_vec(&facts)?;
+    let (signature, signed) = if minter.has_persistent_key() {
+        (
+            serde_json::Value::String(minter.sign_bytes(PURGE_REPORT_DOMAIN, &canonical)),
+            true,
+        )
+    } else {
+        // No persistent key: no durable attestation exists. Do not fabricate
+        // one — emit null and label it honestly.
+        (serde_json::Value::Null, false)
+    };
+    Ok(serde_json::json!({
+        // `facts` is the exact signed object; `signature` (when present) is
+        // HMAC-SHA256 over its compact JSON under the server key with the
+        // domain tag `verity.erasure.purge-report.v1`.
+        "facts": facts,
+        "algorithm": "HMAC-SHA256",
+        "domain": PURGE_REPORT_DOMAIN,
+        // null under an ephemeral key (dev mode): no durable signature emitted.
+        "signature": signature,
+        // false => ephemeral key: no durable attestation was produced. Set
+        // VERITY_SIGNING_KEY (or VERITY_SCOPE_KEY) to sign durably.
+        "signed": signed,
+    }))
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -296,4 +320,143 @@ pub(crate) async fn dsar_export(
         }
     });
     Ok(Json(bundle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::{ScopeError, ScopeMinter};
+
+    /// A representative purge-facts object, shaped exactly like `admin_erasure`
+    /// builds it: hashed identifiers only, per-table counts, timestamps.
+    fn sample_facts() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "verity.erasure.purge-report",
+            "tenant_id": uuid::Uuid::now_v7(),
+            "subject_sha256": super::sha256_hex("user:alice@example.com"),
+            "entity_sha256": serde_json::Value::Null,
+            "media_ids": Vec::<uuid::Uuid>::new(),
+            "erased": serde_json::json!({ "episodes": 3, "chunks": 12, "facts": 5, "actions": 1 }),
+            "rebac_tuples_deleted": true,
+            "signed_at": chrono::Utc::now(),
+            "retention_window": "backups age out then crypto-shredded; live rows destroyed now",
+        })
+    }
+
+    /// (a) With a persistent signing key, the purge report carries a real
+    /// signature, `signed == true`, and the signature VERIFIES against the
+    /// exact facts under the purge-report domain.
+    #[test]
+    fn persistent_key_signs_durably_and_verifies() {
+        let minter = ScopeMinter::from_key_persistent([0x42u8; 32]);
+        let facts = sample_facts();
+        let report = sign_purge_report(&minter, facts.clone()).expect("build report");
+
+        assert_eq!(report["signed"], serde_json::json!(true));
+        assert_eq!(report["algorithm"], serde_json::json!("HMAC-SHA256"));
+        assert_eq!(report["domain"], serde_json::json!(PURGE_REPORT_DOMAIN));
+
+        let sig = report["signature"].as_str().expect("signature present");
+        // Recompute over the SAME canonical bytes the signer used: compact
+        // serialization of the facts object echoed back in the report.
+        let canonical = serde_json::to_vec(&report["facts"]).expect("canon");
+        minter
+            .verify_bytes(PURGE_REPORT_DOMAIN, &canonical, sig)
+            .expect("signature verifies against the signed facts");
+
+        // The echoed facts are byte-identical to the input we signed.
+        assert_eq!(report["facts"], facts);
+    }
+
+    /// (a') Domain separation is load-bearing: the same tag must NOT verify
+    /// under a different domain (e.g. a media-URI or scope-handle surface),
+    /// so a purge signature can never be replayed as another credential.
+    #[test]
+    fn signature_is_domain_separated() {
+        let minter = ScopeMinter::from_key_persistent([0x11u8; 32]);
+        let report = sign_purge_report(&minter, sample_facts()).expect("build report");
+        let sig = report["signature"].as_str().expect("signature present");
+        let canonical = serde_json::to_vec(&report["facts"]).expect("canon");
+
+        assert!(matches!(
+            minter.verify_bytes("verity.media.v1", &canonical, sig),
+            Err(ScopeError::BadSignature)
+        ));
+    }
+
+    /// (b) With NO persistent key (dev / ephemeral), the report is honestly
+    /// `signed == false` and emits NO signature — a process-scoped tag is never
+    /// dressed up as a durable attestation.
+    #[test]
+    fn ephemeral_key_emits_no_signature() {
+        let minter = ScopeMinter::ephemeral();
+        let report = sign_purge_report(&minter, sample_facts()).expect("build report");
+
+        assert_eq!(report["signed"], serde_json::json!(false));
+        assert!(
+            report["signature"].is_null(),
+            "no bogus signature under an ephemeral key, got {:?}",
+            report["signature"]
+        );
+        // The facts and metadata are still present and honest.
+        assert_eq!(report["algorithm"], serde_json::json!("HMAC-SHA256"));
+        assert_eq!(
+            report["facts"]["kind"],
+            serde_json::json!("verity.erasure.purge-report")
+        );
+    }
+
+    /// (c) Tampering with the signed facts breaks verification: a holder who
+    /// alters a per-table count (or any field) cannot re-derive a valid tag
+    /// without the server key.
+    #[test]
+    fn tampering_with_facts_breaks_verification() {
+        let minter = ScopeMinter::from_key_persistent([0x7fu8; 32]);
+        let facts = sample_facts();
+        let report = sign_purge_report(&minter, facts.clone()).expect("build report");
+        let sig = report["signature"].as_str().expect("signature present");
+
+        // Flip a purge count in the attested facts, re-serialize canonically.
+        let mut tampered = facts;
+        tampered["erased"]["episodes"] = serde_json::json!(9999);
+        let tampered_canonical = serde_json::to_vec(&tampered).expect("canon");
+
+        assert!(matches!(
+            minter.verify_bytes(PURGE_REPORT_DOMAIN, &tampered_canonical, sig),
+            Err(ScopeError::BadSignature)
+        ));
+
+        // Sanity: the untampered facts still verify with the same tag.
+        let good_canonical = serde_json::to_vec(&report["facts"]).expect("canon");
+        assert!(minter
+            .verify_bytes(PURGE_REPORT_DOMAIN, &good_canonical, sig)
+            .is_ok());
+    }
+
+    /// The report's hashed subject identifier matches the sha256 the surviving
+    /// audit row would carry — never plaintext PII — so a holder can cross-check
+    /// the report against audit.
+    #[test]
+    fn signed_facts_use_sha256_not_plaintext() {
+        let subject = "user:carol@example.com";
+        let hashed = super::sha256_hex(subject);
+        // 64 hex chars, and it is NOT the plaintext.
+        assert_eq!(hashed.len(), 64);
+        assert!(hashed.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(hashed, subject);
+
+        let minter = ScopeMinter::from_key_persistent([0x01u8; 32]);
+        let facts = serde_json::json!({
+            "kind": "verity.erasure.purge-report",
+            "subject_sha256": hashed,
+        });
+        let report = sign_purge_report(&minter, facts).expect("build report");
+        assert_eq!(report["facts"]["subject_sha256"], serde_json::json!(hashed));
+        // The plaintext subject appears nowhere in the signed report.
+        let blob = serde_json::to_string(&report).unwrap();
+        assert!(
+            !blob.contains(subject),
+            "plaintext PII leaked into purge report"
+        );
+    }
 }

@@ -121,6 +121,19 @@ impl ScopeMinter {
         }
     }
 
+    /// Test-only: build a minter from an explicit 32-byte key, flagged as
+    /// PERSISTENT — the equivalent of a `VERITY_SIGNING_KEY`-configured server,
+    /// but without touching the process environment (so tests stay hermetic and
+    /// parallel-safe). Lets a test both produce a purge-report signature and
+    /// independently recompute the HMAC over the same facts to verify it.
+    #[cfg(test)]
+    pub(crate) fn from_key_persistent(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            persistent_key: true,
+        }
+    }
+
     /// Whether this minter's key is persistent (env-provided) rather than a
     /// random per-process key. A `false` here is the honest "dev-mode /
     /// process-scoped signature" signal the console surfaces on purge reports.
@@ -138,6 +151,26 @@ impl ScopeMinter {
         mac.update(b":");
         mac.update(msg);
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    /// Verify a URL-safe base64 tag produced by `sign_bytes` over `(domain,
+    /// msg)`. Constant-time via the Mac trait; any malformation fails closed.
+    /// This is the exact inverse of `sign_bytes` — the purge-report verifier
+    /// (console-side, and the erasure tests) checks a report's signature with
+    /// this so it can never diverge from how the tag was produced.
+    // Exercised by the compliance tests only (the bin has no in-process
+    // verifier yet — verification happens holder-side); keep it available
+    // without tripping dead_code in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn verify_bytes(&self, domain: &str, msg: &[u8], sig: &str) -> Result<(), ScopeError> {
+        let sig = URL_SAFE_NO_PAD
+            .decode(sig)
+            .map_err(|_| ScopeError::Malformed)?;
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("any key length works");
+        mac.update(domain.as_bytes());
+        mac.update(b":");
+        mac.update(msg);
+        mac.verify_slice(&sig).map_err(|_| ScopeError::BadSignature)
     }
 
     pub fn mint(&self, mut payload: ScopePayload, ttl_seconds: i64) -> (String, DateTime<Utc>) {
