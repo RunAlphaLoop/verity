@@ -1563,8 +1563,10 @@ mod tests {
         let known = KnownCanonicals::new(["canon:hubspot:B"], std::iter::empty());
         let p2 = fold_with_known_canonicals(&evs, &cfg, &known);
         assert!(
-            p2.chunk_tags.iter().any(|t| t.subject_ref == "chunk:gdrive:D9:0"
-                && t.tags.contains(&"canon:hubspot:B".to_string())),
+            p2.chunk_tags
+                .iter()
+                .any(|t| t.subject_ref == "chunk:gdrive:D9:0"
+                    && t.tags.contains(&"canon:hubspot:B".to_string())),
             "already-folded (known) canonical + co-signal → tag materializes"
         );
     }
