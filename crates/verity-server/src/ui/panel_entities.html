@@ -16,10 +16,14 @@
            (GET /v1/admin/entity-resolution/review-queue · admin-token) as
            SIDE-BY-SIDE diff cards: left entity vs right, their field summaries,
            the matching method + score + key + namespace + judge rationale.
-           PRIORITIZED (design §8 Later): ordered by a priority score built from
-           frequency, entity value, tier, and recency, with an aging / SLA term
-           so the oldest-waiting candidate is never starved. Each card shows its
-           priority + wait-age; ordering only — no fold/merge behaviour changes.
+           PRIORITIZED (design §8 Later): the server orders by a priority score
+           built from frequency, entity value, tier, and recency, with an aging /
+           SLA term so the oldest-waiting candidate is never starved. The panel
+           renders that order as a RANKED list — each card shows its #rank,
+           priority score, and wait-age — and flags the longest-waiting card not
+           yet at the top as an ⚠ SLA-risk (amber rail) so a reviewer clears it.
+           This is a read-out of the server ordering: ordering only — no client
+           re-sort and no fold/merge behaviour changes.
            CONFIRM merge / REJECT (anti-link) per candidate → POST
            /v1/admin/entity-resolution/decide (re-runs the fold, then refreshes
            the queue + browser so badges/clusters update). A SPLIT affordance on
