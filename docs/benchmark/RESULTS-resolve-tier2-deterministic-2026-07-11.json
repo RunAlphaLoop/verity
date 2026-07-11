@@ -1,0 +1,50 @@
+{
+  "date": "2026-07-11",
+  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json",
+  "judge": "deterministic",
+  "metric": "entity_resolution_judge_precision_recall",
+  "result": {
+    "confusion": {
+      "fn": 2,
+      "fp": 0,
+      "tn": 35,
+      "tp": 31
+    },
+    "corpus": {
+      "easy_negatives": 3,
+      "hard_negatives": 32,
+      "negatives": 35,
+      "positives": 33,
+      "total": 68
+    },
+    "f1": 0.96875,
+    "false_merge_rate": 0.0,
+    "false_merges": [],
+    "missed_examples": [
+      {
+        "id": "er-0057",
+        "left": [
+          "Globex Corporation",
+          ""
+        ],
+        "right": [
+          "Globex",
+          "globex.io"
+        ]
+      },
+      {
+        "id": "er-0061",
+        "left": [
+          "Chotchkie's",
+          "chotchkies.com"
+        ],
+        "right": [
+          "Chotchkies",
+          "chotchkies.com"
+        ]
+      }
+    ],
+    "precision": 1.0,
+    "recall": 0.9393939393939394
+  }
+}

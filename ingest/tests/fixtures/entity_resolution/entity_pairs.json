@@ -1,0 +1,549 @@
+{
+  "_about": "Labeled entity-pair eval set for the ER Tier-2 sameness judge (resolve_tier2.EntityJudge). MIRRORS docs/benchmark/consolidation-pairs.jsonl in spirit but stored as a test fixture (like the other ingest/tests/fixtures). Each pair is two business entities (name + optional domain + source ledger ref 'source:entity_id') labeled same=true/false. PRECISION-FIRST composition: a FALSE merge unions two customers' scopes (a leak, resolve_tier2.py §3.2), so hard negatives (confusable-but-distinct companies) are heavily represented. 'kind' is one of: positive, hard_negative, easy_negative. 'rationale' says WHY the label is what it is. The deterministic oracle (EntityDeterministicJudge) must never fuse a negative (precision==1.0 / false_merge_rate==0.0); it WILL miss same-company positives that lack a clean shared domain — that recall gap is expected and acceptable, and is what the live EntityAnthropicJudge closes.",
+  "pairs": [
+    {
+      "id": "er-0001",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xACME", "name": "Acme, Inc.", "domain": "acme.com"},
+      "right": {"ref": "hubspot:4207",         "name": "Acme",      "domain": "acme.com"},
+      "rationale": "Canonical cross-source dup: legal-suffix/punctuation variation on the SAME registrable domain acme.com. The load-bearing true positive."
+    },
+    {
+      "id": "er-0002",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xGLBX", "name": "Globex Corporation", "domain": "globex.io"},
+      "right": {"ref": "hubspot:8815",         "name": "Globex",            "domain": "globex.io"},
+      "rationale": "Legal-suffix drop ('Corporation') on a shared domain — same company, two CRMs."
+    },
+    {
+      "id": "er-0003",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xINITECH", "name": "Initech LLC", "domain": "initech.com"},
+      "right": {"ref": "hubspot:2210",            "name": "Initech",     "domain": "https://www.initech.com/"},
+      "rationale": "URL-form domain (scheme + www + trailing slash) normalizes to initech.com; suffix 'LLC' dropped. Same entity."
+    },
+    {
+      "id": "er-0004",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xUMBRELLA", "name": "Umbrella Corp.", "domain": "umbrella.com"},
+      "right": {"ref": "gong:acct-771",            "name": "UMBRELLA",      "domain": "umbrella.com"},
+      "rationale": "Casing variation (all-caps vs title case) plus 'Corp.' suffix on a shared domain."
+    },
+    {
+      "id": "er-0005",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xHOOLI", "name": "Hooli", "domain": "hooli.com"},
+      "right": {"ref": "linear:org-3f1a",       "name": "Hooli, Inc.", "domain": "jane@hooli.com"},
+      "rationale": "Right domain is an EMAIL; its registrable part is hooli.com == left. Suffix variation only. Same."
+    },
+    {
+      "id": "er-0006",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xVEHM", "name": "Vehement Capital Partners", "domain": "vehement.com"},
+      "right": {"ref": "hubspot:6620",         "name": "Vehement Capital",         "domain": "vehement.com"},
+      "rationale": "Token subset ('Partners' dropped) on a shared domain — name-token subset + exact domain = same."
+    },
+    {
+      "id": "er-0007",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xSTRK", "name": "Stark Industries", "domain": "stark.com"},
+      "right": {"ref": "hubspot:1099",         "name": "Stark Industries Inc", "domain": "www2.stark.com"},
+      "rationale": "www2. host prefix strips to stark.com; identical name modulo suffix. Same."
+    },
+    {
+      "id": "er-0008",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xWNKA", "name": "Wonka Industries", "domain": "wonka.com"},
+      "right": {"ref": "gong:acct-042",        "name": "Wonka",           "domain": "WONKA.COM"},
+      "rationale": "Casefolded domain match; name-token subset ('Wonka' ⊂ 'Wonka Industries'). Same."
+    },
+    {
+      "id": "er-0009",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xSOYL", "name": "Soylent Corp", "domain": "soylent.com"},
+      "right": {"ref": "hubspot:3301",         "name": "Soylent Corporation", "domain": "soylent.com/contact"},
+      "rationale": "Path stripped from domain; 'Corp' vs 'Corporation' are both legal suffixes. Same."
+    },
+    {
+      "id": "er-0010",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xTYRL", "name": "Tyrell Corporation", "domain": "tyrell.com"},
+      "right": {"ref": "linear:org-9c",        "name": "The Tyrell Corporation", "domain": "tyrell.com"},
+      "rationale": "Leading article 'The' is a stripped filler token; shared domain. Same."
+    },
+    {
+      "id": "er-0011",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xWAYNE", "name": "Wayne Enterprises", "domain": "wayne.com"},
+      "right": {"ref": "hubspot:5150",          "name": "Wayne Enterprises", "domain": "wayne.com:443"},
+      "rationale": "Port suffix :443 stripped; identical names + domain. Trivially same (dedup across sources)."
+    },
+    {
+      "id": "er-0012",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xPIED", "name": "Pied Piper", "domain": "piedpiper.com"},
+      "right": {"ref": "gong:acct-808",        "name": "Pied Piper, LLC", "domain": "www.piedpiper.com"},
+      "rationale": "www + suffix variation on a shared domain. Same."
+    },
+    {
+      "id": "er-0013",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xMASS", "name": "Massive Dynamic", "domain": "massivedynamic.com"},
+      "right": {"ref": "hubspot:7007",         "name": "Massive Dynamic Co.", "domain": "massivedynamic.com"},
+      "rationale": "'Co.' suffix on a shared domain. Same."
+    },
+    {
+      "id": "er-0014",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xGEK", "name": "Gekko & Co", "domain": "gekko.com"},
+      "right": {"ref": "hubspot:2020",        "name": "Gekko and Company", "domain": "gekko.com"},
+      "rationale": "'& Co' vs 'and Company' — ampersand/punctuation + suffix variation; the discriminative token 'gekko' matches on a shared domain. Same."
+    },
+    {
+      "id": "er-0015",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xNAKA", "name": "Nakatomi Trading Corp", "domain": "nakatomi.co.jp"},
+      "right": {"ref": "hubspot:8080",         "name": "Nakatomi Trading",      "domain": "nakatomi.co.jp"},
+      "rationale": "Token subset + shared ccTLD domain nakatomi.co.jp. Same."
+    },
+    {
+      "id": "er-0016",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xCYBD", "name": "Cyberdyne Systems", "domain": "cyberdyne.com"},
+      "right": {"ref": "gong:acct-1984",       "name": "Cyberdyne Systems Corporation", "domain": "cyberdyne.com"},
+      "rationale": "Suffix addition ('Corporation') on a shared domain. Same."
+    },
+    {
+      "id": "er-0017",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xOSCORP", "name": "Oscorp Industries", "domain": "oscorp.com"},
+      "right": {"ref": "hubspot:6301",           "name": "OSCORP",           "domain": "oscorp.com"},
+      "rationale": "All-caps + token subset on a shared domain. Same."
+    },
+    {
+      "id": "er-0018",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xBLUEB", "name": "Bluebook Analytics", "domain": "bluebook.io"},
+      "right": {"ref": "hubspot:4444",          "name": "Bluebook Analytics, Inc.", "domain": "bluebook.io"},
+      "rationale": "Suffix-only difference on a shared domain. Same."
+    },
+    {
+      "id": "er-0019",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xVIRT", "name": "Virtucon", "domain": "virtucon.com"},
+      "right": {"ref": "linear:org-777",       "name": "Virtucon Global Holdings", "domain": "virtucon.com"},
+      "rationale": "Token superset ('Global Holdings' added, both filler-ish/legal); 'virtucon' is the discriminative shared token on a shared domain. Same."
+    },
+    {
+      "id": "er-0020",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xPRIMA", "name": "Primatech Paper Co.", "domain": "primatech.com"},
+      "right": {"ref": "hubspot:9099",          "name": "Primatech Paper",     "domain": "primatech.com"},
+      "rationale": "'Co.' suffix on a shared domain. Same."
+    },
+    {
+      "id": "er-0021",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xDUFF", "name": "Duff Beer", "domain": "duffbeer.com"},
+      "right": {"ref": "gong:acct-7up",        "name": "Duff Beer Company", "domain": "duffbeer.com"},
+      "rationale": "'Company' suffix on a shared domain. Same."
+    },
+    {
+      "id": "er-0022",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xVANDE", "name": "Vandelay Industries", "domain": "vandelay.com"},
+      "right": {"ref": "hubspot:4990",          "name": "Vandelay Imports",   "domain": "vandelay.com"},
+      "rationale": "SAME DOMAIN, DIFFERENT descriptive word ('Industries' vs 'Imports'). Same registrable domain + shared discriminative token 'vandelay' — a DBA/naming variance of one company. Same. (Deterministic oracle needs token overlap OR subset; 'vandelay' overlaps, so it fuses — correct here.)"
+    },
+    {
+      "id": "er-0023",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xKRUG", "name": "Krusty Krab", "domain": "krustykrab.com"},
+      "right": {"ref": "hubspot:1112",         "name": "The Krusty Krab Restaurant", "domain": "krustykrab.com"},
+      "rationale": "Article + descriptor added ('The ... Restaurant'); shared discriminative tokens on a shared domain. Same."
+    },
+    {
+      "id": "er-0024",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xCONT", "name": "Contoso Ltd", "domain": "contoso.com"},
+      "right": {"ref": "hubspot:3003",         "name": "Contoso Limited", "domain": "contoso.com"},
+      "rationale": "'Ltd' vs 'Limited' — both stripped legal suffixes; shared domain. Same."
+    },
+    {
+      "id": "er-0025",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xFABR", "name": "Fabrikam", "domain": "fabrikam.com"},
+      "right": {"ref": "gong:acct-fab",        "name": "Fabrikam GmbH", "domain": "fabrikam.com"},
+      "rationale": "'GmbH' legal suffix; shared domain; token subset. Same."
+    },
+    {
+      "id": "er-0026",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xNORTHW", "name": "Northwind Traders", "domain": "northwind.com"},
+      "right": {"ref": "hubspot:5566",           "name": "Northwind Traders PLC", "domain": "northwind.com"},
+      "rationale": "'PLC' suffix on a shared domain. Same."
+    },
+    {
+      "id": "er-0027",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xADAT", "name": "Adatum", "domain": "adatum.com"},
+      "right": {"ref": "linear:org-ad",        "name": "Adatum Corporation", "domain": "www.adatum.com"},
+      "rationale": "www + suffix; token subset on a shared domain. Same."
+    },
+    {
+      "id": "er-0028",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xACMEC", "name": "Acme Corp",    "domain": "acmecorp.com"},
+      "right": {"ref": "hubspot:9200",          "name": "Acme Freight", "domain": "acmefreight.com"},
+      "rationale": "Confusable name stem 'Acme' but DIFFERENT companies on DIFFERENT registrable domains. A false merge here leaks one customer into another's scope. Must stay apart."
+    },
+    {
+      "id": "er-0029",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xDELTAAIR", "name": "Delta Air Lines",       "domain": "delta.com"},
+      "right": {"ref": "hubspot:6120",             "name": "Delta Faucet Company",  "domain": "deltafaucet.com"},
+      "rationale": "Same first token 'Delta', totally different industries and domains (airline vs plumbing). Classic confusable. Must stay apart."
+    },
+    {
+      "id": "er-0030",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xSUMBK", "name": "Summit Bank",     "domain": "summitbank.com"},
+      "right": {"ref": "hubspot:6121",          "name": "Summit Roofing", "domain": "summitroofing.com"},
+      "rationale": "Shared 'Summit' token, different businesses and domains. Must stay apart."
+    },
+    {
+      "id": "er-0031",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xUNITEDA", "name": "United Airlines",     "domain": "united.com"},
+      "right": {"ref": "hubspot:6122",            "name": "United Van Lines",   "domain": "unitedvanlines.com"},
+      "rationale": "'United ...' is a shared generic token; airline vs moving company, different domains. Must stay apart."
+    },
+    {
+      "id": "er-0032",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xNATLB", "name": "National Bank",        "domain": "nationalbank.com"},
+      "right": {"ref": "hubspot:6123",          "name": "National Car Rental", "domain": "nationalcar.com"},
+      "rationale": "'National' is a generic shared token across unrelated firms; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0033",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xACMECOM", "name": "Acme", "domain": "acme.com"},
+      "right": {"ref": "linear:org-acmedev",      "name": "Acme", "domain": "acme.dev"},
+      "rationale": "IDENTICAL name, DIFFERENT registrable domains (acme.com vs acme.dev) — the §7 guard. Different companies (or prod vs an unrelated org). Must stay apart."
+    },
+    {
+      "id": "er-0034",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xPARENT", "name": "Globex Corporation",              "domain": "globex.com"},
+      "right": {"ref": "hubspot:6124",            "name": "Globex Financial Services",       "domain": "globexfinancial.com"},
+      "rationale": "Parent vs a genuinely-distinct subsidiary with its OWN domain and scope. They are separate legal entities with separate data scopes — merging would over-broaden. Must stay apart."
+    },
+    {
+      "id": "er-0035",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xINTERNAL", "name": "Verity",   "domain": "verity.internal"},
+      "right": {"ref": "hubspot:6125",             "name": "Verity Analytics", "domain": "veritas-analytics.com"},
+      "rationale": "Internal-org entity (our own company, verity.internal) vs a CUSTOMER named similarly. Merging an internal entity into a customer scope is a direct leak. Different domains. Must stay apart."
+    },
+    {
+      "id": "er-0036",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xJANE", "name": "Jane Smith",  "domain": "gmail.com"},
+      "right": {"ref": "hubspot:6126",         "name": "John Doe",    "domain": "gmail.com"},
+      "rationale": "Two people on a FREE-MAIL domain (gmail.com). A shared free-mail domain is NOT identity evidence — co-tenancy, not co-company. Different names. Must stay apart."
+    },
+    {
+      "id": "er-0037",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xCON1", "name": "Consulting", "domain": "outlook.com"},
+      "right": {"ref": "hubspot:6127",         "name": "Consulting", "domain": "outlook.com"},
+      "rationale": "Placeholder name on a free-mail/webmail domain (outlook.com). Same name + same free-mail domain must NOT link — the domain carries no company identity. Must stay apart."
+    },
+    {
+      "id": "er-0038",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xPHX1", "name": "Phoenix Systems",   "domain": "phoenixsystems.com"},
+      "right": {"ref": "hubspot:6128",         "name": "Phoenix Contact",   "domain": "phoenixcontact.com"},
+      "rationale": "Shared 'Phoenix' token; different second token, different domains, different companies. Must stay apart."
+    },
+    {
+      "id": "er-0039",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xMONARCH1", "name": "Monarch Health",   "domain": "monarchhealth.com"},
+      "right": {"ref": "hubspot:6129",             "name": "Monarch Beverage", "domain": "monarchbeverage.com"},
+      "rationale": "Same-name-different-industry ('Monarch' health vs beverage); different domains. Must stay apart."
+    },
+    {
+      "id": "er-0040",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xAPEX1", "name": "Apex Legal",     "domain": "apexlegal.com"},
+      "right": {"ref": "hubspot:6130",          "name": "Apex Fitness",   "domain": "apexfitness.com"},
+      "rationale": "Shared 'Apex' brand-y token across unrelated verticals; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0041",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xPINN1", "name": "Pinnacle Group", "domain": "pinnaclegroup.com"},
+      "right": {"ref": "hubspot:6131",          "name": "Pinnacle Bank",  "domain": "pinnaclebank.com"},
+      "rationale": "'Pinnacle' shared; group (staffing) vs bank; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0042",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xACMEUK", "name": "Acme Corporation", "domain": "acme.co.uk"},
+      "right": {"ref": "hubspot:6132",           "name": "Acme Corporation", "domain": "acme.com"},
+      "rationale": "Same name, DIFFERENT registrable domains (acme.co.uk vs acme.com) — possibly related regional entities but distinct scopes; without a human link they must NOT auto-fuse. Precision-first: distinct domains => stay apart."
+    },
+    {
+      "id": "er-0043",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xSTERL", "name": "Sterling Cooper",        "domain": "sterlingcooper.com"},
+      "right": {"ref": "hubspot:6133",          "name": "Sterling Cooper Draper Pryce", "domain": "scdp.com"},
+      "rationale": "A predecessor firm vs the renamed successor on a DIFFERENT domain. Related history but distinct entities/domains; no clean shared-domain signal. Must stay apart (deterministically)."
+    },
+    {
+      "id": "er-0044",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xWONKAA", "name": "Wonka Industries", "domain": "wonka.com"},
+      "right": {"ref": "hubspot:6134",           "name": "Wonka Candy Co.",  "domain": "wonkacandy.com"},
+      "rationale": "Confusable Wonka names but DIFFERENT domains (wonka.com vs wonkacandy.com). Must stay apart — pairs with the er-0008 positive (which shares wonka.com) to prove domain, not name, decides."
+    },
+    {
+      "id": "er-0045",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xSTARK1", "name": "Stark Industries", "domain": "stark.com"},
+      "right": {"ref": "hubspot:6135",           "name": "Stark Bank",       "domain": "starkbank.com"},
+      "rationale": "'Stark' shared; industrial vs bank; different domains. Must stay apart (contrasts er-0007's true positive on stark.com)."
+    },
+    {
+      "id": "er-0046",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xEMP1", "name": "Bob Vance", "domain": "dundermifflin.com"},
+      "right": {"ref": "hubspot:6136",         "name": "Vance Refrigeration", "domain": "vancerefrigeration.com"},
+      "rationale": "An internal-employee-email entity (someone @dundermifflin.com) vs a real customer company. Name token 'Vance' overlaps but the entities are of different kinds; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0047",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xGENERIC1", "name": "Solutions Inc",  "domain": "solutionsinc.com"},
+      "right": {"ref": "hubspot:6137",             "name": "Solutions LLC",  "domain": "solutions-llc.com"},
+      "rationale": "After stripping legal suffixes BOTH names normalize to 'solutions' — a generic word — but the domains differ. Generic-name collision must NOT fuse. Must stay apart."
+    },
+    {
+      "id": "er-0048",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xCAP1", "name": "Capital One",   "domain": "capitalone.com"},
+      "right": {"ref": "hubspot:6138",         "name": "Capital Group", "domain": "capitalgroup.com"},
+      "rationale": "'Capital' shared token; bank vs asset manager; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0049",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xLIB1", "name": "Liberty Mutual",  "domain": "libertymutual.com"},
+      "right": {"ref": "hubspot:6139",         "name": "Liberty Media",   "domain": "libertymedia.com"},
+      "rationale": "'Liberty' shared; insurance vs media holding; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0050",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xFIRST1", "name": "First National",  "domain": "firstnational.com"},
+      "right": {"ref": "hubspot:6140",           "name": "First Republic",  "domain": "firstrepublic.com"},
+      "rationale": "'First ...' generic banking prefix; distinct banks and domains. Must stay apart."
+    },
+    {
+      "id": "er-0051",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xORACLE1", "name": "Oracle", "domain": "oracle.com"},
+      "right": {"ref": "hubspot:6141",            "name": "Oracle", "domain": "yahoo.com"},
+      "rationale": "Real company (oracle.com) vs an entity that only has a free-mail contact domain (yahoo.com). The free-mail side carries no company identity even with an identical name. Must stay apart."
+    },
+    {
+      "id": "er-0052",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xTESLA1", "name": "Tesla",         "domain": "tesla.com"},
+      "right": {"ref": "hubspot:6142",           "name": "Tesla Medical", "domain": "teslamedical.com"},
+      "rationale": "Famous single-word brand vs an unrelated firm reusing the name; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0053",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xSHELL1", "name": "Shell",           "domain": "shell.com"},
+      "right": {"ref": "hubspot:6143",           "name": "Shell Shockers",  "domain": "shellshockers.io"},
+      "rationale": "Energy major vs an unrelated game studio; shared first token, different domains. Must stay apart."
+    },
+    {
+      "id": "er-0054",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xMETA1", "name": "Meta Platforms", "domain": "meta.com"},
+      "right": {"ref": "hubspot:6144",          "name": "Meta Financial", "domain": "metafinancial.com"},
+      "rationale": "'Meta' shared; social vs financial; different domains. Must stay apart."
+    },
+    {
+      "id": "er-0055",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xNODOM1", "name": "Initech", "domain": ""},
+      "right": {"ref": "hubspot:6145",           "name": "Initrode", "domain": ""},
+      "rationale": "No domain on either side and similar-looking names of DIFFERENT companies. With no domain evidence the judge must abstain (fail closed) — name-only never merges. Must stay apart."
+    },
+    {
+      "id": "er-0056",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xSUBSID1", "name": "Alphabet",   "domain": "abc.xyz"},
+      "right": {"ref": "hubspot:6146",            "name": "Google",     "domain": "google.com"},
+      "rationale": "Parent (Alphabet) vs subsidiary (Google) — real relationship but distinct entities, distinct domains, distinct data scopes. Auto-fusing them over-broadens scope. Must stay apart (a human link, not the auto-judge, would relate them)."
+    },
+    {
+      "id": "er-0057",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xNAMEONLY", "name": "Globex Corporation", "domain": ""},
+      "right": {"ref": "hubspot:8815",             "name": "Globex",            "domain": "globex.io"},
+      "rationale": "Genuinely the SAME company as er-0002, but the left side has NO domain, so there is no exact shared-domain signal. The strict deterministic oracle MUST abstain here (name-only is ambiguous => fail closed => predicts NOT same), so this is a RECALL MISS (a false negative), NOT a false merge. Included deliberately to exercise the recall gap the live judge is meant to close. Labeled same=true."
+    },
+    {
+      "id": "er-0058",
+      "kind": "easy_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xEASY1", "name": "Zorp Robotics", "domain": "zorp.io"},
+      "right": {"ref": "hubspot:6147",          "name": "Wexler Foods",  "domain": "wexlerfoods.com"},
+      "rationale": "Totally unrelated names and domains — the blocker should not even surface this. Trivial true negative (sanity anchor)."
+    },
+    {
+      "id": "er-0059",
+      "kind": "easy_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xEASY2", "name": "Quokka Ltd",       "domain": "quokka.com"},
+      "right": {"ref": "hubspot:6148",           "name": "Bison Logistics", "domain": "bisonlogistics.com"},
+      "rationale": "Unrelated on every axis. Trivial true negative."
+    },
+    {
+      "id": "er-0060",
+      "kind": "easy_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xEASY3", "name": "Marigold Media",   "domain": "marigold.tv"},
+      "right": {"ref": "hubspot:6149",           "name": "Ironclad Steel",  "domain": "ironcladsteel.com"},
+      "rationale": "Unrelated names/domains. Trivial true negative."
+    },
+    {
+      "id": "er-0061",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xCHOTCH", "name": "Chotchkie's", "domain": "chotchkies.com"},
+      "right": {"ref": "hubspot:6150",           "name": "Chotchkies",  "domain": "chotchkies.com"},
+      "rationale": "Apostrophe/punctuation variation ('Chotchkie's' vs 'Chotchkies') on a shared domain. Same."
+    },
+    {
+      "id": "er-0062",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xLUMON", "name": "Lumon Industries", "domain": "lumon.com"},
+      "right": {"ref": "hubspot:6151",          "name": "lumon industries", "domain": "lumon.com"},
+      "rationale": "Pure casing difference on a shared domain. Same."
+    },
+    {
+      "id": "er-0063",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xBUYNL", "name": "Buy n Large", "domain": "buynlarge.com"},
+      "right": {"ref": "hubspot:6152",          "name": "Buy 'n Large Corp", "domain": "buynlarge.com"},
+      "rationale": "Punctuation ('n vs n) + suffix variation on a shared domain. Same."
+    },
+    {
+      "id": "er-0064",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xGRINGO", "name": "Los Pollos Hermanos", "domain": "lospolloshermanos.com"},
+      "right": {"ref": "hubspot:6153",           "name": "Los Pollos Hermanos LLC", "domain": "www.lospolloshermanos.com"},
+      "rationale": "www + suffix on a shared domain; multiword name matches. Same."
+    },
+    {
+      "id": "er-0065",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xDMFF", "name": "Dunder Mifflin Paper Company", "domain": "dundermifflin.com"},
+      "right": {"ref": "hubspot:6154",         "name": "Dunder Mifflin", "domain": "dundermifflin.com"},
+      "rationale": "Token subset ('Paper Company' dropped) on a shared domain. Same. (Contrasts er-0046, where a Dunder-Mifflin EMPLOYEE entity must NOT fuse with a customer.)"
+    },
+    {
+      "id": "er-0066",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xDMFF2", "name": "Dunder Mifflin", "domain": "dundermifflin.com"},
+      "right": {"ref": "hubspot:6155",          "name": "Michael Scott Paper Company", "domain": "michaelscottpaper.com"},
+      "rationale": "A breakaway company vs the original — related in the world but distinct entities on distinct domains. No shared-domain signal. Must stay apart."
+    },
+    {
+      "id": "er-0067",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xTWOSAME", "name": "Acme", "domain": "hotmail.com"},
+      "right": {"ref": "hubspot:6156",            "name": "Acme", "domain": "acme.com"},
+      "rationale": "One side's only domain is free-mail (hotmail.com), the other is the real corporate domain. Even with identical names, the free-mail side is not identity evidence, and the domains differ. Must stay apart."
+    },
+    {
+      "id": "er-0068",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xVAND2", "name": "Vandelay Industries", "domain": "vandelay-industries.com"},
+      "right": {"ref": "hubspot:6157",          "name": "Vandelay Imports",   "domain": "vandelay-imports.com"},
+      "rationale": "SAME confusable stem as the er-0022 positive but here the DOMAINS DIFFER (vandelay-industries.com vs vandelay-imports.com) — so they are two different companies. Proves the decision rides on domain, not name similarity. Must stay apart."
+    }
+  ]
+}

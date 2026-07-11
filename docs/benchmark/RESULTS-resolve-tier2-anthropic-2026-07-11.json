@@ -1,0 +1,64 @@
+{
+  "date": "2026-07-11",
+  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json",
+  "judge": "anthropic",
+  "metric": "entity_resolution_judge_precision_recall",
+  "result": {
+    "confusion": {
+      "fn": 1,
+      "fp": 2,
+      "tn": 33,
+      "tp": 32
+    },
+    "corpus": {
+      "easy_negatives": 3,
+      "hard_negatives": 32,
+      "negatives": 35,
+      "positives": 33,
+      "total": 68
+    },
+    "f1": 0.955223880597015,
+    "false_merge_rate": 0.05714285714285714,
+    "false_merges": [
+      {
+        "id": "er-0051",
+        "left": [
+          "Oracle",
+          "oracle.com"
+        ],
+        "rationale": "Real company (oracle.com) vs an entity that only has a free-mail contact domain (yahoo.com). The free-mail side carries no company identity even with an identical name. Must stay apart.",
+        "right": [
+          "Oracle",
+          "yahoo.com"
+        ]
+      },
+      {
+        "id": "er-0067",
+        "left": [
+          "Acme",
+          "hotmail.com"
+        ],
+        "rationale": "One side's only domain is free-mail (hotmail.com), the other is the real corporate domain. Even with identical names, the free-mail side is not identity evidence, and the domains differ. Must stay apart.",
+        "right": [
+          "Acme",
+          "acme.com"
+        ]
+      }
+    ],
+    "missed_examples": [
+      {
+        "id": "er-0057",
+        "left": [
+          "Globex Corporation",
+          ""
+        ],
+        "right": [
+          "Globex",
+          "globex.io"
+        ]
+      }
+    ],
+    "precision": 0.9411764705882353,
+    "recall": 0.9696969696969697
+  }
+}
