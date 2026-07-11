@@ -81,6 +81,7 @@ fn proposal(tenant: TenantId, statement: &str, evidence: Vec<EpisodeId>) -> Know
     KnowledgeProposal {
         tenant_id: tenant,
         statement: statement.into(),
+        canonical_statement: None,
         categories: vec!["industry:healthcare".into(), "objection:dpa".into()],
         evidence,
         proposed_by_sub: Some("user:test".into()),

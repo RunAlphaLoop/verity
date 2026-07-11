@@ -452,6 +452,10 @@ fn hit_from_payload(
         score,
         entity_tags,
         kind: get_str("kind")?,
+        // Knowledge support tier is a publish-time field on the Postgres
+        // carve-out chunk; the Qdrant payload does not mirror it (this profile
+        // delegates knowledge/publish to Postgres), so it is absent here.
+        support_tier: None,
         acl_provenance: AclProvenance::from_str_lossy(&get_str("acl_provenance")?),
         trust_tier: if get_i64("trust_tier")? == 1 {
             TrustTier::Authoritative

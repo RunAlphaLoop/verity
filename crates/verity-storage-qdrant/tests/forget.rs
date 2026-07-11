@@ -187,6 +187,7 @@ async fn episode_forget_cascades_published_knowledge() {
         .propose_knowledge(KnowledgeProposal {
             tenant_id: tenant,
             statement: "Buyers in this segment escalate renewal pricing to procurement.".into(),
+            canonical_statement: None,
             categories: vec!["objection:pricing".into()],
             evidence: vec![e1, e2, e3],
             proposed_by_sub: None,
