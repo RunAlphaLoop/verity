@@ -178,12 +178,30 @@ _CANONICAL_SYNONYMS = {
 }
 
 # Multi-word phrases collapsed to a single canonical token BEFORE tokenization.
+# ORDER MATTERS: longer / more specific phrases first so they win. The security
+# artifacts (DPA, SOC 2 report, penetration test, security questionnaire, BAA)
+# each map to a DISTINCT stable token — this is the recall aid for the
+# security_dpa cluster's same-artifact paraphrases, and the precision guard for
+# its hard negatives (different artifact => different canonical form => no merge;
+# the role-based assembly keeps the artifact token in the discriminative slot).
 _CANONICAL_PHRASES = [
+    # Artifacts (distinct tokens — NEVER collapse two different artifacts).
     (re.compile(r"\bdata\s+processing\s+agreement\b", re.IGNORECASE), " signed_dpa "),
     (re.compile(r"\bsigned\s+dpa\b", re.IGNORECASE), " signed_dpa "),
-    (re.compile(r"\bsecurity\s+(?:review|assessment)\b", re.IGNORECASE), " security_review "),
+    (re.compile(r"\bbusiness\s+associate\s+agreement\b", re.IGNORECASE), " signed_baa "),
+    (re.compile(r"\bbaa\b", re.IGNORECASE), " signed_baa "),
+    (
+        re.compile(r"\bsoc\s*2(?:\s+type\s+ii)?(?:\s+(?:report|attestation))?\b", re.IGNORECASE),
+        " soc2_report ",
+    ),
+    (re.compile(r"\b(?:third[- ]party\s+|independent\s+)?pen(?:etration)?[- ]test(?:\s+report)?\b",
+                re.IGNORECASE), " pentest "),
+    (re.compile(r"\b(?:vendor\s+)?security\s+questionnaire\b", re.IGNORECASE),
+     " security_questionnaire "),
+    # Gate / event phrases.
+    (re.compile(r"\bsecurity\s+(?:review|assessment|evaluation|evaluations)\b", re.IGNORECASE),
+     " security_review "),
     (re.compile(r"\bsecurity\s+teams?\b", re.IGNORECASE), " segment_buyer "),
-    (re.compile(r"\bsecurity\s+team\b", re.IGNORECASE), " segment_buyer "),
 ]
 
 
@@ -339,18 +357,35 @@ class KnowledgeCandidate:
     categories: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
     canonical_statement: str | None = None
+    # The judge's DECISION (knowledge-merge-tuning.md §2, stage 2), filled in by
+    # the worker AFTER extraction: the existing knowledge_id the judge ruled is
+    # the SAME generalization as this candidate, plus its one-line reason. None
+    # = no judged merge (blocker empty, judge NO/uncertain, or LLM unavailable —
+    # all fail closed to a fresh candidate). The server still runs the
+    # deterministic canonical-exact fast path itself; these fields only carry the
+    # LLM-judged path.
+    merge_into: str | None = None
+    judge_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.canonical_statement is None:
             self.canonical_statement = canonical_statement(self.statement)
 
     def to_json(self) -> dict:
-        return {
+        body: dict[str, Any] = {
             "statement": self.statement,
             "categories": self.categories,
             "evidence": self.evidence,
             "canonical_statement": self.canonical_statement,
         }
+        # Only emit the judged-merge fields when the judge actually decided a
+        # merge — keeps the wire body identical to Phase 1 for the no-merge case
+        # (fixtures, fail-closed paths) and the server treats absence as "fresh".
+        if self.merge_into is not None:
+            body["merge_into"] = self.merge_into
+            if self.judge_reason is not None:
+                body["judge_reason"] = self.judge_reason
+        return body
 
 
 @dataclass
@@ -703,6 +738,254 @@ class AnthropicExtractor:
 
 
 # ---------------------------------------------------------------------------
+# The JUDGE (knowledge-merge-tuning.md §2, stage 2)
+#
+# Stage 1 (the BLOCKER) runs server-side: /v1/admin/consolidation/merge-candidates
+# returns the low-τ cosine + shared-category candidate SET. Stage 2 (the JUDGE)
+# runs HERE, in the worker, because the worker already holds the LLM and the
+# cross-scope read. For each blocker candidate the judge answers, strictly,
+# "is the proposed statement the SAME generalization as this existing one?" —
+# yes/no + a one-line reason. Ties / uncertainty / any error => NO (fail closed:
+# a missed merge is the acceptable failure, a false merge is not). The worker
+# passes the FIRST yes as {merge_into, judge_reason} to complete(); the server
+# still runs the deterministic canonical-exact fast path itself and VALIDATES
+# the judged id before merging.
+#
+# Two judges ship, wired like the extractors (--judge / build_judge):
+#   - DeterministicJudge — LLM-FREE, used by ALL automated tests. "Same" iff the
+#     canonical_statements are byte-identical OR a conservative structural rule
+#     matches (same required artifact + same before/gate tokens). Precision-first:
+#     it never says yes on distinct required artifacts (DPA vs SOC2 stay apart).
+#   - AnthropicJudge — the live seam behind ANTHROPIC_API_KEY (httpx Messages
+#     API, strict yes/no+reason JSON, fail-closed parse). Shape-tested via respx.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JudgeVerdict:
+    """One judge decision for a (proposed, existing) pair."""
+
+    same: bool
+    reason: str
+
+
+@dataclass
+class JudgeExisting:
+    """An existing knowledge item as returned by the blocker (merge-candidates)."""
+
+    knowledge_id: str
+    statement: str
+    categories: list[str] = field(default_factory=list)
+    canonical_statement: str | None = None
+    cosine: float | None = None
+
+    @classmethod
+    def from_json(cls, body: dict) -> "JudgeExisting":
+        return cls(
+            knowledge_id=body["knowledge_id"],
+            statement=body.get("statement", ""),
+            categories=list(body.get("categories", [])),
+            canonical_statement=body.get("canonical_statement"),
+            cosine=body.get("cosine"),
+        )
+
+
+class Judge(Protocol):
+    def judge(self, proposed: KnowledgeCandidate, existing: JudgeExisting) -> JudgeVerdict: ...
+
+
+# Controlled ARTIFACT vocabulary (knowledge-merge-tuning.md §2/§3): the closed
+# set of stable tokens the phrase-normalizer emits for a required security
+# artifact. These are the DISCRIMINATIVE payload of the "requires <artifact>
+# before <gate>" family — two generalizations requiring DIFFERENT artifacts are
+# DIFFERENT generalizations (DPA vs SOC 2 vs pen-test vs questionnaire vs BAA).
+# The judge keys sameness on this set, so it is robust to free-text filler
+# (adjectives, verbs, "completed"/"recent"/"annual"/"demands"/"ask for") that
+# varies across paraphrases but carries no generalization content. Adding a token
+# here NEVER lowers precision (distinct tokens stay distinct); it only lets the
+# judge recognize same-artifact paraphrases (recall).
+_ARTIFACT_VOCAB = frozenset(
+    {
+        "signed_dpa",
+        "signed_baa",
+        "soc2_report",
+        "pentest",
+        "security_questionnaire",
+    }
+)
+
+
+def _artifact_set(statement: str, canon: str | None = None) -> frozenset[str]:
+    """The controlled-vocabulary artifact tokens a statement carries.
+
+    Runs the deterministic canonicalizer (which maps the surface artifact phrases
+    to their stable tokens) and intersects with `_ARTIFACT_VOCAB`. Filler words
+    are ignored — only the closed artifact vocabulary counts, so paraphrases with
+    the same artifact align regardless of wording, and different artifacts never
+    collide."""
+    form = canon or canonical_statement(statement)
+    return frozenset(t for t in form.split() if t in _ARTIFACT_VOCAB)
+
+
+class DeterministicJudge:
+    """LLM-free judge — the honest oracle every automated test uses.
+
+    Says SAME iff EITHER the two canonical statements are byte-identical, OR they
+    carry the identical NON-EMPTY controlled-artifact set (the "requires
+    <artifact> before <gate>" family — DPA/SOC2/pen-test/questionnaire/BAA). Both
+    legs are precision-first: byte-identity never over-normalizes, and the
+    artifact-set rule keys on a closed distinct vocabulary, so it NEVER fuses two
+    different required artifacts (no false merge — DPA-before-review and
+    SOC2-before-review stay apart). It WILL miss paraphrases outside the artifact
+    family (recall gap, the acceptable failure); the live AnthropicJudge closes
+    that gap without lowering precision."""
+
+    def judge(self, proposed: KnowledgeCandidate, existing: JudgeExisting) -> JudgeVerdict:
+        pc = (proposed.canonical_statement or canonical_statement(proposed.statement)).strip()
+        ec = (
+            existing.canonical_statement
+            or canonical_statement(existing.statement)
+        ).strip()
+        if pc and pc == ec:
+            return JudgeVerdict(True, "identical canonical generalization")
+        p_art = _artifact_set(proposed.statement, pc)
+        e_art = _artifact_set(existing.statement, ec)
+        # Same required artifact(s), non-empty on both sides: same generalization.
+        # Distinct artifacts (or an empty set on either side) => NOT SAME.
+        if p_art and p_art == e_art:
+            return JudgeVerdict(True, f"same required artifact {sorted(p_art)}")
+        return JudgeVerdict(False, "different generalization (required artifact or gate differ)")
+
+
+ANTHROPIC_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "same_generalization": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["same_generalization", "reason"],
+    "additionalProperties": False,
+}
+
+_JUDGE_PROMPT = """\
+You are a STRICT precision-first judge for an enterprise memory system. You are \
+given two entity-free generalizations ("lessons learned across customers"). \
+Decide whether they are THE SAME generalization — i.e. whether an incoming \
+lesson should accrue support onto the existing one rather than stand alone.
+
+Rules:
+- Answer SAME only if they assert the same requirement/behavior about the same \
+subject with the same object/artifact and (if present) the same gating event. \
+Paraphrase, word order, synonyms, and hedging do NOT matter.
+- If they differ in the REQUIRED ARTIFACT (e.g. a DPA vs a SOC 2 report vs a \
+penetration test) or in the GATED EVENT, answer NOT SAME — even if they are \
+topically close.
+- If you are uncertain, or it is a tie, answer NOT SAME. A missed merge is \
+acceptable; a wrong merge fabricates cross-customer support and is not.
+
+Existing generalization: {existing}
+Incoming generalization: {proposed}
+
+Return JSON {{"same_generalization": bool, "reason": "<one line>"}}."""
+
+
+class AnthropicJudge:
+    """Messages-API judge — the live seam, active only with ANTHROPIC_API_KEY.
+
+    Strict yes/no + one-line reason via structured outputs. Fail-closed on any
+    parse/transport error: returns NOT SAME (never a merge). Shape-tested with
+    respx; a live call runs only when the key exists."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = ANTHROPIC_MODEL,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise RuntimeError(
+                "AnthropicJudge requires ANTHROPIC_API_KEY; "
+                "use DeterministicJudge without one"
+            )
+        self.model = model
+        self._client = client or httpx.Client(timeout=60.0)
+
+    def judge(self, proposed: KnowledgeCandidate, existing: JudgeExisting) -> JudgeVerdict:
+        prompt = _JUDGE_PROMPT.format(existing=existing.statement, proposed=proposed.statement)
+        try:
+            response = self._client.post(
+                ANTHROPIC_API_URL,
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "max_tokens": 512,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "output_config": {
+                        "format": {"type": "json_schema", "schema": ANTHROPIC_JUDGE_SCHEMA}
+                    },
+                },
+            )
+            response.raise_for_status()
+            body = response.json()
+            if body.get("stop_reason") == "refusal":
+                return JudgeVerdict(False, "judge refused; failing closed (no merge)")
+            text = next(b["text"] for b in body["content"] if b["type"] == "text")
+            parsed = json.loads(text)
+            same = bool(parsed["same_generalization"])
+            reason = str(parsed.get("reason", "")).strip() or "no reason given"
+        except (httpx.HTTPError, KeyError, ValueError, StopIteration) as exc:
+            # Fail closed: any error => NOT SAME, never a merge.
+            return JudgeVerdict(False, f"judge error, failing closed: {exc}")
+        return JudgeVerdict(same, reason)
+
+
+def build_judge(name: str) -> Judge:
+    if name == "deterministic":
+        return DeterministicJudge()
+    if name == "anthropic":
+        return AnthropicJudge()
+    raise ValueError(f"unknown judge {name!r}")
+
+
+def decide_merges(
+    client: "ConsolidationClient",
+    tenant_id: str,
+    judge: Judge,
+    candidates: list[KnowledgeCandidate],
+) -> None:
+    """Run the cascade's stages 1b+2 for each candidate, in place.
+
+    For each candidate: ask the server for the blocker candidate set (stage 1),
+    run the judge over it (stage 2), and set merge_into+judge_reason on the FIRST
+    yes. Fail-closed everywhere: an empty set, all-NO, or a blocker/judge error
+    leaves merge_into=None (the server mints a fresh candidate). Never raises on
+    the blocker call — the LLM-unavailable / server-hiccup path degrades to no
+    auto-merge, exactly as the design requires (never a bare low-τ merge)."""
+    for cand in candidates:
+        try:
+            existing = client.merge_candidates(
+                tenant_id,
+                canonical_statement=cand.canonical_statement,
+                statement=cand.statement,
+                categories=cand.categories,
+            )
+        except httpx.HTTPError:
+            # Blocker unavailable => no auto-merge (fail closed).
+            continue
+        for item in existing:
+            verdict = judge.judge(cand, item)
+            if verdict.same:
+                cand.merge_into = item.knowledge_id
+                cand.judge_reason = verdict.reason
+                break
+
+
+# ---------------------------------------------------------------------------
 # Client + loop
 # ---------------------------------------------------------------------------
 
@@ -729,6 +1012,28 @@ class ConsolidationClient:
         response.raise_for_status()
         return [LeasedEpisode.from_json(e) for e in response.json()["episodes"]]
 
+    def merge_candidates(
+        self,
+        tenant_id: str,
+        canonical_statement: str | None,
+        statement: str,
+        categories: list[str],
+    ) -> list[JudgeExisting]:
+        """Stage 1 (BLOCKER): ask the server for the candidate SET the judge
+        should rule on — existing knowledge with cosine >= τ_block and (when
+        categories are given) shared >= 1 category, capped server-side."""
+        response = self._client.post(
+            "/v1/admin/consolidation/merge-candidates",
+            json={
+                "tenant_id": tenant_id,
+                "canonical_statement": canonical_statement,
+                "statement": statement,
+                "categories": categories,
+            },
+        )
+        response.raise_for_status()
+        return [JudgeExisting.from_json(c) for c in response.json().get("candidates", [])]
+
     def complete(self, tenant_id: str, episode_id: str, extraction: Extraction) -> dict:
         response = self._client.post(
             "/v1/admin/consolidation/complete",
@@ -743,14 +1048,25 @@ def run_once(
     tenant_id: str,
     extractor: Extractor,
     limit: int = 16,
+    judge: Judge | None = None,
 ) -> int:
-    """One lease -> extract -> complete pass. Returns episodes completed.
-    An `already_processed` acknowledgement (another worker won, or a retry
-    after our own crash-and-re-lease) counts as done — idempotent by design."""
+    """One lease -> extract -> (judge) -> complete pass. Returns episodes done.
+
+    When a `judge` is given, the merge cascade runs BETWEEN extract and complete:
+    for each knowledge candidate the worker calls the blocker (merge-candidates)
+    and runs the judge over the returned set, tagging the candidate with
+    merge_into+judge_reason on a yes (stage 2). Without a judge, no judged merge
+    is proposed — the server still runs its deterministic canonical-exact fast
+    path. Fail-closed throughout (see `decide_merges`).
+
+    An `already_processed` acknowledgement (another worker won, or a retry after
+    our own crash-and-re-lease) counts as done — idempotent by design."""
     episodes = client.lease(tenant_id, limit=limit)
     completed = 0
     for episode in episodes:
         extraction = extractor.extract(episode)
+        if judge is not None and extraction.knowledge_candidates:
+            decide_merges(client, tenant_id, judge, extraction.knowledge_candidates)
         client.complete(tenant_id, episode.episode_id, extraction)
         completed += 1
     return completed
@@ -778,15 +1094,24 @@ def main(argv: list[str] | None = None) -> int:
         choices=["deterministic", "anthropic"],
         default="deterministic",
     )
+    parser.add_argument(
+        "--judge",
+        choices=["none", "deterministic", "anthropic"],
+        default="none",
+        help="merge-cascade stage-2 judge: none (no judged merge; deterministic "
+        "canonical-exact fast path still runs server-side), deterministic "
+        "(LLM-free canonical+rule oracle), or anthropic (live, needs ANTHROPIC_API_KEY)",
+    )
     parser.add_argument("--limit", type=int, default=16)
     parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument("--once", action="store_true", help="one pass, then exit (tests)")
     args = parser.parse_args(argv)
 
     extractor = build_extractor(args.extractor)
+    judge = None if args.judge == "none" else build_judge(args.judge)
     client = ConsolidationClient(args.base_url, admin_token=args.admin_token)
     while True:
-        completed = run_once(client, args.tenant_id, extractor, limit=args.limit)
+        completed = run_once(client, args.tenant_id, extractor, limit=args.limit, judge=judge)
         print(f"consolidation: completed {completed} episode(s)", file=sys.stderr)
         if args.once:
             return 0

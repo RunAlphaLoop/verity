@@ -20,20 +20,27 @@ import respx
 
 from verity_ingest.consolidation import (
     ANTHROPIC_API_URL,
+    ANTHROPIC_JUDGE_SCHEMA,
     ANTHROPIC_MODEL,
     AnthropicExtractor,
+    AnthropicJudge,
     ConsolidationClient,
     DeterministicExtractor,
+    DeterministicJudge,
     Extraction,
+    JudgeExisting,
     KnowledgeCandidate,
     L2Fact,
     LeasedEpisode,
     TagSuggestion,
     build_extractor,
+    build_judge,
     canonical_predicate,
     canonical_statement,
+    decide_merges,
     run_once,
 )
+from verity_ingest.consolidation_eval import evaluate as evaluate_cascade
 
 FIXTURES = Path(__file__).parent / "fixtures" / "consolidation"
 BASE_URL = "http://verity.test:7717"
@@ -406,3 +413,258 @@ def test_anthropic_extractor_live_smoke() -> None:
     # Loose assertions: a live model is not deterministic, the seam is.
     body = extraction.to_complete_body(TENANT, episode.episode_id)
     assert set(body) == {"tenant_id", "episode_id", "l2_facts", "tag_suggestions", "knowledge_candidates"}
+
+
+# ---------- the JUDGE (knowledge-merge-tuning.md §2, stage 2) ----------
+
+
+def _existing(statement: str) -> JudgeExisting:
+    return JudgeExisting(knowledge_id="k-existing", statement=statement)
+
+
+def test_deterministic_judge_merges_dpa_paraphrases() -> None:
+    """The DPA trio: three paraphrases of ONE generalization the cosine blocker
+    could not merge. The DeterministicJudge says SAME on all pairs."""
+    j = DeterministicJudge()
+    a, b, c = DPA_TRIO
+    assert j.judge(KnowledgeCandidate(b), _existing(a)).same
+    assert j.judge(KnowledgeCandidate(c), _existing(a)).same
+    assert j.judge(KnowledgeCandidate(c), _existing(b)).same
+    verdict = j.judge(KnowledgeCandidate(b), _existing(a))
+    assert verdict.reason  # a reason is always recorded
+
+
+def test_deterministic_judge_keeps_distinct_artifacts_apart() -> None:
+    """The precision guard: DPA vs SOC 2 vs pen-test vs BAA are DIFFERENT
+    generalizations — the judge must say NOT SAME. A false merge here fabricates
+    cross-customer support (knowledge-merge-tuning.md §1)."""
+    j = DeterministicJudge()
+    dpa = "enterprise buyers require a signed DPA before a security review"
+    soc2 = "enterprise buyers require a current SOC 2 report before security review"
+    pentest = "enterprise buyers require an annual third-party penetration test"
+    baa = "healthcare accounts require a signed Business Associate Agreement before sharing patient data"
+    for other in (soc2, pentest, baa):
+        assert not j.judge(KnowledgeCandidate(dpa), _existing(other)).same
+    # SOC2 vs pentest also distinct.
+    assert not j.judge(KnowledgeCandidate(soc2), _existing(pentest)).same
+
+
+def test_deterministic_judge_no_artifact_is_not_same() -> None:
+    """Two statements with no controlled artifact don't merge on the rule leg
+    (they'd need byte-identical canonical forms). Fail closed, not a guess."""
+    j = DeterministicJudge()
+    a = "SMB buyers are highly price-sensitive and churn on any price increase"
+    b = "small businesses cancel quickly when prices are raised"
+    # Distinct canonical forms, no artifact tokens → NOT SAME (a missed merge).
+    assert not j.judge(KnowledgeCandidate(a), _existing(b)).same
+
+
+@respx.mock
+def test_decide_merges_sets_merge_into_on_judge_yes() -> None:
+    """The worker flow: blocker returns a candidate set, the DeterministicJudge
+    rules SAME on a true paraphrase, and decide_merges tags the candidate with
+    merge_into + judge_reason."""
+    existing_id = "018f6b7a-1111-7000-8000-000000000001"
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "knowledge_id": existing_id,
+                        "statement": DPA_TRIO[0],
+                        "categories": ["security"],
+                        "cosine": 0.62,
+                    }
+                ]
+            },
+        )
+    )
+    client = ConsolidationClient(BASE_URL)
+    cand = KnowledgeCandidate(DPA_TRIO[1], categories=["security"], evidence=["ep"])
+    decide_merges(client, TENANT, DeterministicJudge(), [cand])
+    assert cand.merge_into == existing_id
+    assert cand.judge_reason
+    # The judged fields ride through to the wire body.
+    body = cand.to_json()
+    assert body["merge_into"] == existing_id
+    assert "judge_reason" in body
+
+
+@respx.mock
+def test_decide_merges_fails_closed_on_judge_no() -> None:
+    """Blocker surfaces a topically-close but DISTINCT item (SOC 2 vs DPA); the
+    judge says NO, so no merge_into is set (fresh candidate)."""
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "knowledge_id": "018f6b7a-2222-7000-8000-000000000002",
+                        "statement": "enterprise buyers require a current SOC 2 report before security review",
+                        "categories": ["security"],
+                        "cosine": 0.55,
+                    }
+                ]
+            },
+        )
+    )
+    client = ConsolidationClient(BASE_URL)
+    cand = KnowledgeCandidate(
+        "enterprise buyers require a signed DPA before a security review",
+        categories=["security"],
+    )
+    decide_merges(client, TENANT, DeterministicJudge(), [cand])
+    assert cand.merge_into is None
+    assert cand.to_json().get("merge_into") is None
+
+
+@respx.mock
+def test_decide_merges_empty_blocker_is_fresh() -> None:
+    """Empty blocker set → no LLM call needed, no merge (fresh candidate)."""
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(200, json={"candidates": []})
+    )
+    client = ConsolidationClient(BASE_URL)
+    cand = KnowledgeCandidate(DPA_TRIO[0], categories=["security"])
+    decide_merges(client, TENANT, DeterministicJudge(), [cand])
+    assert cand.merge_into is None
+
+
+@respx.mock
+def test_decide_merges_degrades_when_blocker_unavailable() -> None:
+    """LLM/blocker unavailable (server error) → no auto-merge, never a bare
+    low-threshold merge. The candidate stays fresh; the worker does not raise."""
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(503, text="down")
+    )
+    client = ConsolidationClient(BASE_URL)
+    cand = KnowledgeCandidate(DPA_TRIO[0], categories=["security"])
+    decide_merges(client, TENANT, DeterministicJudge(), [cand])  # must not raise
+    assert cand.merge_into is None
+
+
+@respx.mock
+def test_run_once_with_judge_wires_the_cascade() -> None:
+    """run_once(..., judge=) calls merge-candidates between extract and complete
+    and forwards the judged merge in the complete body."""
+    existing_id = "018f6b7a-3333-7000-8000-000000000003"
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/lease").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "episodes": [
+                    {
+                        "episode_id": "018f6b7a-0000-7000-8000-000000000009",
+                        "source": "agent",
+                        "source_entity": "cust-b",
+                        "kind": "observation",
+                        "payload": {
+                            "observation": (
+                                "Enterprise accounts consistently require a Data Processing "
+                                "Agreement to be signed before any security assessment can proceed."
+                            ),
+                            "entities": ["cust-b"],
+                        },
+                        "chunks": [],
+                    }
+                ]
+            },
+        )
+    )
+    mc = respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(
+            200,
+            json={"candidates": [{"knowledge_id": existing_id, "statement": DPA_TRIO[0]}]},
+        )
+    )
+    complete_route = respx.post(f"{BASE_URL}/v1/admin/consolidation/complete").mock(
+        return_value=httpx.Response(200, json={"episode_id": "e", "knowledge": []})
+    )
+    client = ConsolidationClient(BASE_URL)
+    completed = run_once(client, TENANT, DeterministicExtractor(), judge=DeterministicJudge())
+    assert completed == 1
+    assert mc.called
+    body = json.loads(complete_route.calls.last.request.content)
+    assert body["knowledge_candidates"][0]["merge_into"] == existing_id
+    assert body["knowledge_candidates"][0]["judge_reason"]
+
+
+@respx.mock
+def test_run_once_without_judge_proposes_no_merge() -> None:
+    """No judge → no blocker call, no merge_into (the server still runs its own
+    deterministic canonical-exact fast path)."""
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/lease").mock(
+        return_value=httpx.Response(200, json=fixture("lease_observation.json"))
+    )
+    mc = respx.post(f"{BASE_URL}/v1/admin/consolidation/merge-candidates").mock(
+        return_value=httpx.Response(200, json={"candidates": []})
+    )
+    respx.post(f"{BASE_URL}/v1/admin/consolidation/complete").mock(
+        return_value=httpx.Response(200, json={"episode_id": "e", "knowledge": []})
+    )
+    client = ConsolidationClient(BASE_URL)
+    run_once(client, TENANT, DeterministicExtractor())  # judge defaults to None
+    assert not mc.called
+
+
+def test_build_judge_selects_and_none_is_llm_free() -> None:
+    assert isinstance(build_judge("deterministic"), DeterministicJudge)
+    with pytest.raises(ValueError):
+        build_judge("bogus")
+
+
+def test_anthropic_judge_requires_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        build_judge("anthropic")
+
+
+@respx.mock
+def test_anthropic_judge_request_shape_and_parse() -> None:
+    route = respx.post(ANTHROPIC_API_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "text", "text": json.dumps({"same_generalization": True, "reason": "same DPA gate"})}
+                ],
+                "stop_reason": "end_turn",
+            },
+        )
+    )
+    j = AnthropicJudge(api_key="test-key")
+    verdict = j.judge(KnowledgeCandidate(DPA_TRIO[1]), _existing(DPA_TRIO[0]))
+    assert verdict.same and verdict.reason == "same DPA gate"
+    body = json.loads(route.calls.last.request.content)
+    assert body["model"] == ANTHROPIC_MODEL
+    assert body["output_config"]["format"]["schema"] == ANTHROPIC_JUDGE_SCHEMA
+    assert route.calls.last.request.headers["x-api-key"] == "test-key"
+
+
+@respx.mock
+def test_anthropic_judge_fails_closed_on_error() -> None:
+    """Any transport/parse error or a refusal → NOT SAME (never a merge)."""
+    respx.post(ANTHROPIC_API_URL).mock(return_value=httpx.Response(500, text="boom"))
+    assert not AnthropicJudge(api_key="k").judge(KnowledgeCandidate("a"), _existing("b")).same
+    respx.post(ANTHROPIC_API_URL).mock(
+        return_value=httpx.Response(200, json={"content": [], "stop_reason": "refusal"})
+    )
+    assert not AnthropicJudge(api_key="k").judge(KnowledgeCandidate("a"), _existing("b")).same
+
+
+# ---------- metric #6: the DeterministicJudge cascade beats the cosine baseline ----------
+
+
+def test_deterministic_judge_cascade_metric6_precision_and_recall() -> None:
+    """Run the cascade decision over the 206-pair eval set. The trust contract:
+    precision 1.0 (zero false merges — DPA vs SOC2 etc. stay separate) and recall
+    materially above the ~11% cosine baseline at the precision-preserving
+    frontier (knowledge-merge-tuning.md §4)."""
+    r = evaluate_cascade()
+    assert r["confusion"]["fp"] == 0, f"false merges: {r['false_merges']}"
+    assert r["precision"] == 1.0
+    assert r["false_merge_rate"] == 0.0
+    # Materially beats the 11% cosine recall. (Measured ~0.30 for this judge.)
+    assert r["recall"] > 0.11, f"recall {r['recall']:.4f} must beat the cosine baseline"

@@ -138,9 +138,6 @@ pub(crate) struct AppState {
     /// widen retrieval scope for entity-bound scopes (SPEC §7d), so the
     /// default posture is suggest-only with human approval.
     pub(crate) auto_tag: bool,
-    /// Cosine-similarity floor for knowledge candidate merge (support
-    /// accrual) — `VERITY_KNOWLEDGE_MERGE_THRESHOLD`, default 0.85.
-    pub(crate) knowledge_merge_threshold: f32,
 }
 
 impl AppState {
@@ -247,10 +244,6 @@ async fn main() -> anyhow::Result<()> {
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
         auto_tag: std::env::var("VERITY_AUTO_TAG").is_ok_and(|v| v == "1"),
-        knowledge_merge_threshold: std::env::var("VERITY_KNOWLEDGE_MERGE_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(consolidation::DEFAULT_MERGE_THRESHOLD),
     });
 
     let app = Router::new()
@@ -286,6 +279,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/consolidation/complete",
             post(consolidation::complete),
+        )
+        .route(
+            "/v1/admin/consolidation/merge-candidates",
+            post(consolidation::merge_candidates),
         )
         .route(
             "/v1/admin/tag-suggestions",

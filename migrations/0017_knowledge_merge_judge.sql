@@ -1,0 +1,19 @@
+-- The three-stage merge cascade (knowledge-merge-tuning.md §2, Phase 2).
+-- Append-only migration.
+--
+-- Phase 2 REMOVES the server-side bare cosine auto-merge (the old τ=0.85
+-- `1 - (statement_embedding <=> vec) >= threshold` leg). The server no longer
+-- decides a semantic merge on cosine alone. Merges now come only from:
+--   (1) the deterministic canonical-exact fast path (unchanged, no LLM), or
+--   (2) a worker-supplied, LLM-JUDGED decision: the worker calls the new
+--       /v1/admin/consolidation/merge-candidates endpoint to get the blocker
+--       candidate set (low-τ cosine + shared-category pre-filter), runs its
+--       judge over that set, and passes {merge_into, judge_reason} back in
+--       complete(). The server VALIDATES merge_into (same tenant, still a
+--       candidate/published item) and records the judge's reason here.
+--
+-- statement_embedding stays (it now feeds the blocker's candidate-set query,
+-- not an auto-merge). This column records WHY a judged merge fired, so every
+-- non-deterministic merge is auditable and reversible (§5: "no merge is
+-- authoritative without the judge's recorded reason").
+ALTER TABLE knowledge ADD COLUMN merge_reason text;

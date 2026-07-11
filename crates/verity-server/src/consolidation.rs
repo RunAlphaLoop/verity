@@ -19,10 +19,25 @@
 //!   into a scope it wasn't retrievable from before), hence the explicit env
 //!   opt-in rather than a default.
 //! - Knowledge candidates go through the EXISTING propose_knowledge gate, but
-//!   only after a similarity-merge check: a statement matching an existing
-//!   candidate/published item (normalized-exact or embedding cosine >= the
-//!   threshold) accrues evidence on that item (support accrual, SPEC v1.3 §2
-//!   "agents are reinforcement voters") instead of minting a duplicate.
+//!   only after the three-stage merge cascade (knowledge-merge-tuning.md §2,
+//!   Phase 2). A candidate merges (accrues evidence, SPEC v1.3 §2 "agents are
+//!   reinforcement voters") into an existing candidate/published item ONLY via:
+//!     1. the DETERMINISTIC canonical-exact fast path — byte-identical
+//!        canonical_statement, no embedding/LLM cost (Phase 1), or
+//!     2. a worker-supplied JUDGED decision — the worker calls the
+//!        merge-candidates endpoint (the BLOCKER: low-τ cosine + shared-category
+//!        pre-filter over knowledge rows), runs its LLM judge over the returned
+//!        set, and passes {merge_into, judge_reason} back in complete(). The
+//!        server VALIDATES merge_into (same tenant, still candidate/published)
+//!        and records the reason. Fail-closed on invalid → fresh candidate.
+//!
+//!   The old bare cosine auto-merge (τ=0.85 on the write path) is REMOVED: the
+//!   server no longer decides a semantic merge on cosine alone. A false merge
+//!   fabricates cross-customer support (§1's governing asymmetry), so the
+//!   semantic call is the worker's precision-tuned judge, gated + recorded,
+//!   never a 384-d threshold. The stored statement_embedding now feeds the
+//!   blocker's candidate-set query, not an auto-merge.
+//!
 //!   Deviation from the recall-over-chunks sketch, documented: candidates have
 //!   no §7g chunk until publish, so a recall over kind='knowledge' chunks can
 //!   only ever see published items and the required candidate-merge path would
@@ -48,8 +63,18 @@ use crate::{internal, AppState, HandlerResult};
 const LEASE_MINUTES: i32 = 5;
 /// Auto-apply floor: below this, VERITY_AUTO_TAG=1 still only suggests.
 const AUTO_TAG_MIN_CONFIDENCE: f32 = 0.9;
-/// Default cosine-similarity threshold for knowledge statement merge.
-pub(crate) const DEFAULT_MERGE_THRESHOLD: f32 = 0.85;
+// NOTE: the legacy cosine merge threshold (VERITY_KNOWLEDGE_MERGE_THRESHOLD,
+// default 0.85) is GONE from the write path — Phase 2 removed the bare
+// cosine auto-merge (knowledge-merge-tuning.md §2). It survives only as the
+// historical baseline the cascade must beat, measured in verity-bench metric #6
+// (which keeps its own copy of the constant). The server no longer reads it.
+/// BLOCKER threshold (knowledge-merge-tuning.md §2, stage 1): a LOW cosine floor
+/// whose only job is to bound the candidate set the judge sees. High recall /
+/// low precision by design — precision comes from the stage-2 judge, not here.
+pub(crate) const TAU_BLOCK: f32 = 0.45;
+/// Cap on the blocker candidate set handed to the judge, top-N by cosine. Bounds
+/// the worker's per-candidate LLM-call count (§7 cost mitigation).
+const BLOCKER_CANDIDATE_CAP: i64 = 8;
 
 /// SPEC §2 L2: supersession is keyed on NORMALIZED (subject, relation).
 /// Normalization is deterministic: lowercase, trim, collapse whitespace.
@@ -206,9 +231,23 @@ pub(crate) struct KnowledgeCandidateIn {
     /// stripped, controlled-vocab predicate). Drives the exact-match fast-path
     /// merge; the human `statement` is kept for display. `None` when the
     /// extractor emitted no canonical form (that candidate simply never takes
-    /// the fast path — the cosine fallback still applies).
+    /// the fast path).
     #[serde(default)]
     canonical_statement: Option<String>,
+    /// The judge's DECISION (knowledge-merge-tuning.md §2, stage 2): the existing
+    /// knowledge_id the WORKER's LLM judge ruled is the SAME generalization as
+    /// this candidate. `None` = no judged merge (blocker empty, judge said NO, or
+    /// the LLM was unavailable — all fail-closed to a fresh candidate). The
+    /// server VALIDATES this id (same tenant, still candidate/published) before
+    /// merging; an invalid id fails closed to a fresh candidate. It never
+    /// overrides the canonical-exact fast path (that runs first, deterministically).
+    #[serde(default)]
+    merge_into: Option<Uuid>,
+    /// One-line rationale the judge recorded for `merge_into`. Stored on the
+    /// merge (§5: "no merge is authoritative without the judge's recorded
+    /// reason") — auditable, reversible.
+    #[serde(default)]
+    judge_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +404,102 @@ pub(crate) async fn complete(
     })))
 }
 
+// ---------- POST /v1/admin/consolidation/merge-candidates ----------
+
+#[derive(Deserialize)]
+pub(crate) struct MergeCandidatesRequest {
+    tenant_id: TenantId,
+    /// The proposed candidate's canonical form (drives the deterministic exact
+    /// fast path the worker mirrors) — echoed back for the worker's convenience.
+    #[serde(default)]
+    canonical_statement: Option<String>,
+    /// Statement to embed for the blocker's cosine leg. The server embeds it with
+    /// its own encoder; the worker never supplies vectors.
+    #[serde(default)]
+    statement: Option<String>,
+    /// Categories of the proposed candidate — the shared-category (Jaccard > 0)
+    /// pre-filter. Empty categories means no category signal; the blocker then
+    /// returns cosine-only matches (the judge is still the decision).
+    #[serde(default)]
+    categories: Vec<String>,
+}
+
+/// BLOCKER (knowledge-merge-tuning.md §2, stage 1): return the candidate SET the
+/// WORKER's judge should rule on. Server-side and cheap: embed the statement,
+/// find existing candidate/published knowledge in this tenant with cosine at or
+/// above τ_block (LOW, recall-oriented) AND sharing at least one category
+/// (Jaccard > 0 when the caller supplies categories), capped at the top-N by
+/// cosine. An empty set means the worker mints a fresh candidate with no LLM
+/// call. This surface makes NO merge decision — it only bounds how many
+/// comparisons the judge makes.
+///
+/// Fail-closed: with no encoder the cosine leg is dead; the endpoint returns an
+/// empty set (never a bare merge). The exact-canonical fast path still runs in
+/// complete() regardless.
+pub(crate) async fn merge_candidates(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<MergeCandidatesRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+
+    let statement = req.statement.as_deref().unwrap_or("");
+    let embedding = if statement.is_empty() {
+        None
+    } else {
+        state.encode(statement).await.ok().flatten()
+    };
+    let Some(embedding) = embedding else {
+        // No encoder / empty statement: the blocker cannot shrink the space, so
+        // it hands the judge nothing. The worker mints fresh (fail-closed).
+        return Ok(Json(serde_json::json!({ "candidates": [] })));
+    };
+    let vector = pgvector::Vector::from(embedding);
+
+    // Category pre-filter: when the caller supplies categories, require Jaccard
+    // overlap > 0 (shared >= 1 category). `&&` is the pg array-overlap operator.
+    // Empty categories → no category constraint (cosine-only candidate set).
+    let has_categories = !req.categories.is_empty();
+    let rows = sqlx::query(
+        "SELECT id, statement, categories, 1 - (statement_embedding <=> $2) AS cosine
+         FROM knowledge
+         WHERE tenant_id = $1
+           AND status IN ('candidate', 'published')
+           AND statement_embedding IS NOT NULL
+           AND 1 - (statement_embedding <=> $2) >= $3
+           AND ($4 = false OR categories && $5)
+         ORDER BY statement_embedding <=> $2 ASC
+         LIMIT $6",
+    )
+    .bind(req.tenant_id)
+    .bind(&vector)
+    .bind(TAU_BLOCK)
+    .bind(has_categories)
+    .bind(&req.categories)
+    .bind(BLOCKER_CANDIDATE_CAP)
+    .fetch_all(state.pool())
+    .await
+    .map_err(internal)?;
+
+    let candidates: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| -> HandlerResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "knowledge_id": row.try_get::<Uuid, _>("id").map_err(internal)?,
+                "statement": row.try_get::<String, _>("statement").map_err(internal)?,
+                "categories": row.try_get::<Vec<String>, _>("categories").map_err(internal)?,
+                "cosine": row.try_get::<f64, _>("cosine").map_err(internal)?,
+            }))
+        })
+        .collect::<HandlerResult<_>>()?;
+
+    Ok(Json(serde_json::json!({
+        "canonical_statement": req.canonical_statement,
+        "tau_block": TAU_BLOCK,
+        "candidates": candidates,
+    })))
+}
+
 /// Apply a tag to a chunk's entity_tags in place (dedup'd). acl_provenance
 /// and visibility are untouched — this changes ENTITY scoping only, and only
 /// runs on the explicitly opted-in auto-tag path or human approval.
@@ -387,23 +522,27 @@ async fn apply_tag(
     Ok(())
 }
 
-/// Similarity-merge seam: an incoming candidate whose statement matches an
-/// existing candidate/published item (normalized-exact, or stored-embedding
-/// cosine >= threshold) accrues its evidence onto that item instead of
-/// creating a new one. Otherwise it goes through the existing
-/// propose_knowledge path (de-identification gate included) and its embedding
-/// is stored for future merges.
+/// The Phase-2 merge cascade for one candidate (knowledge-merge-tuning.md §2).
+/// A candidate accrues its evidence onto an existing item ONLY via (1) the
+/// DETERMINISTIC canonical-exact fast path (byte-identical canonical_statement,
+/// no embedding/LLM cost), or (2) a worker-supplied JUDGED decision carrying
+/// `merge_into` and `judge_reason`, which the server VALIDATES (same tenant,
+/// still candidate/published) and records. The bare cosine auto-merge is GONE:
+/// absent both, the
+/// candidate is fresh (a missed merge, the acceptable failure — never a false
+/// merge). Its embedding is stored so the blocker can surface it to the judge
+/// for future candidates.
 async fn propose_or_merge(
     state: &Arc<AppState>,
     tenant: TenantId,
     cand: &KnowledgeCandidateIn,
 ) -> HandlerResult<serde_json::Value> {
-    // --- Exact-canonical-match FAST PATH (knowledge-merge-tuning.md §3) ---
-    // Before any embedding/LLM cost: if an existing candidate/published item in
-    // this tenant has a byte-identical canonical_statement, merge immediately.
-    // This is the safe, precise path — two paraphrases that canonicalize to the
-    // same form ARE the same generalization (extraction guarantees distinct
-    // generalizations do not collapse), so no similarity judgement is needed.
+    // --- Stage 1a: exact-canonical-match FAST PATH (deterministic, no LLM). ---
+    // If an existing candidate/published item in this tenant has a byte-identical
+    // canonical_statement, merge immediately. Two paraphrases that canonicalize
+    // to the same form ARE the same generalization (extraction guarantees
+    // distinct generalizations do not collapse), so no judge is needed. This runs
+    // BEFORE any judged decision — the deterministic path wins.
     if let Some(canon) = cand
         .canonical_statement
         .as_deref()
@@ -432,35 +571,66 @@ async fn propose_or_merge(
         }
     }
 
-    let embedding = state.encode(&cand.statement).await.ok().flatten();
-    let vector = embedding.clone().map(pgvector::Vector::from);
-
-    let target: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM knowledge
-         WHERE tenant_id = $1 AND status IN ('candidate', 'published')
-           AND (lower(regexp_replace(statement, '\\s+', ' ', 'g')) = $2
-                OR ($3::vector IS NOT NULL AND statement_embedding IS NOT NULL
-                    AND 1 - (statement_embedding <=> $3) >= $4))
-         ORDER BY (lower(regexp_replace(statement, '\\s+', ' ', 'g')) = $2) DESC,
-                  statement_embedding <=> $3 ASC NULLS LAST
-         LIMIT 1",
-    )
-    .bind(tenant)
-    .bind(normalize_term(&cand.statement))
-    .bind(vector.clone())
-    .bind(state.knowledge_merge_threshold)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(internal)?;
-
-    if let Some((knowledge_id,)) = target {
-        merge_evidence(state, tenant, knowledge_id, &cand.evidence).await?;
-        return Ok(serde_json::json!({
-            "knowledge_id": knowledge_id,
-            "merged": true,
-            "merge": "cosine",
-        }));
+    // --- Stage 2: JUDGED merge (the worker's LLM judge already decided). ---
+    // The worker called merge-candidates (the blocker), ran its judge over the
+    // returned set, and — if the judge said "same generalization" — passed the
+    // existing knowledge_id here. The server does NOT re-run the judge; it
+    // VALIDATES the decision and fails closed to a fresh candidate on anything
+    // invalid (wrong tenant, nonexistent, or no longer candidate/published).
+    if let Some(target_id) = cand.merge_into {
+        let valid: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM knowledge
+             WHERE tenant_id = $1 AND id = $2 AND status IN ('candidate', 'published')",
+        )
+        .bind(tenant)
+        .bind(target_id)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(internal)?;
+        match valid {
+            Some((knowledge_id,)) => {
+                merge_evidence(state, tenant, knowledge_id, &cand.evidence).await?;
+                let reason = cand
+                    .judge_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty());
+                if let Some(reason) = reason {
+                    sqlx::query(
+                        "UPDATE knowledge SET merge_reason = $3
+                         WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant)
+                    .bind(knowledge_id)
+                    .bind(reason)
+                    .execute(state.pool())
+                    .await
+                    .map_err(internal)?;
+                }
+                return Ok(serde_json::json!({
+                    "knowledge_id": knowledge_id,
+                    "merged": true,
+                    "merge": "judge",
+                    "judge_reason": reason,
+                }));
+            }
+            None => {
+                // Fail closed: the judge's target is invalid. Log and fall
+                // through to a fresh candidate — NEVER a bare merge.
+                tracing::warn!(
+                    tenant = %tenant, merge_into = %target_id,
+                    "consolidation: rejecting invalid judged merge_into (wrong tenant, \
+                     nonexistent, or not candidate/published); proposing fresh candidate"
+                );
+            }
+        }
     }
+
+    // --- Fresh candidate: blocker empty / judge NO / judge invalid / LLM down. ---
+    // The candidate's statement embedding is stored below so the blocker can
+    // surface THIS item to the judge when future candidates arrive.
+    let embedding = state.encode(&cand.statement).await.ok().flatten();
+    let vector = embedding.map(pgvector::Vector::from);
 
     let item = state
         .storage
@@ -474,10 +644,11 @@ async fn propose_or_merge(
         })
         .await
         .map_err(internal)?;
-    // Store the canonical form for the exact-match fast path on future
-    // candidates, and the embedding for the cosine fallback. Both are written on
-    // the fresh row (propose_knowledge itself stays canonical-agnostic — the
-    // human statement is its input, matching is a consolidation-plane concern).
+    // Store the canonical form for the exact-match fast path AND the statement
+    // embedding for the BLOCKER's candidate-set query on future candidates. Both
+    // are written on the fresh row (propose_knowledge itself stays canonical-
+    // agnostic — the human statement is its input, matching is a consolidation-
+    // plane concern).
     if let Some(canon) = cand
         .canonical_statement
         .as_deref()

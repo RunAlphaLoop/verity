@@ -50,7 +50,6 @@ async fn test_state(
         allow_restricted_without_rebac: allow_restricted,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
-        knowledge_merge_threshold: crate::consolidation::DEFAULT_MERGE_THRESHOLD,
     });
     Some((state, tenant))
 }

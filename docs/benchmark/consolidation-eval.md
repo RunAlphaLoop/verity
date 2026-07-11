@@ -114,3 +114,33 @@ buying only **~11% recall**. Lowering the threshold to recover paraphrase (e.g. 
 recall) drives the false-merge rate to ~13%, unacceptable under the precision-first contract.
 This quantifies the design doc's finding and is the baseline the cascade (§2) must beat. See
 [`RESULTS-consolidation-2026-07-10.md`](RESULTS-consolidation-2026-07-10.md).
+
+## Phase-2 result — the DeterministicJudge cascade
+
+Phase 2 replaced the bare cosine decision with the three-stage cascade (design §2):
+the deterministic **canonical-exact fast path**, then the low-τ **blocker**
+(`/v1/admin/consolidation/merge-candidates`, τ_block ≈ 0.45 + shared-category
+pre-filter, capped) feeding a worker-side **judge**, then the unchanged human gate.
+**The server-side τ=0.85 cosine auto-merge is REMOVED** (migration `0017`): the server
+no longer merges on cosine alone — merges come only from canonical-exact or a
+worker-supplied, validated, *judged* decision (`merge_into` + recorded `judge_reason`).
+
+The `verity-bench` metric above still measures the **cosine baseline** (it is Phase-0's
+instrument and mirrors the old decision, unchanged). The **cascade decision** is measured
+separately, LLM-free, by the `DeterministicJudge` over the same 206 pairs
+(`ingest/verity_ingest/consolidation_eval.py`; run `python -m
+verity_ingest.consolidation_eval`):
+
+| decision | precision | recall | false-merge-rate |
+|---|---|---|---|
+| cosine @ 0.85 (baseline) | 1.00 | **0.00** | 0.00 |
+| cosine @ ≥0.99-precision frontier (τ≈0.73) | 1.00 | **~0.11** | 0.00 |
+| **DeterministicJudge cascade** | **1.00** | **0.30** (28/94) | **0.00** |
+
+The DeterministicJudge (canonical-exact OR same controlled-artifact rule) holds
+**precision 1.0 / zero false merges** — DPA vs SOC 2 vs pen-test vs BAA stay separate on
+the hard negatives — while ~3× the cosine frontier's recall on true paraphrase, via
+canonicalization plus the artifact-set rule. The **AnthropicJudge** (behind
+`ANTHROPIC_API_KEY`, not runnable here without a key) would extend recall further at the
+same precision, since it catches paraphrases outside the artifact family that the
+deterministic rule misses.

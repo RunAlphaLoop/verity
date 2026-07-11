@@ -1,0 +1,490 @@
+{
+  "corpus": {
+    "chunks": 1000005
+  },
+  "date": "2026-07-11",
+  "machine": {
+    "cpu": "Apple M3 Pro",
+    "mem": "36 GB",
+    "os": "Darwin 23.6.0 arm64"
+  },
+  "metrics": {
+    "consolidation_precision_recall": {
+      "corpus": {
+        "easy_negatives": 22,
+        "hard_negatives": 90,
+        "negatives": 112,
+        "positives": 94,
+        "total_pairs": 206
+      },
+      "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+      "encoder_dim": 384,
+      "eval_set": "docs/benchmark/consolidation-pairs.jsonl",
+      "hardest_true_paraphrase": {
+        "a": "SMB accounts are the first to leave after a rate hike",
+        "b": "small businesses cancel quickly when prices are raised",
+        "note": "lowest-cosine same-generalization pair — the paraphrase recall the 0.85 threshold misses",
+        "score": 0.2396133691072464
+      },
+      "metric": "consolidation_precision_recall",
+      "mirrors": "crates/verity-server/src/consolidation.rs propose_or_merge (lines 373-405), merge predicate lines 381-397; normalize_term lines 56-61; threshold DEFAULT_MERGE_THRESHOLD line 52",
+      "operating_point": {
+        "confusion": {
+          "fn": 94,
+          "fp": 0,
+          "tn": 112,
+          "tp": 0
+        },
+        "f1": 0.0,
+        "false_merge_rate": 0.0,
+        "precision": 1.0,
+        "recall": 0.0,
+        "threshold": 0.8500000238418579
+      },
+      "operating_threshold": 0.8500000238418579,
+      "pr_curve": [
+        {
+          "f1": 0.7200000000000001,
+          "false_merge_rate": 0.5892857142857143,
+          "fn": 4,
+          "fp": 66,
+          "precision": 0.5769230769230769,
+          "recall": 0.9574468085106383,
+          "threshold": 0.30000001192092896,
+          "tn": 46,
+          "tp": 90
+        },
+        {
+          "f1": 0.773913043478261,
+          "false_merge_rate": 0.41964285714285715,
+          "fn": 5,
+          "fp": 47,
+          "precision": 0.6544117647058824,
+          "recall": 0.9468085106382979,
+          "threshold": 0.3499999940395355,
+          "tn": 65,
+          "tp": 89
+        },
+        {
+          "f1": 0.7830188679245284,
+          "false_merge_rate": 0.3125,
+          "fn": 11,
+          "fp": 35,
+          "precision": 0.7033898305084746,
+          "recall": 0.8829787234042553,
+          "threshold": 0.4000000059604645,
+          "tn": 77,
+          "tp": 83
+        },
+        {
+          "f1": 0.7593582887700534,
+          "false_merge_rate": 0.19642857142857142,
+          "fn": 23,
+          "fp": 22,
+          "precision": 0.7634408602150538,
+          "recall": 0.7553191489361702,
+          "threshold": 0.45000001788139343,
+          "tn": 90,
+          "tp": 71
+        },
+        {
+          "f1": 0.7251461988304093,
+          "false_merge_rate": 0.13392857142857142,
+          "fn": 32,
+          "fp": 15,
+          "precision": 0.8051948051948052,
+          "recall": 0.6595744680851063,
+          "threshold": 0.5,
+          "tn": 97,
+          "tp": 62
+        },
+        {
+          "f1": 0.6174496644295302,
+          "false_merge_rate": 0.08035714285714286,
+          "fn": 48,
+          "fp": 9,
+          "precision": 0.8363636363636363,
+          "recall": 0.48936170212765956,
+          "threshold": 0.550000011920929,
+          "tn": 103,
+          "tp": 46
+        },
+        {
+          "f1": 0.5,
+          "false_merge_rate": 0.07142857142857142,
+          "fn": 60,
+          "fp": 8,
+          "precision": 0.8095238095238095,
+          "recall": 0.3617021276595745,
+          "threshold": 0.6000000238418579,
+          "tn": 104,
+          "tp": 34
+        },
+        {
+          "f1": 0.3770491803278688,
+          "false_merge_rate": 0.044642857142857144,
+          "fn": 71,
+          "fp": 5,
+          "precision": 0.8214285714285714,
+          "recall": 0.24468085106382978,
+          "threshold": 0.6500000357627869,
+          "tn": 107,
+          "tp": 23
+        },
+        {
+          "f1": 0.2702702702702703,
+          "false_merge_rate": 0.017857142857142856,
+          "fn": 79,
+          "fp": 2,
+          "precision": 0.8823529411764706,
+          "recall": 0.1595744680851064,
+          "threshold": 0.699999988079071,
+          "tn": 110,
+          "tp": 15
+        },
+        {
+          "f1": 0.1923076923076923,
+          "false_merge_rate": 0.0,
+          "fn": 84,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.10638297872340426,
+          "threshold": 0.75,
+          "tn": 112,
+          "tp": 10
+        },
+        {
+          "f1": 0.08163265306122448,
+          "false_merge_rate": 0.0,
+          "fn": 90,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.0425531914893617,
+          "threshold": 0.800000011920929,
+          "tn": 112,
+          "tp": 4
+        },
+        {
+          "f1": 0.0,
+          "false_merge_rate": 0.0,
+          "fn": 94,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.0,
+          "threshold": 0.8500000238418579,
+          "tn": 112,
+          "tp": 0
+        },
+        {
+          "f1": 0.0,
+          "false_merge_rate": 0.0,
+          "fn": 94,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.0,
+          "threshold": 0.9000000357627869,
+          "tn": 112,
+          "tp": 0
+        },
+        {
+          "f1": 0.0,
+          "false_merge_rate": 0.0,
+          "fn": 94,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.0,
+          "threshold": 0.949999988079071,
+          "tn": 112,
+          "tp": 0
+        },
+        {
+          "f1": 0.0,
+          "false_merge_rate": 0.0,
+          "fn": 94,
+          "fp": 0,
+          "precision": 1.0,
+          "recall": 0.0,
+          "threshold": 1.0,
+          "tn": 112,
+          "tp": 0
+        }
+      ],
+      "precision_99_frontier": {
+        "false_merge_rate": 0.0,
+        "fn": 84,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 0.10638297872340426,
+        "threshold": 0.7299999594688416,
+        "tn": 112,
+        "tp": 10
+      },
+      "spec": "docs/design/knowledge-merge-tuning.md §4",
+      "threshold_source": "VERITY_KNOWLEDGE_MERGE_THRESHOLD (default 0.85)",
+      "worst_hard_negative": {
+        "a": "the deepest discounts are offered at the end of the quarter",
+        "b": "the deepest discounts are offered for large volume commitments",
+        "note": "highest-cosine genuinely-DISTINCT pair — the false merge risk the threshold must stay above",
+        "score": 0.7248652577400208
+      }
+    },
+    "freshness_lag": {
+      "reason": "requires live connectors sampling source-event time vs queryable time; ships as the public freshness dashboard (SPEC §13, v0.2)",
+      "status": "defined_not_reported"
+    },
+    "latency": {
+      "cases": [
+        {
+          "case": "unfiltered (broad token)",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 6.819,
+          "p95_ms": 9.471,
+          "p99_ms": 10.855
+        },
+        {
+          "case": "filtered ANN @ 0.1% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 51.679,
+          "p95_ms": 75.199,
+          "p99_ms": 93.695
+        },
+        {
+          "case": "filtered ANN @ 1.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 62.463,
+          "p95_ms": 74.751,
+          "p99_ms": 90.815
+        },
+        {
+          "case": "filtered ANN @ 10.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 165.247,
+          "p95_ms": 192.127,
+          "p99_ms": 275.455
+        },
+        {
+          "case": "filtered ANN @ 50.0% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 1063.935,
+          "p95_ms": 1226.751,
+          "p99_ms": 1619.967
+        },
+        {
+          "case": "BM25 @ 1% selectivity",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 19.839,
+          "p95_ms": 23.455,
+          "p99_ms": 25.087
+        },
+        {
+          "case": "hybrid (dense+BM25) @ 1%",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 65.919,
+          "p95_ms": 83.135,
+          "p99_ms": 141.439
+        },
+        {
+          "case": "BM25 entity-bound + broad visibility",
+          "k": 10,
+          "mean_hits": 10.0,
+          "p50_ms": 18.303,
+          "p95_ms": 22.895,
+          "p99_ms": 30.943
+        },
+        {
+          "case": "L1 point read (current_fact)",
+          "k": 1,
+          "mean_hits": 1.0,
+          "p50_ms": 0.309,
+          "p95_ms": 0.385,
+          "p99_ms": 0.821
+        }
+      ],
+      "conditions": {
+        "effective_cache_size": "15545MB",
+        "note": "In-process adapter calls on the shared dev box (no HTTP hop). Dense-ANN latency at 1M chunks is dominated by whether the index+heap working set fits the engine's page cache; under memory contention from co-tenant workloads the large-footprint cases (10%/50% selectivity) become disk-bound and rise far above the warm single-tenant curve recorded in docs/BENCHMARKS.md. Correctness metrics (1, 2) are unaffected by cache state.",
+        "other_active_backends_at_start": 0,
+        "shared_buffers": "1GB"
+      },
+      "corpus_chunks": 1000005,
+      "end_to_end_note": "local query encode p95 + worst dense/hybrid recall p95, additive worst case; in-process adapter calls, no HTTP hop",
+      "end_to_end_recall_p95_ms": 1237.654,
+      "k": 10,
+      "load": {
+        "duration_secs_per_level": 20,
+        "levels": [
+          {
+            "concurrency": 4,
+            "duration_secs": 20.059982584,
+            "ops": [
+              {
+                "op": "hybrid recall @ 1%",
+                "ops": 759,
+                "ops_per_sec": 37.83652337791082,
+                "p50_ms": 102.271,
+                "p95_ms": 140.799,
+                "p99_ms": 190.975
+              },
+              {
+                "op": "current_fact",
+                "ops": 225,
+                "ops_per_sec": 11.21636068515143,
+                "p50_ms": 0.788,
+                "p95_ms": 2.879,
+                "p99_ms": 8.671
+              },
+              {
+                "op": "activity",
+                "ops": 107,
+                "ops_per_sec": 5.33400263693868,
+                "p50_ms": 0.74,
+                "p95_ms": 3.917,
+                "p99_ms": 4.843
+              }
+            ],
+            "qps": 54.386886700000936,
+            "total_ops": 1091
+          },
+          {
+            "concurrency": 16,
+            "duration_secs": 20.20075725,
+            "ops": [
+              {
+                "op": "hybrid recall @ 1%",
+                "ops": 921,
+                "ops_per_sec": 45.592350257067714,
+                "p50_ms": 331.263,
+                "p95_ms": 464.127,
+                "p99_ms": 512.767
+              },
+              {
+                "op": "current_fact",
+                "ops": 266,
+                "ops_per_sec": 13.16782320128123,
+                "p50_ms": 31.103,
+                "p95_ms": 76.287,
+                "p99_ms": 100.287
+              },
+              {
+                "op": "activity",
+                "ops": 137,
+                "ops_per_sec": 6.78192397960725,
+                "p50_ms": 31.423,
+                "p95_ms": 74.879,
+                "p99_ms": 117.951
+              }
+            ],
+            "qps": 65.5420974379562,
+            "total_ops": 1324
+          }
+        ],
+        "mix": "70% hybrid recall @ 1% selectivity / 20% current_fact / 10% activity"
+      },
+      "local_encoder": {
+        "case": "local query encode (MiniLM-L6 ONNX)",
+        "k": 1,
+        "mean_hits": 1.0,
+        "p50_ms": 7.659,
+        "p95_ms": 10.903,
+        "p99_ms": 15.695
+      },
+      "queries_per_case": 200
+    },
+    "leakage": {
+      "adversarial_scopes": 200,
+      "corpus": {
+        "actions": 64,
+        "chunks": 204,
+        "sentinel_chunks": 4
+      },
+      "injection_query_strings": 10,
+      "items_checked": 15300,
+      "leakage_rate": 0.0,
+      "leaked_items": 0,
+      "leaks": [],
+      "per_path": {
+        "activity": {
+          "errors": 0,
+          "items": 424,
+          "leaks": 0,
+          "probes": 200
+        },
+        "latest_chunks": {
+          "errors": 0,
+          "items": 1567,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_bm25": {
+          "errors": 0,
+          "items": 3833,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_dense": {
+          "errors": 0,
+          "items": 2917,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_hybrid": {
+          "errors": 0,
+          "items": 3833,
+          "leaks": 0,
+          "probes": 200
+        },
+        "recall_injection": {
+          "errors": 0,
+          "items": 2726,
+          "leaks": 0,
+          "probes": 220
+        }
+      },
+      "probe_errors": 0,
+      "target": 0.0,
+      "total_probes": 1220
+    },
+    "stale_citation": {
+      "consistency_timeouts": 0,
+      "cycles": 100,
+      "per_path": {
+        "current_fact": {
+          "reads": 100,
+          "stale": 0
+        },
+        "recall_bm25": {
+          "reads": 100,
+          "stale": 0
+        }
+      },
+      "stale_citation_rate": 0.0,
+      "stale_reads": 0,
+      "target": 0.0,
+      "total_reads": 200,
+      "write_to_consistent_read_gap_ms": {
+        "current_fact": {
+          "p50": 0.379,
+          "p95": 0.612,
+          "p99": 1.061
+        },
+        "recall": {
+          "p50": 11.431,
+          "p95": 13.407,
+          "p99": 15.207
+        }
+      }
+    },
+    "tagger_recall": {
+      "reason": "requires the labeled multi-entity document corpus; ships with probabilistic entity tagging (SPEC §13, v0.3)",
+      "status": "defined_not_reported"
+    }
+  },
+  "srb_version": "srb-v0"
+}

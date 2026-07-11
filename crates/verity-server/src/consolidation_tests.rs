@@ -19,8 +19,10 @@ use crate::revocation::RevocationPlane;
 use crate::scope::ScopeMinter;
 use crate::{consolidation, AdminAuth, AppState};
 
-/// Real AppState against VERITY_TEST_DSN (no encoder: the knowledge merge
-/// path under test is the deterministic normalized-exact-match leg).
+/// Real AppState against VERITY_TEST_DSN. No encoder: the blocker's cosine leg
+/// is dead here, so the ONLY merges exercisable are the deterministic
+/// canonical-exact fast path and the worker-supplied JUDGED merge (`merge_into`)
+/// — exactly the two paths Phase 2 permits (the bare cosine auto-merge is gone).
 async fn test_state(auto_tag: bool) -> Option<(Arc<AppState>, TenantId)> {
     let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
     let pg = PostgresAdapter::connect(&dsn).await.expect("connect");
@@ -43,9 +45,56 @@ async fn test_state(auto_tag: bool) -> Option<(Arc<AppState>, TenantId)> {
         allow_restricted_without_rebac: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag,
-        knowledge_merge_threshold: consolidation::DEFAULT_MERGE_THRESHOLD,
     });
     Some((state, tenant))
+}
+
+/// Like `test_state` but WITH the local encoder wired, so the blocker's cosine
+/// leg (merge-candidates) is live. Returns None when the encoder can't load
+/// (offline model download) — the test then skips, same policy as VERITY_TEST_DSN.
+async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
+    let (state, tenant) = test_state(false).await?;
+    let encoder = tokio::task::spawn_blocking(verity_encoder::QueryEncoder::load)
+        .await
+        .ok()?
+        .ok()?;
+    // Rebuild AppState with the encoder set (fields are pub(crate) in-crate).
+    let AppState {
+        storage,
+        minter,
+        purposes,
+        admin,
+        rebac,
+        revocations,
+        allow_restricted_without_rebac,
+        subscribers,
+        auto_tag,
+        ..
+    } = Arc::try_unwrap(state).ok()?;
+    Some((
+        Arc::new(AppState {
+            storage,
+            encoder: Some(Arc::new(encoder)),
+            minter,
+            purposes,
+            admin,
+            rebac,
+            revocations,
+            allow_restricted_without_rebac,
+            subscribers,
+            auto_tag,
+        }),
+        tenant,
+    ))
+}
+
+async fn merge_candidates(state: &Arc<AppState>, body: serde_json::Value) -> serde_json::Value {
+    let req = serde_json::from_value(body).unwrap();
+    let Json(v) =
+        consolidation::merge_candidates(State(state.clone()), HeaderMap::new(), Json(req))
+            .await
+            .expect("merge-candidates");
+    v
 }
 
 async fn append(
@@ -238,10 +287,15 @@ async fn complete_writes_l2_facts_with_subject_relation_supersession() {
     assert!(asof.is_some());
 }
 
-// ---------- knowledge merge: support accrual ----------
+// ---------- knowledge merge: JUDGED merge (worker-supplied merge_into) ----------
 
 #[tokio::test]
-async fn similar_statement_merges_and_accrues_support() {
+async fn judged_merge_into_accrues_support_and_records_reason() {
+    // Phase 2: the worker's judge decided two paraphrases are the SAME
+    // generalization and passed merge_into + judge_reason. The server VALIDATES
+    // the target and accrues evidence (distinct_entities 1 -> 2), recording the
+    // reason. No encoder here, so this is purely the judged path — proof the
+    // merge is the cascade, not the removed cosine auto-merge.
     let Some((state, tenant)) = test_state(false).await else {
         eprintln!("VERITY_TEST_DSN not set; skipping");
         return;
@@ -250,12 +304,14 @@ async fn similar_statement_merges_and_accrues_support() {
     let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
     lease_ids(&state, tenant).await;
 
-    let statement = "Healthcare customers consistently require DPA redlines before review.";
     let body1 = complete(
         &state,
         json!({
             "tenant_id": tenant, "episode_id": obs1,
-            "knowledge_candidates": [{ "statement": statement, "categories": ["industry:healthcare"], "evidence": [obs1] }],
+            "knowledge_candidates": [{
+                "statement": "Enterprise security teams require a signed DPA before a security review.",
+                "categories": ["security"], "evidence": [obs1],
+            }],
         }),
     )
     .await
@@ -266,21 +322,28 @@ async fn similar_statement_merges_and_accrues_support() {
         .unwrap()
         .to_string();
 
-    // Whitespace/case variation still merges: the check is normalized.
+    // A DIFFERENT paraphrase with NO shared canonical form, but the worker's
+    // judge ruled SAME and supplied merge_into — the server merges on that.
     let body2 = complete(
         &state,
         json!({
             "tenant_id": tenant, "episode_id": obs2,
-            "knowledge_candidates": [{ "statement": "healthcare customers  consistently require dpa redlines before review.", "evidence": [obs2] }],
+            "knowledge_candidates": [{
+                "statement": "Procurement blocks the security evaluation until the DPA is executed.",
+                "evidence": [obs2],
+                "merge_into": kid,
+                "judge_reason": "same DPA-before-security-review generalization",
+            }],
         }),
     )
     .await
     .expect("complete 2");
     assert_eq!(body2["knowledge"][0]["merged"], json!(true));
+    assert_eq!(body2["knowledge"][0]["merge"], json!("judge"));
     assert_eq!(
         body2["knowledge"][0]["knowledge_id"].as_str().unwrap(),
         kid,
-        "similar statement must accrue on the existing item, not mint a new one"
+        "judged merge must accrue on the existing item, not mint a new one"
     );
 
     let items = state
@@ -293,6 +356,171 @@ async fn similar_statement_merges_and_accrues_support() {
     assert_eq!(item.distinct_entities, 2, "distinct-entity support accrued");
     assert_eq!(item.episode_count, 2);
     assert!(item.last_reinforced >= item.first_seen);
+
+    // The judge's reason is recorded on the merge (auditable, §5).
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT merge_reason FROM knowledge WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(kid.parse::<Uuid>().unwrap())
+            .fetch_one(state.pool())
+            .await
+            .expect("merge_reason");
+    assert_eq!(
+        reason.as_deref(),
+        Some("same DPA-before-security-review generalization")
+    );
+}
+
+#[tokio::test]
+async fn invalid_merge_into_fails_closed_to_fresh_candidate() {
+    // The server VALIDATES the worker's merge_into. A nonexistent id, or one in
+    // another tenant, must NOT merge — it fails closed to a fresh candidate.
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    // A foreign item in a DIFFERENT tenant — a cross-tenant merge must be refused.
+    let other = state
+        .storage
+        .inner()
+        .create_tenant(&format!("other-{}", Uuid::now_v7()))
+        .await
+        .expect("other tenant");
+    let ep_other = append(&state, other, EpisodeKind::Observation, "x", "x").await;
+    lease_ids(&state, other).await;
+    let foreign = complete(
+        &state,
+        json!({
+            "tenant_id": other, "episode_id": ep_other,
+            "knowledge_candidates": [{ "statement": "Some other generalization here.", "evidence": [ep_other] }],
+        }),
+    )
+    .await
+    .expect("foreign complete");
+    let foreign_kid = foreign["knowledge"][0]["knowledge_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let obs = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    lease_ids(&state, tenant).await;
+
+    // Case 1: merge_into a NONEXISTENT id → fresh.
+    let nonexistent = Uuid::now_v7();
+    let body1 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs,
+            "knowledge_candidates": [{
+                "statement": "Enterprise buyers negotiate hard on price.",
+                "evidence": [obs], "merge_into": nonexistent,
+                "judge_reason": "should be ignored",
+            }],
+        }),
+    )
+    .await
+    .expect("complete nonexistent");
+    assert_eq!(
+        body1["knowledge"][0]["merged"],
+        json!(false),
+        "nonexistent merge_into must fail closed to a fresh candidate"
+    );
+
+    // Case 2: merge_into an id in ANOTHER tenant → fresh (cross-tenant refused).
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    lease_ids(&state, tenant).await;
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "knowledge_candidates": [{
+                "statement": "Enterprise buyers prefer annual billing.",
+                "evidence": [obs2], "merge_into": foreign_kid,
+            }],
+        }),
+    )
+    .await
+    .expect("complete foreign");
+    assert_eq!(
+        body2["knowledge"][0]["merged"],
+        json!(false),
+        "cross-tenant merge_into must fail closed"
+    );
+
+    // Two fresh candidates minted in THIS tenant; the foreign item untouched.
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(
+        items.len(),
+        2,
+        "both invalid merges became fresh candidates"
+    );
+    let foreign_distinct: i32 = sqlx::query_scalar(
+        "SELECT distinct_entities FROM knowledge WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(other)
+    .bind(foreign_kid.parse::<Uuid>().unwrap())
+    .fetch_one(state.pool())
+    .await
+    .expect("foreign item");
+    assert_eq!(
+        foreign_distinct, 1,
+        "the foreign item must not have accrued cross-tenant evidence"
+    );
+}
+
+#[tokio::test]
+async fn no_merge_into_and_no_canonical_mints_fresh() {
+    // LLM-unavailable / judge-NO path: the worker omits merge_into. With no
+    // canonical fast-path hit either, the candidate is fresh — NEVER a bare
+    // auto-merge (the removed cosine leg would have to be gone for this to hold).
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let obs1 = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    let obs2 = append(&state, tenant, EpisodeKind::Observation, "cust-b", "b").await;
+    lease_ids(&state, tenant).await;
+
+    // Two byte-identical statements but NO canonical_statement and NO merge_into:
+    // the server has no authority to merge (the normalized-exact leg is removed).
+    let stmt = "Enterprise buyers negotiate hard on price.";
+    complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs1,
+            "knowledge_candidates": [{ "statement": stmt, "evidence": [obs1] }],
+        }),
+    )
+    .await
+    .expect("complete 1");
+    let body2 = complete(
+        &state,
+        json!({
+            "tenant_id": tenant, "episode_id": obs2,
+            "knowledge_candidates": [{ "statement": stmt, "evidence": [obs2] }],
+        }),
+    )
+    .await
+    .expect("complete 2");
+    assert_eq!(
+        body2["knowledge"][0]["merged"],
+        json!(false),
+        "without canonical or merge_into the server must NOT auto-merge"
+    );
+    let items = state
+        .storage
+        .list_knowledge(tenant, None)
+        .await
+        .expect("list");
+    assert_eq!(
+        items.len(),
+        2,
+        "no bare auto-merge: two separate candidates"
+    );
 }
 
 // ---------- exact-canonical-match fast path (Phase 1) ----------
@@ -418,6 +646,114 @@ async fn distinct_canonical_statements_do_not_fast_path_merge() {
         .await
         .expect("list");
     assert_eq!(items.len(), 2, "two distinct generalizations, two items");
+}
+
+// ---------- merge-candidates: the BLOCKER set (Phase 2) ----------
+
+#[tokio::test]
+async fn merge_candidates_returns_blocker_set_with_category_filter_and_cap() {
+    // The blocker (stage 1): cosine >= τ_block AND shared >= 1 category, capped.
+    // Needs the encoder for the cosine leg; skips if it can't load.
+    let Some((state, tenant)) = test_state_with_encoder().await else {
+        eprintln!("VERITY_TEST_DSN or encoder unavailable; skipping");
+        return;
+    };
+    let ep = append(&state, tenant, EpisodeKind::Observation, "cust-a", "a").await;
+    lease_ids(&state, tenant).await;
+
+    // Seed three fresh candidates directly via propose_knowledge (complete is
+    // idempotent per-episode): two about DPA-before-security (security category),
+    // one about pricing (a different category AND a distant statement).
+    for (stmt, cats) in [
+        (
+            "Enterprise buyers require a signed DPA before a security review.",
+            vec!["security", "compliance"],
+        ),
+        (
+            "Procurement blocks the security review until the data processing agreement is executed.",
+            vec!["security"],
+        ),
+        ("SMB buyers are highly price-sensitive.", vec!["pricing"]),
+    ] {
+        let item = state
+            .storage
+            .propose_knowledge(verity_core::types::KnowledgeProposal {
+                tenant_id: tenant,
+                statement: stmt.into(),
+                categories: cats.into_iter().map(String::from).collect(),
+                evidence: vec![],
+                proposed_by_sub: None,
+                proposed_by_azp: Some("test".into()),
+            })
+            .await
+            .expect("seed item");
+        if let Some(v) = state.encode(stmt).await.expect("encode") {
+            sqlx::query(
+                "UPDATE knowledge SET statement_embedding = $3 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant)
+            .bind(item.id)
+            .bind(pgvector::Vector::from(v))
+            .execute(state.pool())
+            .await
+            .expect("embed");
+        }
+    }
+    let _ = ep; // episode leased above; seeds use propose_knowledge directly
+
+    // Query the blocker for a DPA paraphrase in the security category. The two
+    // security items should surface; the pricing item is filtered out (no shared
+    // category AND low cosine).
+    let out = merge_candidates(
+        &state,
+        json!({
+            "tenant_id": tenant,
+            "statement": "Enterprise accounts require a Data Processing Agreement before any security assessment.",
+            "categories": ["security"],
+        }),
+    )
+    .await;
+    let cands = out["candidates"].as_array().expect("candidates");
+    let statements: Vec<&str> = cands
+        .iter()
+        .map(|c| c["statement"].as_str().unwrap())
+        .collect();
+    assert!(
+        statements.iter().all(|s| !s.contains("price-sensitive")),
+        "pricing item must be filtered by the category pre-filter, got {statements:?}"
+    );
+    assert!(
+        !cands.is_empty(),
+        "the security DPA items must be in the blocker set"
+    );
+    // Every returned item is at or above τ_block and shares the category.
+    for c in cands {
+        assert!(
+            c["cosine"].as_f64().unwrap() >= consolidation::TAU_BLOCK as f64 - 1e-6,
+            "blocker must enforce τ_block"
+        );
+    }
+    assert!(cands.len() <= 8, "the blocker set is capped at 8");
+}
+
+#[tokio::test]
+async fn merge_candidates_empty_without_encoder_fails_closed() {
+    // No encoder: the blocker cannot shrink the space, so it returns an empty set
+    // (the worker mints fresh) — never a bare merge.
+    let Some((state, tenant)) = test_state(false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let out = merge_candidates(
+        &state,
+        json!({
+            "tenant_id": tenant,
+            "statement": "anything at all",
+            "categories": ["security"],
+        }),
+    )
+    .await;
+    assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
 }
 
 // ---------- L2 supersession aligns on canonical_predicate (Phase 1) ----------
