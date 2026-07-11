@@ -27,6 +27,7 @@ mod media;
 mod media_tests;
 mod purpose;
 mod rebac;
+mod rebac_watch;
 mod resolver;
 mod revocation;
 mod scheduler;
@@ -169,6 +170,11 @@ pub(crate) struct AppState {
     /// it and the Temporal hook are belt-and-suspenders, deduped by the shared
     /// debounce + idempotent evidence.
     pub(crate) resolution: scheduler::ResolutionScheduler,
+    /// SpiceDB Watch consumer health (rebac_watch.rs; SPEC §7b, opt-in via
+    /// `VERITY_SPICEDB_WATCH=1`). Always present so the admin status endpoint
+    /// can report `enabled: false`; the consumer only ADDS revocation
+    /// tombstones — the read path never consults it.
+    pub(crate) watch: Arc<rebac_watch::WatchStatus>,
 }
 
 impl AppState {
@@ -286,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         // Reads VERITY_RESOLVE_DEBOUNCE (same env var as the Python hook,
         // default 900s, 0 disables). See scheduler.rs.
         resolution: scheduler::ResolutionScheduler::from_env(),
+        watch: Arc::new(rebac_watch::WatchStatus::new()),
     });
 
     let app = Router::new()
@@ -378,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
             post(consolidation::approve_tag_suggestion),
         )
         .route("/v1/admin/principals", post(admin_principals))
+        .route("/v1/admin/rebac-watch", get(rebac_watch::admin_status))
         .route(
             "/v1/admin/groups",
             post(admin_group_add).delete(admin_group_remove),
@@ -420,6 +428,30 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!(
             "server-side auto-resolve DISABLED (VERITY_RESOLVE_DEBOUNCE=0) — resolution stays manual / Temporal-hook-only"
+        );
+    }
+
+    // SpiceDB Watch-driven revocation materialization (rebac_watch.rs, SPEC
+    // §7b). Opt-in: VERITY_SPICEDB_WATCH=1 AND ReBAC configured. The consumer
+    // only ADDS tombstones — the windowed subtraction, mint-time resolution,
+    // and restricted recheck keep enforcing regardless of watch health. A
+    // configured watch whose stream can't be opened at startup is a hard
+    // failure (same posture as ensure_schema — never silent).
+    if std::env::var("VERITY_SPICEDB_WATCH").is_ok_and(|v| v == "1") {
+        let Some(r) = &state.rebac else {
+            anyhow::bail!("VERITY_SPICEDB_WATCH=1 requires VERITY_SPICEDB_URL");
+        };
+        r.watch_probe().await.map_err(|e| {
+            anyhow::anyhow!("VERITY_SPICEDB_WATCH=1 but the SpiceDB watch stream is unusable: {e}")
+        })?;
+        state.watch.set_enabled(true);
+        tracing::info!(
+            "spicedb watch-driven revocation materialization enabled (accelerator over the windowed baseline; health at GET /v1/admin/rebac-watch)"
+        );
+        tokio::spawn(rebac_watch::run(Arc::clone(&state)));
+    } else {
+        tracing::info!(
+            "spicedb watch disabled (set VERITY_SPICEDB_WATCH=1 with VERITY_SPICEDB_URL to accelerate out-of-band revocation propagation)"
         );
     }
 

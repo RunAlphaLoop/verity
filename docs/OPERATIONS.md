@@ -514,3 +514,46 @@ sameness by a model whose reasoning is recorded and auditable, and are never
 published without human approval — which is off by default. A wrong
 generalization is structurally harder to publish than a real one is, and both
 are fully reversible.*
+
+## SpiceDB Watch-driven revocation materialization (SPEC §7b, opt-in)
+
+A background consumer of SpiceDB's Watch API that turns `group#member` tuple
+DELETEs — including ones performed **directly against SpiceDB** (zed CLI, a
+SCIM bridge, another writer) that Verity's admin plane never saw — into the
+same durable revocation tombstones `DELETE /v1/admin/groups` writes. Out-of-
+band membership removals then bite on the very next read instead of waiting
+for handle expiry. It is an **accelerator, never a replacement**: the windowed
+subtraction, mint-time fully-consistent resolution, and restricted-class
+recheck all keep enforcing regardless of watch health, so a dead or gapped
+stream can never under-hide relative to the baseline.
+
+### Enabling (default OFF in this release)
+
+```bash
+export VERITY_SPICEDB_URL=http://localhost:8443   # ReBAC must be configured
+export VERITY_SPICEDB_WATCH=1                     # the opt-in gate
+```
+
+Both are required; `VERITY_SPICEDB_WATCH=1` without `VERITY_SPICEDB_URL` is a
+startup error, and a configured watch whose stream cannot be opened at startup
+fails startup loudly (same posture as the schema write — never silent).
+
+### Health & degraded mode
+
+`GET /v1/admin/rebac-watch` (admin bearer) reports `enabled`, `connected`,
+`degraded`, `gaps`, `reconnects`, `events_seen`, `deltas_applied`,
+`tombstones_written`, `last_token`, `last_error`.
+
+- **Disconnect / transport error:** reconnect with capped backoff from the
+  durable cursor (`rebac_watch_cursor` table); the failed frame's cursor was
+  never persisted, so it replays (replay is additive/over-hiding and deduped).
+- **Unresumable cursor** (SpiceDB GC'd the revision — `FAILED_PRECONDITION`):
+  treated as a **gap**, not a fresh start. `degraded` latches (cleared only by
+  restart, after operator review), the cursor is cleared, the stream resumes
+  from head, and the event is logged at error level. Alert on `degraded`.
+- During any of the above, revocation guarantees are exactly the documented
+  baseline (`VERITY_REVOCATION_WINDOW_SECS` tombstones + fresh resolution at
+  mint + restricted recheck) — the watch never weakens them.
+
+Grants are deliberately not accelerated (SPEC §7b rule 3: the staleness window
+applies only to grants); a new membership still takes effect at the next mint.

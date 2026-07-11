@@ -62,6 +62,7 @@ async fn test_state(with_s3: bool) -> Option<(Arc<AppState>, TenantId)> {
         },
         rebac: None,
         revocations: RevocationPlane::new(300),
+        watch: std::sync::Arc::new(crate::rebac_watch::WatchStatus::new()),
         allow_restricted_without_rebac: false,
         subscribers: Subscribers::new(64),
         auto_tag: false,
