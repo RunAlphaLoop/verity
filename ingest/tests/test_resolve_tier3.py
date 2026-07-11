@@ -167,7 +167,7 @@ def test_gate_nil_when_no_candidate() -> None:
 
 
 def test_gate_nil_below_tau() -> None:
-    weak = [Candidate(entity=ACME, score=0.3)]  # below default tau_nil 0.55
+    weak = [Candidate(entity=ACME, score=0.3)]  # below default tau_nil 0.70
     d = disambiguate(Mention(chunk_ref="c:1", text="Acme"), weak, Tier3Config())
     assert d.outcome is Tier3Outcome.NIL
     assert d.emit_evidence is False

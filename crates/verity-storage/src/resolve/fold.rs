@@ -407,7 +407,8 @@ pub fn fold_with_known_canonicals(
     let mut suppressed_for_min_keys: BTreeSet<UnorderedPair> = BTreeSet::new();
     for (pair, ev) in &candidate_edges {
         // Human confirmation and refless strong edges (crm_fk, external_id,
-        // admin_crosswalk, email_exact) satisfy the bar on their own.
+        // admin_crosswalk) satisfy the bar on their own. email_exact does NOT
+        // (amended 2026-07-11, measured leak — see strong_method).
         if ev.strong_single_key || human_confirmed.contains(pair) {
             continue;
         }
@@ -590,6 +591,26 @@ pub fn fold_with_known_canonicals(
     plan
 }
 
+/// Default cluster-join size floor for the incremental drift guard: either
+/// prior component at or above this size routes a fusion to review. MEASURED,
+/// not guessed — re-measured 2026-07-11 after the `email_exact` strong-set
+/// demotion (see `strong_method`): with the free-mail-adjacent email vector
+/// stopped upstream by the per-kind min-keys bar, the built-in tier1-any bar
+/// (a single crm_fk / external_id / admin_crosswalk bridge — all measured
+/// FMR-0 kinds) is leak-free at every floor <= 8 on the 520-scenario stress
+/// set: 0 bad auto-joins / 114 of 260 legitimate joins auto-applied / review
+/// volume 126 at (8, tier1-any). Floors 12/20 leak double-coincidence clusters
+/// (10/27) under BOTH tier1 bars. The first measurement (email still strong;
+/// tier1-any 1→87 leaks; recommendation (8, tier1-multi-key)) is superseded.
+/// See docs/benchmark/RESULTS-cluster-join-2026-07-11.md.
+///
+/// Honesty caveats carried from the measurement: tier1-any's safety rests on
+/// the trustworthiness of external_id/crm_fk/admin values (a factually wrong
+/// crosswalk is anti-link/review territory, not a threshold problem), and the
+/// double-coincidence corpus bounds the recommendable floor at 8 by
+/// construction.
+pub const DEFAULT_LARGE_COMPONENT_FLOOR: usize = 8;
+
 /// The incremental re-fold entry point (§4.2 "Incremental fold"). Given the
 /// affected ref `R`, the caller has already loaded R's component neighborhood
 /// (its members' live evidence). This re-runs the pure fold on that neighborhood
@@ -602,7 +623,9 @@ pub fn fold_with_known_canonicals(
 /// `prior_canonicals` maps a member ref (`source:entity_id`) → the canonical it
 /// resolved to BEFORE this fold (from `entity_link_meta` back-refs / the current
 /// `entity_aliases`). `large_component_floor` is the size above which a
-/// pre-existing component is "large" and must never fuse silently.
+/// pre-existing component is "large" and must never fuse silently. Callers
+/// without a tenant-specific policy should pass
+/// [`DEFAULT_LARGE_COMPONENT_FLOOR`].
 pub fn refold_incremental(
     neighborhood_evidence: &[EvidenceRow],
     config: &FoldConfig,
@@ -727,7 +750,7 @@ struct EdgeEvidence {
     evidence_ids: Vec<Uuid>,
     /// True if any justifying row is a strong single key that satisfies
     /// min_independent_keys on its own (crm_fk / external_id / admin_crosswalk /
-    /// email_exact / human_confirmed).
+    /// human_confirmed — NOT email_exact; see `strong_method`).
     strong_single_key: bool,
     /// If this edge is mediated ENTIRELY by a shared key-node, its ref (so a
     /// fanned-out key can suppress it). None for direct member↔member edges.
@@ -740,9 +763,19 @@ struct EdgeEvidence {
 }
 
 fn strong_method(method: &str) -> bool {
+    // `email_exact` is deliberately NOT here (amended 2026-07-11): a lone
+    // shared email welds shared humans (fractional CFO, serial founder, agency
+    // contact) — measured email-alone FMR 3/4 eligible negatives
+    // (docs/benchmark/RESULTS-key-independence-2026-07-11.md), and the
+    // cluster-join grid found a lone email_exact bridge never leak-free at any
+    // floor (RESULTS-cluster-join-2026-07-11.md). Email edges are still Tier-1;
+    // they now clear the per-kind `min_independent_keys` bar (email = 2 by
+    // default). §4.2 S1 person↔person lone-email welds remain available as an
+    // explicit per-namespace tenant opt-in (config email → min_independent_keys
+    // = 1) — fail-closed by default, recoverable by config.
     matches!(
         method,
-        "crm_fk" | "external_id" | "admin_crosswalk" | "email_exact" | "human_confirmed"
+        "crm_fk" | "external_id" | "admin_crosswalk" | "human_confirmed"
     )
 }
 

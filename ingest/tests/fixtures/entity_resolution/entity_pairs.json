@@ -1,5 +1,5 @@
 {
-  "_about": "Labeled entity-pair eval set for the ER Tier-2 sameness judge (resolve_tier2.EntityJudge). MIRRORS docs/benchmark/consolidation-pairs.jsonl in spirit but stored as a test fixture (like the other ingest/tests/fixtures). Each pair is two business entities (name + optional domain + source ledger ref 'source:entity_id') labeled same=true/false. PRECISION-FIRST composition: a FALSE merge unions two customers' scopes (a leak, resolve_tier2.py §3.2), so hard negatives (confusable-but-distinct companies) are heavily represented. 'kind' is one of: positive, hard_negative, easy_negative. 'rationale' says WHY the label is what it is. The deterministic oracle (EntityDeterministicJudge) must never fuse a negative (precision==1.0 / false_merge_rate==0.0); it WILL miss same-company positives that lack a clean shared domain — that recall gap is expected and acceptable, and is what the live EntityAnthropicJudge closes.",
+  "_about": "Labeled entity-pair eval set for the ER Tier-2 sameness judge (resolve_tier2.EntityJudge) AND the key-independence sweep (resolve_keys_sweep, design doc §4.1 min_independent_keys / §10 Q2). MIRRORS docs/benchmark/consolidation-pairs.jsonl in spirit but stored as a test fixture (like the other ingest/tests/fixtures). Each pair is two business entities (name + optional domain + source ledger ref 'source:entity_id') labeled same=true/false. Sides MAY additionally carry 'email' (an exact customer-contact email) and 'external_id' ({namespace, value} — a cross-system crosswalk key); the Tier-2 judge eval IGNORES those two fields (it scores name+domain only), while resolve_keys_sweep.py consumes all three key kinds to measure per-kind single-key false-merge rates. PRECISION-FIRST composition: a FALSE merge unions two customers' scopes (a leak, resolve_tier2.py §3.2), so hard negatives (confusable-but-distinct companies) are heavily represented. er-0069..er-0082 are DOMAIN-SHARED-BUT-DISTINCT negatives (parent/subsidiary, conglomerate brands, agency-of-record, franchise, coworking/shared-infra, marketplace, PEO, university, ISP domains): two DISTINCT entities that legitimately collide on ONE domain — the cases that decide whether a lone domain may ever auto-merge. er-0083..er-0086 are shared-contact-EMAIL negatives (fractional CFO, serial founder, agency contact, role-local). er-0087..er-0088 are external_id near-collisions (cross-namespace, near-miss value). er-0090..er-0103 are clean SINGLE-STRONG-KEY (or two-key) true positives labeled by which key alone links them. 'kind' is one of: positive, hard_negative, easy_negative. 'rationale' says WHY the label is what it is. The deterministic Tier-2 oracle (EntityDeterministicJudge) must never fuse a negative (precision==1.0 / false_merge_rate==0.0); it WILL miss same-company positives that lack a clean shared domain — that recall gap is expected and acceptable, and is what the live EntityAnthropicJudge closes. This corpus is a SYNTHETIC, HAND-LABELED STRESS SET, not a natural distribution: rates measured on it bound behavior on adversarial cases; they are not field rates.",
   "pairs": [
     {
       "id": "er-0001",
@@ -544,6 +544,293 @@
       "left":  {"ref": "salesforce:001xVAND2", "name": "Vandelay Industries", "domain": "vandelay-industries.com"},
       "right": {"ref": "hubspot:6157",          "name": "Vandelay Imports",   "domain": "vandelay-imports.com"},
       "rationale": "SAME confusable stem as the er-0022 positive but here the DOMAINS DIFFER (vandelay-industries.com vs vandelay-imports.com) — so they are two different companies. Proves the decision rides on domain, not name similarity. Must stay apart."
+    },
+
+    {
+      "id": "er-0069",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xPG",  "name": "Procter & Gamble", "domain": "pg.com"},
+      "right": {"ref": "hubspot:7101",        "name": "Gillette",         "domain": "pg.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: parent (P&G) and a consumer brand it owns, BOTH carrying the parent's domain pg.com in CRM. Distinct entities, distinct deal scopes. A domain-alone auto-merge fuses them — exactly the leak min_independent_keys exists to stop. Must stay apart."
+    },
+    {
+      "id": "er-0070",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xUNI", "name": "Unilever",               "domain": "unilever.com"},
+      "right": {"ref": "hubspot:7102",        "name": "Ben & Jerry's Homemade", "domain": "unilever.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: conglomerate vs one of its brands; the brand's CRM record was enriched with the parent's corporate domain. Two entities, one domain. Domain alone must not merge. Must stay apart."
+    },
+    {
+      "id": "er-0071",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xBRK", "name": "Berkshire Hathaway", "domain": "berkshirehathaway.com"},
+      "right": {"ref": "hubspot:7103",        "name": "GEICO",              "domain": "berkshirehathaway.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: holding company vs a wholly-owned subsidiary whose record carries the holding domain. Separate legal entities, separate data scopes. Must stay apart."
+    },
+    {
+      "id": "er-0072",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xRWD", "name": "Redwood Dental",  "domain": "brightsidemarketing.com"},
+      "right": {"ref": "hubspot:7104",        "name": "Harbor Plumbing", "domain": "brightsidemarketing.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated small businesses whose CRM domain field holds their shared marketing AGENCY's domain (agency-managed email/website). The domain identifies the agency, not either client. Must stay apart."
+    },
+    {
+      "id": "er-0073",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xLMB", "name": "Lumen Bio",    "domain": "members.thehive.work"},
+      "right": {"ref": "hubspot:7105",        "name": "Quartz Legal", "domain": "members.thehive.work"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two coworking-space members using the space's shared member domain. Shared infrastructure, not shared identity — the co-tenancy failure on a domain that is NOT in any free-mail denylist. Must stay apart."
+    },
+    {
+      "id": "er-0074",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xMAR", "name": "Marriott International",     "domain": "marriott.com"},
+      "right": {"ref": "hubspot:7106",        "name": "Desert Springs Hospitality", "domain": "marriott.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: franchisor vs an independent franchise operator whose contacts use brand-domain email. The franchisee is its own company with its own contracts and scope. Must stay apart."
+    },
+    {
+      "id": "er-0075",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xCRK", "name": "Crick Therapeutics", "domain": "stanford.edu"},
+      "right": {"ref": "hubspot:7107",        "name": "Turing Robotics",    "domain": "stanford.edu"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated university spinouts whose records inherited the founders' .edu domain from contact enrichment. Institutional domains are co-tenant domains. Must stay apart."
+    },
+    {
+      "id": "er-0076",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xHHW", "name": "Hartley's Hardware", "domain": "comcast.net"},
+      "right": {"ref": "hubspot:7108",        "name": "Bayside Florist",    "domain": "comcast.net"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two small businesses on an ISP mail domain (comcast.net) that is deliberately NOT in the free-mail denylist — proves the denylist cannot enumerate every shared-infrastructure domain, so the structural min_independent_keys guard must exist independently. Must stay apart."
+    },
+    {
+      "id": "er-0077",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xMBT", "name": "Meridian Battery", "domain": "heliosgroup.com"},
+      "right": {"ref": "hubspot:7109",        "name": "Solward Grid",     "domain": "heliosgroup.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two SIBLING subsidiaries of one holding group (Helios Group), both on the parent's domain. Merging siblings through the parent domain unions two unrelated books of business. Must stay apart."
+    },
+    {
+      "id": "er-0078",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xMPC", "name": "Maple Crafts",    "domain": "etsy.com"},
+      "right": {"ref": "hubspot:7110",        "name": "Cedar Woodworks", "domain": "etsy.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two marketplace sellers whose 'website' field holds the marketplace's domain. Platform domain, not company identity. Must stay apart."
+    },
+    {
+      "id": "er-0079",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xOKF", "name": "Oakfield Robotics", "domain": "trinetclients.com"},
+      "right": {"ref": "hubspot:7111",        "name": "Pinehurst Media",   "domain": "trinetclients.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two companies using the same PEO/employer-of-record, whose HR-sourced contacts share the PEO's client mail domain. Shared back office, distinct companies. Must stay apart."
+    },
+    {
+      "id": "er-0080",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xNSD", "name": "Northstar Distribution", "domain": "vulcantools.com"},
+      "right": {"ref": "hubspot:7112",        "name": "Vulcan Tools",           "domain": "vulcantools.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a distributor whose record carries its MANUFACTURER's domain (rep works from the vendor's portal/email) vs the manufacturer itself. Supply-chain adjacency, not identity. Must stay apart."
+    },
+    {
+      "id": "er-0081",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xNMB", "name": "Nimbus Software", "domain": "vectorsystems.com"},
+      "right": {"ref": "hubspot:7113",        "name": "Vector Systems",  "domain": "vectorsystems.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a recently ACQUIRED company whose mailboxes migrated to the acquirer's domain vs the acquirer. Their pre-acquisition data scopes remain distinct; fusing them is a human decision (admin crosswalk), never a domain-alone auto-merge. Must stay apart."
+    },
+    {
+      "id": "er-0082",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xKTA", "name": "Kite Aerospace", "domain": "thornegroup.com"},
+      "right": {"ref": "hubspot:7114",        "name": "Fenwick Marine", "domain": "thornegroup.com"},
+      "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two divisions of a conglomerate (Thorne Group) sharing the group domain. Divisions transact independently; a shared group domain must not weld their scopes. Must stay apart."
+    },
+
+    {
+      "id": "er-0083",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xALP", "name": "Alpine Physio",  "domain": "alpinephysio.com",  "email": "m.tran@ledgerpartners.co"},
+      "right": {"ref": "hubspot:7115",        "name": "Basalt Brewing", "domain": "basaltbrewing.com", "email": "m.tran@ledgerpartners.co"},
+      "rationale": "SHARED-EMAIL-BUT-DISTINCT: one fractional CFO (m.tran@ledgerpartners.co) is the billing contact for TWO unrelated companies. An exact shared customer-contact email between two ACCOUNT records is one shared human, not one company — email alone must not auto-merge accounts. Must stay apart."
+    },
+    {
+      "id": "er-0084",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xPRG", "name": "Peregrine Labs",    "domain": "peregrinelabs.com",    "email": "jsmith.builds@gmail.com"},
+      "right": {"ref": "hubspot:7116",        "name": "Copperline Coffee", "domain": "copperlinecoffee.com", "email": "jsmith.builds@gmail.com"},
+      "rationale": "SHARED-EMAIL-BUT-DISTINCT: a serial founder's personal gmail is the contact on both of their (distinct) companies. The free-mail DOMAIN is denylisted upstream, but the exact ADDRESS still matches — one person owning two companies does not make them one entity. Must stay apart."
+    },
+    {
+      "id": "er-0085",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xORC", "name": "Orchid Skincare",    "domain": "orchidskincare.com",    "email": "k.ito@vantageagency.com"},
+      "right": {"ref": "hubspot:7117",        "name": "Truss Construction", "domain": "trussconstruction.com", "email": "k.ito@vantageagency.com"},
+      "rationale": "SHARED-EMAIL-BUT-DISTINCT: an agency-of-record account manager is the listed contact on two client accounts. Shared vendor human, distinct customers. Must stay apart."
+    },
+    {
+      "id": "er-0086",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xFRN", "name": "Fernway Yoga",    "domain": "fernwayyoga.com",    "email": "info@sharedspaces.com"},
+      "right": {"ref": "hubspot:7118",        "name": "Gable Insurance", "domain": "gableinsurance.com", "email": "info@sharedspaces.com"},
+      "rationale": "SHARED-EMAIL-BUT-DISTINCT with a ROLE local part: info@ is a denylisted role account (§4.1 denylist_values) and must never form a key at all — this pair documents the denylist guard working (no key ⇒ no merge signal), independent of min_independent_keys. Must stay apart."
+    },
+
+    {
+      "id": "er-0087",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xLKS", "name": "Larkspur Financial", "domain": "larkspurfinancial.com", "external_id": {"namespace": "hubspot_company_id", "value": "88213"}},
+      "right": {"ref": "hubspot:7119",        "name": "Bramble Toys",       "domain": "brambletoys.com",       "external_id": {"namespace": "netsuite_customer_id", "value": "88213"}},
+      "rationale": "EXTERNAL-ID NEAR-COLLISION: the same bare numeral '88213' in two DIFFERENT id namespaces (a HubSpot company id vs a NetSuite customer id). An external_id key is only a key WITHIN its namespace — cross-namespace value equality is noise. The namespaced scorer must refuse it. Must stay apart."
+    },
+    {
+      "id": "er-0088",
+      "kind": "hard_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xHRW", "name": "Harrow Freight",   "domain": "harrowfreight.com",  "external_id": {"namespace": "erp_account_code", "value": "ACC-00512"}},
+      "right": {"ref": "hubspot:7120",        "name": "Quince Textiles",  "domain": "quincetextiles.com", "external_id": {"namespace": "erp_account_code", "value": "ACC-0512"}},
+      "rationale": "EXTERNAL-ID NEAR-MISS in the SAME namespace: ACC-00512 vs ACC-0512 — a plausible fat-finger. Exact equality (never normalization/fuzzy) is the external_id contract; the scorer must not 'helpfully' canonicalize digits. Must stay apart."
+    },
+    {
+      "id": "er-0089",
+      "kind": "easy_negative",
+      "same": false,
+      "left":  {"ref": "salesforce:001xZPH", "name": "Zephyr Kites", "domain": "zephyrkites.com", "email": "a.bell@zephyrkites.com", "external_id": {"namespace": "crm_crosswalk", "value": "ZK-111"}},
+      "right": {"ref": "hubspot:7121",        "name": "Onyx Paving",  "domain": "onyxpaving.com",  "email": "c.diaz@onyxpaving.com",  "external_id": {"namespace": "crm_crosswalk", "value": "OP-222"}},
+      "rationale": "Sanity anchor: BOTH sides carry all three key kinds and NONE match. Keeps the key-eligible denominators honest (an eligible pair that correctly stays apart). Trivial true negative."
+    },
+
+    {
+      "id": "er-0090",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xJNP", "name": "Juniper Robotics", "domain": "", "external_id": {"namespace": "hubspot_company_id", "value": "77401"}},
+      "right": {"ref": "hubspot:77401",       "name": "Juniper Robotics", "domain": "", "external_id": {"namespace": "hubspot_company_id", "value": "77401"}},
+      "rationale": "SINGLE-STRONG-KEY TP (external_id only): a sync integration wrote the HubSpot company id onto the Salesforce record before either side was enriched with a domain. The exact namespaced crosswalk is an intentional assertion of identity by the integration — the canonical clean external_id case. Same."
+    },
+    {
+      "id": "er-0091",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xSBL", "name": "Sable Analytics",     "domain": "", "external_id": {"namespace": "salesforce_account_id", "value": "001xSBL"}},
+      "right": {"ref": "gong:acct-2210",      "name": "Sable Analytics Inc", "domain": "", "external_id": {"namespace": "salesforce_account_id", "value": "001xSBL"}},
+      "rationale": "SINGLE-STRONG-KEY TP (external_id only): Gong stores the Salesforce account id it was linked against. Exact crosswalk, no domain on either record. Same."
+    },
+    {
+      "id": "er-0092",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xFXG", "name": "Foxglove Health", "domain": "", "external_id": {"namespace": "netsuite_customer_id", "value": "5501"}},
+      "right": {"ref": "hubspot:7122",        "name": "Foxglove",        "domain": "", "external_id": {"namespace": "netsuite_customer_id", "value": "5501"}},
+      "rationale": "SINGLE-STRONG-KEY TP (external_id only): both CRMs carry the same ERP (NetSuite) customer id. Names vary (token subset), domains absent — the crosswalk alone links them. Same."
+    },
+    {
+      "id": "er-0093",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xRKE", "name": "Rooke Manufacturing", "domain": "", "external_id": {"namespace": "erp_account_code", "value": "ACC-00777"}},
+      "right": {"ref": "hubspot:7123",        "name": "Rooke Mfg",           "domain": "", "external_id": {"namespace": "erp_account_code", "value": "ACC-00777"}},
+      "rationale": "SINGLE-STRONG-KEY TP (external_id only): same ERP account code, abbreviated name variant, no domains. Contrast er-0088: equality is exact ('ACC-00777' == 'ACC-00777'), not fuzzy. Same."
+    },
+
+    {
+      "id": "er-0094",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xWLF", "name": "Willow & Finch",   "domain": "willowfinch.com"},
+      "right": {"ref": "hubspot:7124",        "name": "Willow Finch Ltd", "domain": "willowfinch.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (verified domain only): exact shared registrable domain, agreeing names, NO email/external_id anywhere. Under min_independent_keys=2 for domain this true dup is FORGONE as an auto-merge (it must route to Tier-2 review) — the measured recall cost of the domain=2 bar. Same."
+    },
+    {
+      "id": "er-0095",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xKSD", "name": "Kestrel Data",       "domain": "kestreldata.io"},
+      "right": {"ref": "hubspot:7125",        "name": "Kestrel Data, Inc.", "domain": "kestreldata.io"},
+      "rationale": "SINGLE-STRONG-KEY TP (verified domain only): shared .io domain, suffix-only name variance, no second key. Auto-merge forgone under domain=2; surfaces via Tier-2 review instead. Same."
+    },
+    {
+      "id": "er-0096",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xABL", "name": "Arbor Lane Software", "domain": "arborlane.dev"},
+      "right": {"ref": "linear:org-abl",      "name": "Arbor Lane",          "domain": "arborlane.dev"},
+      "rationale": "SINGLE-STRONG-KEY TP (verified domain only): shared dev-TLD domain, token-subset names, no second key. Same."
+    },
+    {
+      "id": "er-0097",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xPSL", "name": "Portside Logistics",     "domain": "portsidelogistics.com"},
+      "right": {"ref": "hubspot:7126",        "name": "PORTSIDE LOGISTICS LLC", "domain": "portsidelogistics.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (verified domain only): casing + suffix variance on one shared domain, no second key. Same."
+    },
+
+    {
+      "id": "er-0098",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "gong:acct-grv",  "name": "Grover Industrial",        "domain": "",                     "email": "d.okafor@groverindustrial.com"},
+      "right": {"ref": "hubspot:7127",    "name": "Grover Industrial Supply", "domain": "groverindustrial.com", "email": "d.okafor@groverindustrial.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (customer-contact email only): a Gong account with NO domain captured, linked to the CRM account solely by the exact contact email. (The email's own domain equals the right side's domain — email and domain are CORRELATED keys here, a caveat the sweep documents.) Same."
+    },
+    {
+      "id": "er-0099",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "linear:org-hfx", "name": "Halifax Optics", "domain": "",                  "email": "s.reyes@halifaxoptics.com"},
+      "right": {"ref": "hubspot:7128",    "name": "Halifax Optics", "domain": "halifaxoptics.com", "email": "s.reyes@halifaxoptics.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (customer-contact email only): support tracker org with no domain field; the exact reporter email is the only shared key. Same."
+    },
+    {
+      "id": "er-0100",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xTMR", "name": "Tamarind Foods",     "domain": "", "email": "p.nair@tamarindfoods.com"},
+      "right": {"ref": "hubspot:7129",        "name": "Tamarind Foods Pvt", "domain": "", "email": "p.nair@tamarindfoods.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (customer-contact email only): neither record has a domain; the exact named-person contact email alone links them. Same."
+    },
+    {
+      "id": "er-0101",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xQPB", "name": "Quill & Page Books", "domain": "", "email": "j.whitfield@quillandpage.com"},
+      "right": {"ref": "gong:acct-qpb",       "name": "Quill and Page",     "domain": "", "email": "j.whitfield@quillandpage.com"},
+      "rationale": "SINGLE-STRONG-KEY TP (customer-contact email only): ampersand/'and' name variance, no domains, exact shared contact email. Same."
+    },
+
+    {
+      "id": "er-0102",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xASH", "name": "Ashgrove Cider",    "domain": "ashgrovecider.com", "email": "t.boone@ashgrovecider.com"},
+      "right": {"ref": "hubspot:7130",        "name": "Ashgrove Cider Co", "domain": "ashgrovecider.com", "email": "t.boone@ashgrovecider.com"},
+      "rationale": "TWO-KEY TP (domain + email): the pair every min_independent_keys=2 policy still auto-merges — two distinct key kinds agree. (Correlated-key caveat: the email lives on the shared domain.) Same."
+    },
+    {
+      "id": "er-0103",
+      "kind": "positive",
+      "same": true,
+      "left":  {"ref": "salesforce:001xBLW", "name": "Bellweather Insurance",       "domain": "bellweather.com", "external_id": {"namespace": "hubspot_company_id", "value": "66001"}},
+      "right": {"ref": "hubspot:66001",       "name": "Bellweather Insurance Group", "domain": "bellweather.com", "external_id": {"namespace": "hubspot_company_id", "value": "66001"}},
+      "rationale": "TWO-KEY TP (domain + external_id): genuinely independent key kinds agree (a synced crosswalk id plus the verified domain) — auto-merges under every swept policy. Same."
     }
   ]
 }

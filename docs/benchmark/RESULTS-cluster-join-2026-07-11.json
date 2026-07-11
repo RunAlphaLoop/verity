@@ -1,0 +1,282 @@
+{
+  "benchmark": "cluster-join-policy",
+  "corpus": {
+    "illegitimate": 260,
+    "legitimate": 260,
+    "note": "synthetic, hand-labeled STRESS corpus \u2014 adversarial composition, not a natural distribution",
+    "total_scenarios": 520
+  },
+  "design": "docs/design/cross-source-entity-resolution.md \u00a74.2 incremental fold + \u00a710 Q3",
+  "grid": [
+    {
+      "bad_auto_joins": 0,
+      "floor": 2,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 2,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 198,
+      "review_queue_volume": 238,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 2,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 6,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 194,
+      "review_queue_volume": 234,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 2,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 1,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 199,
+      "review_queue_volume": 239,
+      "tier_bar": "human-only"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 3,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 8,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 192,
+      "review_queue_volume": 232,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 3,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 20,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 180,
+      "review_queue_volume": 220,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 3,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 2,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 198,
+      "review_queue_volume": 238,
+      "tier_bar": "human-only"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 5,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 32,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 168,
+      "review_queue_volume": 208,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 5,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 69,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 131,
+      "review_queue_volume": 171,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 5,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 14,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 186,
+      "review_queue_volume": 226,
+      "tier_bar": "human-only"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 8,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 58,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 142,
+      "review_queue_volume": 182,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 8,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 114,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 86,
+      "review_queue_volume": 126,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 8,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 20,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 180,
+      "review_queue_volume": 220,
+      "tier_bar": "human-only"
+    },
+    {
+      "bad_auto_joins": 10,
+      "floor": 12,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 30,
+      "legit_auto_joins": 72,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 128,
+      "review_queue_volume": 158,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 10,
+      "floor": 12,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 30,
+      "legit_auto_joins": 136,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 64,
+      "review_queue_volume": 94,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 12,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 27,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 173,
+      "review_queue_volume": 213,
+      "tier_bar": "human-only"
+    },
+    {
+      "bad_auto_joins": 27,
+      "floor": 20,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 13,
+      "legit_auto_joins": 87,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 113,
+      "review_queue_volume": 126,
+      "tier_bar": "tier1-multi-key"
+    },
+    {
+      "bad_auto_joins": 27,
+      "floor": 20,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 13,
+      "legit_auto_joins": 176,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 24,
+      "review_queue_volume": 37,
+      "tier_bar": "tier1-any"
+    },
+    {
+      "bad_auto_joins": 0,
+      "floor": 20,
+      "illegit_blocked_separate": 220,
+      "illegit_routed_to_review": 40,
+      "legit_auto_joins": 35,
+      "legit_blocked_separate": 60,
+      "legit_routed_to_review": 165,
+      "review_queue_volume": 205,
+      "tier_bar": "human-only"
+    }
+  ],
+  "per_family_at_recommended": [
+    {
+      "auto_join": 0,
+      "blocked_separate": 30,
+      "family": "IL-CROSSNS",
+      "review": 0
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 30,
+      "family": "IL-DENYLIST",
+      "review": 0
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 0,
+      "family": "IL-DOUBLE",
+      "review": 40
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 70,
+      "family": "IL-FREEMAIL-ADJ",
+      "review": 0
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 50,
+      "family": "IL-LONE-DOMAIN",
+      "review": 0
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 40,
+      "family": "IL-NAME-ONLY",
+      "review": 0
+    },
+    {
+      "auto_join": 38,
+      "blocked_separate": 0,
+      "family": "LG-EMAIL-MULTI",
+      "review": 22
+    },
+    {
+      "auto_join": 0,
+      "blocked_separate": 60,
+      "family": "LG-EMAIL-SINGLE",
+      "review": 0
+    },
+    {
+      "auto_join": 37,
+      "blocked_separate": 0,
+      "family": "LG-EXT",
+      "review": 23
+    },
+    {
+      "auto_join": 19,
+      "blocked_separate": 0,
+      "family": "LG-FK",
+      "review": 21
+    },
+    {
+      "auto_join": 20,
+      "blocked_separate": 0,
+      "family": "LG-HUMAN",
+      "review": 20
+    }
+  ],
+  "recommended": {
+    "size_floor": 8,
+    "tier_bar": "tier1-any"
+  }
+}

@@ -623,20 +623,39 @@ pub struct EntityResolutionConfig {
 impl EntityResolutionConfig {
     /// The sane defaults `read_resolution_config` returns when a tenant has no
     /// config row for a `(key_kind, key_namespace)`: fail-closed-friendly —
-    /// eligible as an edge, empty denylist, `min_independent_keys=2`, Tier-1
-    /// auto-merge on, Tier-3 auto-link OFF (§4.1).
+    /// eligible as an edge, empty denylist, per-kind `min_independent_keys`
+    /// (external_id=1, everything else 2), Tier-1 auto-merge on, Tier-3
+    /// auto-link OFF (§4.1). The tuning numbers are MEASURED, not guessed —
+    /// see docs/benchmark/RESULTS-tuning-defaults-2026-07-11.md (synthetic
+    /// hand-labeled stress sets, not natural distributions).
     pub fn defaults(tenant: TenantId, key_kind: &str, key_namespace: &str) -> Self {
+        // Per-kind key-independence floor, measured on the 103-pair stress set
+        // (docs/benchmark/RESULTS-key-independence-2026-07-11.md):
+        //   external_id = 1 — exact namespaced crosswalk, FMR 0/3 eligible negatives;
+        //   domain      = 2 — domain-alone FMR 0.2745 (14 FP: parents, franchises,
+        //                     co-tenants — structural, un-denylistable);
+        //   email       = 2 — email-alone FMR 3/4 eligible (shared humans:
+        //                     fractional CFO, serial founder, agency contact).
+        let min_independent_keys = match key_kind {
+            "external_id" => 1,
+            _ => 2,
+        };
         Self {
             tenant_id: tenant,
             key_kind: key_kind.to_string(),
             key_namespace: key_namespace.to_string(),
             eligible_as_edge: true,
             denylist_values: Vec::new(),
-            min_independent_keys: 2,
+            min_independent_keys,
             auto_merge_tier1: true,
             auto_link_tier3: false,
-            tau_nil: None,
-            margin_delta: None,
+            // Tier-3 abstain gates, measured on the 106-case mention sweep
+            // (docs/benchmark/RESULTS-tier3-gates-2026-07-11.md): (0.70, 0.15)
+            // is the max-recall point with link-precision 1.0000 and zero false
+            // links (recall 0.7812); the former 0.55 admits 10 false links in
+            // the fuzzy-backstop regime.
+            tau_nil: Some(0.70),
+            margin_delta: Some(0.15),
             component_size_cap: None,
         }
     }

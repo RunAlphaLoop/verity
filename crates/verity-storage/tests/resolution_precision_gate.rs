@@ -5,26 +5,31 @@
 //!
 //! This IS the CI precision gate: CI runs `cargo test --workspace`
 //! (.github/workflows/ci.yml), so any regression here fails the build. It
-//! scores TWO deciders against the READ-ONLY labeled fixture
+//! scores the deciders against the READ-ONLY labeled fixture
 //! `ingest/tests/fixtures/entity_resolution/entity_pairs.json`
-//! (33 positives / 35 negatives, hard negatives heavily represented):
+//! (47 positives / 56 negatives since the 2026-07-11 key-independence
+//! expansion — hard negatives heavily represented, including 14
+//! domain-shared-but-distinct structural negatives er-0069..er-0082:
+//! parent/brand, franchisor, co-tenant, ISP mail domain, ...).
 //!
-//! 1. The DETERMINISTIC JUDGE (S0 canonicalization): "same iff both sides
+//! 1. The DOMAIN-EQUALITY SIGNAL (S0 canonicalization): "both sides
 //!    canonicalize to the SAME clean registrable domain" — free-mail /
-//!    placeholder domains fail closed to None inside `canonicalize_domain`, so
-//!    they can never match. Gate: precision == 1.0, false-merge-rate == 0.0
-//!    (strictly stronger than the ≥0.99 bar), recall non-vacuous.
+//!    placeholder domains fail closed to None inside `canonicalize_domain`.
+//!    MEASURED (docs/benchmark/RESULTS-key-independence-2026-07-11.md): this
+//!    signal alone false-merges EXACTLY the 14 structural negatives
+//!    (FMR 0.2745 on eligible negatives) — which is WHY domain keeps
+//!    `min_independent_keys = 2` and domain equality is a candidate signal,
+//!    never a lone decider. Gate: the false-merge set is pinned to exactly
+//!    those 14 ids (anything new fails the build), recall non-vacuous.
 //!
-//! 2. The FOLD at the deterministic-oracle operating point: judge-positive
-//!    pairs become `domain_match` ledger evidence and the pure fold
-//!    (min_independent_keys=1 for the domain key — modeling the oracle's
-//!    "clean shared registrable domain merges" rule) must merge NO labeled
-//!    negative pair, transitivity included. Gate: fold precision == 1.0 /
-//!    FMR == 0.0 over the labeled pairs.
+//! 2. The FOLD at `min_independent_keys = 1` for domain (the pre-measurement
+//!    "oracle" rule, kept as a documented COUNTEREXAMPLE): through the real
+//!    fold, transitivity included, it must false-merge exactly the same
+//!    pinned 14 — the measured reason the shipped default is 2.
 //!
-//! 3. The OSS DEFAULT (min_independent_keys=2) folds the SAME evidence to
+//! 3. The SHIPPED DEFAULT (min_independent_keys=2) folds the SAME evidence to
 //!    ZERO merges — a lone domain never auto-merges in the shipped default
-//!    ("annoying, never wrong").
+//!    ("annoying, never wrong"). THIS is the §3.2 precision-1.0 decider.
 //!
 //! The intentional asymmetry (§3.2): under-merge = annoyance, over-merge = a
 //! scope leak. Precision is the SECURITY number; the recall floor only proves
@@ -83,7 +88,7 @@ fn clean_domain(raw: &Option<String>) -> Option<String> {
         .map(|k| k.value)
 }
 
-/// Deterministic judge: same iff both sides carry the SAME clean domain.
+/// Deterministic domain-equality signal: both sides carry the SAME clean domain.
 fn judge_same(p: &LabeledPair) -> bool {
     match (clean_domain(&p.left_domain), clean_domain(&p.right_domain)) {
         (Some(l), Some(r)) => l == r,
@@ -91,8 +96,21 @@ fn judge_same(p: &LabeledPair) -> bool {
     }
 }
 
+/// The 14 domain-shared-but-distinct STRUCTURAL negatives (er-0069..er-0082,
+/// added 2026-07-11): parent/brand on one domain, conglomerate brands, holding
+/// co/subsidiary, agency-of-record, coworking co-tenants, franchisor/franchisee,
+/// .edu spinouts, ISP mail domain (comcast.net — deliberately NOT denylisted),
+/// sibling subsidiaries, marketplace sellers, PEO client, distributor, mail
+/// migration, conglomerate divisions. Domain equality CANNOT separate these —
+/// measured FMR 0.2745 on eligible negatives
+/// (docs/benchmark/RESULTS-key-independence-2026-07-11.md) — which is why
+/// `min_independent_keys` stays 2 for domain.
+fn structural_domain_negatives() -> Vec<String> {
+    (69..=82).map(|n| format!("er-{n:04}")).collect()
+}
+
 #[test]
-fn deterministic_judge_precision_gate() {
+fn domain_equality_signal_false_merge_set_is_pinned() {
     let pairs = load_pairs();
     let (mut tp, mut fp, mut tn, mut fn_) = (0u32, 0u32, 0u32, 0u32);
     let mut false_merges: Vec<&str> = Vec::new();
@@ -107,34 +125,27 @@ fn deterministic_judge_precision_gate() {
             (false, true) => fn_ += 1,
         }
     }
-    let precision = if tp + fp == 0 {
-        1.0
-    } else {
-        tp as f64 / (tp + fp) as f64
-    };
     let fmr = fp as f64 / (fp + tn).max(1) as f64;
 
-    // The gate. ≥0.99 is the published bar; the deterministic judge must hold
-    // the cascade's measured 1.000 / 0.000 (a single false merge fails).
+    // The gate: the signal's false-merge set is EXACTLY the known structural
+    // set — one NEW false merge (any id outside the pinned 14) fails the
+    // build. This pins the measured domain-alone FMR (14 FP / 0.25 over all
+    // 56 negatives) that justifies min_independent_keys=2 for domain.
     assert_eq!(
-        fp, 0,
-        "PRECISION REGRESSION: deterministic judge false-merged {false_merges:?}"
+        false_merges,
+        structural_domain_negatives(),
+        "domain-equality false-merge set drifted from the measured structural set"
     );
-    assert!(
-        precision >= 0.99,
-        "PRECISION REGRESSION: {precision:.4} < 0.99 (tp={tp}, fp={fp})"
-    );
-    assert_eq!(fmr, 0.0, "false-merge-rate must be 0.0, got {fmr:.4}");
-    // Non-vacuous: the judge must actually merge the clean-shared-domain
-    // positives (31/33 at fixture authoring; floor set below to allow benign
-    // fixture growth, never silent decay to zero).
+    // Non-vacuous: the signal must still merge the clean-shared-domain
+    // positives (38/47 measured at the 2026-07-11 expansion; floor allows
+    // benign fixture growth, never silent decay).
     assert!(
         tp >= 25,
         "recall collapsed: only {tp} true merges — the gate is vacuous (fn={fn_})"
     );
     println!(
-        "deterministic-judge gate: precision {precision:.3}, FMR {fmr:.3}, \
-         tp={tp} fp={fp} tn={tn} fn={fn_} over {} labeled pairs",
+        "domain-equality signal: tp={tp} fp={fp} (pinned structural set) tn={tn} fn={fn_}, \
+         FMR {fmr:.4} over {} labeled pairs",
         pairs.len()
     );
 }
@@ -173,8 +184,11 @@ fn fold_precision_gate_on_labeled_pairs() {
         });
     }
 
-    // --- Operating point A: the deterministic-oracle rule (a clean shared
+    // --- Operating point A: the pre-measurement "oracle" rule (a clean shared
     // registrable domain merges — min_independent_keys=1 for the domain key).
+    // Kept as a documented COUNTEREXAMPLE since 2026-07-11: the expanded
+    // fixture proves this rule false-merges the 14 structural negatives
+    // (docs/benchmark/RESULTS-key-independence-2026-07-11.md).
     let mut oracle_domain = EntityResolutionConfig::defaults(t, "domain", "customer_contact");
     oracle_domain.min_independent_keys = 1;
     let fallback = EntityResolutionConfig::defaults(t, "*", "*");
@@ -214,23 +228,33 @@ fn fold_precision_gate_on_labeled_pairs() {
             tn += 1;
         }
     }
-    // The gate: through the REAL fold (transitivity, key handling and all),
-    // zero labeled negatives merge. precision == 1.0 / FMR == 0.0 ≥ the 0.99 bar.
+    // The counterexample, pinned: through the REAL fold (transitivity, key
+    // handling and all), min_independent_keys=1 for domain false-merges
+    // EXACTLY the 14 structural negatives — the measured reason the shipped
+    // default is 2. A 15th false merge (fixture drift / fold regression)
+    // fails the build.
+    assert_eq!(fp as usize, false_merges.len());
+    assert_eq!(fp + tn, 56, "labeled negative count drifted");
     assert_eq!(
-        fp, 0,
-        "FOLD PRECISION REGRESSION: fold merged labeled negatives {false_merges:?}"
+        false_merges,
+        structural_domain_negatives(),
+        "fold@domain-min=1 false-merge set drifted from the measured structural set"
     );
-    assert_eq!(fp as f64 / (fp + tn).max(1) as f64, 0.0);
     let recall = tp as f64 / positives.max(1) as f64;
+    // Domain-alone recall measured 0.8085 (38/47) on the expanded fixture —
+    // the other 9 positives link only via external_id / email keys.
     assert!(
-        recall >= 0.85,
-        "fold recall collapsed at the oracle operating point: {recall:.3} \
-         ({tp}/{positives}) — the gate is going vacuous"
+        recall >= 0.75,
+        "fold recall collapsed at the domain-min=1 operating point: {recall:.3} \
+         ({tp}/{positives}) — the counterexample is going vacuous"
     );
 
-    // --- Operating point B: the shipped OSS default (min_independent_keys=2).
-    // The SAME lone-domain evidence must merge NOTHING — under-merge is the
-    // safe side, and a lone MEDIUM key never auto-merges alone.
+    // --- Operating point B: the shipped OSS default (min_independent_keys=2,
+    // docs/benchmark/RESULTS-tuning-defaults-2026-07-11.md). The SAME
+    // lone-domain evidence must merge NOTHING — under-merge is the safe side,
+    // and a lone MEDIUM key never auto-merges alone. THIS is the §3.2
+    // precision gate on the shipped decider: precision 1.0 / FMR 0.0 by
+    // construction (zero merges ⇒ zero false merges).
     let default_cfg = FoldConfig::new(t, Vec::new(), fallback);
     let default_plan = fold(&evidence, &default_cfg);
     assert!(
@@ -241,7 +265,8 @@ fn fold_precision_gate_on_labeled_pairs() {
     );
 
     println!(
-        "fold gate: oracle point precision 1.000 / FMR 0.000, recall {recall:.3} \
-         ({tp}/{positives}); OSS default merged 0 (fail-closed)"
+        "fold gate: domain-min=1 counterexample false-merges exactly the pinned 14 \
+         (recall {recall:.3} = {tp}/{positives}); shipped default merged 0 (fail-closed, \
+         precision 1.000 / FMR 0.000)"
     );
 }

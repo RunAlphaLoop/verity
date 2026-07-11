@@ -1,0 +1,3082 @@
+{
+  "_about": "Tier-3 abstain-gate SWEEP corpus (cross-source-entity-resolution.md \u00a75, \u00a710 Q6). Synthetic, hand-labeled STRESS set \u2014 NOT a natural mention distribution: bands were designed to sit on the deterministic scorer's decision boundaries (exact 1.0 / fuzzy 0.75 / 0.6667 / 0.6 / co-signal-saturated 1.0) so a (tau_nil, margin_delta) grid sweep has measurable cliffs. Unlike mention_cases.json (whose labels are outcome-taxonomy labels at the shipped default config), each case here carries a config-INDEPENDENT gold label: gold=\"account:x\" means the mention truly refers to that catalog entity and the correct decision is to RESOLVE (tag or reviewer_hint \u2014 the tag gate is orthogonal to the abstain gates); gold=null means the correct decision is to ABSTAIN (unknown org, distinct near-miss org, or genuinely undecidable ambiguity). 'detector_spans' are deterministic scripted stand-ins for what an NER backstop would return \u2014 the sweep makes NO LLM calls; they exist because the gazetteer window pass only ever produces exact (1.0) matches, so tau_nil is exercisable only in the backstop regime. Cases with annex=true are containment-detection failures that NO gate setting can block; they are excluded from grid metrics and reported separately. Every case's rationale quotes scores MEASURED against the shipped pipeline at generation time (gen_sweep_corpus.py calibration).",
+  "graded_cases": 102,
+  "gold_link_cases": 64,
+  "gold_abstain_cases": 38,
+  "annex_cases": 4,
+  "cases": [
+    {
+      "id": "s3-0001-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:acme",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:acme",
+          "name": "Acme, Inc.",
+          "aliases": [
+            "Acme"
+          ],
+          "domains": [
+            "acme.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW1:0",
+        "text": "Repro confirmed for Acme's Q3 rollout blocker; full trace attached.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "acme.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Acme, Inc.' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (acme.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0002-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:globex",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:globex",
+          "name": "Globex",
+          "aliases": [],
+          "domains": [
+            "globex.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW2:0",
+        "text": "Globex renewal terms agreed \u2014 SOW draft at globex.io/sow for review.",
+        "chunk_domains": [
+          "globex.io"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Globex' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (globex.io) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0003-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:initech",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:initech",
+          "name": "Initech",
+          "aliases": [],
+          "domains": [
+            "initech.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW3:0",
+        "text": "Initech SSO cutover runbook, phase 2 of 3.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "initech.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Initech' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (initech.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0004-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:hooli",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:hooli",
+          "name": "Hooli",
+          "aliases": [],
+          "domains": [
+            "hooli.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW4:0",
+        "text": "Hooli expansion pricing approved; invoices route via billing@hooli.com.",
+        "chunk_domains": [
+          "hooli.com"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Hooli' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (hooli.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0005-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:stark",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:stark",
+          "name": "Stark Industries",
+          "aliases": [],
+          "domains": [
+            "stark.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW5:0",
+        "text": "Stark Industries pilot feedback: latency budget met on all three regions.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "stark.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Stark Industries' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (stark.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0006-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:wayne",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:wayne",
+          "name": "Wayne Enterprises",
+          "aliases": [],
+          "domains": [
+            "wayne.co"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW6:0",
+        "text": "Renewal brief for Wayne Enterprises \u2014 procurement contact is legal@wayne.co.",
+        "chunk_domains": [
+          "wayne.co"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Wayne Enterprises' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (wayne.co) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0007-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:vandelay",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:vandelay",
+          "name": "Vandelay Industries",
+          "aliases": [],
+          "domains": [
+            "vandelay.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW7:0",
+        "text": "Vandelay Industries import/export integration is blocked on the API quota.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "vandelay.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Vandelay Industries' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (vandelay.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0008-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:wonka",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:wonka",
+          "name": "Wonka Confections",
+          "aliases": [],
+          "domains": [
+            "wonka.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW8:0",
+        "text": "Wonka Confections tasting-room order form now lives at wonka.com/orders.",
+        "chunk_domains": [
+          "wonka.com"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Wonka Confections' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (wonka.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0009-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:cyberdyne",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:cyberdyne",
+          "name": "Cyberdyne Systems",
+          "aliases": [],
+          "domains": [
+            "cyberdyne.ai"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW9:0",
+        "text": "Cyberdyne Systems escalation: model rollback requested for the fleet.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "cyberdyne.ai"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Cyberdyne Systems' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (cyberdyne.ai) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0010-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:soylent",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:soylent",
+          "name": "Soylent Foods",
+          "aliases": [],
+          "domains": [
+            "soylent.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW10:0",
+        "text": "Soylent Foods co-packing schedule; specs mirrored at soylent.io/specs.",
+        "chunk_domains": [
+          "soylent.io"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Soylent Foods' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (soylent.io) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0011-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:piedpiper",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:piedpiper",
+          "name": "Pied Piper",
+          "aliases": [],
+          "domains": [
+            "piedpiper.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW11:0",
+        "text": "Pied Piper's compression benchmark reran clean after the patch.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "piedpiper.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Pied Piper' appears verbatim; measured top score 1.000, sole candidate; deterministic ACL-domain co-signal (piedpiper.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0012-b1_exact_cosignal",
+      "band": "b1_exact_cosignal",
+      "gold": "account:aviato",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:aviato",
+          "name": "Aviato",
+          "aliases": [],
+          "domains": [
+            "aviato.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW12:0",
+        "text": "Aviato itinerary sync bug closed; changelog posted to aviato.com/changelog.",
+        "chunk_domains": [
+          "aviato.com"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Aviato' appears verbatim; measured top score 1.000, sole candidate; deterministic body-domain co-signal (aviato.com) corroborates. Gold LINK: unambiguous + corroborated. Must resolve at every tau_nil <= 1.0 and every margin_delta (no second candidate). At the shipped kill-switch default this is the TAG path."
+    },
+    {
+      "id": "s3-0013-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:contoso-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:contoso-com",
+          "name": "Contoso",
+          "aliases": [],
+          "domains": [
+            "contoso.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW13:0",
+        "text": "Contoso onboarding notes from the discovery call.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Contoso'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0014-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:fabrikam-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:fabrikam-com",
+          "name": "Fabrikam",
+          "aliases": [],
+          "domains": [
+            "fabrikam.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW14:0",
+        "text": "Fabrikam asked for the updated DPA before signature.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Fabrikam'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0015-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:northwindtraders-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:northwindtraders-com",
+          "name": "Northwind Traders",
+          "aliases": [],
+          "domains": [
+            "northwindtraders.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW15:0",
+        "text": "Northwind Traders reported duplicate rows in the nightly export.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Northwind Traders'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0016-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:duff-beer",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:duff-beer",
+          "name": "Duff Brewing",
+          "aliases": [],
+          "domains": [
+            "duff.beer"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW16:0",
+        "text": "Duff Brewing keg-tracking pilot kicks off Monday.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Duff Brewing'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0017-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:oscorp-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:oscorp-com",
+          "name": "Oscorp",
+          "aliases": [],
+          "domains": [
+            "oscorp.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW17:0",
+        "text": "Oscorp red-team findings are due back Friday.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Oscorp'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0018-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:tyrell-bio",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:tyrell-bio",
+          "name": "Tyrell Biotech",
+          "aliases": [],
+          "domains": [
+            "tyrell.bio"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW18:0",
+        "text": "Tyrell Biotech wants the audit-log retention extended to 400 days.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Tyrell Biotech'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0019-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:sterlingcooper-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:sterlingcooper-com",
+          "name": "Sterling Cooper",
+          "aliases": [],
+          "domains": [
+            "sterlingcooper.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW19:0",
+        "text": "Sterling Cooper campaign asset sync failed twice this week.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Sterling Cooper'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0020-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:dundermifflin-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:dundermifflin-com",
+          "name": "Dunder Mifflin",
+          "aliases": [],
+          "domains": [
+            "dundermifflin.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW20:0",
+        "text": "Dunder Mifflin branch rollout: Scranton is the reference site.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Dunder Mifflin'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0021-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:prestigeworldwide-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:prestigeworldwide-com",
+          "name": "Prestige Worldwide",
+          "aliases": [],
+          "domains": [
+            "prestigeworldwide.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW21:0",
+        "text": "Prestige Worldwide demo environment reset requested.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Prestige Worldwide'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0022-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:bluthhomes-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:bluthhomes-com",
+          "name": "Bluth Homes",
+          "aliases": [],
+          "domains": [
+            "bluthhomes.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW22:0",
+        "text": "Bluth Homes model-home inventory feed needs the new schema.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Bluth Homes'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0023-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:gekkocapital-com",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:gekkocapital-com",
+          "name": "Gekko Capital",
+          "aliases": [],
+          "domains": [
+            "gekkocapital.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW23:0",
+        "text": "Gekko Capital compliance export must exclude draft memos.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Gekko Capital'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0024-b2_exact_no_cosignal",
+      "band": "b2_exact_no_cosignal",
+      "gold": "account:ingen-bio",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ingen-bio",
+          "name": "Ingen Biosciences",
+          "aliases": [],
+          "domains": [
+            "ingen.bio"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW24:0",
+        "text": "Ingen Biosciences lab-notebook import finished without conflicts.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Exact catalog surface for 'Ingen Biosciences'; measured top 1.000, sole candidate; NO domain co-signal on the chunk. Gold LINK: Decision B still resolves confidently \u2014 the tau/margin gates pass \u2014 and the outcome is a REVIEWER_HINT (the \u00a75 tag gate, not the abstain gates, withholds the tag). For the gate sweep a hint counts as a resolved link: tau_nil/margin_delta govern resolve-vs-abstain, not tag authority."
+    },
+    {
+      "id": "s3-0025-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:acme-us",
+          "name": "Acme Corp",
+          "aliases": [],
+          "domains": [
+            "acmeus.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:acme-eu",
+          "name": "Acme Inc",
+          "aliases": [],
+          "domains": [
+            "acme.eu"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW25:0",
+        "text": "Kickoff with Acme went well; next steps by Friday.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Acme' (Acme Corp -> account:acme-us, Acme Inc -> account:acme-eu; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0026-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:apex-legal",
+          "name": "Apex Group",
+          "aliases": [],
+          "domains": [
+            "apexlegal.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:apex-sports",
+          "name": "Apex Ltd",
+          "aliases": [],
+          "domains": [
+            "apexsports.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW26:0",
+        "text": "Apex flagged the seat-count mismatch again.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Apex' (Apex Group -> account:apex-legal, Apex Ltd -> account:apex-sports; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0027-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:vertex-nl",
+          "name": "Vertex NV",
+          "aliases": [],
+          "domains": [
+            "vertex.nl"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:vertex-us",
+          "name": "Vertex Inc",
+          "aliases": [],
+          "domains": [
+            "vertex.us"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW27:0",
+        "text": "Vertex renewal deck v2 attached.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Vertex' (Vertex NV -> account:vertex-nl, Vertex Inc -> account:vertex-us; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0028-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:summit-bank",
+          "name": "Summit Co",
+          "aliases": [],
+          "domains": [
+            "summitbank.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:summit-media",
+          "name": "Summit Corp",
+          "aliases": [],
+          "domains": [
+            "summitmedia.tv"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW28:0",
+        "text": "Summit asked to move the QBR to Thursday.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Summit' (Summit Co -> account:summit-bank, Summit Corp -> account:summit-media; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0029-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:orion-aero",
+          "name": "Orion Holdings",
+          "aliases": [],
+          "domains": [
+            "orionaero.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:orion-energy",
+          "name": "Orion Limited",
+          "aliases": [],
+          "domains": [
+            "orionenergy.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW29:0",
+        "text": "Orion trial extended two weeks.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Orion' (Orion Holdings -> account:orion-aero, Orion Limited -> account:orion-energy; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0030-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:zenith-mfg",
+          "name": "Zenith plc",
+          "aliases": [],
+          "domains": [
+            "zenithmfg.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:zenith-watch",
+          "name": "Zenith LLC",
+          "aliases": [],
+          "domains": [
+            "zenithwatch.ch"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW30:0",
+        "text": "Zenith escalation resolved after the hotfix.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Zenith' (Zenith plc -> account:zenith-mfg, Zenith LLC -> account:zenith-watch; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0031-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:titan-mining",
+          "name": "Titan Group",
+          "aliases": [],
+          "domains": [
+            "titanmining.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:titan-soft",
+          "name": "Titan Inc",
+          "aliases": [],
+          "domains": [
+            "titansoft.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW31:0",
+        "text": "Titan procurement wants net-60 terms.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Titan' (Titan Group -> account:titan-mining, Titan Inc -> account:titan-soft; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0032-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:nova-energy",
+          "name": "Nova Corp",
+          "aliases": [],
+          "domains": [
+            "novaenergy.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:nova-press",
+          "name": "Nova Ltd",
+          "aliases": [],
+          "domains": [
+            "novapress.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW32:0",
+        "text": "Nova signed the pilot addendum.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Nova' (Nova Corp -> account:nova-energy, Nova Ltd -> account:nova-press; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0033-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:cascade-brew",
+          "name": "Cascade Co",
+          "aliases": [],
+          "domains": [
+            "cascadebrew.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:cascade-consult",
+          "name": "Cascade Inc",
+          "aliases": [],
+          "domains": [
+            "cascadeconsulting.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW33:0",
+        "text": "Cascade wants SSO before rollout.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Cascade' (Cascade Co -> account:cascade-brew, Cascade Inc -> account:cascade-consult; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0034-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:beacon-health",
+          "name": "Beacon Corp",
+          "aliases": [],
+          "domains": [
+            "beaconhealth.org"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:beacon-sec",
+          "name": "Beacon Ltd",
+          "aliases": [],
+          "domains": [
+            "beaconsecurity.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW34:0",
+        "text": "Beacon integration test passed staging.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Beacon' (Beacon Corp -> account:beacon-health, Beacon Ltd -> account:beacon-sec; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0035-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:harbor-finance",
+          "name": "Harbor Inc",
+          "aliases": [],
+          "domains": [
+            "harborfinance.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:harbor-freight2",
+          "name": "Harbor Group",
+          "aliases": [],
+          "domains": [
+            "harborshipping.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW35:0",
+        "text": "Harbor asked for the usage report early.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Harbor' (Harbor Inc -> account:harbor-finance, Harbor Group -> account:harbor-freight2; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0036-b3_ambiguous_two_exact",
+      "band": "b3_ambiguous_two_exact",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:falcon-air",
+          "name": "Falcon Corp",
+          "aliases": [],
+          "domains": [
+            "falconair.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:falcon-data",
+          "name": "Falcon Ltd",
+          "aliases": [],
+          "domains": [
+            "falcondata.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW36:0",
+        "text": "Falcon churn risk flagged by CS.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "TWO catalog entities normalize to the shared surface 'Falcon' (Falcon Corp -> account:falcon-air, Falcon Ltd -> account:falcon-data; legal suffixes are stripped by normalize_name). Bare mention, no co-signal: both candidates measure 1.000, margin 0.000. Gold ABSTAIN: undecidable even for a human labeler without more signal. Any margin_delta > 0 abstains; margin_delta = 0 falls through to a deterministic alphabetical tie-break \u2014 a guess, counted as a false link."
+    },
+    {
+      "id": "s3-0037-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:apex-logistics",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:apex-legal2",
+          "name": "Apex Inc",
+          "aliases": [],
+          "domains": [
+            "apexlegal2.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:apex-logistics",
+          "name": "Apex Group",
+          "aliases": [],
+          "domains": [
+            "apexlogistics.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW37:0",
+        "text": "Apex pallet-scan rollout notes.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "apexlogistics.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Apex' (both 1.000 exact) and the chunk ACL carries apexlogistics.com, a deterministic co-signal for account:apex-logistics \u2014 a human labeler links account:apex-logistics (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0038-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:borealis-mining",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:borealis-air",
+          "name": "Borealis Ltd",
+          "aliases": [],
+          "domains": [
+            "borealisair.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:borealis-mining",
+          "name": "Borealis Corp",
+          "aliases": [],
+          "domains": [
+            "borealismining.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW38:0",
+        "text": "Borealis site-survey summary attached.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "borealismining.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Borealis' (both 1.000 exact) and the chunk ACL carries borealismining.com, a deterministic co-signal for account:borealis-mining \u2014 a human labeler links account:borealis-mining (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0039-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:cobalt-robotics",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:cobalt-bank",
+          "name": "Cobalt Inc",
+          "aliases": [],
+          "domains": [
+            "cobaltbank.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:cobalt-robotics",
+          "name": "Cobalt Group",
+          "aliases": [],
+          "domains": [
+            "cobaltrobotics.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW39:0",
+        "text": "Cobalt pilot metrics for April.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "cobaltrobotics.io"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Cobalt' (both 1.000 exact) and the chunk ACL carries cobaltrobotics.io, a deterministic co-signal for account:cobalt-robotics \u2014 a human labeler links account:cobalt-robotics (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0040-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:drift-marine",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:drift-analytics",
+          "name": "Drift Corp",
+          "aliases": [],
+          "domains": [
+            "driftanalytics.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:drift-marine",
+          "name": "Drift Ltd",
+          "aliases": [],
+          "domains": [
+            "driftmarine.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW40:0",
+        "text": "Drift berth-allocation feature request.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "driftmarine.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Drift' (both 1.000 exact) and the chunk ACL carries driftmarine.com, a deterministic co-signal for account:drift-marine \u2014 a human labeler links account:drift-marine (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0041-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:ember-security",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ember-cafes",
+          "name": "Ember Co",
+          "aliases": [],
+          "domains": [
+            "embercafes.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:ember-security",
+          "name": "Ember Inc",
+          "aliases": [],
+          "domains": [
+            "embersecurity.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW41:0",
+        "text": "Ember incident postmortem draft.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "embersecurity.io"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Ember' (both 1.000 exact) and the chunk ACL carries embersecurity.io, a deterministic co-signal for account:ember-security \u2014 a human labeler links account:ember-security (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0042-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:flux-media",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:flux-energy",
+          "name": "Flux Ltd",
+          "aliases": [],
+          "domains": [
+            "fluxenergy.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:flux-media",
+          "name": "Flux Corp",
+          "aliases": [],
+          "domains": [
+            "fluxmedia.tv"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW42:0",
+        "text": "Flux campaign asset review.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "fluxmedia.tv"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Flux' (both 1.000 exact) and the chunk ACL carries fluxmedia.tv, a deterministic co-signal for account:flux-media \u2014 a human labeler links account:flux-media (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break picks the WRONG entity over the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0043-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:granite-capital",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:granite-capital",
+          "name": "Granite Inc",
+          "aliases": [],
+          "domains": [
+            "granitecapital.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:granite-quarries",
+          "name": "Granite Corp",
+          "aliases": [],
+          "domains": [
+            "granitequarries.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW43:0",
+        "text": "Granite portfolio-report export.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "granitecapital.com"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Granite' (both 1.000 exact) and the chunk ACL carries granitecapital.com, a deterministic co-signal for account:granite-capital \u2014 a human labeler links account:granite-capital (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break happens to pick the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0044-b4_ambiguous_cosignal_capped",
+      "band": "b4_ambiguous_cosignal_capped",
+      "gold": "account:helix-bio",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:helix-bio",
+          "name": "Helix Corp",
+          "aliases": [],
+          "domains": [
+            "helix.bio"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:helix-games",
+          "name": "Helix Ltd",
+          "aliases": [],
+          "domains": [
+            "helixgames.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW44:0",
+        "text": "Helix assay-tracker sync question.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "helix.bio"
+        ]
+      },
+      "detector_spans": [],
+      "rationale": "Two catalog entities share the surface 'Helix' (both 1.000 exact) and the chunk ACL carries helix.bio, a deterministic co-signal for account:helix-bio \u2014 a human labeler links account:helix-bio (gold LINK). But the shipped scorer caps the co-signal boost at 1.0, so both candidates stay 1.000 and the margin stays 0.000: at any margin_delta > 0 the scorer OVER-ABSTAINS (a measured scorer limitation the sweep makes visible), and at margin_delta = 0 the alphabetical tie-break happens to pick the co-signed one. The co-signal cannot break an exact-exact tie under the current scoring."
+    },
+    {
+      "id": "s3-0045-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:url-us",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:url-us",
+          "name": "Umbrella Research Labs",
+          "aliases": [],
+          "domains": [
+            "urlabs.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:url-eu",
+          "name": "Umbrella Research Labs Europe",
+          "aliases": [],
+          "domains": [
+            "urlabs.eu"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW45:0",
+        "text": "Umbrella Research Labs signed off on the containment-test plan.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Umbrella Research Labs' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Umbrella Research Labs Europe', retrieved as a fuzzy second at token-set Jaccard 0.7500 -> measured margin 0.2500. Gold LINK account:url-us: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0046-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:sas-us",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:sas-us",
+          "name": "Stark Applied Sciences",
+          "aliases": [],
+          "domains": [
+            "starkapplied.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:sas-jp",
+          "name": "Stark Applied Sciences Japan",
+          "aliases": [],
+          "domains": [
+            "starkapplied.jp"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW46:0",
+        "text": "Stark Applied Sciences requested the updated calibration firmware.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Stark Applied Sciences' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Stark Applied Sciences Japan', retrieved as a fuzzy second at token-set Jaccard 0.7500 -> measured margin 0.2500. Gold LINK account:sas-us: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0047-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:nimbus-sec",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:nimbus-sec",
+          "name": "Nimbus Cloud Security",
+          "aliases": [],
+          "domains": [
+            "nimbussec.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:nimbus-consult",
+          "name": "Nimbus Cloud Security Consulting",
+          "aliases": [],
+          "domains": [
+            "nimbussecconsulting.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW47:0",
+        "text": "Nimbus Cloud Security escalated the WAF false-positive spike.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Nimbus Cloud Security' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Nimbus Cloud Security Consulting', retrieved as a fuzzy second at token-set Jaccard 0.7500 -> measured margin 0.2500. Gold LINK account:nimbus-sec: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0048-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:vda-us",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:vda-us",
+          "name": "Vector Data Analytics",
+          "aliases": [],
+          "domains": [
+            "vectordata.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:vda-eu",
+          "name": "Vector Data Analytics Europe",
+          "aliases": [],
+          "domains": [
+            "vectordata.eu"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW48:0",
+        "text": "Vector Data Analytics wants row-level lineage in the export.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Vector Data Analytics' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Vector Data Analytics Europe', retrieved as a fuzzy second at token-set Jaccard 0.7500 -> measured margin 0.2500. Gold LINK account:vda-us: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0049-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:afl-us",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:afl-us",
+          "name": "Atlas Freight Lines",
+          "aliases": [],
+          "domains": [
+            "atlasfreight.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:afl-mx",
+          "name": "Atlas Freight Lines Mexico",
+          "aliases": [],
+          "domains": [
+            "atlasfreight.mx"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW49:0",
+        "text": "Atlas Freight Lines confirmed the cross-dock pilot dates.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Atlas Freight Lines' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Atlas Freight Lines Mexico', retrieved as a fuzzy second at token-set Jaccard 0.7500 -> measured margin 0.2500. Gold LINK account:afl-us: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0050-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:stark-ind",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:stark-ind",
+          "name": "Stark Industries",
+          "aliases": [],
+          "domains": [
+            "stark.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:stark-med",
+          "name": "Stark Medical Industries",
+          "aliases": [],
+          "domains": [
+            "starkmedical.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW50:0",
+        "text": "Stark Industries approved the reactor telemetry schema.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Stark Industries' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Stark Medical Industries', retrieved as a fuzzy second at token-set Jaccard 0.6667 -> measured margin 0.3333. Gold LINK account:stark-ind: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0051-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:orion-en",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:orion-en",
+          "name": "Orion Energy",
+          "aliases": [],
+          "domains": [
+            "orionenergy.io"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:orion-store",
+          "name": "Orion Energy Storage",
+          "aliases": [],
+          "domains": [
+            "orionstorage.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW51:0",
+        "text": "Orion Energy asked for the demand-response API keys.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Orion Energy' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Orion Energy Storage', retrieved as a fuzzy second at token-set Jaccard 0.6667 -> measured margin 0.3333. Gold LINK account:orion-en: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0052-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:zenith-media",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:zenith-media",
+          "name": "Zenith Media",
+          "aliases": [],
+          "domains": [
+            "zenithmedia.tv"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:zenith-partners",
+          "name": "Zenith Media Partners",
+          "aliases": [],
+          "domains": [
+            "zenithmediapartners.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW52:0",
+        "text": "Zenith Media renewed the analytics add-on.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Zenith Media' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Zenith Media Partners', retrieved as a fuzzy second at token-set Jaccard 0.6667 -> measured margin 0.3333. Gold LINK account:zenith-media: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0053-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:quantum-net",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:quantum-net",
+          "name": "Quantum Networks",
+          "aliases": [],
+          "domains": [
+            "quantumnet.com"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:quantum-in",
+          "name": "Quantum Networks India",
+          "aliases": [],
+          "domains": [
+            "quantumnet.in"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW53:0",
+        "text": "Quantum Networks reported packet loss on the peering link.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Quantum Networks' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Quantum Networks India', retrieved as a fuzzy second at token-set Jaccard 0.6667 -> measured margin 0.3333. Gold LINK account:quantum-net: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0054-b5_separable_two_candidates",
+      "band": "b5_separable_two_candidates",
+      "gold": "account:meridian-health",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:meridian-health",
+          "name": "Meridian Health",
+          "aliases": [],
+          "domains": [
+            "meridianhealth.org"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:meridian-alliance",
+          "name": "Meridian Health Alliance",
+          "aliases": [],
+          "domains": [
+            "meridianalliance.org"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW54:0",
+        "text": "Meridian Health cleared the HIPAA addendum.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The text names 'Meridian Health' exactly (measured 1.000); the catalog also holds the related-but-distinct 'Meridian Health Alliance', retrieved as a fuzzy second at token-set Jaccard 0.6667 -> measured margin 0.3333. Gold LINK account:meridian-health: a human resolves this instantly. Links while margin_delta <= the margin; OVER-ABSTAINS beyond it \u2014 this band prices the recall cost of setting margin_delta too high."
+    },
+    {
+      "id": "s3-0055-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:lph-catering",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:lph-catering",
+          "name": "Los Pollos Hermanos Catering",
+          "aliases": [],
+          "domains": [
+            "lospolloshermanos.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW55:0",
+        "text": "Catering order for the offsite goes through Los Pollos Hermanos as usual.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Los Pollos Hermanos"
+      ],
+      "rationale": "The doc uses the natural partial name 'Los Pollos Hermanos' for the catalog entity 'Los Pollos Hermanos Catering'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0056-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:sca",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:sca",
+          "name": "Sterling Cooper Advertising Agency",
+          "aliases": [],
+          "domains": [
+            "sterlingcooperagency.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW56:0",
+        "text": "Sterling Cooper Advertising sent over the revised media plan.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Sterling Cooper Advertising"
+      ],
+      "rationale": "The doc uses the natural partial name 'Sterling Cooper Advertising' for the catalog entity 'Sterling Cooper Advertising Agency'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0057-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:dmps",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:dmps",
+          "name": "Dunder Mifflin Paper Supply",
+          "aliases": [],
+          "domains": [
+            "dundermifflinpaper.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW57:0",
+        "text": "Dunder Mifflin Paper wants the Q3 pallet forecast.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Dunder Mifflin Paper"
+      ],
+      "rationale": "The doc uses the natural partial name 'Dunder Mifflin Paper' for the catalog entity 'Dunder Mifflin Paper Supply'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0058-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:gcmf",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:gcmf",
+          "name": "Gekko Capital Management Fund",
+          "aliases": [],
+          "domains": [
+            "gekkofund.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW58:0",
+        "text": "Gekko Capital Management flagged the reconciliation delta.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Gekko Capital Management"
+      ],
+      "rationale": "The doc uses the natural partial name 'Gekko Capital Management' for the catalog entity 'Gekko Capital Management Fund'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0059-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:tabs",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:tabs",
+          "name": "Tyrell Advanced Biotech Systems",
+          "aliases": [],
+          "domains": [
+            "tyrellsystems.bio"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW59:0",
+        "text": "Tyrell Advanced Biotech asked about GxP validation artifacts.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Tyrell Advanced Biotech"
+      ],
+      "rationale": "The doc uses the natural partial name 'Tyrell Advanced Biotech' for the catalog entity 'Tyrell Advanced Biotech Systems'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0060-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:pwev",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:pwev",
+          "name": "Prestige Worldwide Entertainment Ventures",
+          "aliases": [],
+          "domains": [
+            "prestigeworldwide.tv"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW60:0",
+        "text": "Prestige Worldwide Entertainment booked the demo studio for Friday.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Prestige Worldwide Entertainment"
+      ],
+      "rationale": "The doc uses the natural partial name 'Prestige Worldwide Entertainment' for the catalog entity 'Prestige Worldwide Entertainment Ventures'. The gazetteer window pass cannot exact-match a partial form, so the span arrives via the deterministic scripted backstop seam and scores token-set Jaccard 0.7500 (3 of 4 name tokens), sole candidate, NO co-signal. Gold LINK: a human resolves it. Links while tau_nil <= 0.75; NILs above \u2014 the upper edge of the tau recall frontier."
+    },
+    {
+      "id": "s3-0061-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:oms",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:oms",
+          "name": "Oscorp Materials Science",
+          "aliases": [],
+          "domains": [
+            "oscorpmaterials.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW61:0",
+        "text": "Oscorp Materials needs the tensile-test raw data.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Oscorp Materials"
+      ],
+      "rationale": "Partial name 'Oscorp Materials' for catalog entity 'Oscorp Materials Science' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0062-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:dbd",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:dbd",
+          "name": "Duff Brewing Distribution",
+          "aliases": [],
+          "domains": [
+            "duffdistribution.beer"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW62:0",
+        "text": "Duff Brewing confirmed the keg RFID rollout window.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Duff Brewing"
+      ],
+      "rationale": "Partial name 'Duff Brewing' for catalog entity 'Duff Brewing Distribution' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0063-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:bhb",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:bhb",
+          "name": "Bluth Home Builders",
+          "aliases": [],
+          "domains": [
+            "bluthbuilders.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW63:0",
+        "text": "Bluth Builders sent the punch-list template.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Bluth Builders"
+      ],
+      "rationale": "Partial name 'Bluth Builders' for catalog entity 'Bluth Home Builders' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0064-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:att",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:att",
+          "name": "Aviato Travel Tech",
+          "aliases": [],
+          "domains": [
+            "aviatotravel.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW64:0",
+        "text": "Aviato Travel reopened the fare-cache ticket.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Aviato Travel"
+      ],
+      "rationale": "Partial name 'Aviato Travel' for catalog entity 'Aviato Travel Tech' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0065-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:ccs",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ccs",
+          "name": "Contoso Cloud Services",
+          "aliases": [],
+          "domains": [
+            "contosocloud.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW65:0",
+        "text": "Contoso Cloud asked for the tenant-isolation whitepaper.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Contoso Cloud"
+      ],
+      "rationale": "Partial name 'Contoso Cloud' for catalog entity 'Contoso Cloud Services' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0066-b6_partial_name_backstop",
+      "band": "b6_partial_name_backstop",
+      "gold": "account:fpt",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:fpt",
+          "name": "Fabrikam Precision Tooling",
+          "aliases": [],
+          "domains": [
+            "fabrikamtooling.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW66:0",
+        "text": "Fabrikam Tooling reported drift on the CNC telemetry feed.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Fabrikam Tooling"
+      ],
+      "rationale": "Partial name 'Fabrikam Tooling' for catalog entity 'Fabrikam Precision Tooling' via the scripted backstop seam: token-set Jaccard 0.6667 (2 of 3 name tokens), sole candidate, NO co-signal. Gold LINK \u2014 but this score is numerically IDENTICAL to the B8 wrong-org traps at 0.6667, so no tau_nil can keep these while blocking those: the precision-first operating point knowingly sacrifices this sub-band (measured over-abstain), and a co-signal (B7) is the sanctioned way such mentions link."
+    },
+    {
+      "id": "s3-0067-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:ifb",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ifb",
+          "name": "Ingen Field Biosciences",
+          "aliases": [],
+          "domains": [
+            "ingenfield.bio"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW67:0",
+        "text": "Ingen Biosciences flagged the sample-chain gap; artifacts at ingenfield.bio/chain.",
+        "chunk_domains": [
+          "ingenfield.bio"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Ingen Biosciences"
+      ],
+      "rationale": "Partial name 'Ingen Biosciences' for 'Ingen Field Biosciences' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic body domain co-signal (ingenfield.bio): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0068-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:wics",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:wics",
+          "name": "Weyland Industrial Cargo Systems",
+          "aliases": [],
+          "domains": [
+            "weylandcargo.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW68:0",
+        "text": "Weyland Cargo Systems manifest import is green again.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "weylandcargo.com"
+        ]
+      },
+      "detector_spans": [
+        "Weyland Cargo Systems"
+      ],
+      "rationale": "Partial name 'Weyland Cargo Systems' for 'Weyland Industrial Cargo Systems' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic ACL domain co-signal (weylandcargo.com): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0069-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:rms",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:rms",
+          "name": "Rekall Memory Services",
+          "aliases": [],
+          "domains": [
+            "rekall.net"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW69:0",
+        "text": "Rekall Memory renewal notes; signed order form at rekall.net/of-114.",
+        "chunk_domains": [
+          "rekall.net"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Rekall Memory"
+      ],
+      "rationale": "Partial name 'Rekall Memory' for 'Rekall Memory Services' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic body domain co-signal (rekall.net): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0070-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:ofrp",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ofrp",
+          "name": "Octan Fuel Refining Partners",
+          "aliases": [],
+          "domains": [
+            "octan.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW70:0",
+        "text": "Octan Fuel Refining turnaround schedule confirmed for August.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "octan.com"
+        ]
+      },
+      "detector_spans": [
+        "Octan Fuel Refining"
+      ],
+      "rationale": "Partial name 'Octan Fuel Refining' for 'Octan Fuel Refining Partners' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic ACL domain co-signal (octan.com): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0071-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:mcr",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:mcr",
+          "name": "Monarch Crane Rentals",
+          "aliases": [],
+          "domains": [
+            "monarchcrane.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW71:0",
+        "text": "Monarch Rentals asked for the lift-plan template; see monarchcrane.com/lifts.",
+        "chunk_domains": [
+          "monarchcrane.com"
+        ],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Monarch Rentals"
+      ],
+      "rationale": "Partial name 'Monarch Rentals' for 'Monarch Crane Rentals' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic body domain co-signal (monarchcrane.com): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0072-b7_fuzzy_with_cosignal",
+      "band": "b7_fuzzy_with_cosignal",
+      "gold": "account:scp",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:scp",
+          "name": "Sirius Cybernetics Products",
+          "aliases": [],
+          "domains": [
+            "siriuscyber.net"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW72:0",
+        "text": "Sirius Cybernetics door-module RMA batch approved.",
+        "chunk_domains": [],
+        "acl_domains": [
+          "siriuscyber.net"
+        ]
+      },
+      "detector_spans": [
+        "Sirius Cybernetics"
+      ],
+      "rationale": "Partial name 'Sirius Cybernetics' for 'Sirius Cybernetics Products' (fuzzy base 0.6667\u20130.7500 via the scripted backstop) PLUS a deterministic ACL domain co-signal (siriuscyber.net): the +0.4 boost saturates the measured score to 1.000, sole candidate. Gold LINK \u2014 corroborated sub-exact mentions are exactly what the co-signal rule exists to admit; must link at every tau_nil <= 1.0."
+    },
+    {
+      "id": "s3-0073-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:url2",
+          "name": "Umbrella Research Labs",
+          "aliases": [],
+          "domains": [
+            "urlabs.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW73:0",
+        "text": "Intro call with Umbrella Labs, the YC seed startup \u2014 no relation to our customer.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Umbrella Labs"
+      ],
+      "rationale": "The doc names 'Umbrella Labs' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Umbrella Research Labs'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0074-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:pwa",
+          "name": "Pinnacle Wealth Advisors",
+          "aliases": [],
+          "domains": [
+            "pinnaclewealth.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW74:0",
+        "text": "Pinnacle Advisors (the Chicago RIA) asked for a partnership deck.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Pinnacle Advisors"
+      ],
+      "rationale": "The doc names 'Pinnacle Advisors' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Pinnacle Wealth Advisors'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0075-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:vmr",
+          "name": "Vertex Motion Robotics",
+          "aliases": [],
+          "domains": [
+            "vertexmotion.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW75:0",
+        "text": "Vertex Robotics out of Delft demoed their new arm at the booth.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Vertex Robotics"
+      ],
+      "rationale": "The doc names 'Vertex Robotics' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Vertex Motion Robotics'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0076-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:spo",
+          "name": "Summit Peak Outdoors",
+          "aliases": [],
+          "domains": [
+            "summitpeak.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW76:0",
+        "text": "Summit Outdoors is a different retailer; their buyer left a voicemail.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Summit Outdoors"
+      ],
+      "rationale": "The doc names 'Summit Outdoors' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Summit Peak Outdoors'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0077-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:nwa",
+          "name": "Nimbus Weather Analytics",
+          "aliases": [],
+          "domains": [
+            "nimbusweather.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW77:0",
+        "text": "Nimbus Analytics \u2014 the ad-tech shop, not our met-data customer \u2014 pinged sales.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Nimbus Analytics"
+      ],
+      "rationale": "The doc names 'Nimbus Analytics' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Nimbus Weather Analytics'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0078-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:hlp",
+          "name": "Halcyon Legal Partners",
+          "aliases": [],
+          "domains": [
+            "halcyonlegal.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW78:0",
+        "text": "Halcyon Partners is the PE fund; keep separate from the law-firm account.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Halcyon Partners"
+      ],
+      "rationale": "The doc names 'Halcyon Partners' \u2014 a DISTINCT real-world org (the text itself says so) \u2014 while the catalog holds the near-miss customer 'Halcyon Legal Partners'. The scripted backstop span fuzzy-scores 0.6667 against the catalog entity, sole candidate, no co-signal. Gold ABSTAIN: linking would mis-file a stranger's content into a customer scope. Any tau_nil <= 0.6667 FALSE-LINKS here; the margin gate cannot help (one candidate). This sub-band sets the tau floor at > 0.6667."
+    },
+    {
+      "id": "s3-0079-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:rpbmc",
+          "name": "Royal Palm Beach Medical Center",
+          "aliases": [],
+          "domains": [
+            "royalpalmmed.org"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW79:0",
+        "text": "Palm Beach Medical, an unaffiliated clinic, requested a vendor packet.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Palm Beach Medical"
+      ],
+      "rationale": "Distinct org 'Palm Beach Medical' vs near-miss catalog customer 'Royal Palm Beach Medical Center': scripted-backstop span fuzzy-scores 0.6000 (3 shared tokens over a 5-token union), sole candidate, no co-signal. Gold ABSTAIN. Any tau_nil <= 0.6000 false-links; margin gate inapplicable (one candidate)."
+    },
+    {
+      "id": "s3-0080-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:glmib",
+          "name": "Great Lakes Marine Insurance Brokers",
+          "aliases": [],
+          "domains": [
+            "greatlakesmarine.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW80:0",
+        "text": "Great Lakes Insurance (the Munich Re subsidiary) is a different entity entirely.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Great Lakes Insurance"
+      ],
+      "rationale": "Distinct org 'Great Lakes Insurance' vs near-miss catalog customer 'Great Lakes Marine Insurance Brokers': scripted-backstop span fuzzy-scores 0.6000 (3 shared tokens over a 5-token union), sole candidate, no co-signal. Gold ABSTAIN. Any tau_nil <= 0.6000 false-links; margin gate inapplicable (one candidate)."
+    },
+    {
+      "id": "s3-0081-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:fcstb",
+          "name": "First Colonial Savings Trust Bank",
+          "aliases": [],
+          "domains": [
+            "firstcolonial.bank"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW81:0",
+        "text": "First Savings Bank branch flyer came in the mail scan.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "First Savings Bank"
+      ],
+      "rationale": "Distinct org 'First Savings Bank' vs near-miss catalog customer 'First Colonial Savings Trust Bank': scripted-backstop span fuzzy-scores 0.6000 (3 shared tokens over a 5-token union), sole candidate, no co-signal. Gold ABSTAIN. Any tau_nil <= 0.6000 false-links; margin gate inapplicable (one candidate)."
+    },
+    {
+      "id": "s3-0082-b8_wrong_org_trap",
+      "band": "b8_wrong_org_trap",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:pntpe",
+          "name": "Pacific Northwest Timber Products Exchange",
+          "aliases": [],
+          "domains": [
+            "pnwtimber.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW82:0",
+        "text": "Pacific Timber Exchange is the Portland spot market, not our co-op customer.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Pacific Timber Exchange"
+      ],
+      "rationale": "Distinct org 'Pacific Timber Exchange' vs near-miss catalog customer 'Pacific Northwest Timber Products Exchange': scripted-backstop span fuzzy-scores 0.6000 (3 shared tokens over a 5-token union), sole candidate, no co-signal. Gold ABSTAIN. Any tau_nil <= 0.6000 false-links; margin gate inapplicable (one candidate)."
+    },
+    {
+      "id": "s3-0083-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:acme9",
+          "name": "Acme, Inc.",
+          "aliases": [],
+          "domains": [
+            "acme.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW83:0",
+        "text": "Notes from the Zorp Robotics onboarding webinar \u2014 prospecting only.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Zorp Robotics"
+      ],
+      "rationale": "The only org named, 'Zorp Robotics', is NOT in the catalog; the catalog customer 'Acme, Inc.' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0084-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:globex9",
+          "name": "Globex",
+          "aliases": [],
+          "domains": [
+            "globex.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW84:0",
+        "text": "Quibble Pay's sandbox keys expired; not a current account.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Quibble Pay"
+      ],
+      "rationale": "The only org named, 'Quibble Pay', is NOT in the catalog; the catalog customer 'Globex' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0085-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:initech9",
+          "name": "Initech",
+          "aliases": [],
+          "domains": [
+            "initech.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW85:0",
+        "text": "Frobozz Magic Software demo request came through the website form.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Frobozz Magic Software"
+      ],
+      "rationale": "The only org named, 'Frobozz Magic Software', is NOT in the catalog; the catalog customer 'Initech' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0086-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:hooli9",
+          "name": "Hooli",
+          "aliases": [],
+          "domains": [
+            "hooli.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW86:0",
+        "text": "Yoyodyne Propulsion badge scans from the conference booth.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Yoyodyne Propulsion"
+      ],
+      "rationale": "The only org named, 'Yoyodyne Propulsion', is NOT in the catalog; the catalog customer 'Hooli' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0087-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:stark9",
+          "name": "Stark Industries",
+          "aliases": [],
+          "domains": [
+            "stark.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW87:0",
+        "text": "Encom Digital whitepaper download \u2014 marketing lead only.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Encom Digital"
+      ],
+      "rationale": "The only org named, 'Encom Digital', is NOT in the catalog; the catalog customer 'Stark Industries' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0088-b9_gold_nil_unknown_org",
+      "band": "b9_gold_nil_unknown_org",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:pp9",
+          "name": "Pied Piper",
+          "aliases": [],
+          "domains": [
+            "piedpiper.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW88:0",
+        "text": "Tessier Ashpool inquiry about on-prem pricing; no account exists.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [
+        "Tessier Ashpool"
+      ],
+      "rationale": "The only org named, 'Tessier Ashpool', is NOT in the catalog; the catalog customer 'Pied Piper' shares no surface tokens. The scripted backstop names the span, but it resolves to no catalog entity (exact and fuzzy retrieval both empty) and is dropped fail-closed \u2014 no candidates, no evidence. Gold ABSTAIN at every grid point: an unknown org is never force-fit to the catalog."
+    },
+    {
+      "id": "s3-0089-b9_gold_nil_generic_scatter",
+      "band": "b9_gold_nil_generic_scatter",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:md9",
+          "name": "Massive Dynamic",
+          "aliases": [],
+          "domains": [
+            "massivedynamic.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW89:0",
+        "text": "Massive quarterly load, but the dynamic pricing job finished on time.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Every token of the catalog name 'Massive Dynamic' appears in the text, but only as scattered common words \u2014 never as a contiguous span. The word-boundary window pass finds no exact surface form and the deterministic backstop adds nothing. Gold ABSTAIN: no mention exists; guards the generic-word false-positive mode at every grid point."
+    },
+    {
+      "id": "s3-0090-b9_gold_nil_generic_scatter",
+      "band": "b9_gold_nil_generic_scatter",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:sl9",
+          "name": "Sunrise Logistics",
+          "aliases": [],
+          "domains": [
+            "sunriselogistics.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW90:0",
+        "text": "The sunrise standup covered logistics for the offsite, nothing else.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Every token of the catalog name 'Sunrise Logistics' appears in the text, but only as scattered common words \u2014 never as a contiguous span. The word-boundary window pass finds no exact surface form and the deterministic backstop adds nothing. Gold ABSTAIN: no mention exists; guards the generic-word false-positive mode at every grid point."
+    },
+    {
+      "id": "s3-0091-b9_gold_nil_generic_scatter",
+      "band": "b9_gold_nil_generic_scatter",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:csw9",
+          "name": "Crystal Springs Water",
+          "aliases": [],
+          "domains": [
+            "crystalsprings.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW91:0",
+        "text": "The crystal reporting job runs at midnight; springs cleanup and water-cooler chat can wait.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Every token of the catalog name 'Crystal Springs Water' appears in the text, but only as scattered common words \u2014 never as a contiguous span. The word-boundary window pass finds no exact surface form and the deterministic backstop adds nothing. Gold ABSTAIN: no mention exists; guards the generic-word false-positive mode at every grid point."
+    },
+    {
+      "id": "s3-0092-b9_gold_nil_generic_scatter",
+      "band": "b9_gold_nil_generic_scatter",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:ghf9",
+          "name": "Golden Harvest Foods",
+          "aliases": [],
+          "domains": [
+            "goldenharvest.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW92:0",
+        "text": "A golden opportunity: the harvest sale moved twice the foods volume.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Every token of the catalog name 'Golden Harvest Foods' appears in the text, but only as scattered common words \u2014 never as a contiguous span. The word-boundary window pass finds no exact surface form and the deterministic backstop adds nothing. Gold ABSTAIN: no mention exists; guards the generic-word false-positive mode at every grid point."
+    },
+    {
+      "id": "s3-0093-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": "account:acme10",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:acme10",
+          "name": "Acme, Inc.",
+          "aliases": [
+            "Acme"
+          ],
+          "domains": [
+            "acme.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW93:0",
+        "text": "Acme renewal?",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Two-to-three-word ticket title naming 'Acme, Inc.' exactly; sole candidate, measured 1.000, no co-signal. Gold LINK (the catalog has exactly one plausible referent). The deterministic scorer consumes no context beyond same-chunk domains, so a short doc scores identically to a long one \u2014 stated here so the corpus is honest about what the scorer ignores."
+    },
+    {
+      "id": "s3-0094-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": "account:globex10",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:globex10",
+          "name": "Globex",
+          "aliases": [],
+          "domains": [
+            "globex.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW94:0",
+        "text": "Ping Globex.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Two-to-three-word ticket title naming 'Globex' exactly; sole candidate, measured 1.000, no co-signal. Gold LINK (the catalog has exactly one plausible referent). The deterministic scorer consumes no context beyond same-chunk domains, so a short doc scores identically to a long one \u2014 stated here so the corpus is honest about what the scorer ignores."
+    },
+    {
+      "id": "s3-0095-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": "account:initech10",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:initech10",
+          "name": "Initech",
+          "aliases": [],
+          "domains": [
+            "initech.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW95:0",
+        "text": "Initech follow-up?",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Two-to-three-word ticket title naming 'Initech' exactly; sole candidate, measured 1.000, no co-signal. Gold LINK (the catalog has exactly one plausible referent). The deterministic scorer consumes no context beyond same-chunk domains, so a short doc scores identically to a long one \u2014 stated here so the corpus is honest about what the scorer ignores."
+    },
+    {
+      "id": "s3-0096-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": "account:hooli10",
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:hooli10",
+          "name": "Hooli",
+          "aliases": [],
+          "domains": [
+            "hooli.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW96:0",
+        "text": "Hooli invoice attached.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Two-to-three-word ticket title naming 'Hooli' exactly; sole candidate, measured 1.000, no co-signal. Gold LINK (the catalog has exactly one plausible referent). The deterministic scorer consumes no context beyond same-chunk domains, so a short doc scores identically to a long one \u2014 stated here so the corpus is honest about what the scorer ignores."
+    },
+    {
+      "id": "s3-0097-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:apex10a",
+          "name": "Apex Inc",
+          "aliases": [],
+          "domains": [
+            "apex10a.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:apex10b",
+          "name": "Apex Ltd",
+          "aliases": [],
+          "domains": [
+            "apex10b.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW97:0",
+        "text": "Apex sync at 3.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title with the shared surface 'Apex' and TWO catalog candidates (both 1.000, margin 0.000), zero disambiguating context. Gold ABSTAIN \u2014 the short-doc variant of B3; must abstain at any margin_delta > 0."
+    },
+    {
+      "id": "s3-0098-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:vertex10a",
+          "name": "Vertex Corp",
+          "aliases": [],
+          "domains": [
+            "vertex10a.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:vertex10b",
+          "name": "Vertex GmbH",
+          "aliases": [],
+          "domains": [
+            "vertex10b.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW98:0",
+        "text": "Vertex call notes.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title with the shared surface 'Vertex' and TWO catalog candidates (both 1.000, margin 0.000), zero disambiguating context. Gold ABSTAIN \u2014 the short-doc variant of B3; must abstain at any margin_delta > 0."
+    },
+    {
+      "id": "s3-0099-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:orion10a",
+          "name": "Orion Inc",
+          "aliases": [],
+          "domains": [
+            "orion10a.example"
+          ],
+          "is_canonical": true
+        },
+        {
+          "canonical": "account:orion10b",
+          "name": "Orion Group",
+          "aliases": [],
+          "domains": [
+            "orion10b.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW99:0",
+        "text": "Orion?",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title with the shared surface 'Orion' and TWO catalog candidates (both 1.000, margin 0.000), zero disambiguating context. Gold ABSTAIN \u2014 the short-doc variant of B3; must abstain at any margin_delta > 0."
+    },
+    {
+      "id": "s3-0100-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:wonka10",
+          "name": "Wonka Confections",
+          "aliases": [],
+          "domains": [
+            "wonka.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW100:0",
+        "text": "Blorpo demo.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title naming an org that is not in the catalog and shares no tokens with the catalog customer 'Wonka Confections'. No detection, no candidates. Gold ABSTAIN at every grid point."
+    },
+    {
+      "id": "s3-0101-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:soylent10",
+          "name": "Soylent Foods",
+          "aliases": [],
+          "domains": [
+            "soylent.io"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW101:0",
+        "text": "Meet w/ Zaltech.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title naming an org that is not in the catalog and shares no tokens with the catalog customer 'Soylent Foods'. No detection, no candidates. Gold ABSTAIN at every grid point."
+    },
+    {
+      "id": "s3-0102-b10_short_low_context",
+      "band": "b10_short_low_context",
+      "gold": null,
+      "annex": false,
+      "catalog": [
+        {
+          "canonical": "account:aviato10",
+          "name": "Aviato",
+          "aliases": [],
+          "domains": [
+            "aviato.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:linear:SW102:0",
+        "text": "Quux beta.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "Minimal ticket title naming an org that is not in the catalog and shares no tokens with the catalog customer 'Aviato'. No detection, no candidates. Gold ABSTAIN at every grid point."
+    },
+    {
+      "id": "s3-0103-annex_containment_detection_gap",
+      "band": "annex_containment_detection_gap",
+      "gold": null,
+      "annex": true,
+      "catalog": [
+        {
+          "canonical": "account:acme-ax",
+          "name": "Acme, Inc.",
+          "aliases": [
+            "Acme"
+          ],
+          "domains": [
+            "acme.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW103:0",
+        "text": "Kickoff with Acme Analytics \u2014 the Berlin data consultancy, unrelated to our Acme account.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The catalog surface for 'Acme, Inc.' appears as a contiguous sub-span of the longer, DISTINCT org name 'Acme Analytics', so the window pass exact-matches it at 1.000 with no second candidate: no (tau_nil, margin_delta) setting can block the false link \u2014 the failure is in DETECTION, upstream of the gates. Gold ABSTAIN; EXCLUDED from grid metrics and reported as a standing detection-level limitation (annex)."
+    },
+    {
+      "id": "s3-0104-annex_containment_detection_gap",
+      "band": "annex_containment_detection_gap",
+      "gold": null,
+      "annex": true,
+      "catalog": [
+        {
+          "canonical": "account:stark-ax",
+          "name": "Stark Industries",
+          "aliases": [],
+          "domains": [
+            "stark.com"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW104:0",
+        "text": "Stark Industries Japan KK is a separate legal entity; do not co-mingle with the US account.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The catalog surface for 'Stark Industries' appears as a contiguous sub-span of the longer, DISTINCT org name 'Stark Industries Japan', so the window pass exact-matches it at 1.000 with no second candidate: no (tau_nil, margin_delta) setting can block the false link \u2014 the failure is in DETECTION, upstream of the gates. Gold ABSTAIN; EXCLUDED from grid metrics and reported as a standing detection-level limitation (annex)."
+    },
+    {
+      "id": "s3-0105-annex_containment_detection_gap",
+      "band": "annex_containment_detection_gap",
+      "gold": null,
+      "annex": true,
+      "catalog": [
+        {
+          "canonical": "account:titan-ax",
+          "name": "Titan",
+          "aliases": [],
+          "domains": [
+            "titan.example"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW105:0",
+        "text": "Titan Ventures (the seed fund) reached out about a portfolio intro.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The catalog surface for 'Titan' appears as a contiguous sub-span of the longer, DISTINCT org name 'Titan Ventures', so the window pass exact-matches it at 1.000 with no second candidate: no (tau_nil, margin_delta) setting can block the false link \u2014 the failure is in DETECTION, upstream of the gates. Gold ABSTAIN; EXCLUDED from grid metrics and reported as a standing detection-level limitation (annex)."
+    },
+    {
+      "id": "s3-0106-annex_containment_detection_gap",
+      "band": "annex_containment_detection_gap",
+      "gold": null,
+      "annex": true,
+      "catalog": [
+        {
+          "canonical": "account:nova-ax",
+          "name": "Nova Media",
+          "aliases": [],
+          "domains": [
+            "novamedia.tv"
+          ],
+          "is_canonical": true
+        }
+      ],
+      "chunk": {
+        "chunk_ref": "chunk:gdrive:SW106:0",
+        "text": "Nova Media Group Berlin \u2014 the unrelated German agency \u2014 asked for rates.",
+        "chunk_domains": [],
+        "acl_domains": []
+      },
+      "detector_spans": [],
+      "rationale": "The catalog surface for 'Nova Media' appears as a contiguous sub-span of the longer, DISTINCT org name 'Nova Media Group', so the window pass exact-matches it at 1.000 with no second candidate: no (tau_nil, margin_delta) setting can block the false link \u2014 the failure is in DETECTION, upstream of the gates. Gold ABSTAIN; EXCLUDED from grid metrics and reported as a standing detection-level limitation (annex)."
+    }
+  ]
+}

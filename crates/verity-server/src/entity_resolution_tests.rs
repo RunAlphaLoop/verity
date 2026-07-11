@@ -394,30 +394,30 @@ async fn live_tier1_resolution_merges_company_across_sources_and_fences_others()
         "badge must cite ≥1 justifying evidence row"
     );
 
-    // The two customer contacts merged on the shared corporate email — their own
-    // canonical, also deterministic, via email_exact in customer_contact.
-    let jane_canon = storage
-        .resolve_canonical(tenant, "hubspot", "hs-jane")
-        .await
-        .unwrap()
-        .expect("hs-jane must resolve");
+    // The two customer contacts share one corporate email — under the MEASURED
+    // default (email min_independent_keys = 2; email_exact demoted from the
+    // lone-weld strong set, RESULTS-key-independence-2026-07-11.md) a lone
+    // shared email does NOT auto-weld: shared humans (fractional CFO, agency
+    // contact) measured email-alone FMR 3/4 eligible negatives. The pair stays
+    // separate pending review; a tenant can opt person↔person lone-email welds
+    // back in per namespace (config email → min_independent_keys = 1, covered
+    // by the fold unit test same_namespace_email_merges).
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "hubspot", "hs-jane")
+            .await
+            .unwrap(),
+        None,
+        "a lone shared email must not auto-weld under the measured default"
+    );
     assert_eq!(
         storage
             .resolve_canonical(tenant, "salesforce", "sf-jane")
             .await
-            .unwrap()
-            .as_deref(),
-        Some(jane_canon.as_str()),
-        "both contacts share one canonical person"
+            .unwrap(),
+        None,
+        "the salesforce contact likewise stays its own entity pending review"
     );
-    assert_ne!(jane_canon, acme_canon, "the person is not the account");
-    let jane_badge = storage
-        .link_meta_for_canonical(tenant, &jane_canon)
-        .await
-        .unwrap()
-        .expect("jane badge");
-    assert_eq!(jane_badge.confidence, "deterministic");
-    assert_eq!(jane_badge.strongest_method.as_deref(), Some("email_exact"));
 
     // ---- ASSERT 3 (the security check): the DIFFERENT company never merges in. ----
     // The internal-directory actor is fenced out of BOTH the customer person and
@@ -655,8 +655,10 @@ async fn scheduler_pass_runs_resolution_for_dirty_tenant() {
     let Some((state, tenant)) = test_state().await else {
         return;
     };
-    // A resolvable cross-source pair: same email under two sources → Tier-1
-    // evidence the fold links. This gives run_resolution real work to do.
+    // A resolvable cross-source pair: same email AND same external_id under
+    // two sources → two independent Tier-1 keys, clearing the measured
+    // min_independent_keys bar (a lone email no longer welds by default —
+    // RESULTS-key-independence-2026-07-11.md). Gives run_resolution real work.
     fact(
         &state,
         tenant,
@@ -667,6 +669,24 @@ async fn scheduler_pass_runs_resolution_for_dirty_tenant() {
     )
     .await;
     fact(&state, tenant, "hubspot", "hs-1", "email", json!("a@x.com")).await;
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-1",
+        "external_id",
+        json!("crm-42"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-1",
+        "external_id",
+        json!("crm-42"),
+    )
+    .await;
 
     // Build an ENABLED scheduler (test_state's is disabled) and mark dirty.
     let sched = crate::scheduler::ResolutionScheduler::with_debounce_seconds(900.0);

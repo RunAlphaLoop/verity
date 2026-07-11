@@ -96,9 +96,16 @@ class Tier3Config:
     Defaults are the SAFE, precision-first operating point: ``auto_link_tier3``
     OFF (the ``VERITY_ENTITY_AUTO_LINK=0`` analog), a high ``tau_nil`` so weak
     matches abstain, and a real ``margin_delta`` so two plausible candidates
-    abstain rather than guess."""
+    abstain rather than guess.
 
-    tau_nil: float = 0.55
+    ``(tau_nil, margin_delta) = (0.70, 0.15)`` is MEASURED, not guessed: the
+    max-recall grid point with link-precision 1.0000 and zero false links on
+    the 106-case mention sweep (synthetic hand-labeled stress set — see
+    docs/benchmark/RESULTS-tier3-gates-2026-07-11.md). The former default 0.55
+    admits 10 false links in the fuzzy-backstop regime; on today's pure
+    gazetteer path (every detected mention scores 1.0) the two are identical."""
+
+    tau_nil: float = 0.70
     margin_delta: float = 0.15
     auto_link_tier3: bool = False
 

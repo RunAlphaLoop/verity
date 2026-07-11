@@ -49,6 +49,7 @@ pub use producers::{
 pub use fold::{
     fold, fold_with_known_canonicals, parse_chunk_ref, refold_incremental, split_member_ref,
     AliasWrite, ChunkTagWrite, FoldConfig, FoldPlan, MemberRef, ReviewItem, ReviewReason,
+    DEFAULT_LARGE_COMPONENT_FLOOR,
 };
 
 // §5 Tier-3 mention → chunk-tag eligibility: the "already folded (exists in

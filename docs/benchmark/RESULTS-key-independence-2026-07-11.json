@@ -1,0 +1,605 @@
+{
+  "date": "2026-07-11",
+  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json",
+  "honesty": "Synthetic, hand-labeled STRESS corpus \u2014 adversarial composition, not a natural distribution. Deterministic scorers only; no LLM anywhere.",
+  "metric": "entity_resolution_key_independence_sweep",
+  "result": {
+    "corpus": {
+      "easy_negatives": 4,
+      "hard_negatives": 52,
+      "negatives": 56,
+      "positives": 47,
+      "total": 103
+    },
+    "per_kind_alone": {
+      "domain": {
+        "confusion": {
+          "fn": 9,
+          "fp": 14,
+          "tn": 42,
+          "tp": 38
+        },
+        "eligible_negatives": 51,
+        "eligible_positives": 38,
+        "false_merge_rate_all_negatives": 0.25,
+        "false_merge_rate_eligible": 0.27450980392156865,
+        "false_merges": [
+          {
+            "id": "er-0069",
+            "left": [
+              "Procter & Gamble",
+              "pg.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: parent (P&G) and a consumer brand it owns, BOTH carrying the parent's domain pg.com in CRM. Distinct entities, distinct deal scopes. A domain-alone auto-merge fuses them \u2014 exactly the leak min_independent_keys exists to stop. Must stay apart.",
+            "right": [
+              "Gillette",
+              "pg.com"
+            ]
+          },
+          {
+            "id": "er-0070",
+            "left": [
+              "Unilever",
+              "unilever.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: conglomerate vs one of its brands; the brand's CRM record was enriched with the parent's corporate domain. Two entities, one domain. Domain alone must not merge. Must stay apart.",
+            "right": [
+              "Ben & Jerry's Homemade",
+              "unilever.com"
+            ]
+          },
+          {
+            "id": "er-0071",
+            "left": [
+              "Berkshire Hathaway",
+              "berkshirehathaway.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: holding company vs a wholly-owned subsidiary whose record carries the holding domain. Separate legal entities, separate data scopes. Must stay apart.",
+            "right": [
+              "GEICO",
+              "berkshirehathaway.com"
+            ]
+          },
+          {
+            "id": "er-0072",
+            "left": [
+              "Redwood Dental",
+              "brightsidemarketing.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated small businesses whose CRM domain field holds their shared marketing AGENCY's domain (agency-managed email/website). The domain identifies the agency, not either client. Must stay apart.",
+            "right": [
+              "Harbor Plumbing",
+              "brightsidemarketing.com"
+            ]
+          },
+          {
+            "id": "er-0073",
+            "left": [
+              "Lumen Bio",
+              "members.thehive.work"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two coworking-space members using the space's shared member domain. Shared infrastructure, not shared identity \u2014 the co-tenancy failure on a domain that is NOT in any free-mail denylist. Must stay apart.",
+            "right": [
+              "Quartz Legal",
+              "members.thehive.work"
+            ]
+          },
+          {
+            "id": "er-0074",
+            "left": [
+              "Marriott International",
+              "marriott.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: franchisor vs an independent franchise operator whose contacts use brand-domain email. The franchisee is its own company with its own contracts and scope. Must stay apart.",
+            "right": [
+              "Desert Springs Hospitality",
+              "marriott.com"
+            ]
+          },
+          {
+            "id": "er-0075",
+            "left": [
+              "Crick Therapeutics",
+              "stanford.edu"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated university spinouts whose records inherited the founders' .edu domain from contact enrichment. Institutional domains are co-tenant domains. Must stay apart.",
+            "right": [
+              "Turing Robotics",
+              "stanford.edu"
+            ]
+          },
+          {
+            "id": "er-0076",
+            "left": [
+              "Hartley's Hardware",
+              "comcast.net"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two small businesses on an ISP mail domain (comcast.net) that is deliberately NOT in the free-mail denylist \u2014 proves the denylist cannot enumerate every shared-infrastructure domain, so the structural min_independent_keys guard must exist independently. Must stay apart.",
+            "right": [
+              "Bayside Florist",
+              "comcast.net"
+            ]
+          },
+          {
+            "id": "er-0077",
+            "left": [
+              "Meridian Battery",
+              "heliosgroup.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two SIBLING subsidiaries of one holding group (Helios Group), both on the parent's domain. Merging siblings through the parent domain unions two unrelated books of business. Must stay apart.",
+            "right": [
+              "Solward Grid",
+              "heliosgroup.com"
+            ]
+          },
+          {
+            "id": "er-0078",
+            "left": [
+              "Maple Crafts",
+              "etsy.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two marketplace sellers whose 'website' field holds the marketplace's domain. Platform domain, not company identity. Must stay apart.",
+            "right": [
+              "Cedar Woodworks",
+              "etsy.com"
+            ]
+          },
+          {
+            "id": "er-0079",
+            "left": [
+              "Oakfield Robotics",
+              "trinetclients.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two companies using the same PEO/employer-of-record, whose HR-sourced contacts share the PEO's client mail domain. Shared back office, distinct companies. Must stay apart.",
+            "right": [
+              "Pinehurst Media",
+              "trinetclients.com"
+            ]
+          },
+          {
+            "id": "er-0080",
+            "left": [
+              "Northstar Distribution",
+              "vulcantools.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a distributor whose record carries its MANUFACTURER's domain (rep works from the vendor's portal/email) vs the manufacturer itself. Supply-chain adjacency, not identity. Must stay apart.",
+            "right": [
+              "Vulcan Tools",
+              "vulcantools.com"
+            ]
+          },
+          {
+            "id": "er-0081",
+            "left": [
+              "Nimbus Software",
+              "vectorsystems.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a recently ACQUIRED company whose mailboxes migrated to the acquirer's domain vs the acquirer. Their pre-acquisition data scopes remain distinct; fusing them is a human decision (admin crosswalk), never a domain-alone auto-merge. Must stay apart.",
+            "right": [
+              "Vector Systems",
+              "vectorsystems.com"
+            ]
+          },
+          {
+            "id": "er-0082",
+            "left": [
+              "Kite Aerospace",
+              "thornegroup.com"
+            ],
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two divisions of a conglomerate (Thorne Group) sharing the group domain. Divisions transact independently; a shared group domain must not weld their scopes. Must stay apart.",
+            "right": [
+              "Fenwick Marine",
+              "thornegroup.com"
+            ]
+          }
+        ],
+        "kind": "domain",
+        "lone_key_positive_count": 36,
+        "lone_key_positives": [
+          "er-0001",
+          "er-0002",
+          "er-0003",
+          "er-0004",
+          "er-0005",
+          "er-0006",
+          "er-0007",
+          "er-0008",
+          "er-0009",
+          "er-0010",
+          "er-0011",
+          "er-0012",
+          "er-0013",
+          "er-0014",
+          "er-0015",
+          "er-0016",
+          "er-0017",
+          "er-0018",
+          "er-0019",
+          "er-0020",
+          "er-0021",
+          "er-0022",
+          "er-0023",
+          "er-0024",
+          "er-0025",
+          "er-0026",
+          "er-0027",
+          "er-0061",
+          "er-0062",
+          "er-0063",
+          "er-0064",
+          "er-0065",
+          "er-0094",
+          "er-0095",
+          "er-0096",
+          "er-0097"
+        ],
+        "recall_alone": 0.8085106382978723
+      },
+      "email": {
+        "confusion": {
+          "fn": 42,
+          "fp": 3,
+          "tn": 53,
+          "tp": 5
+        },
+        "eligible_negatives": 4,
+        "eligible_positives": 5,
+        "false_merge_rate_all_negatives": 0.05357142857142857,
+        "false_merge_rate_eligible": 0.75,
+        "false_merges": [
+          {
+            "id": "er-0083",
+            "left": [
+              "Alpine Physio",
+              "alpinephysio.com"
+            ],
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: one fractional CFO (m.tran@ledgerpartners.co) is the billing contact for TWO unrelated companies. An exact shared customer-contact email between two ACCOUNT records is one shared human, not one company \u2014 email alone must not auto-merge accounts. Must stay apart.",
+            "right": [
+              "Basalt Brewing",
+              "basaltbrewing.com"
+            ]
+          },
+          {
+            "id": "er-0084",
+            "left": [
+              "Peregrine Labs",
+              "peregrinelabs.com"
+            ],
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: a serial founder's personal gmail is the contact on both of their (distinct) companies. The free-mail DOMAIN is denylisted upstream, but the exact ADDRESS still matches \u2014 one person owning two companies does not make them one entity. Must stay apart.",
+            "right": [
+              "Copperline Coffee",
+              "copperlinecoffee.com"
+            ]
+          },
+          {
+            "id": "er-0085",
+            "left": [
+              "Orchid Skincare",
+              "orchidskincare.com"
+            ],
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: an agency-of-record account manager is the listed contact on two client accounts. Shared vendor human, distinct customers. Must stay apart.",
+            "right": [
+              "Truss Construction",
+              "trussconstruction.com"
+            ]
+          }
+        ],
+        "kind": "email",
+        "lone_key_positive_count": 4,
+        "lone_key_positives": [
+          "er-0098",
+          "er-0099",
+          "er-0100",
+          "er-0101"
+        ],
+        "recall_alone": 0.10638297872340426
+      },
+      "external_id": {
+        "confusion": {
+          "fn": 42,
+          "fp": 0,
+          "tn": 56,
+          "tp": 5
+        },
+        "eligible_negatives": 3,
+        "eligible_positives": 5,
+        "false_merge_rate_all_negatives": 0.0,
+        "false_merge_rate_eligible": 0.0,
+        "false_merges": [],
+        "kind": "external_id",
+        "lone_key_positive_count": 4,
+        "lone_key_positives": [
+          "er-0090",
+          "er-0091",
+          "er-0092",
+          "er-0093"
+        ],
+        "recall_alone": 0.10638297872340426
+      }
+    },
+    "policies": {
+      "per_kind_email1": {
+        "confusion": {
+          "fn": 37,
+          "fp": 3,
+          "tn": 53,
+          "tp": 10
+        },
+        "false_merge_rate": 0.05357142857142857,
+        "false_merges": [
+          {
+            "id": "er-0083",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: one fractional CFO (m.tran@ledgerpartners.co) is the billing contact for TWO unrelated companies. An exact shared customer-contact email between two ACCOUNT records is one shared human, not one company \u2014 email alone must not auto-merge accounts. Must stay apart."
+          },
+          {
+            "id": "er-0084",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: a serial founder's personal gmail is the contact on both of their (distinct) companies. The free-mail DOMAIN is denylisted upstream, but the exact ADDRESS still matches \u2014 one person owning two companies does not make them one entity. Must stay apart."
+          },
+          {
+            "id": "er-0085",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: an agency-of-record account manager is the listed contact on two client accounts. Shared vendor human, distinct customers. Must stay apart."
+          }
+        ],
+        "forgone_true_pairs": [
+          "er-0001",
+          "er-0002",
+          "er-0003",
+          "er-0004",
+          "er-0005",
+          "er-0006",
+          "er-0007",
+          "er-0008",
+          "er-0009",
+          "er-0010",
+          "er-0011",
+          "er-0012",
+          "er-0013",
+          "er-0014",
+          "er-0015",
+          "er-0016",
+          "er-0017",
+          "er-0018",
+          "er-0019",
+          "er-0020",
+          "er-0021",
+          "er-0022",
+          "er-0023",
+          "er-0024",
+          "er-0025",
+          "er-0026",
+          "er-0027",
+          "er-0057",
+          "er-0061",
+          "er-0062",
+          "er-0063",
+          "er-0064",
+          "er-0065",
+          "er-0094",
+          "er-0095",
+          "er-0096",
+          "er-0097"
+        ],
+        "policy": {
+          "domain": 2,
+          "email": 1,
+          "external_id": 1
+        },
+        "precision": 0.7692307692307693,
+        "recall": 0.2127659574468085
+      },
+      "per_kind_email2": {
+        "confusion": {
+          "fn": 41,
+          "fp": 0,
+          "tn": 56,
+          "tp": 6
+        },
+        "false_merge_rate": 0.0,
+        "false_merges": [],
+        "forgone_true_pairs": [
+          "er-0001",
+          "er-0002",
+          "er-0003",
+          "er-0004",
+          "er-0005",
+          "er-0006",
+          "er-0007",
+          "er-0008",
+          "er-0009",
+          "er-0010",
+          "er-0011",
+          "er-0012",
+          "er-0013",
+          "er-0014",
+          "er-0015",
+          "er-0016",
+          "er-0017",
+          "er-0018",
+          "er-0019",
+          "er-0020",
+          "er-0021",
+          "er-0022",
+          "er-0023",
+          "er-0024",
+          "er-0025",
+          "er-0026",
+          "er-0027",
+          "er-0057",
+          "er-0061",
+          "er-0062",
+          "er-0063",
+          "er-0064",
+          "er-0065",
+          "er-0094",
+          "er-0095",
+          "er-0096",
+          "er-0097",
+          "er-0098",
+          "er-0099",
+          "er-0100",
+          "er-0101"
+        ],
+        "policy": {
+          "domain": 2,
+          "email": 2,
+          "external_id": 1
+        },
+        "precision": 1.0,
+        "recall": 0.1276595744680851
+      },
+      "uniform_min1": {
+        "confusion": {
+          "fn": 1,
+          "fp": 17,
+          "tn": 39,
+          "tp": 46
+        },
+        "false_merge_rate": 0.30357142857142855,
+        "false_merges": [
+          {
+            "id": "er-0069",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: parent (P&G) and a consumer brand it owns, BOTH carrying the parent's domain pg.com in CRM. Distinct entities, distinct deal scopes. A domain-alone auto-merge fuses them \u2014 exactly the leak min_independent_keys exists to stop. Must stay apart."
+          },
+          {
+            "id": "er-0070",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: conglomerate vs one of its brands; the brand's CRM record was enriched with the parent's corporate domain. Two entities, one domain. Domain alone must not merge. Must stay apart."
+          },
+          {
+            "id": "er-0071",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: holding company vs a wholly-owned subsidiary whose record carries the holding domain. Separate legal entities, separate data scopes. Must stay apart."
+          },
+          {
+            "id": "er-0072",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated small businesses whose CRM domain field holds their shared marketing AGENCY's domain (agency-managed email/website). The domain identifies the agency, not either client. Must stay apart."
+          },
+          {
+            "id": "er-0073",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two coworking-space members using the space's shared member domain. Shared infrastructure, not shared identity \u2014 the co-tenancy failure on a domain that is NOT in any free-mail denylist. Must stay apart."
+          },
+          {
+            "id": "er-0074",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: franchisor vs an independent franchise operator whose contacts use brand-domain email. The franchisee is its own company with its own contracts and scope. Must stay apart."
+          },
+          {
+            "id": "er-0075",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two unrelated university spinouts whose records inherited the founders' .edu domain from contact enrichment. Institutional domains are co-tenant domains. Must stay apart."
+          },
+          {
+            "id": "er-0076",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two small businesses on an ISP mail domain (comcast.net) that is deliberately NOT in the free-mail denylist \u2014 proves the denylist cannot enumerate every shared-infrastructure domain, so the structural min_independent_keys guard must exist independently. Must stay apart."
+          },
+          {
+            "id": "er-0077",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two SIBLING subsidiaries of one holding group (Helios Group), both on the parent's domain. Merging siblings through the parent domain unions two unrelated books of business. Must stay apart."
+          },
+          {
+            "id": "er-0078",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two marketplace sellers whose 'website' field holds the marketplace's domain. Platform domain, not company identity. Must stay apart."
+          },
+          {
+            "id": "er-0079",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two companies using the same PEO/employer-of-record, whose HR-sourced contacts share the PEO's client mail domain. Shared back office, distinct companies. Must stay apart."
+          },
+          {
+            "id": "er-0080",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a distributor whose record carries its MANUFACTURER's domain (rep works from the vendor's portal/email) vs the manufacturer itself. Supply-chain adjacency, not identity. Must stay apart."
+          },
+          {
+            "id": "er-0081",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: a recently ACQUIRED company whose mailboxes migrated to the acquirer's domain vs the acquirer. Their pre-acquisition data scopes remain distinct; fusing them is a human decision (admin crosswalk), never a domain-alone auto-merge. Must stay apart."
+          },
+          {
+            "id": "er-0082",
+            "rationale": "DOMAIN-SHARED-BUT-DISTINCT: two divisions of a conglomerate (Thorne Group) sharing the group domain. Divisions transact independently; a shared group domain must not weld their scopes. Must stay apart."
+          },
+          {
+            "id": "er-0083",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: one fractional CFO (m.tran@ledgerpartners.co) is the billing contact for TWO unrelated companies. An exact shared customer-contact email between two ACCOUNT records is one shared human, not one company \u2014 email alone must not auto-merge accounts. Must stay apart."
+          },
+          {
+            "id": "er-0084",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: a serial founder's personal gmail is the contact on both of their (distinct) companies. The free-mail DOMAIN is denylisted upstream, but the exact ADDRESS still matches \u2014 one person owning two companies does not make them one entity. Must stay apart."
+          },
+          {
+            "id": "er-0085",
+            "rationale": "SHARED-EMAIL-BUT-DISTINCT: an agency-of-record account manager is the listed contact on two client accounts. Shared vendor human, distinct customers. Must stay apart."
+          }
+        ],
+        "forgone_true_pairs": [
+          "er-0057"
+        ],
+        "policy": {
+          "domain": 1,
+          "email": 1,
+          "external_id": 1
+        },
+        "precision": 0.7301587301587301,
+        "recall": 0.9787234042553191
+      },
+      "uniform_min2": {
+        "confusion": {
+          "fn": 45,
+          "fp": 0,
+          "tn": 56,
+          "tp": 2
+        },
+        "false_merge_rate": 0.0,
+        "false_merges": [],
+        "forgone_true_pairs": [
+          "er-0001",
+          "er-0002",
+          "er-0003",
+          "er-0004",
+          "er-0005",
+          "er-0006",
+          "er-0007",
+          "er-0008",
+          "er-0009",
+          "er-0010",
+          "er-0011",
+          "er-0012",
+          "er-0013",
+          "er-0014",
+          "er-0015",
+          "er-0016",
+          "er-0017",
+          "er-0018",
+          "er-0019",
+          "er-0020",
+          "er-0021",
+          "er-0022",
+          "er-0023",
+          "er-0024",
+          "er-0025",
+          "er-0026",
+          "er-0027",
+          "er-0057",
+          "er-0061",
+          "er-0062",
+          "er-0063",
+          "er-0064",
+          "er-0065",
+          "er-0090",
+          "er-0091",
+          "er-0092",
+          "er-0093",
+          "er-0094",
+          "er-0095",
+          "er-0096",
+          "er-0097",
+          "er-0098",
+          "er-0099",
+          "er-0100",
+          "er-0101"
+        ],
+        "policy": {
+          "domain": 2,
+          "email": 2,
+          "external_id": 2
+        },
+        "precision": 1.0,
+        "recall": 0.0425531914893617
+      }
+    }
+  }
+}
