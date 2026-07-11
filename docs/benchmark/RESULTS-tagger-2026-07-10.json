@@ -1,0 +1,340 @@
+{
+  "corpus": {
+    "total": 118,
+    "expected_tags_total": 100,
+    "distractors_total": 188,
+    "examples_with_no_expected_tag": 40,
+    "by_category": {
+      "common_word": {
+        "tp": 2,
+        "fp": 9,
+        "fn": 0,
+        "precision": 0.1818,
+        "recall": 1.0,
+        "f1": 0.3077,
+        "distractor_fp_rate": 0.5
+      },
+      "multi_entity": {
+        "tp": 36,
+        "fp": 0,
+        "fn": 4,
+        "precision": 1.0,
+        "recall": 0.9,
+        "f1": 0.9474,
+        "distractor_fp_rate": 0.0
+      },
+      "none": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "distractor_fp_rate": 0.0
+      },
+      "partial_name": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 12,
+        "precision": 1.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "distractor_fp_rate": 0.0
+      },
+      "pronoun_only": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "distractor_fp_rate": 0.0
+      },
+      "single_entity": {
+        "tp": 39,
+        "fp": 0,
+        "fn": 5,
+        "precision": 1.0,
+        "recall": 0.8864,
+        "f1": 0.9398,
+        "distractor_fp_rate": 0.0
+      },
+      "substring_collision": {
+        "tp": 2,
+        "fp": 5,
+        "fn": 0,
+        "precision": 0.2857,
+        "recall": 1.0,
+        "f1": 0.4444,
+        "distractor_fp_rate": 0.8333
+      }
+    }
+  },
+  "confusion": {
+    "tp": 79,
+    "fp": 14,
+    "fn": 21
+  },
+  "precision": 0.8494623655913979,
+  "recall": 0.79,
+  "f1": 0.8186528497409327,
+  "distractor_fp_rate": 0.07446808510638298,
+  "distractor_tagged": 14,
+  "exact_examples": 87,
+  "false_tag_examples": [
+    {
+      "id": "tg-0045",
+      "category": "common_word",
+      "content": "We shipped the fix on Monday and the box turned green in CI.",
+      "false_tags": [
+        "account:box"
+      ]
+    },
+    {
+      "id": "tg-0046",
+      "category": "common_word",
+      "content": "The apple of the sales team's eye this quarter is the enterprise segment.",
+      "false_tags": [
+        "account:apple"
+      ]
+    },
+    {
+      "id": "tg-0047",
+      "category": "common_word",
+      "content": "Support gave the ticket top priority and closed it within the hour.",
+      "false_tags": [
+        "account:priority"
+      ]
+    },
+    {
+      "id": "tg-0048",
+      "category": "common_word",
+      "content": "There was a general consensus that pricing needs a rework.",
+      "false_tags": [
+        "account:general"
+      ]
+    },
+    {
+      "id": "tg-0049",
+      "category": "common_word",
+      "content": "The buyer wants a summit with our exec team before signing.",
+      "false_tags": [
+        "account:summit"
+      ]
+    },
+    {
+      "id": "tg-0050",
+      "category": "common_word",
+      "content": "We need a bridge call to align both sides before the renewal.",
+      "false_tags": [
+        "account:bridge"
+      ]
+    },
+    {
+      "id": "tg-0068",
+      "category": "substring_collision",
+      "content": "Metadata pipeline is healthy; no issues to report this week.",
+      "false_tags": [
+        "account:data",
+        "account:meta"
+      ]
+    },
+    {
+      "id": "tg-0069",
+      "category": "substring_collision",
+      "content": "The catalog sync ran clean overnight across all regions.",
+      "false_tags": [
+        "account:cat",
+        "account:log"
+      ]
+    },
+    {
+      "id": "tg-0071",
+      "category": "substring_collision",
+      "content": "Northstar's contract is signed; the north star metric is activation.",
+      "false_tags": [
+        "account:star"
+      ]
+    },
+    {
+      "id": "tg-0116",
+      "category": "common_word",
+      "content": "We put a stake in the ground on the Q3 targets today.",
+      "false_tags": [
+        "account:stake"
+      ]
+    },
+    {
+      "id": "tg-0117",
+      "category": "common_word",
+      "content": "The North team hit quota; the South team is trailing.",
+      "false_tags": [
+        "account:north",
+        "account:south"
+      ]
+    }
+  ],
+  "missed_examples": [
+    {
+      "id": "tg-0015",
+      "category": "single_entity",
+      "content": "Massive Dynamic escalated a billing dispute over the March invoice.",
+      "missed_tags": [
+        "account:massive-dynamic"
+      ]
+    },
+    {
+      "id": "tg-0016",
+      "category": "single_entity",
+      "content": "Pied Piper needs a middle-out compression benchmark before they'll expand.",
+      "missed_tags": [
+        "account:pied-piper"
+      ]
+    },
+    {
+      "id": "tg-0017",
+      "category": "single_entity",
+      "content": "Dunder Mifflin's regional managers want a demo of the new dashboard.",
+      "missed_tags": [
+        "account:dunder-mifflin"
+      ]
+    },
+    {
+      "id": "tg-0019",
+      "category": "single_entity",
+      "content": "Blue Sun reported degraded sync performance across three integrations.",
+      "missed_tags": [
+        "account:blue-sun"
+      ]
+    },
+    {
+      "id": "tg-0026",
+      "category": "multi_entity",
+      "content": "Pied Piper is migrating off Blue Sun's legacy stack onto ours.",
+      "missed_tags": [
+        "account:blue-sun",
+        "account:pied-piper"
+      ]
+    },
+    {
+      "id": "tg-0027",
+      "category": "multi_entity",
+      "content": "Both Dunder Mifflin and Prestige Worldwide asked for the same case study.",
+      "missed_tags": [
+        "account:dunder-mifflin"
+      ]
+    },
+    {
+      "id": "tg-0028",
+      "category": "multi_entity",
+      "content": "Soylent flagged the bug; Massive Dynamic hit the same one an hour later.",
+      "missed_tags": [
+        "account:massive-dynamic"
+      ]
+    },
+    {
+      "id": "tg-0053",
+      "category": "partial_name",
+      "content": "IBM's procurement team wants a volume discount for 10k seats.",
+      "missed_tags": [
+        "account:international-business-machines"
+      ]
+    },
+    {
+      "id": "tg-0054",
+      "category": "partial_name",
+      "content": "GE flagged a compliance requirement we haven't seen before.",
+      "missed_tags": [
+        "account:general-electric"
+      ]
+    },
+    {
+      "id": "tg-0055",
+      "category": "partial_name",
+      "content": "HP is consolidating vendors and we're on the shortlist.",
+      "missed_tags": [
+        "account:hewlett-packard"
+      ]
+    },
+    {
+      "id": "tg-0056",
+      "category": "partial_name",
+      "content": "MassDyn wants a QBR before they'll discuss the expansion.",
+      "missed_tags": [
+        "account:massive-dynamic"
+      ]
+    },
+    {
+      "id": "tg-0057",
+      "category": "partial_name",
+      "content": "Vandelay Ind. is late on the March invoice; AR is following up.",
+      "missed_tags": [
+        "account:vandelay-industries"
+      ]
+    },
+    {
+      "id": "tg-0058",
+      "category": "partial_name",
+      "content": "DM Paper's Scranton branch is the most active on the platform.",
+      "missed_tags": [
+        "account:dunder-mifflin-paper"
+      ]
+    },
+    {
+      "id": "tg-0059",
+      "category": "partial_name",
+      "content": "PWW signed but wants the contract restated with the full legal name.",
+      "missed_tags": [
+        "account:prestige-worldwide"
+      ]
+    },
+    {
+      "id": "tg-0060",
+      "category": "partial_name",
+      "content": "Cyberdyne Sys escalated the SSO outage to their CISO.",
+      "missed_tags": [
+        "account:cyberdyne-systems"
+      ]
+    },
+    {
+      "id": "tg-0099",
+      "category": "single_entity",
+      "content": "Blue Sun asked whether we support customer-managed encryption keys.",
+      "missed_tags": [
+        "account:blue-sun"
+      ]
+    },
+    {
+      "id": "tg-0112",
+      "category": "partial_name",
+      "content": "JPMC's risk team needs an on-prem option before they'll proceed.",
+      "missed_tags": [
+        "account:jpmorgan-chase"
+      ]
+    },
+    {
+      "id": "tg-0113",
+      "category": "partial_name",
+      "content": "P&G is standardizing tooling globally and wants a master agreement.",
+      "missed_tags": [
+        "account:procter-gamble"
+      ]
+    },
+    {
+      "id": "tg-0114",
+      "category": "partial_name",
+      "content": "AmEx flagged a PCI requirement for the payments integration.",
+      "missed_tags": [
+        "account:american-express"
+      ]
+    },
+    {
+      "id": "tg-0115",
+      "category": "partial_name",
+      "content": "The DoD contract requires FedRAMP; sending our authorization docs.",
+      "missed_tags": [
+        "account:department-of-defense"
+      ]
+    }
+  ]
+}
