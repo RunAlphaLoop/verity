@@ -6,7 +6,7 @@
      • GET /v1/admin/connector-status?tenant_id=  → [{ source, cursor,
          items_synced, last_event_at|null, updated_at }]
      • GET /v1/slo/freshness?tenant_id=&window_hours= → [{ source, samples,
-         p50_ms|null, p95_ms|null }]                 (NOTE: no p99, no target)
+         p50_ms|null, p95_ms|null, p99_ms|null }]           (NOTE: no target)
      • GET /v1/admin/backfill?tenant_id=          → [{ run_id, source, state,
          total|null, processed, cursor, error|null, started_at, updated_at }]
 
@@ -17,9 +17,10 @@
       a wrong lane label breaks 'never blurred' (SPEC §5e.6). The inline
       error/last-failure is sourced from the matching BACKFILL run's `error`
       (the only real failure signal we have), disclosed as such.
-   2. Freshness emits p50 + p95 only. p99 is an honest seam ('not computed'),
-      never fabricated. The SLO target is OPERATOR-SET (an input) and labeled as
-      such; breach = a REAL percentile exceeding the STATED target.
+   2. Freshness emits p50 + p95 + p99, all from real samples (server-computed
+      over the same window/group), never fabricated — null when a group has no
+      samples. The SLO target is OPERATOR-SET (an input) and labeled as such;
+      breach = a REAL percentile exceeding the STATED target.
    3. True cadence is derived from real timestamps (event age + heartbeat gap),
       never a flagship 'seconds' claim inherited by a daily source (SPEC §5d).
    4. Backfill: determinate bar only when total known; striped indeterminate
@@ -247,8 +248,8 @@
       freshCard.className = "card";
       freshCard.innerHTML =
         '<h2>Freshness SLO <span class="sub">source-change → queryable · GET /v1/slo/freshness</span></h2>' +
-        '<div class="note"><em>Honest percentiles.</em> The endpoint computes <b>p50</b> and <b>p95</b> ' +
-          'from real samples. It does <b>not</b> compute <b>p99</b>, so that column is a labeled seam, ' +
+        '<div class="note"><em>Honest percentiles.</em> The endpoint computes <b>p50</b>, <b>p95</b> ' +
+          'and <b>p99</b> from real samples over the same window (null when a source has no samples), ' +
           'never a fabricated number. The <b>SLO target</b> is <b>operator-set</b> above (not ' +
           'server-authoritative); a value over target is highlighted as a breach (SPEC §5 Screen 5 / ' +
           'CLAUDE.md honest-numbers).</div>' +
@@ -381,15 +382,14 @@
         }
         var body = rows.map(function (r) {
           var breach = (r.p50_ms != null && tgt != null && r.p50_ms > tgt) ||
-                       (r.p95_ms != null && tgt != null && r.p95_ms > tgt);
+                       (r.p95_ms != null && tgt != null && r.p95_ms > tgt) ||
+                       (r.p99_ms != null && tgt != null && r.p99_ms > tgt);
           return '<tr' + (breach ? ' class="flag"' : "") + ">" +
             "<td><b>" + Verity.esc(r.source) + "</b></td>" +
             '<td class="num">' + Verity.esc(r.samples == null ? "—" : r.samples) + "</td>" +
             '<td class="num">' + pctCell(r.p50_ms, tgt) + "</td>" +
             '<td class="num">' + pctCell(r.p95_ms, tgt) + "</td>" +
-            '<td class="num"><span class="refreshed" ' +
-              'title="/v1/slo/freshness computes p50 and p95 only — p99 is not computed; ' +
-              'we do not fabricate it">not computed</span></td>' +
+            '<td class="num">' + pctCell(r.p99_ms, tgt) + "</td>" +
             '<td class="num">' + (tgt != null
               ? '<span title="operator-set target, not server-authoritative">' + Verity.esc(Verity.fmtMs(tgt)) + "</span>"
               : '<span class="refreshed">unset</span>') + "</td>" +
@@ -402,10 +402,10 @@
             '<th class="num">samples</th>' +
             '<th class="num">p50</th>' +
             '<th class="num">p95</th>' +
-            '<th class="num">p99 <span class="sub">(seam)</span></th>' +
+            '<th class="num">p99</th>' +
             '<th class="num">SLO target <span class="sub">(operator-set)</span></th>' +
           "</tr></thead><tbody>" + body + "</tbody></table></div>" +
-          '<div class="note">A red <b>breach</b> chip marks a real p50/p95 exceeding the stated ' +
+          '<div class="note">A red <b>breach</b> chip marks a real p50/p95/p99 exceeding the stated ' +
             (tgt != null ? "target of " + Verity.esc(Verity.fmtMs(tgt)) : "target (unset)") +
             ". The ACL-sync / grant-staleness window is itself an SLO here — never claimed 'instant' " +
             "(SPEC §7b/§14).</div>";

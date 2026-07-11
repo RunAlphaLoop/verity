@@ -314,6 +314,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
         .route("/v1/admin/reembed/cutover", post(admin_reembed_cutover))
         .route("/v1/admin/tenants", post(create_tenant))
+        .route(
+            "/v1/admin/erasure/preview",
+            post(compliance::admin_erasure_preview),
+        )
         .route("/v1/admin/erasure", post(compliance::admin_erasure))
         .route("/v1/admin/dsar/export", get(compliance::dsar_export))
         .route("/v1/admin/audit", get(audit::admin_audit))

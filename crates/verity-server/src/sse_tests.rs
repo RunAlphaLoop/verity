@@ -424,14 +424,19 @@ async fn freshness_slo_reports_sane_percentiles() {
     assert_eq!(row["samples"], json!(2));
     let p50 = row["p50_ms"].as_f64().expect("p50");
     let p95 = row["p95_ms"].as_f64().expect("p95");
+    // p99 is the console-seams addition: it must be present (not null) and
+    // monotone above p95 — the honest tail number the freshness panel now shows.
+    let p99 = row["p99_ms"].as_f64().expect("p99 present");
     // Latencies are ~1000ms and ~5000ms (plus processing): the interpolated
-    // median sits between them, and p95 approaches the slower sample.
+    // median sits between them, and p95/p99 approach the slower sample.
     assert!(p50 > 900.0 && p50 < 20_000.0, "p50 sane: {p50}");
     assert!(p95 >= p50, "p95 >= p50: {p95} vs {p50}");
     assert!(
         p95 > 3_000.0 && p95 < 60_000.0,
         "p95 near the 5s sample: {p95}"
     );
+    assert!(p99 >= p95, "p99 >= p95: {p99} vs {p95}");
+    assert!(p99 < 60_000.0, "p99 near the 5s sample: {p99}");
 
     // A source filter that matches nothing returns an empty report.
     let params = serde_json::from_value(json!({
@@ -443,4 +448,100 @@ async fn freshness_slo_reports_sane_percentiles() {
         .await
         .expect("slo");
     assert!(report.is_empty(), "{report:?}");
+}
+
+/// DSN-only: the erasure DRY RUN reports the counts a real purge WOULD delete
+/// and PURGES NOTHING. We ingest a debezium fact for an entity, preview an
+/// erasure of that entity, assert the response is `dry_run:true` with a
+/// non-zero `would_erase` count, then preview a SECOND time and assert the
+/// identical counts — proving the first preview rolled back (a destructive
+/// erase would have left the second preview at zero). Also asserts the honest
+/// dev-mode signal: the ephemeral-key minter reports the surviving audit trail
+/// stays clean (no 'erasure' audit row is written by a preview).
+#[tokio::test]
+async fn erasure_preview_reports_counts_without_purging() {
+    let Some((state, tenant)) = test_state(64).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    // Ingest one CDC fact so the entity has something to (dry-run) erase.
+    let now_ms = Utc::now().timestamp_millis();
+    let envelope = json!({
+        "payload": {
+            "before": null,
+            "after": {"id": 4242, "stage": "won"},
+            "source": {"connector": "postgresql", "db": "crm", "schema": "public",
+                       "table": "deals", "ts_ms": now_ms},
+            "op": "c",
+            "ts_ms": now_ms + 5
+        }
+    });
+    let params = serde_json::from_value(json!({ "tenant_id": tenant })).expect("params");
+    let Json(v) = crate::ingest_debezium(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Query(params),
+        Json(envelope),
+    )
+    .await
+    .expect("ingest");
+    assert_eq!(v["facts_inserted"], json!(1), "{v}");
+    let entity = "4242"; // debezium keys the fact by the pk value
+
+    let req = |t: TenantId| -> crate::compliance::ErasureRequest {
+        serde_json::from_value(json!({
+            "tenant_id": t,
+            "entity": entity,
+            "media_ids": [],
+        }))
+        .expect("erasure req")
+    };
+
+    // First preview: dry_run true, at least one fact would be erased, coverage
+    // gaps disclosed, ReBAC flag false (no ReBAC configured, and this is an
+    // entity target not a user: subject).
+    let Json(first) = crate::compliance::admin_erasure_preview(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(req(tenant)),
+    )
+    .await
+    .expect("preview");
+    assert_eq!(first["dry_run"], json!(true), "{first}");
+    let facts_first = first["would_erase"]["facts"].as_u64().expect("facts count");
+    assert!(facts_first >= 1, "at least the ingested fact: {first}");
+    assert!(
+        first["coverage_gaps"]["backup_retention_window"].is_string(),
+        "coverage gaps disclosed: {first}"
+    );
+    assert_eq!(
+        first["rebac_tuples_would_delete"],
+        json!(false),
+        "no ReBAC + entity target: {first}"
+    );
+
+    // Second preview: identical counts prove the first rolled back — a real
+    // erase would have dropped this to zero.
+    let Json(second) = crate::compliance::admin_erasure_preview(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        Json(req(tenant)),
+    )
+    .await
+    .expect("preview 2");
+    assert_eq!(
+        second["would_erase"]["facts"], first["would_erase"]["facts"],
+        "preview must not purge: counts stable across runs ({first} vs {second})"
+    );
+
+    // A preview leaves NO surviving 'erasure' audit row (that is the real
+    // purge's trace; a dry run leaves none).
+    let audit_erasures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND verb = 'erasure'",
+    )
+    .bind(tenant)
+    .fetch_one(state.storage.inner().pool())
+    .await
+    .expect("audit count");
+    assert_eq!(audit_erasures, 0, "preview wrote an erasure audit row");
 }

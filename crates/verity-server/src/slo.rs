@@ -9,7 +9,7 @@
 //!
 //! Recording is best-effort telemetry: a failed sample is logged and never
 //! fails the ingest that produced it. The read side
-//! (`GET /v1/slo/freshness`, admin-gated) computes p50/p95 in SQL via
+//! (`GET /v1/slo/freshness`, admin-gated) computes p50/p95/p99 in SQL via
 //! `percentile_cont` — every measured number reported from real samples,
 //! per the CLAUDE.md honesty rule.
 
@@ -80,7 +80,10 @@ pub(crate) async fn freshness(
                     AS p50_ms,
                 percentile_cont(0.95) WITHIN GROUP
                     (ORDER BY extract(epoch FROM (queryable_at - event_at))::float8 * 1000)
-                    AS p95_ms
+                    AS p95_ms,
+                percentile_cont(0.99) WITHIN GROUP
+                    (ORDER BY extract(epoch FROM (queryable_at - event_at))::float8 * 1000)
+                    AS p99_ms
          FROM freshness_samples
          WHERE tenant_id = $1
            AND queryable_at > now() - make_interval(hours => $2)
@@ -102,6 +105,7 @@ pub(crate) async fn freshness(
                 "samples": row.try_get::<i64, _>("samples").map_err(internal)?,
                 "p50_ms": row.try_get::<Option<f64>, _>("p50_ms").map_err(internal)?,
                 "p95_ms": row.try_get::<Option<f64>, _>("p95_ms").map_err(internal)?,
+                "p99_ms": row.try_get::<Option<f64>, _>("p99_ms").map_err(internal)?,
             }))
         })
         .collect::<HandlerResult<Vec<_>>>()?;

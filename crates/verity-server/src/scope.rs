@@ -67,6 +67,11 @@ pub enum ScopeError {
 
 pub struct ScopeMinter {
     key: [u8; 32],
+    /// True when the key came from the environment (survives restarts, shared
+    /// across replicas) rather than a random per-process key. Purge-report
+    /// signatures made under an ephemeral key are honestly labeled dev-mode:
+    /// they verify only within this one process lifetime.
+    persistent_key: bool,
 }
 
 impl ScopeMinter {
@@ -74,14 +79,23 @@ impl ScopeMinter {
     /// or restart-surviving handles. Absent, a random per-process key is used
     /// and a warning logged: dev-mode handles die with the process, fail closed.
     pub fn from_env() -> Self {
-        match std::env::var("VERITY_SCOPE_KEY") {
+        // A dedicated `VERITY_SIGNING_KEY` takes precedence for the server's
+        // signing surface (scope handles, media URIs, purge reports); it falls
+        // back to `VERITY_SCOPE_KEY` so existing single-key deployments keep
+        // working. Either yields a persistent, restart-surviving key.
+        let hex =
+            std::env::var("VERITY_SIGNING_KEY").or_else(|_| std::env::var("VERITY_SCOPE_KEY"));
+        match hex {
             Ok(hex) => {
                 let mut key = [0u8; 32];
                 match const_hex_decode(&hex, &mut key) {
-                    Ok(()) => Self { key },
+                    Ok(()) => Self {
+                        key,
+                        persistent_key: true,
+                    },
                     Err(()) => {
                         tracing::error!(
-                            "VERITY_SCOPE_KEY must be 64 hex chars; using ephemeral key"
+                            "VERITY_SIGNING_KEY/VERITY_SCOPE_KEY must be 64 hex chars; using ephemeral key"
                         );
                         Self::ephemeral()
                     }
@@ -89,7 +103,8 @@ impl ScopeMinter {
             }
             Err(_) => {
                 tracing::warn!(
-                    "VERITY_SCOPE_KEY not set: scope handles will not survive a restart"
+                    "VERITY_SIGNING_KEY/VERITY_SCOPE_KEY not set: scope handles and purge-report \
+                     signatures will not survive a restart (dev mode)"
                 );
                 Self::ephemeral()
             }
@@ -100,7 +115,29 @@ impl ScopeMinter {
         let mut key = [0u8; 32];
         use rand_core::RngCore;
         rand_core::OsRng.fill_bytes(&mut key);
-        Self { key }
+        Self {
+            key,
+            persistent_key: false,
+        }
+    }
+
+    /// Whether this minter's key is persistent (env-provided) rather than a
+    /// random per-process key. A `false` here is the honest "dev-mode /
+    /// process-scoped signature" signal the console surfaces on purge reports.
+    pub fn has_persistent_key(&self) -> bool {
+        self.persistent_key
+    }
+
+    /// Sign arbitrary canonical bytes under the server key — the primitive the
+    /// purge-report signer uses. Returns the URL-safe base64 HMAC-SHA256 tag.
+    /// Distinct from `sign_media`/scope handles by an explicit domain prefix so
+    /// a signature from one surface can never be replayed as another.
+    pub fn sign_bytes(&self, domain: &str, msg: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("any key length works");
+        mac.update(domain.as_bytes());
+        mac.update(b":");
+        mac.update(msg);
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
     pub fn mint(&self, mut payload: ScopePayload, ttl_seconds: i64) -> (String, DateTime<Utc>) {

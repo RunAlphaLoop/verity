@@ -10,11 +10,26 @@
    with the token absent.
 
    Backing endpoints (shapes verified against the server):
+     • POST /v1/admin/erasure/preview  { tenant_id, subject?, entity?, media_ids?[] }
+         → { dry_run: true, would_erase: <ErasureReport>,
+             coverage_gaps: { operator_named_media, exact_string_matching,
+                              backup_retention_window },
+             rebac_tuples_would_delete: bool }. TRUE dry run — rolls back its
+             own transaction and purges nothing. `would_erase` is the exact same
+             ErasureReport a real erasure produces (both call walk_lineage), so
+             it covers subject-, entity- AND media-only erasures. At least one of
+             subject / entity / media_ids required (else 422).
      • POST /v1/admin/erasure   { tenant_id, subject?, entity?, media_ids?[] }
-         → { erased: <ErasureReport>, rebac_tuples_deleted: bool }
+         → { erased: <ErasureReport>, rebac_tuples_deleted: bool,
+             purge_report: { facts, algorithm, domain, signature, signed } }.
          ErasureReport = { episodes, chunks, facts, actions, knowledge_evidence,
                            knowledge_invalidated, quarantine_preview, audit_log,
-                           media } (all u64). At least one of
+                           media } (all u64). `purge_report` is SERVER-SIGNED:
+                           signature = HMAC-SHA256 over the compact JSON of the
+                           `facts` object; signed=false means an ephemeral/dev
+                           key (process-scoped, not durable). Identifiers in
+                           `facts` are sha256-hashed, matching the surviving
+                           verb='erasure' audit row. At least one of
                            subject / entity / media_ids is required (else 422).
      • GET  /v1/admin/dsar/export?tenant_id=&subject=
          → { tenant_id, subject, generated_at, episodes[], chunks[], actions[],
@@ -25,18 +40,19 @@
      • POST /v1/forget { scope_handle, ref:{kind:"chunk"|"episode", id}, reason }
          → { retired: <u64> }. INVALIDATION (reversible), not deletion.
 
-   HONEST SEAMS (designed, never faked — SPEC §3):
-     1. No dedicated preview endpoint. The erasure PREVIEW is a read-only proxy
-        over GET /v1/admin/dsar/export for the same subject, LABELED an
-        approximation of the destructive lineage walk, not a byte-exact dry run.
-        It also cannot preview entity- or media-only erasures (DSAR keys on
-        subject) — that gap is stated, not hidden.
-     2. No server-issued signature on the purge report. The downloadable report
-        is an attestation assembled client-side from the returned counts +
-        context (build hash, timestamp), explicitly NOT a server cryptographic
-        signature. The signed-report seam is disclosed.
-     3. Coverage gaps disclosed: operator-named media (no auto subject
-        attribution), exact-string match, backup-retention window.
+   SEAMS NOW CLOSED (were honest seams; now backed by real endpoints):
+     1. The erasure PREVIEW is a REAL dry run against POST /v1/admin/erasure/preview
+        — it rolls back its own transaction (purges nothing) and returns the exact
+        would-purge counts, because preview and erase share one walk_lineage. It
+        covers entity- and media-only erasures too, not just subject.
+     2. The purge report is SERVER-SIGNED (HMAC-SHA256, domain-separated) — the
+        console displays the server's signature, it does not assemble one. When
+        the server runs on an ephemeral/dev key (signed=false), that is surfaced
+        honestly as process-scoped, not a durable attestation.
+
+   STILL DISCLOSED (real coverage gaps, returned by the server): operator-named
+   media (no auto subject attribution), exact-string subject/entity match, and
+   the backup-retention window.
 
    Zero LLM / zero live-ReBAC calls from this panel — pure admin fetches.
    ========================================================================== */
@@ -176,21 +192,19 @@
       '<div class="err" id="er-lookup-err"></div>';
     el.appendChild(lookup);
 
-    /* -- erasure PREVIEW card (read-only proxy — honest seam) ------------- */
+    /* -- erasure PREVIEW card (real dry run — POST /v1/admin/erasure/preview) */
     var preview = document.createElement("div");
     preview.className = "card";
     preview.innerHTML =
-      '<h2>Erasure preview <span class="sub">what would purge — read-only</span></h2>' +
-      '<div class="note"><b>Honest seam: there is no dedicated dry-run endpoint.</b> ' +
-        "This preview is a <b>read-only proxy</b> built from " +
-        "<code>GET /v1/admin/dsar/export</code> for the <b>subject</b> — it shows the same lineage " +
-        "(episodes, chunks, actions, proposed knowledge) the destructive walk starts from, so you can " +
-        "eyeball scope before running. It is an <b>approximation, not a byte-exact dry run</b>: it keys " +
-        "on <code>subject</code> only (an <em>entity-</em> or <em>media-only</em> erasure cannot be " +
-        "previewed this way), and the true purge also walks the entity-tag and knowledge-cascade fan-out " +
-        "the DSAR read does not enumerate.</div>" +
+      '<h2>Erasure preview <span class="sub">what would purge — true dry run, purges nothing</span></h2>' +
+      '<div class="note"><b>This is a real dry run.</b> It calls ' +
+        "<code>POST /v1/admin/erasure/preview</code>, which runs the exact same lineage walk as the " +
+        "destructive erasure inside a transaction it then <b>rolls back</b> — <b>nothing is purged</b>. " +
+        "The counts below are the <b>true would-purge counts</b>: one shared <code>walk_lineage</code> " +
+        "feeds both preview and erase, so they cannot drift. Unlike the old DSAR-based proxy, this covers " +
+        "<em>entity-</em> and <em>media-only</em> erasures too, not just subject.</div>" +
       '<div class="row" style="margin-top:8px">' +
-        '<div class="tight"><button id="er-preview" class="primary">Preview subject lineage</button></div>' +
+        '<div class="tight"><button id="er-preview" class="primary">Preview would-purge counts</button></div>' +
         '<div class="tight"><span class="refreshed" id="er-preview-stamp"></span></div>' +
       "</div>" +
       '<div class="err" id="er-preview-err"></div>' +
@@ -367,71 +381,98 @@
     };
 
     /* ==================================================================== */
-    /*  PREVIEW (read-only DSAR proxy — honest seam)                         */
+    /*  PREVIEW (real dry run — POST /v1/admin/erasure/preview)              */
     /* ==================================================================== */
     Verity.$("er-preview").onclick = async function () {
       Verity.clearErr("er-preview-err");
       Verity.$("er-preview-out").innerHTML = "";
       Verity.$("er-preview-stamp").textContent = "";
       var tenant = activeTenant();
-      var subject = currentSubject();
+      var s = currentSubject(), e = currentEntity(), m = parseMediaIds();
       if (!tenant) { Verity.err("er-preview-err", new Error("enter a tenant_id")); return; }
-      if (!subject) {
+      if (!s && !e && !m.length) {
         Verity.err("er-preview-err", new Error(
-          "preview requires a subject — the read-only proxy keys on subject only " +
-          "(entity-/media-only erasures cannot be previewed this way; this is the disclosed seam)"));
+          "nothing to preview — provide at least one of subject / entity / media_ids (server returns 422 otherwise)"));
         return;
       }
+      var body = { tenant_id: tenant };
+      if (s) body.subject = s;
+      if (e) body.entity = e;
+      if (m.length) body.media_ids = m;
       var out = Verity.$("er-preview-out");
-      out.innerHTML = '<div class="note">walking GET /v1/admin/dsar/export (read-only proxy) …</div>';
+      out.innerHTML = '<div class="note">POST /v1/admin/erasure/preview … (dry run — rolls back, purges nothing)</div>';
       try {
-        var b = await Verity.api(
-          "/v1/admin/dsar/export?tenant_id=" + encodeURIComponent(tenant) +
-            "&subject=" + encodeURIComponent(subject),
-          { admin: true });
-        renderPreview(out, b);
+        var res = await Verity.api("/v1/admin/erasure/preview", { admin: true, json: body });
+        renderPreview(out, res, { tenant: tenant, subject: s, entity: e, media_ids: m });
         Verity.$("er-preview-stamp").textContent =
-          "previewed " + Verity.fmtTime(Date.now()) + " (this preview read self-audits as a dsar_export)";
-      } catch (e) {
+          "previewed " + Verity.fmtTime(Date.now()) + " · dry run, nothing purged";
+      } catch (e2) {
         out.innerHTML = "";
-        Verity.err("er-preview-err", e);
+        Verity.err("er-preview-err", e2);
       }
     };
 
-    function renderPreview(out, b) {
-      b = b || {};
-      var counts = {
-        episodes: (b.episodes || []).length,
-        chunks: (b.chunks || []).length,
-        actions: (b.actions || []).length,
-        audit_log: (b.audit_log || []).length,
-        knowledge: (b.knowledge || []).length,
-      };
-      var anything = counts.episodes + counts.chunks + counts.actions + counts.knowledge;
+    function renderPreview(out, res, req) {
+      res = res || {};
+      var report = res.would_erase || {};
+      var gaps = res.coverage_gaps || {};
+
+      // Same per-table rows the real erasure result renders, from the SAME
+      // ErasureReport shape — preview and erase share walk_lineage, so these are
+      // the true would-purge counts, not an approximation.
+      var anything = 0;
+      var rows = REPORT_ROWS.map(function (r) {
+        var key = r[0], label = r[1], meaning = r[2];
+        var n = report[key];
+        anything += Number(n || 0);
+        return "<tr>" +
+          "<td>" + Verity.esc(label) + "</td>" +
+          '<td class="num">' + Verity.esc(n == null ? "0" : n) + "</td>" +
+          '<td><span class="note">' + Verity.esc(meaning) + "</span></td>" +
+        "</tr>";
+      }).join("");
+
+      var target =
+        (req.subject ? "subject <code>" + Verity.esc(req.subject) + "</code>" : "") +
+        (req.entity ? (req.subject ? " · " : "") + "entity <code>" + Verity.esc(req.entity) + "</code>" : "") +
+        (req.media_ids && req.media_ids.length
+          ? ((req.subject || req.entity) ? " · " : "") + req.media_ids.length + " media_id(s)" : "");
+
+      var rebacLine = res.rebac_tuples_would_delete === true
+        ? '<div style="margin-top:8px">' + Verity.badge("ReBAC tuples would be deleted", "b-provenance") + "</div>"
+        : '<div style="margin-top:8px">' + Verity.badge("no ReBAC tuple delete", "b-inferred") +
+          ' <span class="note">(SpiceDB not configured, or the subject is not a <code>user:</code> principal)</span></div>';
+
       var head =
-        '<div class="note" style="margin-top:10px"><b>Approximate purge scope for subject ' +
-          "<code>" + Verity.esc(b.subject || currentSubject()) + "</code>.</b> " +
-          "Counts below are the subject-keyed lineage the DSAR read enumerates; the destructive walk " +
-          "additionally covers entity-tagged fan-out and the knowledge cascade not shown here.</div>" +
+        '<div class="note" style="margin-top:10px"><b>True would-purge counts for ' + target + ".</b> " +
+          "This is a real dry run: the server ran the destructive lineage walk and <b>rolled it back</b>. " +
+          "The same <code>walk_lineage</code> runs on erasure, so these counts cannot drift from what a " +
+          "real erasure would purge.</div>" +
+        rebacLine +
         '<div class="tablewrap" style="margin-top:8px"><table><thead><tr>' +
-          "<th>lineage</th><th class=\"num\">rows (subject-keyed)</th></tr></thead><tbody>" +
-          "<tr><td>episodes (L0)</td><td class=\"num\">" + counts.episodes + "</td></tr>" +
-          "<tr><td>derived chunks</td><td class=\"num\">" + counts.chunks + "</td></tr>" +
-          "<tr><td>actions</td><td class=\"num\">" + counts.actions + "</td></tr>" +
-          "<tr><td>access-audit rows</td><td class=\"num\">" + counts.audit_log + "</td></tr>" +
-          "<tr><td>proposed knowledge</td><td class=\"num\">" + counts.knowledge + "</td></tr>" +
-        "</tbody></table></div>";
+          "<th>table</th><th class=\"num\">would purge</th><th>what</th>" +
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>";
       if (!anything) {
-        head += '<div class="empty" style="margin-top:8px">Nothing attributable to this subject was found. ' +
-          "An erasure would purge 0 rows for it — verify the subject id (exact-string match).</div>";
+        head += '<div class="empty" style="margin-top:8px">Nothing attributable to this target was found. ' +
+          "An erasure would purge 0 rows — verify the identifiers (exact-string match).</div>";
       }
-      // Raw lineage, collapsible, so the reviewer can see the actual rows.
-      var detail =
-        jsonDetails("episodes", counts.episodes, b.episodes || []) +
-        jsonDetails("chunks", counts.chunks, b.chunks || []) +
-        jsonDetails("actions", counts.actions, b.actions || []) +
-        jsonDetails("proposed knowledge", counts.knowledge, b.knowledge || []);
-      out.innerHTML = head + detail;
+
+      // Coverage-gap disclosure, driven by the SERVER's own returned strings.
+      var gapRows = [
+        ["operator_named_media", "operator-named media"],
+        ["exact_string_matching", "exact-string matching"],
+        ["backup_retention_window", "backup-retention window"],
+      ].filter(function (g) { return gaps[g[0]]; })
+       .map(function (g) {
+        return "<li><b>" + Verity.esc(g[1]) + ".</b> " + Verity.esc(gaps[g[0]]) + "</li>";
+      }).join("");
+      var gapBlock = gapRows
+        ? '<div class="note" style="margin-top:12px;border-left:3px solid var(--amber,#c90);padding-left:10px">' +
+            "<b>Coverage gaps — reported by the server, not hidden.</b>" +
+            '<ul style="margin:6px 0 0 0;padding-left:18px">' + gapRows + "</ul></div>"
+        : "";
+
+      out.innerHTML = head + gapBlock;
     }
 
     /* ==================================================================== */
@@ -492,7 +533,7 @@
         try {
           var res = await Verity.api("/v1/admin/erasure", { admin: true, json: body });
           confirmDlg.close();
-          renderErasureResult(res, { tenant: tenant, subject: s, entity: e, media_ids: m });
+          renderErasureResult(res);
         } catch (err) {
           Verity.err("er-confirm-err", err);
           go.disabled = false;
@@ -502,10 +543,9 @@
     };
     Verity.$("er-confirm-cancel").onclick = function () { confirmDlg.close(); };
 
-    function renderErasureResult(res, req) {
+    function renderErasureResult(res) {
       res = res || {};
       var report = res.erased || {};
-      var when = new Date().toISOString();
 
       // Per-table purge counts.
       var rows = REPORT_ROWS.map(function (r) {
@@ -535,27 +575,50 @@
           : "No published generalization dropped below the k=3 floor from this erasure. ") +
         "Withdrawn evidence rows: <b>" + (report.knowledge_evidence || 0) + "</b>.</div>";
 
-      // The purge "report" — HONEST SEAM: the server returns UNSIGNED counts +
-      // a surviving sha256 audit row. We assemble a client-side attestation and
-      // say plainly it is NOT a server cryptographic signature.
-      var attestation = {
-        kind: "verity.erasure.attestation",
-        note: "Client-assembled attestation of a completed erasure. NOT a server " +
-              "cryptographic signature — the server returns unsigned per-table counts " +
-              "plus a surviving audit_log row (verb='erasure') holding a sha256 of the " +
-              "subject/entity. Cross-check against that audit row for tamper-evidence.",
-        generated_at: when,
-        build_hash: Verity.buildHash(),
-        request: {
-          tenant_id: req.tenant,
-          subject: req.subject || null,
-          entity: req.entity || null,
-          media_ids: req.media_ids || [],
-        },
-        erased: report,
-        rebac_tuples_deleted: rebac === true,
-      };
-      var attestationJson = JSON.stringify(attestation, null, 2);
+      // The purge report is now SERVER-SIGNED. The server returns a `purge_report`
+      // envelope { facts, algorithm, domain, signature, signed }. We DISPLAY the
+      // server's signature — we do not assemble one. `signed:false` = ephemeral/
+      // dev key (process-scoped, not durable); surfaced honestly below.
+      var pr = res.purge_report || null;
+      var reportJson = pr ? JSON.stringify(pr, null, 2) : "";
+      var signed = !!(pr && pr.signed);
+      var sig = (pr && pr.signature) || "";
+      var facts = (pr && pr.facts) || {};
+
+      var sigBlock;
+      if (!pr) {
+        // Backward-compat: an older server without purge_report. Say so honestly.
+        sigBlock =
+          '<div class="note" style="margin-top:10px;border-left:3px solid var(--amber,#c90);padding-left:10px">' +
+            "<b>No signed report returned.</b> This server build did not include a " +
+            "<code>purge_report</code> in its response. What survives is one <code>erasure</code> audit row " +
+            "holding a <code>sha256</code> of the subject/entity + these counts — cross-check against Access Audit." +
+          "</div>";
+      } else {
+        var trustLine = signed
+          ? Verity.badge("server-signed", "b-provenance") +
+            ' <span class="note">HMAC-SHA256 over the compact <code>facts</code> object, domain ' +
+            "<code>" + Verity.esc(pr.domain || "") + "</code>, under the server's persistent signing key.</span>"
+          : Verity.badge("dev key — unsigned", "b-inferred") +
+            ' <span class="note">The server is running on an <b>ephemeral/dev key</b> ' +
+            "(no <code>VERITY_SIGNING_KEY</code>/<code>VERITY_SCOPE_KEY</code> set). The tag below only " +
+            "verifies within the current process lifetime — it is <b>process-scoped, not a durable " +
+            "attestation</b>. Set a persistent key for a real signature.</span>";
+        sigBlock =
+          '<div class="note" style="margin-top:10px;border-left:3px solid var(--' +
+            (signed ? "green,#2a7" : "amber,#c90") + ');padding-left:10px">' +
+            "<b>Server-signed purge report.</b> " + trustLine + "<br>" +
+            "Identifiers in the report are <code>sha256</code>-hashed (never plaintext) and match the " +
+            "surviving <code>erasure</code> audit row, so a report holder can cross-check it against " +
+            "Access Audit." +
+          '<div style="margin-top:8px"><b>algorithm:</b> <code>' + Verity.esc(pr.algorithm || "—") + "</code> · " +
+            "<b>domain:</b> <code>" + Verity.esc(pr.domain || "—") + "</code></div>" +
+          '<div style="margin-top:6px"><b>signature:</b><br>' +
+            '<code style="word-break:break-all">' + Verity.esc(sig || "(none)") + "</code></div>" +
+          '<div style="margin-top:6px"><b>signed_at:</b> <code>' +
+            Verity.esc(facts.signed_at ? Verity.fmtTime(facts.signed_at) : "—") + "</code></div>" +
+          "</div>";
+      }
 
       var out = Verity.$("er-run-out");
       out.innerHTML =
@@ -566,26 +629,23 @@
             "<th>table</th><th class=\"num\">purged</th><th>what</th>" +
           "</tr></thead><tbody>" + rows + "</tbody></table></div>" +
           cascade +
-          // Signed-report seam, disclosed.
-          '<div class="note" style="margin-top:10px;border-left:3px solid var(--amber,#c90);padding-left:10px">' +
-            "<b>Signed purge report — honest seam.</b> The server does not issue a cryptographic signature " +
-            "on this report today. What survives on the server is one <code>erasure</code> audit row holding " +
-            "a <code>sha256</code> of the subject/entity + these counts (no plaintext PII). The download below " +
-            "is a <b>client-assembled attestation</b> of the returned counts + context (build hash, timestamp), " +
-            "<b>not</b> a server signature — verify it against that audit row." +
-          "</div>" +
-          '<div class="actions" style="margin-top:8px">' +
-            '<button class="primary" id="er-report-dl">Download purge report (attestation)</button>' +
-            '<button id="er-report-copy">Copy JSON</button>' +
-          "</div>" +
+          sigBlock +
+          (pr
+            ? '<div class="actions" style="margin-top:8px">' +
+                '<button class="primary" id="er-report-dl">Download signed purge report</button>' +
+                '<button id="er-report-copy">Copy JSON</button>' +
+              "</div>"
+            : "") +
         "</div>";
 
-      Verity.$("er-report-dl").onclick = function () {
-        download("verity-erasure-report-" + Date.now() + ".json", "application/json", attestationJson);
-      };
-      Verity.$("er-report-copy").onclick = function () {
-        try { navigator.clipboard && navigator.clipboard.writeText(attestationJson); } catch (e) { /* clipboard best-effort */ }
-      };
+      if (pr) {
+        Verity.$("er-report-dl").onclick = function () {
+          download("verity-erasure-report-" + Date.now() + ".json", "application/json", reportJson);
+        };
+        Verity.$("er-report-copy").onclick = function () {
+          try { navigator.clipboard && navigator.clipboard.writeText(reportJson); } catch (e) { /* clipboard best-effort */ }
+        };
+      }
     }
 
     /* ==================================================================== */
