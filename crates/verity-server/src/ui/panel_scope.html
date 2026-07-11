@@ -1,0 +1,18 @@
+<!-- ==========================================================================
+     panel_scope.html — Screen 1 · Scope Inspector  [MVP]  (TA.1)
+     --------------------------------------------------------------------------
+     The crown jewel: "what can this agent see, exactly?" Paste a vs_… handle,
+     decode its signed claims client-side, then probe recall / brief / activity
+     THROUGH that exact handle — each hit rendered with the full honesty payload
+     (ACL provenance · confidentiality · trust tier · tag-derivation solid-vs-
+     dashed · bi-temporal · citation→L0). Boundary trace, Explain-zero, honest
+     session-local latency, and Export boundary as evidence.
+
+     Owns ONLY this file + panel_scope.js. Reuses theme.css / core.js verbatim;
+     mounts everything into #scope-mount. No other panel's DOM is touched.
+     ========================================================================== -->
+<section class="panel" id="panel-scope">
+  <h1>Scope Inspector</h1>
+  <div class="subtitle"><b>What can this agent see, exactly?</b> Paste a scope handle, read its signed claims, then probe recall, briefs, and activity through it &mdash; read-only, client-side decode, against this server.</div>
+  <div id="scope-mount"></div>
+</section>

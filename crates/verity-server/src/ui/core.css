@@ -1,0 +1,244 @@
+/* ============================================================================
+   core.css — LAYOUT PRIMITIVES  ·  FROZEN (T0.3)
+   ----------------------------------------------------------------------------
+   Structural / component CSS built on theme.css tokens. Panels compose these
+   classes; they do not redefine them. Colors come from theme.css only — this
+   file reaches for var(--*) and never hard-codes a hue.
+
+   Vocabulary panels reuse: .badge (+ .b-inferred modifier), .card, .tablewrap,
+   table, .bar, .dialog, button, .note/.ribbon, .kv, .hit, .row, inputs.
+   ============================================================================ */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--fs-base);
+  line-height: var(--lh);
+}
+
+/* ---------------------------------------------------------------- app shell */
+/* Fixed left rail + header, scrollable content pane. The shell markup lives in
+   shell.html; these rules give it geometry. */
+#app { min-height: 100vh; }
+
+#topbar {
+  position: sticky; top: 0; z-index: 30;
+  height: var(--header-h);
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-4);
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+#topbar .brand { font-size: var(--fs-lg); font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+#topbar .brand .v { color: var(--accent); }
+#topbar .spacer { flex: 1; }
+#topbar .buildhash { color: var(--faint); font-size: var(--fs-sm); white-space: nowrap; }
+
+#shell { display: flex; align-items: stretch; }
+
+#rail {
+  flex: 0 0 var(--rail-w);
+  border-right: 1px solid var(--border);
+  padding: var(--sp-4) 0;
+  min-height: calc(100vh - var(--header-h));
+}
+#rail .group-label {
+  color: var(--dim); font-size: var(--fs-xs); text-transform: uppercase;
+  letter-spacing: .1em; padding: var(--sp-2) var(--sp-4) var(--sp-1);
+}
+#rail .group-label:not(:first-child) { margin-top: var(--sp-3); }
+#rail .navitem {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  color: var(--text); cursor: pointer; border-left: 2px solid transparent;
+  font-size: 12.5px;
+}
+#rail .navitem:hover { background: var(--panel); }
+#rail .navitem.active { background: var(--panel); border-left-color: var(--accent); color: var(--accent); }
+#rail .navitem.soon { color: var(--faint); cursor: not-allowed; }
+#rail .navitem.soon:hover { background: transparent; }
+#rail .navitem .num { color: var(--faint); font-size: var(--fs-sm); min-width: 1.2em; }
+#rail .navitem .tag {
+  margin-left: auto; font-size: var(--fs-xs); color: var(--faint);
+  border: 1px solid var(--border); border-radius: var(--r-pill); padding: 0 5px;
+}
+
+#content { flex: 1; min-width: 0; padding: var(--sp-5) var(--sp-5) 80px; }
+.content-inner { max-width: 1100px; margin: 0 auto; }
+
+/* ------------------------------------------------------- session + tenant */
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 3px 8px; font-size: 12px; background: var(--panel2); color: var(--dim);
+}
+.chip b { color: var(--text); font-weight: 600; }
+#tenantSwitch select, #topbar select {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-family: var(--mono); font-size: 12px; padding: 3px 6px;
+}
+.session-badge { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+
+/* ------------------------------------------------------------------ panels */
+/* Each panel is a <section class="panel"> hidden until routed to. */
+.panel { display: none; }
+.panel.active { display: block; }
+.panel > h1 {
+  font-size: var(--fs-md); font-weight: 600; letter-spacing: .02em;
+  margin-bottom: var(--sp-1);
+}
+.panel > .subtitle { color: var(--dim); margin-bottom: var(--sp-4); font-size: 12.5px; }
+.panel > .subtitle b { color: var(--text); font-weight: 600; }
+
+/* ------------------------------------------------------------------- cards */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+.card > h2 {
+  font-size: var(--fs-base); font-weight: 600; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--accent); margin-bottom: var(--sp-3);
+}
+.card > h2 .sub {
+  color: var(--dim); text-transform: none; letter-spacing: 0; font-weight: 400;
+  margin-left: var(--sp-2); font-size: 12px;
+}
+
+/* -------------------------------------------------- read-only ribbon (§4) */
+.ribbon {
+  display: flex; align-items: center; gap: var(--sp-2);
+  background: var(--amber-soft); border: 1px solid var(--amber-line);
+  border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+  color: var(--amber); font-size: 12px; margin-bottom: var(--sp-4);
+}
+.ribbon::before { content: "v0.1"; font-weight: 600; letter-spacing: .04em;
+  border: 1px solid var(--amber-line); border-radius: var(--r-sm); padding: 0 5px; }
+.ribbon b { color: var(--text); font-weight: 600; }
+
+/* --------------------------------------------------------- form controls */
+label {
+  color: var(--dim); font-size: var(--fs-sm); text-transform: uppercase;
+  letter-spacing: .06em; display: block; margin-bottom: 3px;
+}
+input[type=text], input[type=password], input[type=number], textarea, select.field {
+  width: 100%; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 12.5px; padding: 7px 9px;
+}
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+textarea { resize: vertical; min-height: 58px; word-break: break-all; }
+
+button {
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 12.5px; padding: 7px 14px;
+  cursor: pointer; white-space: nowrap;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.primary { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .5; cursor: not-allowed; border-color: var(--border); color: var(--dim); }
+
+.row { display: flex; gap: var(--sp-3); align-items: flex-end; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 140px; }
+.row > .tight { flex: 0 0 auto; min-width: 0; }
+
+.checkline { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; cursor: pointer; }
+.checkline input { accent-color: var(--accent); }
+
+/* ---------------------------------------------------------- inline errors */
+.err {
+  display: none; margin-top: var(--sp-2); padding: 8px 10px;
+  background: var(--red-soft); border: 1px solid var(--red-line);
+  border-radius: var(--r-sm); color: var(--red); word-break: break-word; white-space: pre-wrap;
+}
+.err.on { display: block; }
+
+/* -------------------------------------------------------------- notes */
+.note { color: var(--dim); font-size: 12px; margin-top: var(--sp-2); }
+.note em { color: var(--amber); font-style: normal; }
+.refreshed { color: var(--dim); font-size: var(--fs-sm); margin-left: 10px; }
+.empty { color: var(--dim); margin-top: var(--sp-2); }
+
+/* -------------------------------------------------------------- badges
+   Base geometry only; every color comes from a theme.css class. */
+.badge {
+  display: inline-block; padding: 1px 7px; border-radius: var(--r-pill);
+  font-size: 11px; border: 1px solid var(--border); margin: 1px 3px 1px 0;
+  vertical-align: middle; white-space: nowrap;
+}
+/* THE ENCODING: dashed, unfilled outline = inferred (probabilistic).
+   Usable standalone (.b-inferred in theme.css) OR as a modifier on any badge. */
+.badge.b-inferred { border-style: dashed; background: transparent; }
+
+/* -------------------------------------------------- key/value claim block */
+.kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 14px; margin-top: var(--sp-3); }
+.kv dt { color: var(--dim); }
+.kv dd { word-break: break-all; }
+.expired { color: var(--red); }
+.live { color: var(--green); }
+
+/* ------------------------------------------------------------- hit cards */
+.hit {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 10px 12px; margin-top: var(--sp-2);
+}
+.hit .content { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+.hit .meta { color: var(--dim); font-size: 11px; word-break: break-all; }
+.score { color: var(--accent); }
+
+/* ---------------------------------------------------------------- tables */
+.tablewrap { overflow-x: auto; margin-top: var(--sp-2); }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th {
+  color: var(--dim); font-weight: 500; text-transform: uppercase;
+  font-size: var(--fs-xs); letter-spacing: .06em; white-space: nowrap;
+}
+td { word-break: break-word; }
+td.num, th.num { text-align: right; }
+td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+tr.flag td { background: var(--red-soft); }        /* compliance/defense rows */
+
+/* -------------------------------------------------------- progress bars */
+.bar {
+  height: 8px; border-radius: 5px; background: var(--panel2);
+  border: 1px solid var(--border); overflow: hidden; min-width: 110px; margin: 1px 0 3px;
+}
+.bar > i { display: block; height: 100%; border-radius: 5px 0 0 5px; transition: width .3s ease; background: var(--accent); }
+.bar.completed > i { background: var(--green); }
+.bar.failed > i    { background: var(--red); }
+.bar.paused > i    { background: var(--dim); }
+/* striped indeterminate track — used ONLY when a total is genuinely unknown
+   (never fabricate a percentage). */
+.bar.indet { background: repeating-linear-gradient(45deg, var(--panel2) 0 6px, var(--border) 6px 12px); }
+.bar.indet > i { display: none; }
+.pct { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* --------------------------------------------------------------- dialogs
+   <div class="dialog-backdrop"><div class="dialog">…</div></div>
+   Hidden by default; core.js Verity.dialog() toggles .open on the backdrop. */
+.dialog-backdrop {
+  display: none; position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .55); align-items: flex-start; justify-content: center;
+  padding: 8vh var(--sp-4);
+}
+.dialog-backdrop.open { display: flex; }
+.dialog {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--sp-4);
+  width: 100%; max-width: 560px; max-height: 80vh; overflow-y: auto;
+}
+.dialog h3 { font-size: var(--fs-md); margin-bottom: var(--sp-3); }
+.dialog .actions { display: flex; gap: var(--sp-2); justify-content: flex-end; margin-top: var(--sp-4); }
+
+/* ---------------------------------------------------- responsive collapse */
+@media (max-width: 720px) {
+  #shell { flex-direction: column; }
+  #rail { flex-basis: auto; border-right: none; border-bottom: 1px solid var(--border); min-height: 0; }
+}

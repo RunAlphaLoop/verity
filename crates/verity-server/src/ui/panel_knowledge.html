@@ -1,0 +1,25 @@
+<!-- ==========================================================================
+     panel_knowledge.html — Screen 3 · Knowledge Review (TA.3 · BeyondMVP)
+     --------------------------------------------------------------------------
+     The human gate. Queue (GET /v1/knowledge) + item detail drawer
+     (GET /v1/admin/knowledge/{id}); admin-exact support shown here with a note
+     that agent-facing previews are BUCKETED; k-support math + de-id gate +
+     audit-scope-only lineage in the drawer.
+
+     The read-only ribbon is LIFTED on this panel: the two flagship human-gated
+     WRITES are wired live (SPEC §5 Screen 3 'Actions (v0.2)'):
+       • Publish → POST /v1/knowledge/{id}/publish  (admin-token)
+       • Reject  → POST /v1/admin/knowledge/{id}/reject (admin-token)
+     Publish REQUIRES an explicit visibility set AND k_min (clamped ≥3): there is
+     NO default visibility — leaving visibility unset REFUSES the submit
+     (SPEC §3 / §5e.8). Retraction of a published item has NO endpoint; it is
+     rendered as a disabled Erasure/forget seam we design but never fake.
+
+     Owns ONLY this file + panel_knowledge.js. Reuses frozen theme/core classes
+     and Verity.* helpers; never edits them. Mounts into #knowledge-mount.
+     ========================================================================== -->
+<section class="panel" id="panel-knowledge">
+  <h1>Knowledge Review</h1>
+  <div class="subtitle"><b>The human gate.</b> Cross-customer generalizations are never auto-published — this is the admin surface where a person reviews, and publishes or rejects, them.</div>
+  <div id="knowledge-mount"></div>
+</section>

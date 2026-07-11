@@ -1,0 +1,115 @@
+/* ============================================================================
+   theme.css — DESIGN TOKENS ONLY  ·  FROZEN CONTRACT (T0.2)
+   ----------------------------------------------------------------------------
+   The single shared design file. Panels CONSUME these classes and CSS custom
+   properties; no panel (and no other core file) edits this file. Everything
+   here is a token or a badge-color rule — no layout, no component structure
+   (those live in core.css). If you are a panel builder, you only ever read
+   this. See the FROZEN CONTRACT returned by T0 for the class vocabulary.
+
+   Palette provenance: the dark GitHub-ish ground is inherited verbatim from
+   the original single-file ui.html so the console reads as the same product.
+   Accent (--accent, blue) is deliberately held DISTINCT from the semantic
+   green/amber/blue/red so an interactive accent never reads as a provenance
+   or confidentiality signal.
+   ============================================================================ */
+
+:root {
+  /* ---- ground + surfaces (blue-slate biased dark) ---- */
+  --bg:      #0d1117;   /* page ground */
+  --panel:   #131920;   /* card / section surface */
+  --panel2:  #1a2129;   /* raised surface: hit cards, inputs-on-panel, chips */
+  --border:  #2b3540;   /* hairline dividers, card borders */
+
+  /* ---- text ---- */
+  --text:    #cdd6df;   /* primary body text */
+  --dim:     #7d8894;   /* secondary / labels / muted meta */
+  --faint:   #4d5763;   /* tertiary: disabled, placeholder-ish */
+
+  /* ---- interactive accent (NOT a semantic color) ---- */
+  --accent:      #58a6ff;
+  --accent-soft: rgba(88, 166, 255, .10);
+
+  /* ---- semantic hues (each with a soft fill + a border tint) ---- */
+  --green:      #3fb950;  --green-soft:  rgba(63, 185, 80, .10);  --green-line:  rgba(63, 185, 80, .50);
+  --amber:      #d29922;  --amber-soft:  rgba(210, 153, 34, .10); --amber-line:  rgba(210, 153, 34, .50);
+  --blue:       #4493f8;  --blue-soft:   rgba(68, 147, 248, .10); --blue-line:   rgba(68, 147, 248, .50);
+  --red:        #f85149;  --red-soft:    rgba(248, 81, 73, .10);  --red-line:    rgba(248, 81, 73, .50);
+  --violet:     #a371f7;  --violet-soft: rgba(163, 113, 247, .10);--violet-line: rgba(163, 113, 247, .50);
+
+  /* ---- type ---- */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --fs-xs:   10.5px;  /* table headers, chip micro-labels */
+  --fs-sm:   11px;    /* field labels, meta */
+  --fs-base: 13px;    /* body */
+  --fs-md:   14px;    /* panel titles */
+  --fs-lg:   18px;    /* app title */
+  --lh: 1.5;
+
+  /* ---- spacing scale (4px base) ---- */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;  --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+
+  /* ---- radii ---- */
+  --r-sm: 6px;   /* inputs, buttons, hit cards */
+  --r-md: 8px;   /* sections, dialogs */
+  --r-pill: 10px;/* badges */
+
+  /* ---- chrome geometry (consumed by core.css layout) ---- */
+  --rail-w: 232px;
+  --header-h: 52px;
+}
+
+/* ============================================================================
+   BADGE COLOR VOCABULARY  (colors only — .badge base geometry is in core.css)
+   ----------------------------------------------------------------------------
+   CRITICAL ENCODING — deterministic vs probabilistic:
+     • SOLID-FILL badge  = provenance  (a guaranteed, deterministic tag)
+     • DASHED-OUTLINE    = inferred    (a probabilistic / model-derived tag)
+   The `.b-inferred` modifier (in core.css) turns any badge dashed + no-fill.
+   Panels MUST apply `.b-inferred` to any badge whose value came from
+   inference so the visual guarantee/probability split is never lost.
+   ============================================================================ */
+
+/* ---- ACL provenance (SPEC §5e) — the four-way lane signal ---- */
+.b-mirrored       { color: var(--green); border-color: var(--green-line); background: var(--green-soft); }
+.b-approximated   { color: var(--amber); border-color: var(--amber-line); background: var(--amber-soft); }
+.b-admin-assigned { color: var(--blue);  border-color: var(--blue-line);  background: var(--blue-soft); }
+.b-quarantined    { color: var(--red);   border-color: var(--red-line);   background: var(--red-soft); }
+
+/* ---- confidentiality (4-level: public / internal / confidential / restricted) ---- */
+.b-conf-0 { color: var(--green); border-color: var(--green-line); background: var(--green-soft); } /* public */
+.b-conf-1 { color: var(--blue);  border-color: var(--blue-line);  background: var(--blue-soft); }  /* internal */
+.b-conf-2 { color: var(--amber); border-color: var(--amber-line); background: var(--amber-soft); } /* confidential */
+.b-conf-3 { color: var(--red);   border-color: var(--red-line);   background: var(--red-soft); }   /* restricted */
+
+/* ---- knowledge lifecycle (status badges) ---- */
+.b-st-candidate   { color: var(--dim);    border-color: var(--border); }
+.b-st-eligible    { color: var(--amber);  border-color: var(--amber-line); background: var(--amber-soft); }
+.b-st-published   { color: var(--green);  border-color: var(--green-line); background: var(--green-soft); }
+.b-st-quarantined { color: var(--red);    border-color: var(--red-line);   background: var(--red-soft); }
+.b-st-rejected    { color: var(--red);    border-color: var(--red-line);   background: rgba(248, 81, 73, .05); }
+.b-st-invalidated { color: var(--dim);    border-color: var(--red-line); }
+
+/* ---- trust tier (authoritative Tier-1 vs agent_observation) ---- */
+.b-trust     { color: var(--dim);    border-color: var(--border); }              /* generic / observation */
+.b-tier      { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); } /* Tier-1 authoritative */
+
+/* ---- entity tags ---- */
+.b-entity    { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+/* ---- neutral kind/label chip (kinds, counts, generic labels) ---- */
+.b-kind      { color: var(--text);   border-color: var(--border); background: var(--panel2); }
+
+/* ---- tag-derivation dedicated chips (the guarantee/probability legend) ----
+   `.b-provenance` = solid green (deterministic), `.b-inferred` = dashed
+   violet outline (probabilistic). `.b-inferred` is also usable as a MODIFIER
+   on any other badge (see core.css) to switch it to the dashed encoding. */
+.b-provenance { color: var(--green);  border-color: var(--green-line); background: var(--green-soft); }
+.b-inferred   { color: var(--violet); border-color: var(--violet-line); }
+
+/* ---- defense / adversarial-probe badge (Access Audit) ---- */
+.b-defense   { color: var(--violet); border-color: var(--violet-line); background: var(--violet-soft); }
+
+/* ---- trust-downgrade chip (email-mapped principals — SPEC §6b) ---- */
+.b-downgrade { color: var(--red);    border-color: var(--red-line); background: var(--red-soft); }

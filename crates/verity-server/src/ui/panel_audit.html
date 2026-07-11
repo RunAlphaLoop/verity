@@ -1,0 +1,19 @@
+<!-- ==========================================================================
+     panel_audit.html — Screen 2 · Access Audit  [MVP]  (TA.2, builder B)
+     --------------------------------------------------------------------------
+     Who saw what, on the record. Newest-first table of every scoped read
+     (recall | get | activity | brief | forget | dsar_export), backed by
+     GET /v1/admin/audit (admin token). Client-side filter/search over the
+     fetched window, blocked-injection defense badges + zero-leak summary,
+     policy-version column (honest "not recorded" when the row carries none),
+     compliance-event row styling, CSV/JSON (SIEM-shaped) export, ~5s
+     auto-refresh, and the audit-of-audit disclosure.
+
+     OWNS: this file + panel_audit.js. Reuses frozen theme/core classes and the
+     Verity.* helpers only. Mounts into #audit-mount.
+     ========================================================================== -->
+<section class="panel" id="panel-audit">
+  <h1>Access Audit</h1>
+  <div class="subtitle"><b>Who saw what, on the record.</b> Every scoped read, newest first, with the policy version that governed it &mdash; reading this panel is itself audited.</div>
+  <div id="audit-mount"></div>
+</section>

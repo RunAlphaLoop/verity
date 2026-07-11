@@ -1,0 +1,160 @@
+<!-- ==========================================================================
+     shell.html — BODY CHROME (T0.4)
+     --------------------------------------------------------------------------
+     Doctype-less body fragment: the header (brand + tenant switcher + session
+     badge + build hash), the left rail (grouped nav with live + v0.2/Later
+     placeholder entries), and the content pane the panels mount into. Panel
+     <section>s are appended AFTER this fragment by the assembler and are
+     hidden until the router shows one.
+
+     Consumed contracts:
+       • rail entries carry data-nav="<panel-id>"; live ones match a panel that
+         calls Verity.register({id:"<panel-id>"}). .soon entries are inert.
+       • the session badge / tenant switcher ids are read by core.js glue below.
+       • the read-only ribbon is a REUSABLE TEMPLATE (<template id="ribbon-tpl">)
+         panels clone; per SPEC §4 the ribbon is per-panel, not one global band.
+     ========================================================================== -->
+
+<div id="app">
+
+  <!-- ----------------------------------------------------------- header -->
+  <div id="topbar">
+    <div class="brand"><span class="v">verity</span> console</div>
+    <div id="tenantSwitch" class="chip" title="one active tenant_id — auto-fills from a decoded handle">
+      tenant
+      <select id="tenantSelect"><option value="">— none —</option></select>
+    </div>
+    <div class="spacer"></div>
+    <div id="sessionBadge" class="session-badge">
+      <!-- populated by the glue script below from the decoded handle / admin token -->
+      <span class="chip" id="adminChip" title="admin bearer token — sessionStorage only">admin: <b id="adminState">dev-mode (unset)</b></span>
+    </div>
+    <div class="buildhash" id="buildHashLabel" title="the served page is embedded in the binary — the hash IS the version">build …</div>
+  </div>
+
+  <!-- ------------------------------------------------------------ shell -->
+  <div id="shell">
+
+    <!-- ----------------------------------------------------- left rail -->
+    <nav id="rail">
+      <div class="group-label">Prove · Evidence</div>
+      <div class="navitem" data-nav="scope">     <span class="num">1</span> Scope Inspector</div>
+      <div class="navitem" data-nav="audit">     <span class="num">2</span> Access Audit</div>
+      <div class="navitem" data-nav="knowledge"> <span class="num">3</span> Knowledge Review</div>
+      <div class="navitem soon" data-nav="erasure"><span class="num">4</span> Erasure &amp; DSAR <span class="tag">v0.2</span></div>
+
+      <div class="group-label">Run · Operations</div>
+      <div class="navitem soon" data-nav="sources">    <span class="num">5</span> Sources &amp; Freshness <span class="tag">v0.2</span></div>
+      <div class="navitem soon" data-nav="quarantine"> <span class="num">6</span> Quarantine <span class="tag">v0.2</span></div>
+      <div class="navitem soon" data-nav="migrations"> <span class="num">7</span> Migrations <span class="tag">Later</span></div>
+
+      <div class="group-label">Configure · Admin</div>
+      <div class="navitem soon" data-nav="principals"><span class="num">8</span> Principals &amp; Groups <span class="tag">Later</span></div>
+      <div class="navitem soon" data-nav="entities">  <span class="num">9</span> Entities &amp; Precedence <span class="tag">Later</span></div>
+    </nav>
+
+    <!-- --------------------------------------------------- content pane -->
+    <main id="content">
+      <div class="content-inner">
+
+        <!-- Admin/tenant credential inputs — shared across admin panels.
+             The admin token is held in sessionStorage only (never disk). -->
+        <div class="card" id="credentials">
+          <h2>Session <span class="sub">credentials for admin-plane probes — read only, held in this tab</span></h2>
+          <div class="row">
+            <div>
+              <label for="adminToken">admin token (sessionStorage only — never persisted to disk)</label>
+              <input type="password" id="adminToken" placeholder="empty = dev mode (server allows + warns)" autocomplete="off">
+            </div>
+            <div>
+              <label for="tenantInput">tenant_id (auto-filled from a decoded handle)</label>
+              <input type="text" id="tenantInput" placeholder="uuid" spellcheck="false">
+            </div>
+          </div>
+        </div>
+
+        <!-- Panel <section>s are appended here by the assembler, after this
+             fragment. Each is a <section class="panel" id="panel-<id>">. -->
+
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- ------------------------------------- reusable per-panel ribbon template -->
+<!-- Clone with Verity: const r = document.getElementById('ribbon-tpl')
+     .content.cloneNode(true); fill .ribbon-action; prepend into the panel.
+     Per SPEC §4 the ribbon is PER-PANEL and lifts screen-by-screen at v0.2. -->
+<template id="ribbon-tpl">
+  <div class="ribbon">
+    this panel is <b>read-only</b> · the <span class="ribbon-action">publish/reject/erase</span>
+    action routes to CLI/REST until v0.2 — see below.
+  </div>
+</template>
+
+<!-- ------------------------------------------ generic "coming later" panel -->
+<!-- The router only wires live panels; .soon rail entries are inert. This
+     placeholder <section> is shown if a hash points at a not-yet-built panel
+     (defensive; normal nav never reaches a .soon panel). -->
+<section class="panel" id="panel-_placeholder">
+  <h1>Not yet built</h1>
+  <div class="subtitle">This screen ships in a later milestone. The rail entry is labeled with its target version.</div>
+</section>
+
+<script>
+/* ------------------------- shell glue (chrome wiring) -------------------------
+   Small, panel-agnostic glue that lives with the shell: it fills the build
+   hash, binds the tenant switcher + tenant input to Verity's shared tenant
+   state, and binds the admin-token input to sessionStorage with an honest
+   session-badge reflection. Panels never touch this. */
+(function () {
+  document.addEventListener("DOMContentLoaded", init);
+  // If the DOM is already parsed (script runs after body content), init now.
+  if (document.readyState !== "loading") init();
+  let inited = false;
+
+  function init() {
+    if (inited) return; inited = true;
+
+    // build hash header
+    var bh = Verity.buildHash();
+    var lbl = document.getElementById("buildHashLabel");
+    if (lbl) lbl.textContent = "build " + bh;
+
+    // admin token → sessionStorage, reflected in the session badge honestly
+    var adminInput = document.getElementById("adminToken");
+    var adminState = document.getElementById("adminState");
+    if (adminInput) {
+      adminInput.value = Verity.getAdminToken();
+      reflectAdmin();
+      adminInput.addEventListener("input", function () {
+        Verity.setAdminToken(adminInput.value.trim());
+        reflectAdmin();
+      });
+    }
+    function reflectAdmin() {
+      if (!adminState) return;
+      var t = Verity.getAdminToken();
+      adminState.textContent = t ? "set (this tab only)" : "dev-mode (unset)";
+    }
+
+    // tenant switcher <-> tenant input <-> shared state
+    var tenantSelect = document.getElementById("tenantSelect");
+    var tenantInput = document.getElementById("tenantInput");
+    function pushTenant(v) { Verity.setTenant(v); }
+    if (tenantInput) tenantInput.addEventListener("input", function () { pushTenant(tenantInput.value.trim()); });
+    if (tenantSelect) tenantSelect.addEventListener("change", function () { pushTenant(tenantSelect.value); });
+    Verity.onTenant(function (t) {
+      if (tenantInput && tenantInput.value !== t) tenantInput.value = t;
+      if (tenantSelect) {
+        // add the tenant as an option if unseen, then select it
+        if (t && !Array.prototype.some.call(tenantSelect.options, function (o) { return o.value === t; })) {
+          var opt = document.createElement("option"); opt.value = t; opt.textContent = t;
+          tenantSelect.appendChild(opt);
+        }
+        tenantSelect.value = t || "";
+      }
+    });
+  }
+})();
+</script>
