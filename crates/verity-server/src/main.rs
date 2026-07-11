@@ -1241,18 +1241,67 @@ struct ReviewCandidate {
     /// off the match-key columns). `None` when the producer left it unset.
     rationale: Option<String>,
     valid_from: DateTime<Utc>,
+    /// Prioritization (design §8 Later — review-queue prioritization + SLA). The
+    /// combined priority score the queue is ORDERed by (DESC). Higher = surfaced
+    /// sooner. Unbounded because of the linear aging term, so a long-waiting
+    /// candidate can never be indefinitely buried. Ordering only — no fold/merge
+    /// behaviour changes, read path untouched.
+    priority: f64,
+    /// SLA read-out: seconds this candidate has waited (now() − `valid_from`).
+    /// Surfaced so an operator can watch the oldest-waiting candidate directly.
+    wait_age_secs: f64,
+    /// FREQUENCY signal: live evidence rows recurring on this unordered ref-pair.
+    frequency: i64,
+    /// ENTITY VALUE signal: distinct alias members in the two refs' clusters.
+    entity_value: i64,
 }
 
-impl From<EvidenceRow> for ReviewCandidate {
-    fn from(e: EvidenceRow) -> Self {
-        // Summaries are filled in by the handler (they need a DB read); default
-        // to empty here so the pure conversion stays infallible.
-        Self {
+/// GET /v1/admin/entity-resolution/review-queue (admin): live Tier-2/Tier-3
+/// evidence awaiting a human decision (§4.1, §4.3), ENRICHED for side-by-side
+/// review AND PRIORITIZED (design §8 Later — review-queue prioritization + SLA).
+/// Tier-2 needs a `human_confirmed` before it can form an edge; Tier-3 never
+/// auto-merges. Each candidate carries both refs, their member field summaries,
+/// the method/score/key_value/key_namespace, the rationale, and — new — its
+/// `priority`, `wait_age_secs`, `frequency`, and `entity_value`. Ordered by
+/// priority DESC (see `PostgresAdapter::review_queue` for the formula + the
+/// anti-starvation aging term). Empty in the MVP (no Tier-2/3 producers ship
+/// yet) but fully wired so the surface exists the day they turn on. Capped.
+/// Purely additive derived reads — no LLM, no live ReBAC, no fold; ordering
+/// only, read path untouched.
+async fn admin_review_queue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ReviewQueueQuery>,
+) -> HandlerResult<Json<Vec<ReviewCandidate>>> {
+    state.admin.check(&headers)?;
+    let items = state
+        .storage
+        .inner()
+        .review_queue(q.tenant_id, q.limit)
+        .await
+        .map_err(internal)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let e = item.evidence;
+        // Attach each ref's light field summary for the side-by-side view.
+        let left_summary = state
+            .storage
+            .inner()
+            .ref_field_summary(q.tenant_id, &e.left_ref)
+            .await
+            .map_err(internal)?;
+        let right_summary = state
+            .storage
+            .inner()
+            .ref_field_summary(q.tenant_id, &e.right_ref)
+            .await
+            .map_err(internal)?;
+        out.push(ReviewCandidate {
             evidence_id: e.evidence_id,
             left_ref: e.left_ref,
             right_ref: e.right_ref,
-            left_summary: EntityFieldSummary::default(),
-            right_summary: EntityFieldSummary::default(),
+            left_summary,
+            right_summary,
             tier: e.tier,
             method: e.method,
             score: e.score,
@@ -1261,47 +1310,11 @@ impl From<EvidenceRow> for ReviewCandidate {
             polarity: e.polarity,
             rationale: e.evidence_l0_ref,
             valid_from: e.valid_from,
-        }
-    }
-}
-
-/// GET /v1/admin/entity-resolution/review-queue (admin): live Tier-2/Tier-3
-/// evidence awaiting a human decision (§4.1, §4.3), ENRICHED for side-by-side
-/// review. Tier-2 needs a `human_confirmed` before it can form an edge; Tier-3
-/// never auto-merges. Each candidate carries both refs, their member field
-/// summaries, the method/score/key_value/key_namespace, and the rationale. Empty
-/// in the MVP (no Tier-2/3 producers ship yet) but fully wired so the surface
-/// exists the day they turn on. Newest first, capped. Purely additive derived
-/// reads — no LLM, no live ReBAC, no fold.
-async fn admin_review_queue(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<ReviewQueueQuery>,
-) -> HandlerResult<Json<Vec<ReviewCandidate>>> {
-    state.admin.check(&headers)?;
-    let rows = state
-        .storage
-        .inner()
-        .review_queue(q.tenant_id, q.limit)
-        .await
-        .map_err(internal)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut candidate = ReviewCandidate::from(row);
-        // Attach each ref's light field summary for the side-by-side view.
-        candidate.left_summary = state
-            .storage
-            .inner()
-            .ref_field_summary(q.tenant_id, &candidate.left_ref)
-            .await
-            .map_err(internal)?;
-        candidate.right_summary = state
-            .storage
-            .inner()
-            .ref_field_summary(q.tenant_id, &candidate.right_ref)
-            .await
-            .map_err(internal)?;
-        out.push(candidate);
+            priority: item.priority,
+            wait_age_secs: item.wait_age_secs,
+            frequency: item.frequency,
+            entity_value: item.entity_value,
+        });
     }
     Ok(Json(out))
 }

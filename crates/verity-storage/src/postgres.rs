@@ -15,6 +15,27 @@ use verity_core::types::*;
 /// [`PostgresAdapter::list_current_facts_grouped`].
 pub type GroupedFacts = ((String, String), Vec<(String, serde_json::Value)>);
 
+/// One prioritized review-queue candidate: the full [`EvidenceRow`] plus the
+/// priority signals [`PostgresAdapter::review_queue`] computes for ordering
+/// (design §8 Later — review-queue prioritization + SLA). Ordering-only
+/// enrichment; the ledger row itself is unchanged. `wait_age_secs` is the
+/// SLA read-out (now() − valid_from), surfaced per row so an operator can watch
+/// the oldest-waiting candidate; `priority` is the score the query ORDERs by.
+#[derive(Debug, Clone)]
+pub struct ReviewQueueItem {
+    /// The underlying ledger row (unchanged — this is display ordering only).
+    pub evidence: EvidenceRow,
+    /// The combined priority score (see the `review_queue` doc comment). Higher
+    /// = surfaced sooner. Unbounded because of the linear aging term.
+    pub priority: f64,
+    /// Seconds this candidate has waited (now() − valid_from) — the SLA read-out.
+    pub wait_age_secs: f64,
+    /// FREQUENCY signal: live evidence rows recurring on this unordered ref-pair.
+    pub frequency: i64,
+    /// ENTITY VALUE signal: distinct alias members in the two refs' clusters.
+    pub entity_value: i64,
+}
+
 pub struct PostgresAdapter {
     pool: PgPool,
     /// Deployment KEK (SPEC §8a, crypto.rs). None = envelope encryption
@@ -800,16 +821,132 @@ impl PostgresAdapter {
     /// The review queue (§4.1, §4.3): live Tier-2/Tier-3 evidence that never
     /// auto-forms an edge (Tier-2 awaits `human_confirmed`; Tier-3 never merges).
     /// A read-only view over `entity_evidence` — empty in the MVP (no Tier-2/3
-    /// producers ship yet) but fully wired so the admin surface exists. Newest
-    /// first, capped.
-    pub async fn review_queue(&self, tenant: TenantId, limit: i64) -> Result<Vec<EvidenceRow>> {
+    /// producers ship yet) but fully wired so the admin surface exists.
+    ///
+    /// PRIORITIZED (design §8 Later: "review-queue prioritization + SLA —
+    /// starvation risk, surface high-value/high-frequency entities first"). This
+    /// is ORDERING ONLY: the same `tier IN (2,3) AND valid_to IS NULL` candidate
+    /// set as before, no fold/merge behaviour touched, read path untouched. We
+    /// compute a `priority` per candidate from ledger-visible signals and order
+    /// by it DESC so the reviewer's finite attention lands on the candidates that
+    /// matter most — while an aging term guarantees no candidate can be buried
+    /// forever (anti-starvation / SLA).
+    ///
+    /// ── PRIORITY FORMULA ────────────────────────────────────────────────────
+    /// All signals come straight from the append-only ledger (`entity_evidence`)
+    /// + the derived `entity_aliases` — zero LLM, zero live ReBAC, zero fold.
+    ///
+    /// ```text
+    /// priority =  W_FREQ  * ln(1 + frequency)      -- FREQUENCY
+    ///          +  W_VALUE * ln(1 + entity_value)   -- ENTITY VALUE
+    ///          +  W_TIER  * tier_weight            -- TIER (2 before 3)
+    ///          +  W_REC   * recency_decay          -- RECENCY (newest evidence)
+    ///          +  W_AGE   * age_days               -- SLA / ANTI-STARVATION
+    /// ```
+    ///
+    /// - `frequency` — count of LIVE evidence rows recurring between this exact
+    ///   `{left_ref,right_ref}` pair (order-independent). Two refs that keep
+    ///   co-occurring are a stronger, higher-stakes call.
+    /// - `entity_value` — total distinct alias MEMBERS in the clusters the two
+    ///   refs already belong to (via `entity_aliases`). Bigger clusters = more
+    ///   facts/members downstream = higher blast radius, so a merge/split
+    ///   decision there is worth more.
+    /// - `tier_weight` — 1.0 for Tier-2 (a confirm can FORM an edge — actionable),
+    ///   0.4 for Tier-3 (never auto-merges; corroboration only).
+    /// - `recency_decay` — `exp(-age_days / RECENCY_TAU)`: a freshly-produced
+    ///   candidate is likelier to reflect a live workflow the reviewer cares
+    ///   about right now; decays smoothly, never dominates aging.
+    /// - `age_days` — `now() - valid_from`, in days (the candidate's WAIT AGE).
+    ///
+    /// ── AGING / SLA (anti-starvation) ───────────────────────────────────────
+    /// `W_AGE * age_days` is an UNBOUNDED linear term: every other signal is
+    /// bounded (ln() grows sub-linearly and the corpus is finite; tier/recency
+    /// are ≤1), so for any candidate, however low its intrinsic score, its
+    /// priority strictly increases with wait time and will EVENTUALLY exceed any
+    /// fixed-score competitor. The oldest-waiting candidate can never be
+    /// indefinitely buried — it ages into the top of the queue on its own. Tune
+    /// `AGE_WEIGHT` to the SLA: larger = the queue drains closer to strict FIFO;
+    /// smaller = value/frequency dominate until a candidate is quite stale. The
+    /// wait age is returned per row so an operator can watch the SLA directly.
+    ///
+    /// Weights live as SQL constants below so the policy is auditable in one place.
+    /// Ties (identical priority) break by `valid_from ASC` (oldest first) then
+    /// `evidence_id` for a fully deterministic order.
+    pub async fn review_queue(&self, tenant: TenantId, limit: i64) -> Result<Vec<ReviewQueueItem>> {
         let rows = sqlx::query(
-            "SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
-                    key_value, key_namespace, score, evidence_l0_ref, polarity,
-                    valid_from, valid_to, superseded_by
-               FROM entity_evidence
-              WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
-              ORDER BY valid_from DESC, evidence_id
+            // Priority-policy constants (see the doc comment above). Kept inline
+            // so the whole scoring policy is one auditable block.
+            "WITH params AS (
+                 SELECT 1.5::float8  AS freq_weight,
+                        1.0::float8  AS value_weight,
+                        2.0::float8  AS tier_weight,
+                        1.0::float8  AS recency_weight,
+                        0.20::float8 AS age_weight,      -- SLA slope (per day)
+                        14.0::float8 AS recency_tau      -- recency half-life-ish (days)
+             ),
+             -- The candidate set: EXACTLY the old query's rows (ordering only).
+             cand AS (
+                 SELECT evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                        key_value, key_namespace, score, evidence_l0_ref, polarity,
+                        valid_from, valid_to, superseded_by
+                   FROM entity_evidence
+                  WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
+             ),
+             -- FREQUENCY: how often this same unordered ref-pair recurs across
+             -- LIVE evidence. least/greatest makes {a,b} == {b,a}.
+             freq AS (
+                 SELECT least(left_ref, right_ref)    AS a,
+                        greatest(left_ref, right_ref) AS b,
+                        count(*)                       AS n
+                   FROM entity_evidence
+                  WHERE tenant_id = $1 AND valid_to IS NULL AND tier IN (2, 3)
+                  GROUP BY 1, 2
+             ),
+             -- ENTITY VALUE: distinct alias members in each ref's existing
+             -- cluster. A ref like 'salesforce:001' maps to a canonical via
+             -- entity_aliases (source,entity_id); we count members of that
+             -- canonical. Refs with no alias contribute 0 (their own singleton).
+             cluster_size AS (
+                 SELECT a2.canonical_entity, count(*) AS members
+                   FROM entity_aliases a2
+                  WHERE a2.tenant_id = $1
+                  GROUP BY a2.canonical_entity
+             )
+             SELECT c.evidence_id, c.tenant_id, c.left_ref, c.right_ref, c.tier,
+                    c.method, c.key_value, c.key_namespace, c.score,
+                    c.evidence_l0_ref, c.polarity, c.valid_from, c.valid_to,
+                    c.superseded_by,
+                    -- returned wait age in seconds (the SLA read-out for the UI).
+                    EXTRACT(EPOCH FROM (now() - c.valid_from))::float8 AS wait_age_secs,
+                    COALESCE(f.n, 1)                                   AS frequency,
+                    (COALESCE(ls.members, 0) + COALESCE(rs.members, 0))::bigint
+                                                                      AS entity_value,
+                    (
+                      p.freq_weight    * ln(1 + COALESCE(f.n, 1))
+                    + p.value_weight   * ln(1 + COALESCE(ls.members, 0)
+                                                 + COALESCE(rs.members, 0))
+                    + p.tier_weight    * (CASE c.tier WHEN 2 THEN 1.0 ELSE 0.4 END)
+                    + p.recency_weight * exp(
+                          - (EXTRACT(EPOCH FROM (now() - c.valid_from)) / 86400.0)
+                            / p.recency_tau)
+                    -- SLA / anti-starvation: UNBOUNDED linear in wait age (days).
+                    + p.age_weight     * (EXTRACT(EPOCH FROM (now() - c.valid_from))
+                                          / 86400.0)
+                    )::float8                                         AS priority
+               FROM cand c
+               CROSS JOIN params p
+               LEFT JOIN freq f
+                      ON f.a = least(c.left_ref, c.right_ref)
+                     AND f.b = greatest(c.left_ref, c.right_ref)
+               LEFT JOIN entity_aliases la
+                      ON la.tenant_id = c.tenant_id
+                     AND la.source || ':' || la.entity_id = c.left_ref
+               LEFT JOIN cluster_size ls ON ls.canonical_entity = la.canonical_entity
+               LEFT JOIN entity_aliases ra
+                      ON ra.tenant_id = c.tenant_id
+                     AND ra.source || ':' || ra.entity_id = c.right_ref
+               LEFT JOIN cluster_size rs ON rs.canonical_entity = ra.canonical_entity
+              ORDER BY priority DESC, c.valid_from ASC, c.evidence_id
               LIMIT $2",
         )
         .bind(tenant)
@@ -817,7 +954,7 @@ impl PostgresAdapter {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        rows.iter().map(row_to_evidence).collect()
+        rows.iter().map(row_to_review_item).collect()
     }
 
     /// List all key-quality config rows for a tenant (admin plane, §4.1). The GET
@@ -2775,6 +2912,20 @@ fn row_to_evidence(row: &PgRow) -> Result<EvidenceRow> {
         valid_from: row.try_get("valid_from").map_err(db_err)?,
         valid_to: row.try_get("valid_to").map_err(db_err)?,
         superseded_by: row.try_get("superseded_by").map_err(db_err)?,
+    })
+}
+
+/// Map a prioritized review-queue row (the `EvidenceRow` columns + the computed
+/// `priority` / `wait_age_secs` / `frequency` / `entity_value`) to a
+/// [`ReviewQueueItem`]. The evidence columns are the same set `row_to_evidence`
+/// reads, so we reuse it for the embedded row.
+fn row_to_review_item(row: &PgRow) -> Result<ReviewQueueItem> {
+    Ok(ReviewQueueItem {
+        evidence: row_to_evidence(row)?,
+        priority: row.try_get("priority").map_err(db_err)?,
+        wait_age_secs: row.try_get("wait_age_secs").map_err(db_err)?,
+        frequency: row.try_get("frequency").map_err(db_err)?,
+        entity_value: row.try_get("entity_value").map_err(db_err)?,
     })
 }
 

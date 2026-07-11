@@ -36,6 +36,21 @@
     return i < 0 ? s : s.slice(0, i);
   }
 
+  // Wait-age (SLA read-out): seconds → a compact "3d 4h" / "12m" / "45s" string.
+  // The queue is ordered by a priority score with an UNBOUNDED aging term, so a
+  // large wait age is the operator's cue that the anti-starvation term is (or
+  // soon will be) floating this candidate up regardless of its intrinsic value.
+  function fmtAge(secs) {
+    secs = Math.max(0, Math.floor(Number(secs) || 0));
+    var d = Math.floor(secs / 86400);
+    var h = Math.floor((secs % 86400) / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return d + "d " + h + "h";
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m";
+    return secs + "s";
+  }
+
   // Confidence → badge. The frozen encoding: deterministic / human_confirmed are
   // GUARANTEED links (solid); approximated is a PROBABILISTIC link (dashed via
   // the b-inferred modifier). Unknown confidence falls back to a neutral chip.
@@ -125,7 +140,9 @@
             '<div class="tight"><button id="ent-load-queue">Load review queue</button></div>' +
             '<div class="note" style="flex:1">The live <b>Tier-2 / Tier-3</b> candidates the deterministic fold ' +
               'cannot decide alone — a human confirms the merge or rejects it (a <b>permanent</b> anti-link). ' +
-              'Newest first.</div>' +
+              'Ordered by <b>priority</b> (frequency · entity value · tier · recency), with an ' +
+              '<b>aging / SLA</b> term so the oldest-waiting candidate can never be buried — each card shows ' +
+              'its priority and wait-age.</div>' +
           "</div>" +
           '<div class="err" id="ent-queue-err"></div>' +
           '<div id="ent-queue-refreshed"></div>' +
@@ -546,12 +563,33 @@
         var tierChip = Verity.badge("tier " + Verity.esc(c.tier), "b-kind");
         var methodChip = Verity.badge(Verity.esc(c.method), "b-inferred", true);
 
+        // Prioritization chips (design §8 Later). The server orders the queue by
+        // `priority` DESC; we surface the score, the wait-age (SLA read-out), and
+        // the frequency / entity-value signals that fed it so the ordering is
+        // legible, not magic.
+        var prioChip = c.priority == null
+          ? ""
+          : Verity.badge("priority " + Number(c.priority).toFixed(2), "b-entity");
+        var ageChip = c.wait_age_secs == null
+          ? ""
+          : ' <span class="badge b-kind" title="wait age = now() − valid_from; the SLA / anti-starvation aging term floats this up as it grows">waited ' +
+            Verity.esc(fmtAge(c.wait_age_secs)) + "</span>";
+        var freqChip = (c.frequency == null || Number(c.frequency) <= 1)
+          ? ""
+          : ' <span class="badge b-kind" title="FREQUENCY: live evidence rows recurring on this ref-pair">freq ' +
+            Verity.esc(c.frequency) + "</span>";
+        var valChip = (c.entity_value == null || Number(c.entity_value) <= 0)
+          ? ""
+          : ' <span class="badge b-kind" title="ENTITY VALUE: distinct alias members in the two refs\' clusters — bigger = higher blast radius">value ' +
+            Verity.esc(c.entity_value) + "</span>";
+
         var lEsc = Verity.esc(c.left_ref);
         var rEsc = Verity.esc(c.right_ref);
 
         return '<div class="card" style="margin-bottom:12px">' +
           '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">' +
-            methodChip + tierChip + polChip + scoreChip + keyChip + nsChip +
+            prioChip + methodChip + tierChip + polChip + scoreChip + keyChip + nsChip +
+            ageChip + freqChip + valChip +
             ' <span class="note">valid_from ' + Verity.esc(Verity.fmtTime(c.valid_from)) + "</span>" +
           "</div>" +
           '<div class="row" style="align-items:stretch">' +
