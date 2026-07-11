@@ -6,7 +6,10 @@
      THROUGH that exact handle — each hit rendered with the full honesty payload
      (ACL provenance · confidentiality · trust tier · tag-derivation solid-vs-
      dashed · bi-temporal · citation→L0). Boundary trace, Explain-zero, honest
-     session-local latency, and Export boundary as evidence.
+     session-local latency, and Export boundary as evidence. Plus ONE clearly
+     labeled non-pure-read action: "why filtered?" — the admin-gated, audited
+     POST /v1/admin/debug/recall tracer (OFF the read path by construction)
+     that renders per-candidate drop reasons for the current handle + query.
 
      Owns ONLY this file + panel_scope.js. Reuses theme.css / core.js verbatim;
      mounts everything into #scope-mount. No other panel's DOM is touched.

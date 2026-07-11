@@ -14,6 +14,18 @@
      • GET  /v1/entities/{canonical}?scope_handle             — merged field view
          SCOPE-GATED (not admin): per-field winning source + provenance +
          superseded alternatives. Requires a pasted scope handle; disclosed.
+     • POST /v1/admin/entity-precedence                       — PRECEDENCE EDITOR
+         { tenant_id, canonical, field, source_order[] } (SPEC §7f, Screen 9
+         remainder): the per-field source-of-truth ranking, highest first.
+         canonical/field default to "*" server-side; we save the CURRENT
+         canonical with either a specific field or the "*" entity default.
+         The per-field source lists are derived from the loaded merged view
+         (there is no GET for precedence rows), so the editor requires the
+         merged view first. "No rule" is INFERRED, honestly: with no rule the
+         server tie-breaks by most-recent valid_from, so a winner that is NOT
+         the newest cross-source fact proves a rule overrode recency; a winner
+         that IS the newest is indistinguishable from no rule and is labelled
+         exactly that way — never claimed as either.
 
    HONESTY (SPEC §3):
      • confidence rendered faithfully — deterministic / human_confirmed = SOLID
@@ -89,6 +101,16 @@
 
       // -- current-entity state for the detail drawer + split action --------
       var current = { canonical: "", members: [] };
+
+      // -- precedence-editor state (rebuilt from each loaded merged view) ----
+      //   names  : field names in merged-view order (index = stable DOM handle,
+      //            so arbitrary field/source strings never leak into ids)
+      //   orders : field -> editable source order (highest precedence first),
+      //            seeded winner-first from the merged view
+      //   star   : editable order for the "(canonical, *)" entity default —
+      //            the union of sources across all fields
+      //   fields : field -> the raw MergedField (for conflict/provenance render)
+      var prec = { names: [], orders: {}, star: [], fields: {}, ready: false };
 
       /* ---- tabs: (A) browser  (B) review queue ------------------------- */
       var tabs = document.createElement("div");
@@ -173,6 +195,17 @@
             "</div>" +
             '<div class="err" id="ent-merged-err"></div>' +
             '<div id="ent-merged-out"></div>' +
+          "</div>" +
+          '<div class="card" style="margin-top:8px">' +
+            '<h2>Precedence editor <span class="sub">POST /v1/admin/entity-precedence · admin-token</span></h2>' +
+            '<div class="note"><em>Per-field source-of-truth ranking (SPEC §7f).</em> Reorder the sources below ' +
+              '(highest precedence first) and save — the merged view above resolves each field to the highest-ranked ' +
+              'source that has a current fact. Resolution is most-specific-wins: <b>(canonical, field)</b> → ' +
+              '<b>(canonical, *)</b> → <b>(*, *)</b> → none (recency tie-break). The source lists come from the ' +
+              '<b>loaded merged view</b> (there is no read endpoint for precedence rows); saving is <b>admin-gated</b> ' +
+              'even though the view above is scope-gated.</div>' +
+            '<div class="err" id="ent-prec-err"></div>' +
+            '<div id="ent-prec-out"></div>' +
           "</div>" +
           '<div class="card" style="margin-top:8px">' +
             '<h2>Split <span class="sub">retract + anti-link via decide/reject</span></h2>' +
@@ -399,6 +432,14 @@
           "</div>";
         Verity.$("ent-merged-out").innerHTML = "";
         Verity.clearErr("ent-merged-err");
+        // Precedence editor resets with the drawer — its source lists are
+        // derived from THIS canonical's merged view, which is not loaded yet.
+        prec = { names: [], orders: {}, star: [], fields: {}, ready: false };
+        Verity.clearErr("ent-prec-err");
+        Verity.$("ent-prec-out").innerHTML =
+          '<div class="note">Load the <b>merged field view</b> above first — the per-field source lists are derived ' +
+          "from its live facts (there is no read endpoint for precedence rows), so there is nothing honest to edit " +
+          "until it loads.</div>";
         // Prefill scope handle from a previous entry (kept between opens).
         renderSplit();
         dlg.open();
@@ -435,7 +476,7 @@
         };
       }
 
-      Verity.$("ent-load-merged").onclick = async function () {
+      async function loadMerged() {
         Verity.clearErr("ent-merged-err");
         Verity.$("ent-merged-out").innerHTML = "";
         var handle = Verity.$("ent-scope-handle").value.trim();
@@ -445,10 +486,13 @@
             "/v1/entities/" + encodeURIComponent(current.canonical) +
               "?scope_handle=" + encodeURIComponent(handle));
           renderMerged(res);
+          buildPrec(res);
+          renderPrecedence();
         } catch (e) {
           Verity.err("ent-merged-err", e);
         }
-      };
+      }
+      Verity.$("ent-load-merged").onclick = loadMerged;
 
       function renderMerged(res) {
         var fields = (res && res.fields) || {};
@@ -492,6 +536,229 @@
         if (v == null) return "—";
         if (typeof v === "string") return v;
         try { return JSON.stringify(v); } catch (e) { return String(v); }
+      }
+
+      /* ================================================================
+         PRECEDENCE EDITOR — per-field source-of-truth ranking (SPEC §7f,
+         UI-SPEC §5 Screen 9 remainder)
+         ================================================================ */
+
+      // Canonical value string for conflict comparison (jsonb-faithful).
+      function valKey(v) {
+        try { return JSON.stringify(v === undefined ? null : v); }
+        catch (e) { return String(v); }
+      }
+
+      // Cross-source CONFLICT rows for a merged field: alternatives from a
+      // DIFFERENT source carrying a DIFFERENT value than the winner. Same-source
+      // history or agreeing duplicates are not conflicts.
+      function fieldConflicts(f) {
+        var wv = valKey(f.value);
+        return (f.superseded_alternatives || []).filter(function (a) {
+          return a.source !== f.winning_source && valKey(a.value) !== wv;
+        });
+      }
+
+      // HONEST rule inference. There is no GET for precedence rows, but the
+      // no-rule tie-break is deterministic: most-recent valid_from wins. So if
+      // an alternative from ANOTHER source is NEWER than the winner, a
+      // precedence rule demonstrably overrode recency ("rule in effect"). If
+      // the winner IS the newest cross-source fact, a rule that agrees with
+      // recency and no rule at all are indistinguishable — we say exactly that,
+      // we never guess.
+      function ruleInferred(f) {
+        var wf = Date.parse(f.valid_from) || 0;
+        return (f.superseded_alternatives || []).some(function (a) {
+          return a.source !== f.winning_source && (Date.parse(a.valid_from) || 0) > wf;
+        });
+      }
+
+      // Rebuild the editor state from a freshly loaded merged view: per field,
+      // the distinct sources winner-first then alternatives in server order;
+      // the "*" entity default is the union across fields in first-seen order.
+      function buildPrec(res) {
+        var fields = (res && res.fields) || {};
+        prec = { names: Object.keys(fields), orders: {}, star: [], fields: fields, ready: true };
+        var starSeen = {};
+        prec.names.forEach(function (name) {
+          var f = fields[name];
+          var seen = {};
+          var order = [];
+          function push(s) {
+            if (!seen[s]) { seen[s] = true; order.push(s); }
+            if (!starSeen[s]) { starSeen[s] = true; prec.star.push(s); }
+          }
+          push(f.winning_source);
+          (f.superseded_alternatives || []).forEach(function (a) { push(a.source); });
+          prec.orders[name] = order;
+        });
+      }
+
+      // One reorderable ranked source list. `fi` is the field index ("*" for
+      // the entity default) — indexes, never raw strings, travel in data-attrs.
+      function rankList(order, fi) {
+        if (!order.length) return '<div class="note">no sources — nothing to rank</div>';
+        return order.map(function (src, i) {
+          return '<div class="row" style="align-items:center;gap:6px;margin:2px 0">' +
+            '<span class="badge b-kind" style="font-variant-numeric:tabular-nums" title="precedence rank (1 = wins)">#' + (i + 1) + "</span>" +
+            Verity.badge(Verity.esc(src), "b-kind") +
+            '<button class="ent-prec-move" data-fi="' + fi + '" data-idx="' + i + '" data-dir="-1"' +
+              (i === 0 ? " disabled" : "") + ' title="raise precedence">▲</button>' +
+            '<button class="ent-prec-move" data-fi="' + fi + '" data-idx="' + i + '" data-dir="1"' +
+              (i === order.length - 1 ? " disabled" : "") + ' title="lower precedence">▼</button>' +
+          "</div>";
+        }).join("");
+      }
+
+      // Side-by-side conflict panel: the winner and each cross-source
+      // conflicting value as equal columns, each with full provenance.
+      // "Conflict made visible beats conflict resolved wrong."
+      function conflictPanel(f, conflicts) {
+        function col(label, source, value, entityId, validFrom, provenance, winning) {
+          return '<div style="min-width:200px;flex:1;border:1px solid var(--border);border-radius:6px;padding:8px' +
+              (winning ? ";border-color:var(--accent)" : "") + '">' +
+            '<div class="note">' + label + " " + Verity.badge(Verity.esc(source), winning ? "b-provenance" : "b-kind") + "</div>" +
+            '<div class="content" style="margin:4px 0"><b>' + Verity.esc(fmtVal(value)) + "</b></div>" +
+            '<div class="note">entity ' + Verity.esc(entityId) + " · valid_from " + Verity.esc(Verity.fmtTime(validFrom)) +
+              " · citation→L0 " + Verity.esc(provenance) + "</div>" +
+          "</div>";
+        }
+        var cols = [col("current winner", f.winning_source, f.value, f.winning_entity_id, f.valid_from, f.provenance, true)]
+          .concat(conflicts.map(function (a) {
+            return col("conflicting", a.source, a.value, a.entity_id, a.valid_from, a.provenance, false);
+          }));
+        return '<div class="row" style="align-items:stretch;gap:8px;margin-top:6px;flex-wrap:wrap">' + cols.join("") + "</div>";
+      }
+
+      function renderPrecedence() {
+        Verity.clearErr("ent-prec-err");
+        var host = Verity.$("ent-prec-out");
+        if (!prec.ready) return;
+        if (!prec.names.length) {
+          host.innerHTML =
+            '<div class="empty">The loaded merged view has <b>no visible fields</b> under this scope handle — there ' +
+            "is no per-field source list to rank. If the handle cannot see this entity, that fail-closed emptiness " +
+            "is correct, not a bug.</div>";
+          return;
+        }
+
+        var blocks = prec.names.map(function (name, fi) {
+          var f = prec.fields[name];
+          var order = prec.orders[name];
+          var conflicts = fieldConflicts(f);
+          var multi = order.length > 1;
+          var inferred = ruleInferred(f);
+
+          // Rule-state chip: proven rule (solid) / indistinguishable (dashed,
+          // inferred encoding) — never a fabricated "no rule" claim.
+          var ruleChip = inferred
+            ? Verity.badge("rule in effect (inferred)", "b-provenance")
+            : Verity.badge(multi ? "no rule detected (winner = newest — rule-agrees or no rule)" : "single source", "b-inferred", true);
+          var conflictChip = conflicts.length
+            ? ' <span class="badge b-st-eligible" title="cross-source conflict: another source carries a DIFFERENT current value for this field">⚠ cross-source conflict ×' + conflicts.length + "</span>"
+            : "";
+
+          return '<div class="hit" style="margin-bottom:10px">' +
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+              "<b>" + Verity.esc(name) + "</b> " + ruleChip + conflictChip +
+            "</div>" +
+            // A visible, unresolved conflict renders SIDE-BY-SIDE with full
+            // provenance so the admin ranks with the evidence in view.
+            (conflicts.length && !inferred
+              ? '<div class="note" style="margin-top:6px"><em>Conflict made visible.</em> No rule is detectable for ' +
+                "this field, so the winner below is the <b>recency tie-break</b>, not a chosen source of truth. " +
+                "Rank the sources and save to make the choice explicit.</div>" +
+                conflictPanel(f, conflicts)
+              : "") +
+            '<div class="row" style="align-items:flex-start;margin-top:8px">' +
+              '<div style="flex:1">' + rankList(order, fi) + "</div>" +
+              '<div class="tight"><button class="primary ent-prec-save" data-fi="' + fi + '" ' +
+                'title="POST /v1/admin/entity-precedence — saves this exact order for (canonical, field); highest first. Unlisted sources rank after all listed ones.">' +
+                "Save field rule</button></div>" +
+            "</div>" +
+            '<div id="ent-prec-msg-' + fi + '"></div>' +
+          "</div>";
+        }).join("");
+
+        // The "(canonical, *)" entity default — union of sources across fields.
+        var starBlock = prec.star.length > 1
+          ? '<div class="hit" style="margin-bottom:10px">' +
+              '<div><b>* (entity default)</b> ' + Verity.badge("applies to every field without its own rule", "b-kind") + "</div>" +
+              '<div class="note" style="margin-top:4px">Saved as <b>field = "*"</b> for this canonical: the fallback ' +
+                "order for any field that has no field-specific rule. The global (*, *) default is out of scope here — " +
+                "this editor writes only rules for <b>this</b> canonical.</div>" +
+              '<div class="row" style="align-items:flex-start;margin-top:8px">' +
+                '<div style="flex:1">' + rankList(prec.star, "*") + "</div>" +
+                '<div class="tight"><button class="primary ent-prec-save" data-fi="*" ' +
+                  'title="POST /v1/admin/entity-precedence with field=&quot;*&quot; — the entity-level default order.">' +
+                  "Save entity default</button></div>" +
+              "</div>" +
+              '<div id="ent-prec-msg-star"></div>' +
+            "</div>"
+          : "";
+
+        host.innerHTML =
+          '<div class="note">Sources below are the ones with <b>live facts</b> in the merged view (winner-first ' +
+            "seed). Reorder with ▲▼ — <b>highest precedence first</b> — then save. Saving re-loads the merged view " +
+            "so the new winners are shown, not assumed.</div>" +
+          blocks + starBlock;
+
+        // Wire ▲▼ moves (index-addressed; re-render keeps buttons honest).
+        var moves = host.querySelectorAll(".ent-prec-move");
+        for (var i = 0; i < moves.length; i++) {
+          moves[i].onclick = function () {
+            var fi = this.getAttribute("data-fi");
+            var idx = parseInt(this.getAttribute("data-idx"), 10);
+            var dir = parseInt(this.getAttribute("data-dir"), 10);
+            var order = fi === "*" ? prec.star : prec.orders[prec.names[parseInt(fi, 10)]];
+            if (!order) return;
+            var j = idx + dir;
+            if (idx < 0 || j < 0 || idx >= order.length || j >= order.length) return;
+            var t = order[idx]; order[idx] = order[j]; order[j] = t;
+            renderPrecedence();
+          };
+        }
+
+        // Wire saves.
+        var saves = host.querySelectorAll(".ent-prec-save");
+        for (var s = 0; s < saves.length; s++) {
+          saves[s].onclick = function () { savePrecedence(this, this.getAttribute("data-fi")); };
+        }
+      }
+
+      async function savePrecedence(btn, fi) {
+        Verity.clearErr("ent-prec-err");
+        var tenant = activeTenant();
+        if (!tenant) { Verity.err("ent-prec-err", new Error("no tenant selected — type a tenant_id above")); return; }
+        var star = fi === "*";
+        var field = star ? "*" : prec.names[parseInt(fi, 10)];
+        var order = star ? prec.star : prec.orders[field];
+        if (!field || !order || !order.length) {
+          Verity.err("ent-prec-err", new Error("nothing to save — no ranked sources for this field"));
+          return;
+        }
+        btn.disabled = true;
+        try {
+          var res = await Verity.api("/v1/admin/entity-precedence", { admin: true, json: {
+            tenant_id: tenant,
+            canonical: current.canonical,
+            field: field,
+            source_order: order,
+          } });
+          var msg = Verity.$(star ? "ent-prec-msg-star" : "ent-prec-msg-" + fi);
+          if (msg) {
+            msg.innerHTML = '<span class="refreshed">saved: (' + Verity.esc(res.canonical) + ", " +
+              Verity.esc(res.field) + ") → [" +
+              (res.source_order || []).map(Verity.esc).join(" › ") + "] · " +
+              Verity.esc(Verity.fmtTime(Date.now())) + " · re-loading merged view…</span>";
+          }
+          // Show the rule's effect, don't assert it: re-load the merged view so
+          // winners/conflict chips re-derive from the server's own resolution.
+          await loadMerged();
+        } catch (e) {
+          Verity.err("ent-prec-err", e);
+          btn.disabled = false;
+        }
       }
 
       /* ================================================================

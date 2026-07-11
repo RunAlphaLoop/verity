@@ -1,24 +1,28 @@
 <!-- ==========================================================================
-     panel_quarantine.html — Screen 6 · Quarantine  [v0.2]
+     panel_quarantine.html — Screen 6 · Quarantine  [v0.3]
      --------------------------------------------------------------------------
-     The fail-closed queue made visible and explained. Unmappable-ACL /
-     unrecognized-shape webhook payloads that were REFUSED at ingest and now sit
-     invisible to recall by design. Backed by GET /v1/admin/quarantine (admin
-     token): each row carries id, webhook_id, payload (FULL json, never
-     truncated), reason, at.
+     The fail-closed queue made visible, explained — and now actionable.
+     Unmappable-ACL / unrecognized-shape webhook payloads that were REFUSED at
+     ingest and sit invisible to recall by design. Backed by
+     GET /v1/admin/quarantine (admin token): each row carries id, webhook_id,
+     payload (FULL json, never truncated), reason, at.
 
-     This is a READ/EXPORT panel. It honestly states there is NO re-ingest /
-     dismiss endpoint yet — that action is rendered as a DISABLED SEAM we design
-     but never fake, never a phantom button. There is, and will be, NO
-     "index it anyway" affordance: re-ingest can only ever route through a
-     corrected mapping, and that write surface does not exist yet (SPEC §5
-     Screen 6, §7b, §3 non-negotiables).
+     The v0.2 disabled seam is replaced by the REAL write surface (migration
+     0023): POST /v1/admin/quarantine/{id}/reingest re-admits a payload only
+     THROUGH a corrected, admin-supplied ACL mapping (visibility +
+     confidentiality REQUIRED and explicit, stamped admin-assigned; the
+     original payload preserved verbatim for audit), and …/{id}/dismiss
+     acknowledges without indexing anything. Those are the ONLY two exits;
+     both are audited and the row survives either (invalidate-don't-delete).
+     There is, and will be, NO "index it anyway" affordance — no request
+     shape exists that indexes a payload under its original unmappable ACL
+     or any default (SPEC §5 Screen 6, §7b, §3 non-negotiables).
 
      OWNS: this file + panel_quarantine.js. Reuses frozen theme/core classes and
      the Verity.* helpers only; never edits them. Mounts into #quarantine-mount.
      ========================================================================== -->
 <section class="panel" id="panel-quarantine">
   <h1>Quarantine</h1>
-  <div class="subtitle"><b>Fail-closed, visible, and explained.</b> Webhook payloads whose ACL could not be mapped, or whose shape was unrecognized, were refused at ingest &mdash; they sit here, invisible to recall, never indexed permissively.</div>
+  <div class="subtitle"><b>Fail-closed, visible, and explained.</b> Webhook payloads whose ACL could not be mapped, or whose shape was unrecognized, were refused at ingest &mdash; they sit here, invisible to recall, never indexed permissively. The only exits are re-ingest <em>through a corrected admin-supplied mapping</em> or dismiss; both are audited, and neither indexes anything under the original ACL.</div>
   <div id="quarantine-mount"></div>
 </section>

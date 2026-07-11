@@ -10,7 +10,19 @@
            encoding), strongest_method + evidence_count. Click a card → detail:
            the merged field view (GET /v1/entities/{canonical} · SCOPE-gated:
            per-field winning source + provenance + superseded alternatives) plus
-           the evidence trail.
+           the evidence trail, plus the PRECEDENCE EDITOR (UI-SPEC §5 Screen 9
+           remainder): the per-field source-of-truth ranking. For each field of
+           the loaded merged view the admin reorders the live sources (▲▼,
+           highest precedence first) and saves via POST
+           /v1/admin/entity-precedence { tenant_id, canonical, field,
+           source_order } — field-specific rules plus the "(canonical, *)"
+           entity default. When a field carries a cross-source CONFLICT and no
+           rule is detectable (no GET exists for precedence rows; a rule is
+           INFERRED only when the winner provably overrode the recency
+           tie-break), the conflicting values render SIDE-BY-SIDE with full
+           provenance — conflict made visible beats conflict resolved wrong.
+           Saving re-loads the merged view so the new winners are shown from
+           the server's own resolution, never assumed client-side.
 
        (B) REVIEW QUEUE — the Tier-2/3 candidates awaiting a human decision
            (GET /v1/admin/entity-resolution/review-queue · admin-token) as

@@ -36,6 +36,49 @@ pub struct ReviewQueueItem {
     pub entity_value: i64,
 }
 
+/// One tenant-only-filtered candidate for the ADMIN debug-recall "why-out"
+/// trace ([`PostgresAdapter::debug_recall_candidates`]). Carries the RAW
+/// enforcement inputs (visibility tokens, confidentiality class, entity tags,
+/// `valid_to`) so the admin plane can evaluate every mandatory pre-filter
+/// per-candidate and name the drop reason. Never crosses the read path.
+#[derive(Debug, Clone)]
+pub struct DebugCandidate {
+    pub chunk_id: Uuid,
+    pub document_id: String,
+    pub seq: i32,
+    pub content: String,
+    pub score: f32,
+    /// Materialized principal tokens; empty = invisible (fail closed).
+    pub visibility: Vec<PrincipalToken>,
+    pub entity_tags: Vec<String>,
+    pub kind: String,
+    /// Raw class (0 public … 3 restricted) — kept numeric so the trace can
+    /// compare against the scope ceiling without lossy round-trips.
+    pub confidentiality: i16,
+    pub acl_provenance: String,
+    pub trust_tier: i16,
+    pub valid_from: DateTime<Utc>,
+    /// Some = superseded/invalidated — recall never surfaces it (staleness drop).
+    pub valid_to: Option<DateTime<Utc>>,
+    pub provenance: Uuid,
+}
+
+/// One quarantined webhook payload with its lifecycle disposition (0023):
+/// `resolution` None = open, `"reingested"` (re-admitted ONLY through an
+/// admin-supplied corrected ACL mapping) or `"dismissed"` (acknowledged, never
+/// indexed). There is deliberately no permissive third state.
+#[derive(Debug, Clone)]
+pub struct QuarantineRow {
+    pub id: Uuid,
+    pub webhook_id: Uuid,
+    pub payload: serde_json::Value,
+    pub reason: String,
+    pub at: DateTime<Utc>,
+    pub resolution: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution_note: Option<String>,
+}
+
 pub struct PostgresAdapter {
     pool: PgPool,
     /// Deployment KEK (SPEC §8a, crypto.rs). None = envelope encryption
@@ -1068,6 +1111,231 @@ impl PostgresAdapter {
             });
         }
         Ok(out)
+    }
+
+    /// The COMPLETE set of DISTINCT canonical keys folded for a tenant, in
+    /// stable order — the paginated/uncapped counterpart to
+    /// `list_canonical_entities` used by the fold's §5 precondition (a). The
+    /// browser read is capped for display; the fold's Tier-3 tagging must see
+    /// EVERY prior canonical or it under-tags large tenants (a fail-closed
+    /// under-tag, never a wrong tag). This is a DISTINCT-only projection — no
+    /// members, no summaries, no badges — so it stays cheap even when the tenant
+    /// has hundreds of thousands of canonicals, and it pages internally so no
+    /// single statement materializes an unbounded result set. Worker/admin plane
+    /// only; the recall/`get` read path never calls it.
+    pub async fn all_canonical_keys(&self, tenant: TenantId) -> Result<Vec<String>> {
+        // Keyset pagination over the DISTINCT canonical keys, ordered so the
+        // `> $2` cursor is a strict, index-friendly advance. A single
+        // `SELECT DISTINCT ... ORDER BY` would also be correct, but paging keeps
+        // any one round trip bounded and lets a very large tenant stream.
+        const PAGE: i64 = 10_000;
+        let mut out: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let rows = sqlx::query(
+                "SELECT DISTINCT canonical_entity
+                   FROM entity_aliases
+                  WHERE tenant_id = $1
+                    AND ($2::text IS NULL OR canonical_entity > $2)
+                  ORDER BY canonical_entity
+                  LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(cursor.as_deref())
+            .bind(PAGE)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                out.push(r.try_get("canonical_entity").map_err(db_err)?);
+            }
+            // Advance the cursor to the last key of this page; a short page is
+            // the final page.
+            cursor = out.last().cloned();
+            if (rows.len() as i64) < PAGE {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------- admin debug-recall "why-out" trace (UI-SPEC §6 Later) ----------
+
+    /// Candidate rows for the ADMIN debug-recall trace: the top-`limit` chunks
+    /// by query similarity with ONLY the tenant filter applied — visibility,
+    /// confidentiality, entity-scope, and `valid_to` are deliberately NOT
+    /// filtered here, so the caller can evaluate each mandatory pre-filter
+    /// per-candidate and report WHY a near-miss was excluded.
+    ///
+    /// **Never on the read path.** `recall` applies these filters inside the
+    /// index as mandatory pre-filters and refuses this extra work; this method
+    /// exists solely for the admin-gated, audited debug endpoint. Honesty
+    /// bounds: the candidate set is a similarity top-N — a chunk that doesn't
+    /// rank inside `limit` under the tenant-only ordering is not enumerable
+    /// here, and everything is evaluated against the index AS OF NOW, not as of
+    /// any past recall.
+    ///
+    /// Ranking legs mirror recall's: dense (cosine, honoring the tenant's
+    /// embedding route) when an embedding is given, else BM25 over `content`.
+    pub async fn debug_recall_candidates(
+        &self,
+        tenant: TenantId,
+        embedding: Option<&[f32]>,
+        text: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<DebugCandidate>> {
+        let rows = if let Some(embedding) = embedding {
+            let col = match self.embedding_route(tenant).await? {
+                EmbeddingRoute::V1 => "embedding",
+                EmbeddingRoute::V2 => "embedding_v2",
+            };
+            // Safe: `col` is a validated constant; caller data goes through binds.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT id, document_id, seq, content, visibility, entity_tags, kind,
+                        confidentiality, acl_provenance, trust_tier, valid_from, valid_to,
+                        provenance, 1 - ({col} <=> $1) AS score
+                 FROM chunks
+                 WHERE tenant_id = $2 AND {col} IS NOT NULL
+                 ORDER BY {col} <=> $1
+                 LIMIT $3",
+            )))
+            .bind(Vector::from(embedding.to_vec()))
+            .bind(tenant)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        } else if let Some(text) = text {
+            sqlx::query(
+                "SELECT id, document_id, seq, content, visibility, entity_tags, kind,
+                        confidentiality, acl_provenance, trust_tier, valid_from, valid_to,
+                        provenance, paradedb.score(id) AS score
+                 FROM chunks
+                 WHERE id @@@ paradedb.match('content', $1)
+                   AND tenant_id = $2
+                 ORDER BY paradedb.score(id) DESC
+                 LIMIT $3",
+            )
+            .bind(text)
+            .bind(tenant)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        } else {
+            return Err(StorageError::InvalidInput(
+                "debug recall needs text or an embedding".into(),
+            ));
+        };
+        rows.iter()
+            .map(|row| {
+                Ok(DebugCandidate {
+                    chunk_id: row.try_get("id").map_err(db_err)?,
+                    document_id: row.try_get("document_id").map_err(db_err)?,
+                    seq: row.try_get("seq").map_err(db_err)?,
+                    content: row.try_get("content").map_err(db_err)?,
+                    score: row
+                        .try_get::<f64, _>("score")
+                        .map(|s| s as f32)
+                        .or_else(|_| row.try_get::<f32, _>("score"))
+                        .map_err(db_err)?,
+                    visibility: row.try_get("visibility").map_err(db_err)?,
+                    entity_tags: row.try_get("entity_tags").map_err(db_err)?,
+                    kind: row.try_get("kind").map_err(db_err)?,
+                    confidentiality: row.try_get("confidentiality").map_err(db_err)?,
+                    acl_provenance: row.try_get("acl_provenance").map_err(db_err)?,
+                    trust_tier: row.try_get("trust_tier").map_err(db_err)?,
+                    valid_from: row.try_get("valid_from").map_err(db_err)?,
+                    valid_to: row.try_get("valid_to").map_err(db_err)?,
+                    provenance: row.try_get("provenance").map_err(db_err)?,
+                })
+            })
+            .collect()
+    }
+
+    // ---------- quarantine lifecycle (UI-SPEC §5 Screen 6 write surface) ----------
+
+    /// One quarantined payload with its lifecycle disposition (0023). `None`
+    /// resolution = open/awaiting triage.
+    pub async fn quarantine_item(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+    ) -> Result<Option<QuarantineRow>> {
+        let row = sqlx::query(
+            "SELECT id, webhook_id, payload, reason, at, resolution, resolved_at, resolution_note
+             FROM quarantine_preview WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|row| {
+            Ok(QuarantineRow {
+                id: row.try_get("id").map_err(db_err)?,
+                webhook_id: row.try_get("webhook_id").map_err(db_err)?,
+                payload: row.try_get("payload").map_err(db_err)?,
+                reason: row.try_get("reason").map_err(db_err)?,
+                at: row.try_get("at").map_err(db_err)?,
+                resolution: row.try_get("resolution").map_err(db_err)?,
+                resolved_at: row.try_get("resolved_at").map_err(db_err)?,
+                resolution_note: row.try_get("resolution_note").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Atomically claim an OPEN quarantine row with a terminal disposition
+    /// (`reingested` | `dismissed`). Returns false when the row is missing or
+    /// already resolved (the WHERE `resolution IS NULL` guard makes a concurrent
+    /// double-claim lose cleanly). Invalidate-don't-delete: the payload row
+    /// survives for audit; only its disposition is stamped.
+    pub async fn resolve_quarantine(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        resolution: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        if resolution != "reingested" && resolution != "dismissed" {
+            return Err(StorageError::InvalidInput(format!(
+                "invalid quarantine resolution {resolution:?} (reingested|dismissed)"
+            )));
+        }
+        let done = sqlx::query(
+            "UPDATE quarantine_preview
+             SET resolution = $3, resolved_at = now(), resolution_note = $4
+             WHERE tenant_id = $1 AND id = $2 AND resolution IS NULL",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(resolution)
+        .bind(note)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Revert a claimed quarantine row to OPEN — the compensation path when a
+    /// re-ingest fails AFTER the claim (claim-first prevents double-ingest
+    /// races; this puts the item back in the triage queue on failure).
+    pub async fn reopen_quarantine(&self, tenant: TenantId, id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE quarantine_preview
+             SET resolution = NULL, resolved_at = NULL, resolution_note = NULL
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     /// A light `name`/`domain` summary over a canonical's members (§4.3): the

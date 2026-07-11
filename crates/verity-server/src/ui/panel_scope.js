@@ -2,10 +2,16 @@
 /* ==========================================================================
    panel_scope.js — Screen 1 · Scope Inspector  (TA.1 · the crown jewel)
    --------------------------------------------------------------------------
-   Read-path purity: the ONLY network calls are pure reads through Verity.api()
-   to endpoints that already exist — POST /v1/recall, GET /v1/briefs/{entity},
+   Read-path purity: the probe calls are pure reads through Verity.api() to
+   endpoints that already exist — POST /v1/recall, GET /v1/briefs/{entity},
    GET /v1/activity. Handle decode is client-side (Verity.decodeHandle). No LLM
    call, no live-ReBAC call, no permissive-fallback affordance anywhere.
+   ONE deliberate exception, clearly labeled as such in the UI: the "why
+   filtered?" action calls POST /v1/admin/debug/recall — an ADMIN-gated,
+   AUDITED debug tracer that is OFF the pure read path by construction
+   (separate handler + separate tenant-only storage query; recall/get never
+   run it). It re-evaluates the deterministic pre-filters as-of-NOW and shows
+   per-candidate drop reasons; it is never invoked implicitly.
 
    THE HONESTY ENCODING per hit:
      • ACL provenance  → solid provenance badge (mirrored/approximated/…)
@@ -74,6 +80,19 @@
         '<div id="sc-lat"></div>' +
         '<div id="sc-recall-out"></div>' +
         '<div id="sc-trace"></div>' +
+
+        // why filtered? — ADMIN DEBUG, off the pure read path (see header note)
+        '<h3 style="margin-top:16px;font-size:12px">&#9656; why filtered? ' +
+          '<span class="refreshed">POST /v1/admin/debug/recall</span> ' +
+          '<span class="badge b-defense" title="This is NOT the pure read path. Separate admin handler + separate tenant-only storage query; recall/get never run it. Every chunk id it discloses is written to the audit log (verb debug_recall).">admin debug &middot; audited &middot; OFF the read path</span></h3>' +
+        '<div class="note">Per-candidate <b>drop reasons</b> for the current handle + query text: the server re-runs the deterministic pre-filters over the top-N tenant-only candidates and reports exactly why each one was admitted or dropped. Needs the admin bearer (set it in the shell header) <em>and</em> a valid, unexpired handle &mdash; an expired or tampered handle is a 401, fail-closed. This is a debug tracer, not recall: it explains as-of-<b>now</b>, it cannot reconstruct a past read.</div>' +
+        '<div class="row" style="margin-top:8px">' +
+          '<div class="tight" style="width:110px"><label for="sc-why-n">candidates</label><input type="number" id="sc-why-n" value="50" min="1" max="500" style="width:110px" title="how many top-N tenant-only candidates to trace (server clamps 1..500)"></div>' +
+          '<div class="tight"><button id="sc-why">Why filtered?</button></div>' +
+          '<div class="note" style="flex:1">Uses the <b>query text</b> above; runs one audited trace call. No LLM, no live-ReBAC execution &mdash; restricted-class rechecks are <em>flagged</em>, not run.</div>' +
+        '</div>' +
+        '<div class="err" id="sc-why-err"></div>' +
+        '<div id="sc-why-out"></div>' +
 
         // brief
         '<h3 style="margin-top:16px;font-size:12px">&#9656; entity brief <span class="refreshed">GET /v1/briefs/{entity}</span></h3>' +
@@ -184,6 +203,7 @@
       if (S.handle) copy(S.handle, this, "Copy handle");
     };
     Verity.$("sc-recall").onclick = onRecall;
+    Verity.$("sc-why").onclick = onWhyFiltered;
     Verity.$("sc-brief").onclick = onBrief;
     Verity.$("sc-act").onclick = onActivity;
     Verity.$("sc-export").onclick = onExport;
@@ -207,10 +227,11 @@
       S.lat = [];
       renderClaims(p);
       // reset probe + mint outputs on a fresh decode
-      ["sc-lat", "sc-recall-out", "sc-trace", "sc-brief-out", "sc-act-out", "sc-mint-out"].forEach(function (id) {
+      ["sc-lat", "sc-recall-out", "sc-trace", "sc-why-out", "sc-brief-out", "sc-act-out", "sc-mint-out"].forEach(function (id) {
         var n = Verity.$(id); if (n) n.innerHTML = "";
       });
       Verity.clearErr("sc-mint-err");
+      Verity.clearErr("sc-why-err");
       updateDeriveControls(p);
       Verity.$("sc-copy-handle").disabled = false;
       // Probes render even for an empty-principal handle so a reviewer can DEMONSTRATE
@@ -413,8 +434,170 @@
       '<summary style="cursor:pointer;color:var(--accent)">Boundary trace &mdash; what the returned set + handle imply</summary>' +
       '<div style="margin-top:8px">' +
       lines.map(function (l) { return '<div class="note" style="margin-top:4px">' + l + "</div>"; }).join("") +
-      '<div class="note" style="margin-top:8px"><em>Honesty note:</em> this trace explains the returned set and the handle\'s ceiling. It does NOT enumerate every pre-filtered candidate &mdash; full per-candidate drop reasons require the audited debug-recall endpoint, which is deliberately OFF the read path (no LLM / live-ReBAC call here).</div>' +
+      '<div class="note" style="margin-top:8px"><em>Honesty note:</em> this trace explains the returned set and the handle\'s ceiling. It does NOT enumerate every pre-filtered candidate &mdash; full per-candidate drop reasons need the <b>&ldquo;why filtered?&rdquo;</b> action below, which calls the audited admin debug-recall endpoint, deliberately OFF the read path (no LLM / live-ReBAC call on this trace).</div>' +
       "</div></details>";
+  }
+
+  /* ====================================================================
+     "WHY FILTERED?" — POST /v1/admin/debug/recall  (ADMIN DEBUG TRACER)
+     --------------------------------------------------------------------
+     The ONE non-pure-read call this panel can make, and it is labeled as
+     such everywhere it appears. Gating is server-side: admin bearer AND a
+     valid scope_handle (expired/tampered → 401, fail-closed). Every chunk
+     id disclosed is audited (verb `debug_recall`). It re-evaluates the
+     deterministic pre-filters against the CURRENT index over the top-N
+     tenant-only candidates — the response's own `honesty` array states the
+     limits, and we render it verbatim rather than paraphrase it away.
+     ==================================================================== */
+
+  // Human explanations for each wire drop_reason (tooltips, not replacements —
+  // the wire token itself is always shown).
+  var DROP_WHY = {
+    stale_superseded: "bi-temporal: this row's validity window is closed (valid_to set / superseded_by) — current-truth reads exclude it",
+    visibility_empty: "the chunk carries ZERO visibility tokens — invisible to everyone (fail closed, never permissive)",
+    visibility_no_overlap: "no intersection between the chunk's visibility tokens and this handle's effective principals (tokens minus in-window revocations)",
+    confidentiality_above_ceiling: "classified above this handle's max_confidentiality — pre-filtered before ranking; no query parameter can widen the ceiling",
+    entity_scope_untagged: "the handle is entity-bound but the chunk carries no entity tags — deny-by-default",
+    entity_scope_outside: "the chunk's entity tags fall outside the handle's entity_scope",
+    restricted_dropped_no_rebac: "restricted-class chunk whose live ReBAC recheck is not available — dropped fail-closed",
+  };
+  var NOTE_WHY = {
+    restricted_subject_to_live_recheck_not_reproduced_here:
+      "on the real read path this chunk would face a live restricted-class ReBAC recheck; the tracer FLAGS that structurally instead of executing it",
+    restricted_served_without_rebac_by_explicit_override:
+      "this deployment explicitly opted to serve restricted without the live ReBAC recheck — disclosed, never hidden",
+  };
+
+  async function onWhyFiltered() {
+    Verity.clearErr("sc-why-err");
+    Verity.$("sc-why-out").innerHTML = "";
+    if (!S.handle) return Verity.err("sc-why-err", "decode a scope handle first");
+    var q = (Verity.$("sc-q").value || "").trim();
+    if (!q) return Verity.err("sc-why-err", "enter query text above — the tracer explains a concrete query, and this UI sends text (not a raw embedding)");
+    var n = clampInt(Verity.$("sc-why-n").value, 1, 500, 50);
+
+    var btn = Verity.$("sc-why");
+    btn.disabled = true;
+    try {
+      var res = await Verity.api("/v1/admin/debug/recall", {
+        admin: true,
+        json: { scope_handle: S.handle, text: q, candidates: n },
+      });
+      renderWhy(res);
+    } catch (e) {
+      Verity.err("sc-why-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderWhy(res) {
+    if (!res || !res.query) {
+      return Verity.err("sc-why-err", "server returned an unexpected debug-recall shape");
+    }
+    var cands = res.candidates || [];
+    var admitted = 0;
+    var reasonCounts = {};
+    cands.forEach(function (c) {
+      if (c.admitted) admitted++;
+      (c.drop_reasons || []).forEach(function (r) { reasonCounts[r] = (reasonCounts[r] || 0) + 1; });
+    });
+
+    // header: what was traced, under which effective scope
+    var sc = res.scope || {};
+    var head =
+      '<div class="note" style="margin-top:8px">' +
+        "Traced <b>" + esc(res.query.candidates_traced) + "</b> of " + esc(res.query.candidates_requested) +
+        " requested candidates · leg " + Verity.kindBadge(res.query.leg || "?") +
+        " · <b>" + admitted + "</b> admitted · <b>" + (cands.length - admitted) + "</b> dropped." +
+      "</div>" +
+      '<dl class="kv" style="margin-top:8px">' +
+        "<dt>entity_scope</dt><dd>" + ((sc.entity_scope && sc.entity_scope.length)
+          ? Verity.entityBadges(sc.entity_scope)
+          : '<span style="color:var(--dim)">unbound</span>') + "</dd>" +
+        "<dt>ceiling</dt><dd>" + Verity.confBadge(sc.max_confidentiality) + "</dd>" +
+        "<dt>principals effective</dt><dd>" + principalTokens(sc.principals_effective) +
+          ' <span class="note">(handle tokens minus in-window revocation tombstones — mirrors the real read)</span></dd>' +
+        (sc.principals_revoked && sc.principals_revoked.length
+          ? "<dt>principals revoked</dt><dd>" + sc.principals_revoked.map(function (t) {
+              return '<span class="badge b-downgrade">#' + esc(t) + "</span>";
+            }).join(" ") + "</dd>"
+          : "") +
+      "</dl>";
+
+    // drop-reason histogram
+    var hist = Object.keys(reasonCounts).length
+      ? '<div class="note" style="margin-top:6px">Drop reasons: ' +
+          Object.keys(reasonCounts).map(function (r) {
+            return dropBadge(r) + "&times;" + reasonCounts[r];
+          }).join(" &nbsp; ") + "</div>"
+      : "";
+
+    // server-stated honesty limits — rendered VERBATIM, never paraphrased away
+    var honesty = (res.honesty && res.honesty.length)
+      ? '<div class="note" style="margin-top:8px"><em>Server-stated limits of this trace:</em><ul style="margin:4px 0 0 18px;padding:0">' +
+          res.honesty.map(function (h) { return "<li>" + esc(h) + "</li>"; }).join("") +
+        "</ul></div>"
+      : "";
+
+    var cards = cands.length
+      ? cands.map(whyCard).join("")
+      : '<div class="empty" style="margin-top:8px">the tenant-only candidate query surfaced nothing for this text — there is nothing to trace (an ANN miss is invisible to the tracer, by its own admission).</div>';
+
+    Verity.$("sc-why-out").innerHTML =
+      '<div class="card" style="margin-top:10px">' +
+        '<div class="note"><span class="badge b-defense">admin debug &middot; audited &middot; OFF the read path</span> ' +
+        "This trace was written to the audit log (verb <code>debug_recall</code>, every disclosed chunk id recorded). " +
+        "It explains the CURRENT index &mdash; not any past recall.</div>" +
+        head + hist + honesty +
+      "</div>" +
+      cards;
+  }
+
+  // One traced candidate: admitted or dropped, with the wire reasons + notes.
+  function whyCard(c) {
+    var verdict = c.admitted
+      ? '<span class="badge b-st-published" title="passed every deterministic pre-filter re-evaluated by the tracer">admitted</span>'
+      : '<span class="badge b-st-rejected" title="failed one or more mandatory pre-filters — reasons listed">dropped</span>';
+    var reasons = (c.drop_reasons || []).map(dropBadge).join(" ");
+    var notes = (c.notes || []).map(function (n) {
+      return '<div class="note" style="margin-top:4px">&#9888; <em>' + esc(n) + "</em>" +
+        (NOTE_WHY[n] ? " &mdash; " + esc(NOTE_WHY[n]) : "") + "</div>";
+    }).join("");
+    var validity = "valid_from " + esc(Verity.fmtTime(c.valid_from)) +
+      (c.valid_to ? " &rarr; valid_to " + esc(Verity.fmtTime(c.valid_to)) : " &rarr; current");
+    return (
+      '<div class="hit"' + (c.admitted ? "" : ' style="opacity:.75"') + ">" +
+        verdict + " " +
+        '<span class="score">score ' + Number(c.score).toFixed(3) + "</span> " +
+        Verity.kindBadge(c.kind || "content") +
+        Verity.provenanceBadge(c.acl_provenance) +
+        Verity.confBadge(c.confidentiality) +
+        Verity.trustBadge(c.trust_tier) +
+        '<span class="badge b-kind" title="how many visibility tokens the chunk carries (0 = invisible to everyone, fail closed)">vis tokens: ' + esc(c.visibility_token_count) + "</span>" +
+        Verity.entityBadges(c.entity_tags) +
+        (reasons ? '<div style="margin-top:6px">' + reasons + "</div>" : "") +
+        notes +
+        '<div class="content">' + esc(c.content_preview || "") + "</div>" +
+        '<div class="meta">' +
+          "chunk " + esc(c.chunk_id) + " · doc " + esc(c.document_id) + " · seq " + esc(c.seq) +
+          " · " + validity +
+          " · citation&rarr;L0 episode " + esc(c.provenance) +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  function dropBadge(r) {
+    var why = DROP_WHY[r] || "pre-filter drop reason reported by the server";
+    return '<span class="badge b-st-rejected" title="' + esc(why) + '">' + esc(r) + "</span>";
+  }
+
+  function principalTokens(list) {
+    if (!list || !list.length) {
+      return '<span class="expired">&#8709; — effective principal set is empty (fail closed)</span>';
+    }
+    return list.map(function (t) { return '<span class="badge b-kind">#' + esc(t) + "</span>"; }).join(" ");
   }
 
   /* ---------------------------------------------- Explain-zero (0 hits) */
@@ -433,7 +616,8 @@
     return (
       '<div class="empty" style="margin-top:8px"><b>0 hits.</b> Under this scope, nothing matches &mdash; that is the point.</div>' +
       reasons.map(function (r) { return '<div class="note" style="margin-top:4px">' + r + "</div>"; }).join("") +
-      '<div class="note" style="margin-top:6px"><em>Fail-closed is correct here:</em> under-visibility is the guarantee, not a bug.</div>'
+      '<div class="note" style="margin-top:6px"><em>Fail-closed is correct here:</em> under-visibility is the guarantee, not a bug. ' +
+      'For per-candidate proof of <em>which</em> pre-filter dropped <em>what</em>, use the <b>&ldquo;why filtered?&rdquo;</b> admin debug action below (audited, off the read path).</div>'
     );
   }
 
