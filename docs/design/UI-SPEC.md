@@ -4,7 +4,7 @@
 
 **Status:** authoritative build contract for the Verity web console.
 **Scope:** extends the embedded read-only inspector at `GET /ui` into a multi-screen evidence room.
-**Cross-refs:** `SPEC.md` (§§2, 4–9, 11d, 13, 14), `CLAUDE.md` non-negotiables, `crates/verity-server/src/main.rs` (router), `crates/verity-server/src/ui.html` (today's single-file inspector, 737 lines — the thing we extend).
+**Cross-refs:** `SPEC.md` (§§2, 4–9, 11d, 13, 14), `CLAUDE.md` non-negotiables, `crates/verity-server/src/main.rs` (router), `crates/verity-server/src/ui.html` (today's single-file inspector, 737 lines — the thing we extend), **`UI-ACTIONS.md` (the v0.3 action model — see §9)**.
 
 > **Thesis, one line:** Verity's UI is an evidence room, not a control panel. It exists to let a non-engineer *prove the negative* — that customer A cannot see customer B, that nothing stale or unprovenanced is trusted, that every read is on the record — and to walk out with a signed artifact that says so.
 
@@ -407,3 +407,23 @@ Groups run in dependency order; within the "parallel" groups, tasks touch disjoi
 - **TB.3 — Read-path-purity + honesty audit.** Verify zero LLM/live-ReBAC on read; latency label wording ("session-local, not benchmark"); boundary-trace honesty note present; no permissive-fallback affordance anywhere; admin token in `sessionStorage` only. **Files:** review across `ui/`. **Owner:** senior builder + design owner.
 
 **Critical path:** T0.1 → T0.2/T0.3 (parallel) → T0.4 → {TA.1, TA.2, TA.3 parallel} → TB.*. The three MVP screens require **no new server endpoints**.
+
+---
+
+## 9. v0.3 direction: from evidence room to workbench
+
+**Pointer:** the authoritative action model for v0.3 is **`UI-ACTIONS.md`** (same directory). This spec remains the contract for chrome, panel structure, and the fail-closed gates; UI-ACTIONS.md is the contract for *verbs* — what users must be able to DO, grounded in a full action-gap matrix (REST/CLI/MCP/console), a persona×task demand analysis, and four adversarial journey walkthroughs run against the live console.
+
+**What v0.3 changes.** The v0.1/v0.2 build shipped the evidence room and it works — but the journeys show the server outgrew the UI's read-only ceiling: live endpoints sit behind disabled seams (webhook mint, manifest install/**activate** — the spec's one mandated human-approval verb), the default panel demands a scope handle the console refuses to mint (`POST /v1/scopes` is public and the dialog already exists), and a memory product has zero in-console ways to put memory in. v0.3 adds a small closed vocabulary of **named action verbs** — mint a probe handle, add memory (explicit visibility, refusal on omission), an attention-first "needs decision" home, un-seamed source writes, a principal directory read, a run-resolution trigger, and empty states that teach the verb that fills them — per the Now/Next/Later ladder in UI-ACTIONS.md.
+
+**What does not change — the evidence-room ethos and every gate, restated as law:**
+- Fail closed, always; **no "index it anyway" affordance will ever exist**; quarantine keeps exactly its two exits.
+- **No default visibility anywhere** — omission is a refusal, never a silent default.
+- Scope handles **narrow, never widen**; cross-entity work still opens a separate, audited scope.
+- Knowledge stays **human-gated**: publish/reject remain evidence-first, dialog-gated, never bulk; auto-publish stays OFF; the provenance firewall (bucketed support to agents, exact counts + lineage admin/audit-scope-only) is untouched.
+- Erasure stays **structurally admin-gated** (typed confirm, preview-first, signed purge report); `forget` is always "invalidate — reversible."
+- **Read-path purity:** no v0.3 verb adds an LLM or live-ReBAC call to `recall`/`get`; debugging rides the audited, off-hot-path debug endpoint.
+- **Honest numbers or no number**; identity never client-supplied; the console remains a scoped, fail-closed client of the product with no god-mode read path.
+- Disabled seams stay honest in both directions: designed-not-faked while the endpoint is missing, and **removed the release the endpoint goes live** — a stale seam (the Audit-ribbon lesson) is a lie in the other direction.
+
+Every act v0.3 adds must emit or link its evidence (audit row, show-once secret, signed report, decision receipt). The console stays an evidence room; it just stops making you leave the room to act on the evidence.
