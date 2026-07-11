@@ -68,6 +68,8 @@ const UI_BODY: &str = concat!(
     "\n",
     include_str!("panel_quarantine.html"),
     "\n",
+    include_str!("panel_entities.html"),
+    "\n",
     // ---- scripts: core first (defines Verity registry), then panels ----
     "<script>\n",
     include_str!("core.js"),
@@ -84,6 +86,8 @@ const UI_BODY: &str = concat!(
     include_str!("panel_sources.js"),
     "\n",
     include_str!("panel_quarantine.js"),
+    "\n",
+    include_str!("panel_entities.js"),
     "\n",
     // Boot AFTER every panel has called Verity.register(...) at load.
     "Verity.boot();\n",

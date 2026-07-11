@@ -666,6 +666,44 @@ pub struct EntityLinkMeta {
     pub evidence_count: i16,
 }
 
+/// One canonical entity as the entities-browser lists it (§4.3 / §9 Group D):
+/// the canonical key, its source members, a short field summary (name/domain if
+/// present), and — folded in from `entity_link_meta` — the confidence badge. A
+/// pure derived read: no LLM, no live ReBAC, no fold. `merged_record`'s
+/// field-resolution is UNTOUCHED; the field summary is a light additive read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalEntitySummary {
+    pub tenant_id: TenantId,
+    /// The canonical entity key, e.g. `account:acme`.
+    pub canonical_entity: String,
+    /// The `(source, entity_id)` members aliased to this canonical, stable order.
+    pub members: Vec<AliasMember>,
+    /// A light field summary — `name`/`domain` when a current fact exists on any
+    /// member. Additive; not the authoritative precedence-resolved `merged_record`.
+    pub summary: EntityFieldSummary,
+    /// The confidence badge from `entity_link_meta` (the `alias_member` row), or
+    /// `None` when the canonical has no materialized badge (admin-only / unmapped).
+    pub badge: Option<EntityConfidenceBadge>,
+}
+
+/// The light name/domain summary for the entities browser (a display hint, not
+/// the precedence-resolved truth — that stays in `merged_record`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EntityFieldSummary {
+    pub name: Option<String>,
+    pub domain: Option<String>,
+}
+
+/// The `entity_link_meta` confidence badge as a value (surfaced on the entities
+/// browser + the merged-entity response). `deterministic` / `human_confirmed` /
+/// `approximated`, its strongest justifying method, and corroboration depth.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityConfidenceBadge {
+    pub confidence: String,
+    pub strongest_method: Option<String>,
+    pub evidence_count: i16,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]

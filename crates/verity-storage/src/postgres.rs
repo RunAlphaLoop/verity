@@ -840,6 +840,180 @@ impl PostgresAdapter {
             .collect()
     }
 
+    /// LIST the tenant's canonical entities for the entities browser (§4.3 / §9
+    /// Group D). Returns one [`CanonicalEntitySummary`] per DISTINCT
+    /// `canonical_entity` in `entity_aliases`, each carrying its `(source,
+    /// entity_id)` members, a light `name`/`domain` field summary (from current
+    /// facts on any member), and the `entity_link_meta` confidence badge. Ordered
+    /// by canonical key, capped by `limit`.
+    ///
+    /// Purely additive DERIVED reads — `merged_record`'s precedence-resolution is
+    /// UNTOUCHED (the summary is a display hint, not the authoritative merge);
+    /// zero LLM, zero live ReBAC, zero fold. Entities with no alias row are their
+    /// own implicit canonical and are intentionally NOT listed here (there is no
+    /// `entity_aliases` row to enumerate them from — the browser lists MERGED
+    /// entities).
+    pub async fn list_canonical_entities(
+        &self,
+        tenant: TenantId,
+        limit: i64,
+    ) -> Result<Vec<CanonicalEntitySummary>> {
+        // 1. Distinct canonicals + their members in one pass, ordered stably.
+        let rows = sqlx::query(
+            "SELECT canonical_entity, source, entity_id
+               FROM entity_aliases
+              WHERE tenant_id = $1
+                AND canonical_entity IN (
+                    SELECT canonical_entity FROM entity_aliases
+                     WHERE tenant_id = $1
+                     GROUP BY canonical_entity
+                     ORDER BY canonical_entity
+                     LIMIT $2)
+              ORDER BY canonical_entity, source, entity_id",
+        )
+        .bind(tenant)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Group members per canonical, preserving order.
+        let mut grouped: Vec<(String, Vec<AliasMember>)> = Vec::new();
+        for r in &rows {
+            let canonical: String = r.try_get("canonical_entity").map_err(db_err)?;
+            let member = AliasMember {
+                source: r.try_get("source").map_err(db_err)?,
+                entity_id: r.try_get("entity_id").map_err(db_err)?,
+            };
+            match grouped.last_mut() {
+                Some((c, members)) if *c == canonical => members.push(member),
+                _ => grouped.push((canonical, vec![member])),
+            }
+        }
+
+        // 2. For each canonical, attach the light summary + the badge. Both are
+        //    single-canonical derived reads; the corpus here is bounded by
+        //    `limit`, so a per-canonical round trip is fine for an admin browser.
+        let mut out = Vec::with_capacity(grouped.len());
+        for (canonical, members) in grouped {
+            let summary = self.member_field_summary(tenant, &members).await?;
+            let badge = self
+                .link_meta_for_canonical(tenant, &canonical)
+                .await?
+                .map(|m| EntityConfidenceBadge {
+                    confidence: m.confidence,
+                    strongest_method: m.strongest_method,
+                    evidence_count: m.evidence_count,
+                });
+            out.push(CanonicalEntitySummary {
+                tenant_id: tenant,
+                canonical_entity: canonical,
+                members,
+                summary,
+                badge,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A light `name`/`domain` summary over a canonical's members (§4.3): the
+    /// first current (`valid_to IS NULL`) `name`/`domain` fact found on any
+    /// member, in stable `(source, entity_id)` order. This is a display hint for
+    /// the browser — NOT the precedence-resolved truth, which stays in
+    /// `merged_record`. Empty when no member carries either field.
+    pub async fn member_field_summary(
+        &self,
+        tenant: TenantId,
+        members: &[AliasMember],
+    ) -> Result<EntityFieldSummary> {
+        if members.is_empty() {
+            return Ok(EntityFieldSummary::default());
+        }
+        let sources: Vec<String> = members.iter().map(|m| m.source.clone()).collect();
+        let entity_ids: Vec<String> = members.iter().map(|m| m.entity_id.clone()).collect();
+        // Match on the (source, entity_id) pairs via UNNEST-zipped arrays (same
+        // fence merged_record uses) so member A/X never picks up B/X. Deterministic
+        // order so the chosen name/domain is stable across calls.
+        let rows = sqlx::query(
+            "SELECT f.field, f.value FROM facts f
+               JOIN unnest($2::text[], $3::text[]) AS m(source, entity_id)
+                 ON f.source = m.source AND f.entity_id = m.entity_id
+              WHERE f.tenant_id = $1 AND f.valid_to IS NULL
+                AND f.field IN ('name', 'domain')
+              ORDER BY f.field, f.source, f.entity_id",
+        )
+        .bind(tenant)
+        .bind(&sources)
+        .bind(&entity_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let mut summary = EntityFieldSummary::default();
+        for r in &rows {
+            let field: String = r.try_get("field").map_err(db_err)?;
+            let value: serde_json::Value = r.try_get("value").map_err(db_err)?;
+            let scalar = json_scalar_string(&value);
+            match field.as_str() {
+                "name" if summary.name.is_none() => summary.name = scalar,
+                "domain" if summary.domain.is_none() => summary.domain = scalar,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Resolve a ledger REF (`source:entity_id`) to the canonical it currently
+    /// belongs to, for the decide-response (§4.2 S4). Splits on the FIRST `:`
+    /// (matching `split_member_ref`), looks up `entity_aliases`, and falls back
+    /// to the ref itself when unmapped (an unmapped entity is its own canonical —
+    /// "annoying, never wrong"). Non-member refs (`key:*`/`chunk:*`) and
+    /// malformed refs also fall back to the ref as-is.
+    pub async fn resolve_canonical_for_ref(&self, tenant: TenantId, reff: &str) -> Result<String> {
+        if reff.starts_with("key:") || reff.starts_with("chunk:") {
+            return Ok(reff.to_string());
+        }
+        let Some((source, entity_id)) = reff.split_once(':') else {
+            return Ok(reff.to_string());
+        };
+        if source.is_empty() || entity_id.is_empty() {
+            return Ok(reff.to_string());
+        }
+        Ok(self
+            .resolve_canonical(tenant, source, entity_id)
+            .await?
+            .unwrap_or_else(|| reff.to_string()))
+    }
+
+    /// The light `name`/`domain` summary for a single ledger REF
+    /// (`source:entity_id`) — the review-queue side-by-side needs each candidate
+    /// ref's member fields (§4.3 review enrichment). Non-member refs (`key:*`,
+    /// `chunk:*`, malformed) yield an empty summary. Splits on the FIRST `:`
+    /// (entity_ids may contain `:`), matching the fold's `split_member_ref`.
+    pub async fn ref_field_summary(
+        &self,
+        tenant: TenantId,
+        reff: &str,
+    ) -> Result<EntityFieldSummary> {
+        if reff.starts_with("key:") || reff.starts_with("chunk:") {
+            return Ok(EntityFieldSummary::default());
+        }
+        let Some((source, entity_id)) = reff.split_once(':') else {
+            return Ok(EntityFieldSummary::default());
+        };
+        if source.is_empty() || entity_id.is_empty() {
+            return Ok(EntityFieldSummary::default());
+        }
+        self.member_field_summary(
+            tenant,
+            &[AliasMember {
+                source: source.to_string(),
+                entity_id: entity_id.to_string(),
+            }],
+        )
+        .await
+    }
+
     /// The cross-source merged entity view (SPEC §7f). Gathers every current
     /// fact (`valid_to IS NULL`) across all (source, entity_id) members aliased
     /// to `canonical`, then resolves each field to the value of the
@@ -2555,6 +2729,17 @@ fn precedence_rank(order: &[String], source: &str) -> usize {
         .iter()
         .position(|s| s == source)
         .unwrap_or(order.len())
+}
+
+/// Render a jsonb fact value as a short display string for the entity summary:
+/// a JSON string yields its inner text; any other scalar/compound yields its
+/// compact JSON. `None` for a JSON null. Display-only — never a match key.
+fn json_scalar_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 fn row_to_evidence(row: &PgRow) -> Result<EvidenceRow> {

@@ -281,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
         .route("/v1/entities/{canonical}", get(get_merged_entity))
+        .route("/v1/admin/entities", get(admin_list_entities))
         .route("/v1/admin/entity-aliases", post(admin_entity_aliases))
         .route("/v1/admin/entity-precedence", post(admin_entity_precedence))
         .route("/v1/admin/entity-evidence", post(admin_evidence_insert))
@@ -291,6 +292,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/entity-resolution-config",
             get(admin_resolution_config_get).put(admin_resolution_config_put),
+        )
+        .route(
+            "/v1/admin/entity-resolution/decide",
+            post(admin_entity_decide),
         )
         .route("/v1/admin/entity-resolution/fold", post(admin_trigger_fold))
         .route(
@@ -650,6 +655,42 @@ async fn admin_entity_aliases(
 }
 
 #[derive(Deserialize)]
+struct ListEntitiesQuery {
+    tenant_id: TenantId,
+    #[serde(default = "default_entities_limit")]
+    limit: i64,
+}
+
+fn default_entities_limit() -> i64 {
+    100
+}
+
+/// GET /v1/admin/entities (admin): LIST the tenant's canonical entities for the
+/// entities browser (§4.3 / §9 Group D). One row per DISTINCT `canonical_entity`
+/// in `entity_aliases`, each with its `(source, entity_id)` members, the
+/// `entity_link_meta` confidence badge (deterministic / human_confirmed /
+/// approximated + strongest_method + evidence_count), and a light `name`/`domain`
+/// field summary. Purely additive DERIVED reads — `merged_record`'s
+/// field-resolution is UNTOUCHED, zero LLM / live ReBAC / fold. Ordered by
+/// canonical key, capped by `limit` (default 100, clamped 1..=1000). Entities
+/// with no alias row are their own implicit canonical and are not listed (the
+/// browser lists MERGED entities; unmapped ones have nothing to enumerate).
+async fn admin_list_entities(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ListEntitiesQuery>,
+) -> HandlerResult<Json<Vec<CanonicalEntitySummary>>> {
+    state.admin.check(&headers)?;
+    let entities = state
+        .storage
+        .inner()
+        .list_canonical_entities(q.tenant_id, q.limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(entities))
+}
+
+#[derive(Deserialize)]
 struct EntityPrecedenceRequest {
     tenant_id: TenantId,
     /// Defaults to "*" (the global/entity default across all entities).
@@ -949,6 +990,113 @@ async fn admin_run_resolution(
 }
 
 #[derive(Deserialize)]
+struct EntityDecisionRequest {
+    tenant_id: TenantId,
+    /// A canonicalized ref, e.g. `salesforce:001xACME`.
+    left_ref: String,
+    /// The other ref, e.g. `hubspot:4207`.
+    right_ref: String,
+    /// `confirm` (these ARE the same) or `reject` (these are NOT — anti-link).
+    decision: EntityDecision,
+    /// Optional reviewer note, stored as the evidence lineage pointer for audit.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum EntityDecision {
+    Confirm,
+    Reject,
+}
+
+/// The human-gate decision response (§4.2 S4, §6): the evidence row the decision
+/// wrote, the fresh `MaterializeReport` from re-running the fold so the decision
+/// takes effect immediately, and the canonical each ref now resolves to.
+#[derive(Debug, serde::Serialize)]
+struct EntityDecisionResponse {
+    /// The `entity_evidence` row this decision appended (human_confirmed +1, or
+    /// the human_rejected −1 anti-link).
+    evidence: EvidenceRow,
+    /// The fold report after re-materializing (so the decision is live).
+    materialize: resolver::MaterializeReport,
+    /// The canonical `left_ref` now resolves to (its own ref when unmapped).
+    left_canonical: String,
+    /// The canonical `right_ref` now resolves to (its own ref when unmapped).
+    right_canonical: String,
+}
+
+/// POST /v1/admin/entity-resolution/decide (admin): the HUMAN GATE the fold
+/// requires for Tier-2 (§4.2 S4 step 3, §6). `confirm` appends a
+/// `method="human_confirmed"`, `tier=2`, `polarity=+1` evidence row — the only
+/// thing that lets the fold form a Tier-2 edge. `reject` appends a
+/// `method="human_rejected"`, `polarity=-1` **anti-link** — a PERMANENT
+/// must-not-link no positive evidence can override, so the same bad merge cannot
+/// re-form on the next ingestion (§6 invalidate-don't-delete: nothing is deleted;
+/// the anti-link is a standing guardrail). After writing, the fold is re-run
+/// (`run_full_fold`) so the decision takes effect immediately; the response
+/// carries the updated `MaterializeReport` and the resulting canonical(s) for the
+/// two refs. Admin/worker plane only — NEVER on the read path.
+async fn admin_entity_decide(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<EntityDecisionRequest>,
+) -> HandlerResult<Json<EntityDecisionResponse>> {
+    state.admin.check(&headers)?;
+    let (method, polarity) = match req.decision {
+        EntityDecision::Confirm => ("human_confirmed", 1i16),
+        EntityDecision::Reject => ("human_rejected", -1i16),
+    };
+    // 1. Append the human decision to the append-only ledger. Tier-2: a human
+    //    confirm is the sole edge-former for the fuzzy tier; a reject is the
+    //    permanent anti-link. `note` rides the lineage pointer for audit.
+    let evidence = state
+        .storage
+        .inner()
+        .insert_evidence(EvidenceWrite {
+            tenant_id: req.tenant_id,
+            left_ref: req.left_ref.clone(),
+            right_ref: req.right_ref.clone(),
+            tier: 2,
+            method: method.to_string(),
+            key_value: None,
+            key_namespace: None,
+            score: None,
+            evidence_l0_ref: req.note.clone(),
+            polarity,
+        })
+        .await
+        .map_err(internal)?;
+
+    // 2. Re-fold so the decision takes effect immediately (a confirm can merge
+    //    two refs; a reject splits their component). The fold is the sole writer
+    //    of the read-path rows; this is the same materializer /fold calls.
+    let materialize = resolver::run_full_fold(&state, req.tenant_id).await?;
+
+    // 3. Report the canonical each ref now resolves to. `resolve_canonical`
+    //    returns None for an unmapped ref — it is then its own canonical.
+    let left_canonical = state
+        .storage
+        .inner()
+        .resolve_canonical_for_ref(req.tenant_id, &req.left_ref)
+        .await
+        .map_err(internal)?;
+    let right_canonical = state
+        .storage
+        .inner()
+        .resolve_canonical_for_ref(req.tenant_id, &req.right_ref)
+        .await
+        .map_err(internal)?;
+
+    Ok(Json(EntityDecisionResponse {
+        evidence,
+        materialize,
+        left_canonical,
+        right_canonical,
+    }))
+}
+
+#[derive(Deserialize)]
 struct ReviewQueueQuery {
     tenant_id: TenantId,
     #[serde(default = "default_review_limit")]
@@ -959,16 +1107,68 @@ fn default_review_limit() -> i64 {
     100
 }
 
+/// One enriched review-queue candidate (§4.3 review enrichment): everything a
+/// side-by-side human review needs. Both refs, each ref's member field summary
+/// (from current facts), the method/score/key_value/key_namespace off the
+/// evidence row, and the judge/reviewer rationale.
+#[derive(Debug, serde::Serialize)]
+struct ReviewCandidate {
+    evidence_id: uuid::Uuid,
+    left_ref: String,
+    right_ref: String,
+    /// `left_ref`'s light name/domain summary (empty for a `key:*`/`chunk:*` ref).
+    left_summary: EntityFieldSummary,
+    /// `right_ref`'s light name/domain summary.
+    right_summary: EntityFieldSummary,
+    tier: i16,
+    method: String,
+    score: Option<f32>,
+    key_value: Option<String>,
+    key_namespace: Option<String>,
+    polarity: i16,
+    /// The judge/reviewer rationale. It rides `entity_evidence.evidence_l0_ref`
+    /// — the lineage pointer the S2 judge stores its rationale on and where the
+    /// decide endpoint's `note` lands (the design keeps the free-text rationale
+    /// off the match-key columns). `None` when the producer left it unset.
+    rationale: Option<String>,
+    valid_from: DateTime<Utc>,
+}
+
+impl From<EvidenceRow> for ReviewCandidate {
+    fn from(e: EvidenceRow) -> Self {
+        // Summaries are filled in by the handler (they need a DB read); default
+        // to empty here so the pure conversion stays infallible.
+        Self {
+            evidence_id: e.evidence_id,
+            left_ref: e.left_ref,
+            right_ref: e.right_ref,
+            left_summary: EntityFieldSummary::default(),
+            right_summary: EntityFieldSummary::default(),
+            tier: e.tier,
+            method: e.method,
+            score: e.score,
+            key_value: e.key_value,
+            key_namespace: e.key_namespace,
+            polarity: e.polarity,
+            rationale: e.evidence_l0_ref,
+            valid_from: e.valid_from,
+        }
+    }
+}
+
 /// GET /v1/admin/entity-resolution/review-queue (admin): live Tier-2/Tier-3
-/// evidence awaiting a human decision (§4.1, §4.3). Tier-2 needs a
-/// `human_confirmed` before it can form an edge; Tier-3 never auto-merges. Empty
+/// evidence awaiting a human decision (§4.1, §4.3), ENRICHED for side-by-side
+/// review. Tier-2 needs a `human_confirmed` before it can form an edge; Tier-3
+/// never auto-merges. Each candidate carries both refs, their member field
+/// summaries, the method/score/key_value/key_namespace, and the rationale. Empty
 /// in the MVP (no Tier-2/3 producers ship yet) but fully wired so the surface
-/// exists the day they turn on. Newest first, capped.
+/// exists the day they turn on. Newest first, capped. Purely additive derived
+/// reads — no LLM, no live ReBAC, no fold.
 async fn admin_review_queue(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ReviewQueueQuery>,
-) -> HandlerResult<Json<Vec<EvidenceRow>>> {
+) -> HandlerResult<Json<Vec<ReviewCandidate>>> {
     state.admin.check(&headers)?;
     let rows = state
         .storage
@@ -976,7 +1176,25 @@ async fn admin_review_queue(
         .review_queue(q.tenant_id, q.limit)
         .await
         .map_err(internal)?;
-    Ok(Json(rows))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut candidate = ReviewCandidate::from(row);
+        // Attach each ref's light field summary for the side-by-side view.
+        candidate.left_summary = state
+            .storage
+            .inner()
+            .ref_field_summary(q.tenant_id, &candidate.left_ref)
+            .await
+            .map_err(internal)?;
+        candidate.right_summary = state
+            .storage
+            .inner()
+            .ref_field_summary(q.tenant_id, &candidate.right_ref)
+            .await
+            .map_err(internal)?;
+        out.push(candidate);
+    }
+    Ok(Json(out))
 }
 
 // ---------- ingest (trusted connector plane — admin-token gated, task 3;
