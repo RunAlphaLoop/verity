@@ -98,6 +98,16 @@ Runner: ``python -m verity_ingest.connectors.gdirectory --once [--dry-run]``
 with a JSON snapshot state file; ``--dry-run`` prints the would-be admin ops
 instead of calling the server. Best-effort connector-status heartbeat after
 each delivered cycle, like the content connectors.
+
+Verification status (honest-limitations doctrine): this is a
+**fixture-verified slice** — every behavior above is asserted against
+fixtures built from Google's documented Admin SDK Directory API response
+shapes (§6c conformance: pagination, nested groups, a membership cycle,
+suspended-user deprovisioning, unverifiable-member denial), with byte-exact
+expected admin-endpoint bodies. It has NOT been run against a live Google
+Workspace org: live-org validation awaits a customer Workspace admin
+credential (a DWD-configured service account plus an impersonable admin
+subject), which we do not hold and will not fabricate.
 """
 
 from __future__ import annotations
