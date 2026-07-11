@@ -42,6 +42,42 @@ pub(crate) struct MaterializeReport {
     pub canonicals: usize,
 }
 
+/// What a full resolution run did: how many *new* Tier-1 evidence rows the
+/// producer appended, then the fold materializer's report (flattened).
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct RunReport {
+    /// New `tier=1` `entity_evidence` rows the producer inserted this run
+    /// (idempotent — a repeat run over unchanged L1 facts yields 0).
+    pub evidence_produced: usize,
+    #[serde(flatten)]
+    pub materialize: MaterializeReport,
+}
+
+/// **The combined live resolution run (§4.2 S1 → S4).** First populates the
+/// ledger from real L1 data (`produce_tier1_evidence`: read current facts, run
+/// the S0/S1 producers, idempotently INSERT `tier=1` evidence), THEN runs the
+/// existing `run_full_fold` materializer over the now-populated ledger. This is
+/// what makes Tier-1 resolution LIVE end-to-end: nothing else populates the
+/// ledger from L1.
+///
+/// Idempotent: the producer's deterministic `evidence_id` + `ON CONFLICT DO
+/// NOTHING` means re-running adds no duplicate evidence, and the fold is a pure
+/// function of the live ledger — so repeated runs converge.
+pub(crate) async fn run_resolution(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+) -> Result<RunReport, (axum::http::StatusCode, String)> {
+    let storage = state.storage.inner();
+    let evidence_produced = resolve::produce_tier1_evidence(storage, tenant)
+        .await
+        .map_err(crate::internal)?;
+    let materialize = run_full_fold(state, tenant).await?;
+    Ok(RunReport {
+        evidence_produced,
+        materialize,
+    })
+}
+
 /// Run a full fold for `tenant` and materialize its plan. Errors from any writer
 /// abort the run (partial writes are idempotent and re-runnable — the fold is a
 /// pure function of the live ledger, so re-running converges).

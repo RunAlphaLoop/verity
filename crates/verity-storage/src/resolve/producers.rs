@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+use uuid::Uuid;
 use verity_core::types::*;
 
 use super::canon::{
@@ -430,6 +431,271 @@ impl<'a> Tier1Producers<'a> {
         }
         Ok(rows)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic evidence id (idempotency, §4.2).
+// ---------------------------------------------------------------------------
+
+/// A fixed namespace UUID for Tier-1 producer evidence ids. Any stable random
+/// UUID works; it only has to never change so the v5 derivation is reproducible.
+const TIER1_EVIDENCE_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6b, 0x9e, 0x2a, 0x11, 0x4c, 0x3d, 0x54, 0x8f, 0xa1, 0x27, 0x0e, 0x77, 0x9d, 0x3b, 0x62, 0x10,
+]);
+
+/// A **deterministic** `evidence_id` for a Tier-1 [`EvidenceWrite`], a uuid v5
+/// over `tenant + left_ref + right_ref + method + key_value + key_namespace`.
+/// Two runs over the same live L1 facts derive the *identical* id, so the ledger
+/// insert (`INSERT ... ON CONFLICT (evidence_id) DO NOTHING`) is idempotent and
+/// re-running produces no duplicate evidence (§4.2). `evidence_l0_ref`, `score`,
+/// `tier`, and `polarity` are intentionally *excluded* — the identity of a
+/// Tier-1 edge is "these two refs matched by this method on this key," not its
+/// lineage pointer, so an L0-ref change does not spawn a duplicate.
+pub fn deterministic_evidence_id(ev: &EvidenceWrite) -> Uuid {
+    // A field-delimited, unambiguous name string (refs cannot contain the NUL
+    // delimiter, so no two distinct tuples collide).
+    let name = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        ev.tenant_id,
+        ev.left_ref,
+        ev.right_ref,
+        ev.method,
+        ev.key_value.as_deref().unwrap_or(""),
+        ev.key_namespace.as_deref().unwrap_or(""),
+    );
+    Uuid::new_v5(&TIER1_EVIDENCE_NAMESPACE, name.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// L1 → producer-input mapping (the DB-backed Tier-1 production run, §4.2 S1).
+// ---------------------------------------------------------------------------
+
+/// Pull a JSON fact value into a plain string. Handles the common L1 scalar
+/// shapes (a bare JSON string, or a number/bool rendered as text); returns
+/// `None` for null/object/array (never a usable key). Trims whitespace.
+fn fact_str(v: &serde_json::Value) -> Option<String> {
+    let s = match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Case-insensitive lookup of a field within one source entity's fact list.
+fn field_ci<'a>(
+    fields: &'a [(String, serde_json::Value)],
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    fields
+        .iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+/// The three producer-input buckets built from a tenant's grouped current L1
+/// facts. Each is fed to the matching pure Tier-1 producer.
+#[derive(Debug, Default)]
+struct Tier1Inputs {
+    crm_fks: Vec<CrmContactFact>,
+    emails: Vec<EmailFact>,
+    external_ids: Vec<ExternalIdFact>,
+}
+
+/// Map one source entity's `(field, value)` facts onto Tier-1 producer inputs,
+/// using the source-native field names the connectors emit (§1, verified against
+/// `ingest/verity_ingest/connectors/*`):
+///
+/// - **CRM FK** — Salesforce `AccountId` (on `Contact`/`Opportunity`) and the
+///   HubSpot `associatedcompanyid`: an *intra-CRM* pointer to the parent account,
+///   both refs inside the same source (`crm_fk`, exact).
+/// - **email** — Salesforce `Email`, HubSpot `email`, Linear `assignee.email` /
+///   `creator.email` (and their `_`-variants). The §4.4 namespace is stamped by
+///   [`namespace_for_source_field`] off the *source + field name*, so a Linear
+///   actor email lands in `internal_directory` and can never weld to a
+///   `customer_contact`.
+/// - **external_id** — any field named `external_id` / `<system>_id` /
+///   `<system>_customer_id` carrying a synced third-party key. The `id_kind` is
+///   the field name (so the edge only forms within one id system).
+fn map_entity_to_inputs(
+    source: &str,
+    entity_id: &str,
+    fields: &[(String, serde_json::Value)],
+    inputs: &mut Tier1Inputs,
+) {
+    // ---- CRM FK: intra-source pointer to the parent account. ----
+    for fk_field in CRM_FK_FIELDS {
+        if let Some(parent) = field_ci(fields, fk_field).and_then(fact_str) {
+            inputs.crm_fks.push(CrmContactFact {
+                source: source.to_string(),
+                entity_id: entity_id.to_string(),
+                parent_kind: "account".to_string(),
+                parent_id: parent,
+                evidence_l0_ref: None,
+            });
+        }
+    }
+
+    // ---- email: person↔person within a namespace. ----
+    for email_field in EMAIL_FIELDS {
+        if let Some(raw) = field_ci(fields, email_field).and_then(fact_str) {
+            let namespace = super::canon::namespace_for_source_field(source, email_field);
+            inputs.emails.push(EmailFact {
+                source: source.to_string(),
+                entity_id: entity_id.to_string(),
+                email: raw,
+                namespace,
+                evidence_l0_ref: None,
+            });
+        }
+    }
+
+    // ---- external_id: a synced third-party crosswalk key. ----
+    for (field, value) in fields {
+        let lower = field.to_ascii_lowercase();
+        if is_external_id_field(&lower) {
+            if let Some(id_value) = fact_str(value) {
+                inputs.external_ids.push(ExternalIdFact {
+                    source: source.to_string(),
+                    entity_id: entity_id.to_string(),
+                    id_kind: lower,
+                    id_value,
+                    evidence_l0_ref: None,
+                });
+            }
+        }
+    }
+}
+
+/// The intra-CRM foreign-key fields that point at a parent account (§1).
+const CRM_FK_FIELDS: &[&str] = &["AccountId", "associatedcompanyid"];
+
+/// The email-bearing fields across the ingested sources (§1, §4.4). Namespace is
+/// derived per-field by [`namespace_for_source_field`].
+const EMAIL_FIELDS: &[&str] = &[
+    "Email",
+    "email",
+    "assignee.email",
+    "assignee_email",
+    "creator.email",
+    "creator_email",
+    "actor.email",
+    "actor_email",
+    "user.email",
+    "user_email",
+    "reporter.email",
+];
+
+/// A field name is an external-id crosswalk key iff it is exactly `external_id`
+/// or ends in `_id` for a recognized synced-system prefix. Kept conservative so
+/// an intra-source native PK field (e.g. `hs_object_id`) is NOT mistaken for a
+/// cross-source crosswalk. Recognized synced systems: stripe, duns, an explicit
+/// `external_id`.
+fn is_external_id_field(lower: &str) -> bool {
+    lower == "external_id"
+        || lower == "stripe_customer_id"
+        || lower == "stripe_customer"
+        || lower == "duns"
+        || lower == "duns_number"
+}
+
+/// **Tier-1 live production run (§4.2 S1).** Read the tenant's CURRENT L1 facts
+/// (`valid_to IS NULL`), grouped by `(source, entity_id)`; run the S0
+/// canonicalizers + S1 Tier-1 producers over them; and INSERT the resulting
+/// `tier=1` `entity_evidence` rows under a **deterministic** `evidence_id`
+/// (uuid v5, [`deterministic_evidence_id`]) with `ON CONFLICT DO NOTHING`.
+///
+/// **Idempotent by construction:** the same live facts derive the same
+/// `EvidenceWrite`s, hence the same ids, hence the conflict-skip — re-running
+/// converges and produces no duplicate evidence. The denylist + §4.4 namespace
+/// fence are enforced by the pure producers and the per-namespace / per-id-system
+/// `entity_resolution_config` (`eligible_as_edge` + tenant `denylist_values`).
+///
+/// Returns the count of **newly inserted** evidence rows (a repeat run over
+/// unchanged facts returns 0). Never touches the read path.
+pub async fn produce_tier1_evidence(adapter: &PostgresAdapter, tenant: TenantId) -> Result<usize> {
+    // 1. Read + group current L1 facts, map each entity onto producer inputs.
+    let grouped = adapter.list_current_facts_grouped(tenant).await?;
+    let mut inputs = Tier1Inputs::default();
+    for ((source, entity_id), fields) in &grouped {
+        map_entity_to_inputs(source, entity_id, fields, &mut inputs);
+    }
+
+    // 2. Run the config-gated producers, collecting every surviving EvidenceWrite.
+    //    (We re-derive writes here — rather than reuse Tier1Producers, which
+    //    inserts via the non-deterministic insert_evidence — so we can stamp a
+    //    deterministic id and go through the idempotent ON CONFLICT path.)
+    let mut writes: Vec<EvidenceWrite> = Vec::new();
+
+    // 2a. CRM FK — always eligible (an FK is exact, not a key-quality key).
+    writes.extend(tier1_crm_fk_evidence(tenant, &inputs.crm_fks));
+
+    // 2b. email — partitioned by namespace, each gated by ("email", ns) config.
+    {
+        let mut by_ns: HashMap<&'static str, Vec<EmailFact>> = HashMap::new();
+        for f in &inputs.emails {
+            by_ns
+                .entry(f.namespace.as_str())
+                .or_default()
+                .push(f.clone());
+        }
+        for (ns_str, ns_facts) in by_ns {
+            let cfg = adapter
+                .read_resolution_config(tenant, KeyKind::Email.as_str(), ns_str)
+                .await?;
+            if !cfg.eligible_as_edge {
+                continue;
+            }
+            writes.extend(tier1_email_within_namespace_evidence(
+                tenant,
+                &ns_facts,
+                &cfg.denylist_values,
+            ));
+        }
+    }
+
+    // 2c. external_id — partitioned by id_kind, each gated by ("external_id", kind).
+    {
+        let mut by_kind: HashMap<String, Vec<ExternalIdFact>> = HashMap::new();
+        for f in &inputs.external_ids {
+            by_kind
+                .entry(f.id_kind.trim().to_string())
+                .or_default()
+                .push(f.clone());
+        }
+        for (id_kind, kind_facts) in by_kind {
+            if id_kind.is_empty() {
+                continue;
+            }
+            let cfg = adapter
+                .read_resolution_config(tenant, KeyKind::ExternalId.as_str(), &id_kind)
+                .await?;
+            if !cfg.eligible_as_edge {
+                continue;
+            }
+            writes.extend(tier1_external_id_evidence(
+                tenant,
+                &kind_facts,
+                &cfg.denylist_values,
+            ));
+        }
+    }
+
+    // 3. Idempotent persist under a deterministic id.
+    let mut inserted = 0usize;
+    for w in &writes {
+        let id = deterministic_evidence_id(w);
+        if adapter.insert_evidence_with_id(id, w).await? {
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
 }
 
 #[cfg(test)]

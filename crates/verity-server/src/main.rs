@@ -294,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/admin/entity-resolution/fold", post(admin_trigger_fold))
         .route(
+            "/v1/admin/entity-resolution/run",
+            post(admin_run_resolution),
+        )
+        .route(
             "/v1/admin/entity-resolution/review-queue",
             get(admin_review_queue),
         )
@@ -919,6 +923,24 @@ async fn admin_trigger_fold(
 ) -> HandlerResult<Json<resolver::MaterializeReport>> {
     state.admin.check(&headers)?;
     let report = resolver::run_full_fold(&state, req.tenant_id).await?;
+    Ok(Json(report))
+}
+
+/// POST /v1/admin/entity-resolution/run (admin): the LIVE Tier-1 resolution run
+/// (§4.2 S1 → S4). First populates the ledger from the tenant's CURRENT L1 facts
+/// via the S0/S1 producers (idempotent, deterministic `evidence_id` +
+/// `ON CONFLICT DO NOTHING`), THEN runs the `run_full_fold` materializer over the
+/// now-populated ledger. This is the endpoint that makes Tier-1 resolution live
+/// end-to-end — the manual `/fold` only materializes an EXISTING ledger, this one
+/// fills it first. Runs in the worker/admin plane, NEVER on the read path.
+/// Returns `{ evidence_produced, ...MaterializeReport }`.
+async fn admin_run_resolution(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TriggerFoldRequest>,
+) -> HandlerResult<Json<resolver::RunReport>> {
+    state.admin.check(&headers)?;
+    let report = resolver::run_resolution(&state, req.tenant_id).await?;
     Ok(Json(report))
 }
 

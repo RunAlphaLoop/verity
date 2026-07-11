@@ -34,9 +34,11 @@ from verity_ingest.orchestration.activities import run_connector_poll_cycle  # n
 from verity_ingest.orchestration.runners import CycleOutcome  # noqa: E402
 from verity_ingest.orchestration.shared import (  # noqa: E402
     POLL_CYCLE_ACTIVITY,
+    RESOLVE_ACTIVITY,
     ConnectorSyncInput,
     PollCycleInput,
     PollCycleResult,
+    ResolveInput,
 )
 from verity_ingest.orchestration.workflows import ConnectorSyncWorkflow  # noqa: E402
 
@@ -188,6 +190,131 @@ def test_cursor_not_advanced_past_failed_delivery(monkeypatch: pytest.MonkeyPatc
     # Attempt 1 and the retry both saw the pre-failure cursor.
     assert runner.cursors_seen == ["cursor-orig", "cursor-orig"]
     assert runner.delivered == 2
+
+
+# ---------------------------------------------------------------------------
+# Post-ingest resolution hook (debounce is workflow-clock state)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_scenario(input: ConnectorSyncInput, cycle_result: PollCycleResult):
+    """Run the workflow with a fixed poll result and a recording resolve
+    activity; return the list of tenant_ids the resolve activity was called with."""
+    resolved: list[str] = []
+
+    @activity.defn(name=POLL_CYCLE_ACTIVITY)
+    async def mock_cycle(_in: PollCycleInput) -> PollCycleResult:
+        return cycle_result
+
+    @activity.defn(name=RESOLVE_ACTIVITY)
+    async def mock_resolve(rin: ResolveInput) -> int:
+        resolved.append(rin.tenant_id)
+        return 7
+
+    async def scenario() -> None:
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            await _execute(env, [mock_cycle, mock_resolve], input)
+
+    asyncio.run(scenario())
+    return resolved
+
+
+def test_post_ingest_hook_fires_on_delivered_events() -> None:
+    """A cycle that delivered events for a known tenant fires exactly one
+    resolution run for that tenant."""
+    resolved = _resolve_scenario(
+        ConnectorSyncInput(connector="mock", interval_seconds=60.0, max_cycles=1),
+        PollCycleResult(cursor="c1", events_delivered=3, tenant_id="tenant-a"),
+    )
+    assert resolved == ["tenant-a"]
+
+
+def test_post_ingest_hook_skips_when_nothing_delivered() -> None:
+    """No events delivered → no resolve (an empty poll shouldn't fold)."""
+    resolved = _resolve_scenario(
+        ConnectorSyncInput(connector="mock", interval_seconds=60.0, max_cycles=1),
+        PollCycleResult(cursor="c1", events_delivered=0, tenant_id="tenant-a"),
+    )
+    assert resolved == []
+
+
+def test_post_ingest_hook_skips_when_tenant_unknown() -> None:
+    """Runner reported no tenant → skip rather than guess."""
+    resolved = _resolve_scenario(
+        ConnectorSyncInput(connector="mock", interval_seconds=60.0, max_cycles=1),
+        PollCycleResult(cursor="c1", events_delivered=5, tenant_id=None),
+    )
+    assert resolved == []
+
+
+def test_post_ingest_hook_disabled_when_debounce_zero() -> None:
+    """resolve_debounce_seconds<=0 disables the hook (resolution stays manual)."""
+    resolved = _resolve_scenario(
+        ConnectorSyncInput(
+            connector="mock",
+            interval_seconds=60.0,
+            max_cycles=1,
+            resolve_debounce_seconds=0.0,
+        ),
+        PollCycleResult(cursor="c1", events_delivered=3, tenant_id="tenant-a"),
+    )
+    assert resolved == []
+
+
+def test_post_ingest_hook_debounced_across_cycles() -> None:
+    """A backfill paging every 60s with a 3600s debounce resolves ONCE across
+    many cycles — the debounce clock threads through continue-as-new."""
+    resolved: list[str] = []
+
+    @activity.defn(name=POLL_CYCLE_ACTIVITY)
+    async def mock_cycle(_in: PollCycleInput) -> PollCycleResult:
+        return PollCycleResult(cursor="c", events_delivered=2, tenant_id="tenant-a")
+
+    @activity.defn(name=RESOLVE_ACTIVITY)
+    async def mock_resolve(rin: ResolveInput) -> int:
+        resolved.append(rin.tenant_id)
+        return 0
+
+    async def scenario() -> None:
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            await _execute(
+                env,
+                [mock_cycle, mock_resolve],
+                ConnectorSyncInput(
+                    connector="mock",
+                    interval_seconds=60.0,  # 5 pages inside a 3600s window
+                    max_cycles=5,
+                    resolve_debounce_seconds=3600.0,
+                ),
+            )
+
+    asyncio.run(scenario())
+    # 5 cycles * 60s = 300s of workflow time < 3600s debounce → one resolve.
+    assert resolved == ["tenant-a"]
+
+
+def test_post_ingest_hook_failure_does_not_fail_sync() -> None:
+    """A resolve activity that always fails must NOT break the sync loop — the
+    workflow completes and returns its cursor (best-effort hook)."""
+
+    @activity.defn(name=POLL_CYCLE_ACTIVITY)
+    async def mock_cycle(_in: PollCycleInput) -> PollCycleResult:
+        return PollCycleResult(cursor="c-final", events_delivered=1, tenant_id="t")
+
+    @activity.defn(name=RESOLVE_ACTIVITY)
+    async def failing_resolve(_rin: ResolveInput) -> int:
+        raise RuntimeError("resolution server 503")
+
+    async def scenario() -> None:
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            result = await _execute(
+                env,
+                [mock_cycle, failing_resolve],
+                ConnectorSyncInput(connector="mock", interval_seconds=60.0, max_cycles=1),
+            )
+            assert result == "c-final"
+
+    asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------

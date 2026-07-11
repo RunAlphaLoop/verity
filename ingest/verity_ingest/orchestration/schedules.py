@@ -55,7 +55,11 @@ def build_schedule(connector: str, interval_seconds: float) -> Schedule:
     return Schedule(
         action=ScheduleActionStartWorkflow(
             WORKFLOW_NAME,
-            ConnectorSyncInput(connector=connector, interval_seconds=interval_seconds),
+            ConnectorSyncInput(
+                connector=connector,
+                interval_seconds=interval_seconds,
+                resolve_debounce_seconds=config.resolve_debounce_seconds(),
+            ),
             id=workflow_id_for(connector),
             task_queue=config.task_queue(),
         ),

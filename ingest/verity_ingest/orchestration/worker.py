@@ -19,7 +19,10 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from verity_ingest.orchestration import config
-from verity_ingest.orchestration.activities import run_connector_poll_cycle
+from verity_ingest.orchestration.activities import (
+    run_connector_poll_cycle,
+    trigger_entity_resolution,
+)
 from verity_ingest.orchestration.workflows import ConnectorSyncWorkflow
 
 logger = logging.getLogger(__name__)
@@ -38,7 +41,7 @@ async def run_worker() -> None:
         client,
         task_queue=config.task_queue(),
         workflows=[ConnectorSyncWorkflow],
-        activities=[run_connector_poll_cycle],
+        activities=[run_connector_poll_cycle, trigger_entity_resolution],
     )
     await worker.run()
 

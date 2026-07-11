@@ -38,8 +38,9 @@ pub use canon::{
     canonicalize_website_domain, is_denylisted, CanonKey, KeyNamespace,
 };
 pub use producers::{
-    tier1_crm_fk_evidence, tier1_email_within_namespace_evidence, tier1_external_id_evidence,
-    CrmContactFact, EmailFact, ExternalIdFact, Tier1Producers,
+    deterministic_evidence_id, produce_tier1_evidence, tier1_crm_fk_evidence,
+    tier1_email_within_namespace_evidence, tier1_external_id_evidence, CrmContactFact, EmailFact,
+    ExternalIdFact, Tier1Producers,
 };
 
 // S4 — the pure deterministic fold (§4.2). Consumes live evidence produced by

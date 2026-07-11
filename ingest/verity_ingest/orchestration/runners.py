@@ -39,6 +39,10 @@ class UnknownConnectorError(RunnerConfigError):
 class CycleOutcome:
     next_cursor: str | None
     events_delivered: int
+    #: The tenant this cycle wrote into. The runner is the only layer that
+    #: knows it (env or connector config); the workflow needs it to fire the
+    #: post-ingest resolution hook. ``None`` = tenant unknown → hook skipped.
+    tenant_id: str | None = None
 
 
 class PollCycleRunner(Protocol):
@@ -94,7 +98,13 @@ class DebeziumPollRunner:
         # sink.post is synchronous httpx; keep the activity's event loop (and
         # its heartbeats) responsive.
         await asyncio.to_thread(sink.post, list(events), next_cursor)
-        return CycleOutcome(next_cursor=next_cursor, events_delivered=len(events))
+        # The VerityDebeziumSink carries the tenant (VERITY_TENANT_ID); surface
+        # it so the workflow can fire the post-ingest resolution hook.
+        return CycleOutcome(
+            next_cursor=next_cursor,
+            events_delivered=len(events),
+            tenant_id=getattr(sink, "tenant_id", None),
+        )
 
 
 def _hubspot_runner() -> DebeziumPollRunner:
@@ -159,7 +169,11 @@ class GDrivePollRunner:
         telemetry = getattr(sink, "heartbeat", None)
         if telemetry is not None:  # best-effort connector-status heartbeat
             await asyncio.to_thread(telemetry, next_cursor)
-        return CycleOutcome(next_cursor=next_cursor, events_delivered=len(events))
+        return CycleOutcome(
+            next_cursor=next_cursor,
+            events_delivered=len(events),
+            tenant_id=tenant_id,
+        )
 
 
 def _gdrive_runner() -> GDrivePollRunner:

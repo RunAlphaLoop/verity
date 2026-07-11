@@ -180,6 +180,312 @@ async fn merged_entity_endpoint_resolves_precedence() {
     assert_eq!(name.superseded_alternatives[0].source, "hubspot");
 }
 
+/// **Live Tier-1 entity resolution, end-to-end (§4.2 S1 → S4).** Ingest real L1
+/// facts for the SAME company across TWO sources, then drive the actual
+/// produce+run path (`resolver::run_resolution` = `produce_tier1_evidence` → the
+/// `run_full_fold` materializer) and assert the merge is correct, badged
+/// deterministically, and — the security check — that a DIFFERENT company (an
+/// internal-directory actor sharing a byte-identical name/local, and a free-mail
+/// contact) never welds in. Finally re-run to prove idempotency.
+///
+/// This exercises the WHOLE live pipeline off L1: nothing here writes evidence or
+/// aliases by hand — the producer reads `list_current_facts_grouped`, the fold
+/// materializes `entity_aliases` + `entity_link_meta`, and the read path
+/// (`merged_record` + the badge) sees only what the worker plane produced.
+#[tokio::test]
+async fn live_tier1_resolution_merges_company_across_sources_and_fences_others() {
+    let Some((state, tenant)) = test_state().await else {
+        return;
+    };
+
+    // ---- ACME, the company we expect to resolve into one canonical. ----
+    // Salesforce Account: Website (a domain-bearing field, MEDIUM) + a synced
+    // DUNS crosswalk (STRONG external_id — the key that clears min_independent_keys
+    // on its own). The Website/domain pair is deliberately present to prove the
+    // MEDIUM key alone is NOT what merges; the STRONG external_id is.
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-acme",
+        "Website",
+        json!("https://www.acme.com"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-acme",
+        "duns",
+        json!("123456789"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-acme",
+        "name",
+        json!("Acme Corp (SF)"),
+    )
+    .await;
+    // HubSpot company: domain + the SAME DUNS.
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-acme",
+        "domain",
+        json!("acme.com"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-acme",
+        "duns",
+        json!("123456789"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-acme",
+        "name",
+        json!("Acme Corp (HS)"),
+    )
+    .await;
+
+    // Two customer contacts for ACME sharing a corporate email → they resolve into
+    // their OWN canonical (a person), independently, in the customer_contact
+    // namespace. This is the "matching contact email" second independent key path.
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-jane",
+        "Email",
+        json!("jane@acme.com"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-jane",
+        "email",
+        json!("jane@acme.com"),
+    )
+    .await;
+
+    // ---- The security fence: DIFFERENT identities that must NOT merge in. ----
+    // (1) An INTERNAL actor whose email is jane@acme.dev — a Linear-origin
+    //     `email` is stamped internal_directory (§4.4). Even though it is a "jane"
+    //     at an acme-ish domain, the namespace fence forbids any edge to the
+    //     customer_contact jane, and nothing welds it to the ACME account.
+    fact(
+        &state,
+        tenant,
+        "linear",
+        "lin-jane",
+        "email",
+        json!("jane@acme.dev"),
+    )
+    .await;
+    // (2) A free-mail contact (gmail.com is denylisted) — never a key, never an
+    //     edge, so bob resolves to nothing shared even though a second gmail bob
+    //     exists in another source.
+    fact(
+        &state,
+        tenant,
+        "hubspot",
+        "hs-bob",
+        "email",
+        json!("bob@gmail.com"),
+    )
+    .await;
+    fact(
+        &state,
+        tenant,
+        "salesforce",
+        "sf-bob",
+        "Email",
+        json!("bob@gmail.com"),
+    )
+    .await;
+
+    // ---- Run the LIVE produce+run path (S1 producers → S4 fold materializer). ----
+    let report1 = crate::resolver::run_resolution(&state, tenant)
+        .await
+        .expect("run_resolution");
+    assert!(
+        report1.evidence_produced >= 2,
+        "producer must emit ≥2 tier-1 edges (acme external_id + jane email_exact); got {}",
+        report1.evidence_produced
+    );
+
+    let storage = state.storage.inner();
+
+    // ---- ASSERT 1: exactly one canonical for ACME, with BOTH source members. ----
+    let acme_canon = storage
+        .resolve_canonical(tenant, "salesforce", "sf-acme")
+        .await
+        .unwrap()
+        .expect("sf-acme must resolve to a canonical");
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "hubspot", "hs-acme")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(acme_canon.as_str()),
+        "both sources must resolve to the SAME canonical"
+    );
+    // Canonical name is deterministic: canon:<lexically-min source:entity_id>.
+    assert_eq!(acme_canon, "canon:hubspot:hs-acme");
+
+    let members = storage
+        .list_entity_aliases(tenant, &acme_canon)
+        .await
+        .unwrap();
+    assert_eq!(
+        members.len(),
+        2,
+        "exactly two source members in the canonical"
+    );
+    assert!(members.contains(&AliasMember {
+        source: "salesforce".into(),
+        entity_id: "sf-acme".into()
+    }));
+    assert!(members.contains(&AliasMember {
+        source: "hubspot".into(),
+        entity_id: "hs-acme".into()
+    }));
+
+    // merged_record reflects the same two members (the read-path view is unchanged).
+    let merged = storage.merged_record(tenant, &acme_canon).await.unwrap();
+    assert_eq!(
+        merged.members.len(),
+        2,
+        "merged_record: both members present"
+    );
+
+    // ---- ASSERT 2: the entity_link_meta confidence badge is present + deterministic. ----
+    let badge = storage
+        .link_meta_for_canonical(tenant, &acme_canon)
+        .await
+        .unwrap()
+        .expect("acme canonical must carry a materialized badge");
+    assert_eq!(
+        badge.confidence, "deterministic",
+        "a Tier-1 external_id merge is deterministic, never approximated"
+    );
+    assert_eq!(
+        badge.strongest_method.as_deref(),
+        Some("external_id"),
+        "the strongest justifying method is the STRONG external_id key"
+    );
+    assert!(
+        badge.evidence_count >= 1,
+        "badge must cite ≥1 justifying evidence row"
+    );
+
+    // The two customer contacts merged on the shared corporate email — their own
+    // canonical, also deterministic, via email_exact in customer_contact.
+    let jane_canon = storage
+        .resolve_canonical(tenant, "hubspot", "hs-jane")
+        .await
+        .unwrap()
+        .expect("hs-jane must resolve");
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "salesforce", "sf-jane")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(jane_canon.as_str()),
+        "both contacts share one canonical person"
+    );
+    assert_ne!(jane_canon, acme_canon, "the person is not the account");
+    let jane_badge = storage
+        .link_meta_for_canonical(tenant, &jane_canon)
+        .await
+        .unwrap()
+        .expect("jane badge");
+    assert_eq!(jane_badge.confidence, "deterministic");
+    assert_eq!(jane_badge.strongest_method.as_deref(), Some("email_exact"));
+
+    // ---- ASSERT 3 (the security check): the DIFFERENT company never merges in. ----
+    // The internal-directory actor is fenced out of BOTH the customer person and
+    // the account: it resolves to NOTHING shared (no alias row at all).
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "linear", "lin-jane")
+            .await
+            .unwrap(),
+        None,
+        "internal_directory jane@acme.dev must never weld to a customer_contact entity"
+    );
+    // The ACME canonical must contain no linear member.
+    assert!(
+        !members.iter().any(|m| m.source == "linear"),
+        "no internal actor may appear inside the customer account canonical"
+    );
+    // Free-mail contacts form no edge → each resolves to nothing shared.
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "hubspot", "hs-bob")
+            .await
+            .unwrap(),
+        None,
+        "gmail.com is denylisted — never a key, never a merge"
+    );
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "salesforce", "sf-bob")
+            .await
+            .unwrap(),
+        None,
+        "the second free-mail bob likewise stays unmerged"
+    );
+
+    // ---- ASSERT 4: idempotency — a second run adds no evidence, stable canonical. ----
+    let report2 = crate::resolver::run_resolution(&state, tenant)
+        .await
+        .expect("second run_resolution");
+    assert_eq!(
+        report2.evidence_produced, 0,
+        "re-running over unchanged L1 facts produces NO duplicate evidence (deterministic evidence_id + ON CONFLICT DO NOTHING)"
+    );
+    // Canonical + membership are unchanged after the repeat run.
+    assert_eq!(
+        storage
+            .resolve_canonical(tenant, "salesforce", "sf-acme")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(acme_canon.as_str()),
+        "canonical is stable across repeat runs"
+    );
+    let members2 = storage
+        .list_entity_aliases(tenant, &acme_canon)
+        .await
+        .unwrap();
+    assert_eq!(members2.len(), 2, "no duplicate members after re-run");
+    // Still exactly one badge row for the canonical (idempotent upsert).
+    assert!(
+        storage
+            .link_meta_for_canonical(tenant, &acme_canon)
+            .await
+            .unwrap()
+            .is_some(),
+        "badge survives the idempotent re-materialize"
+    );
+}
+
 /// The merged read is scope-handle gated exactly like get_record: a garbage
 /// handle fails closed with 401 (never leaks the merged view).
 #[tokio::test]

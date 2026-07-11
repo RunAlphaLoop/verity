@@ -10,6 +10,11 @@ use uuid::Uuid;
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 
+/// One source entity's current L1 facts, grouped for the Tier-1 producers
+/// (§4.2 S1): `((source, entity_id), [(field, value), …])`. Returned by
+/// [`PostgresAdapter::list_current_facts_grouped`].
+pub type GroupedFacts = ((String, String), Vec<(String, serde_json::Value)>);
+
 pub struct PostgresAdapter {
     pool: PgPool,
     /// Deployment KEK (SPEC §8a, crypto.rs). None = envelope encryption
@@ -435,6 +440,80 @@ impl PostgresAdapter {
         .await
         .map_err(db_err)?;
         row_to_evidence(&row)
+    }
+
+    /// Append evidence under a caller-supplied **deterministic** `evidence_id`,
+    /// idempotently (§4.2: "re-running produces no duplicate evidence"). Uses
+    /// `INSERT ... ON CONFLICT (evidence_id) DO NOTHING` so a repeated Tier-1
+    /// production run over the same live L1 facts converges — the second run
+    /// stamps the identical id and the conflict is a no-op.
+    ///
+    /// Returns `true` if a new row was inserted, `false` if it already existed
+    /// (the idempotent skip). The id must be stable across runs — see
+    /// [`crate::resolve::producers::deterministic_evidence_id`] for the derivation
+    /// (a uuid v5 over `tenant + left_ref + right_ref + method + key_value +
+    /// key_namespace`).
+    pub async fn insert_evidence_with_id(
+        &self,
+        evidence_id: Uuid,
+        ev: &EvidenceWrite,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO entity_evidence
+                 (evidence_id, tenant_id, left_ref, right_ref, tier, method,
+                  key_value, key_namespace, score, evidence_l0_ref, polarity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (evidence_id) DO NOTHING",
+        )
+        .bind(evidence_id)
+        .bind(ev.tenant_id)
+        .bind(&ev.left_ref)
+        .bind(&ev.right_ref)
+        .bind(ev.tier)
+        .bind(&ev.method)
+        .bind(&ev.key_value)
+        .bind(&ev.key_namespace)
+        .bind(ev.score)
+        .bind(&ev.evidence_l0_ref)
+        .bind(ev.polarity)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Read every CURRENT L1 fact (`valid_to IS NULL`) for a tenant, grouped by
+    /// `(source, entity_id)` (§4.2: the Tier-1 producer input). Each group is the
+    /// full field→value map of one source entity, so a producer can pull the
+    /// full field→value map of one source entity, so a producer can pull the
+    /// email / FK / external-id fields it needs off a single entity's facts. The
+    /// value is the raw jsonb; the producer-input builder scalarizes it.
+    ///
+    /// Ordered by `(source, entity_id, field)` for a reproducible grouping.
+    pub async fn list_current_facts_grouped(&self, tenant: TenantId) -> Result<Vec<GroupedFacts>> {
+        let rows = sqlx::query(
+            "SELECT source, entity_id, field, value FROM facts
+              WHERE tenant_id = $1 AND valid_to IS NULL
+              ORDER BY source, entity_id, field",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let mut out: Vec<GroupedFacts> = Vec::new();
+        for r in &rows {
+            let source: String = r.try_get("source").map_err(db_err)?;
+            let entity_id: String = r.try_get("entity_id").map_err(db_err)?;
+            let field: String = r.try_get("field").map_err(db_err)?;
+            let value: serde_json::Value = r.try_get("value").map_err(db_err)?;
+            let key = (source, entity_id);
+            match out.last_mut() {
+                Some((k, fields)) if *k == key => fields.push((field, value)),
+                _ => out.push((key, vec![(field, value)])),
+            }
+        }
+        Ok(out)
     }
 
     /// Retract a live evidence row (§3.3 invalidate-don't-delete): stamps

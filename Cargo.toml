@@ -28,7 +28,7 @@ toml = "0.9"
 # serde_yaml is archived (RUSTSEC-2024-0320); serde_yaml_ng is the maintained,
 # API-compatible fork.
 serde_yaml_ng = "0.10"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"

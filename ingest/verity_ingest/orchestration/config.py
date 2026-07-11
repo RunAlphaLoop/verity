@@ -11,6 +11,11 @@ Everything is environment-first so the worker container needs no config file:
 - ``VERITY_SYNC_INTERVAL``            default poll interval in seconds (300)
 - ``VERITY_SYNC_INTERVAL_<CONNECTOR>`` per-connector override, e.g.
   ``VERITY_SYNC_INTERVAL_HUBSPOT=60``
+- ``VERITY_RESOLVE_DEBOUNCE``         post-ingest resolution debounce in seconds
+  (default 900). After a cycle delivers events the workflow fires the tenant's
+  Tier-1 resolution run at most once per this window, so a large backfill folds
+  on a cadence instead of per page. Set ``0`` to disable the hook (resolution
+  stays fully manual via ``POST /v1/admin/entity-resolution/run``).
 
 Connector credentials/policies ride on the connectors' own env contract
 (``HUBSPOT_PRIVATE_APP_TOKEN``, ``SF_*``, ``GOOGLE_APPLICATION_CREDENTIALS``,
@@ -21,6 +26,8 @@ from __future__ import annotations
 
 import os
 
+from verity_ingest.orchestration.shared import DEFAULT_RESOLVE_DEBOUNCE_SECONDS
+
 DEFAULT_ADDRESS = "localhost:7233"
 DEFAULT_NAMESPACE = "default"
 DEFAULT_TASK_QUEUE = "verity-ingest"
@@ -28,6 +35,7 @@ DEFAULT_INTERVAL_SECONDS = 300.0
 
 CONNECTORS_ENV = "VERITY_CONNECTORS"
 INTERVAL_ENV = "VERITY_SYNC_INTERVAL"
+RESOLVE_DEBOUNCE_ENV = "VERITY_RESOLVE_DEBOUNCE"
 
 
 def temporal_address() -> str:
@@ -67,3 +75,18 @@ def interval_seconds(connector: str) -> float:
     if value <= 0:
         raise RuntimeError(f"sync interval for {connector} must be positive, got {value}")
     return value
+
+
+def resolve_debounce_seconds() -> float:
+    """Post-ingest resolution debounce (seconds). Default 900; ``0`` disables
+    the hook (resolution stays manual). Negative is clamped to 0 (disabled)
+    rather than raising — an operator killing the hook shouldn't crash the
+    scheduler; non-numeric garbage still raises loudly."""
+    raw = os.environ.get(RESOLVE_DEBOUNCE_ENV)
+    if raw is None:
+        return DEFAULT_RESOLVE_DEBOUNCE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {RESOLVE_DEBOUNCE_ENV} {raw!r}") from exc
+    return max(value, 0.0)
