@@ -1969,10 +1969,19 @@ impl PostgresAdapter {
         // Match on the (source, entity_id) pairs via UNNEST-zipped arrays (same
         // fence merged_record uses) so member A/X never picks up B/X. Deterministic
         // order so the chosen name/domain is stable across calls.
+        //
+        // Matched on the CONCATENATION, not the exact pair: alias members come
+        // from `split_member_ref`, which splits the ambiguous ref grammar on
+        // the FIRST `:` — but Debezium sources contain `:`, so the member pair
+        // ("hubspot", "crm.companies:hs-77") disagrees with the fact pair
+        // ("hubspot:crm.companies", "hs-77") for the same entity. The composed
+        // ref is identical either way, so equality on it is exact (the same
+        // fix ref_field_summary got on 2026-07-11; entities browser showed
+        // name:null for entities whose name facts existed, 2026-07-12).
         let rows = sqlx::query(
             "SELECT f.field, f.value FROM facts f
                JOIN unnest($2::text[], $3::text[]) AS m(source, entity_id)
-                 ON f.source = m.source AND f.entity_id = m.entity_id
+                 ON f.source || ':' || f.entity_id = m.source || ':' || m.entity_id
               WHERE f.tenant_id = $1 AND f.valid_to IS NULL
                 AND f.field IN ('name', 'domain')
               ORDER BY f.field, f.source, f.entity_id",
@@ -2107,10 +2116,17 @@ impl PostgresAdapter {
             let entity_ids: Vec<String> = members.iter().map(|m| m.entity_id.clone()).collect();
             // Match on the (source, entity_id) pairs via UNNEST-zipped arrays so
             // a member of source A / entity X never picks up source B / entity X.
+            // Concatenation equality, not exact-pair: alias members carry the
+            // first-colon split of the ambiguous ref grammar, which disagrees
+            // with the fact pair whenever the source contains `:` (Debezium's
+            // `connector:db.table`). The composed ref matches exactly for
+            // however the split fell — see member_field_summary for the full
+            // story. Without this, the MERGED record silently dropped every
+            // colon-source member's fields.
             let rows = sqlx::query(
                 "SELECT f.* FROM facts f
                  JOIN unnest($2::text[], $3::text[]) AS m(source, entity_id)
-                   ON f.source = m.source AND f.entity_id = m.entity_id
+                   ON f.source || ':' || f.entity_id = m.source || ':' || m.entity_id
                  WHERE f.tenant_id = $1 AND f.valid_to IS NULL",
             )
             .bind(tenant)
