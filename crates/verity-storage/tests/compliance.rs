@@ -657,7 +657,27 @@ async fn dsar_bundle_contains_expected_rows_with_decrypted_payloads() {
         return;
     };
     let subject = "user:dsar-subject";
-    interaction(&adapter, tenant, "account:acme", Some(subject), "agent:a").await;
+    let subject_episode = interaction(&adapter, tenant, "account:acme", Some(subject), "agent:a").await;
+    // An L1 fact derived from the subject's episode (linked by provenance) with
+    // a RESTRICTED visibility no ordinary scope holds — DSAR runs under admin
+    // authority and must export it regardless (SPEC §8e).
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: FactKey {
+                source: "agent".into(),
+                entity_id: "account:acme".into(),
+                field: "arr".into(),
+            },
+            value: json!(240000),
+            valid_from: Utc::now(),
+            visibility: vec![4242],
+            confidentiality: Confidentiality::Restricted,
+            provenance: subject_episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
     adapter
         .record_action(ActionWrite {
             tenant_id: tenant,
@@ -710,6 +730,19 @@ async fn dsar_bundle_contains_expected_rows_with_decrypted_payloads() {
         "observation chunk + action summary chunk expected, got {}",
         chunks.len()
     );
+    // The subject's L1 fact is exported despite its restricted visibility —
+    // DSAR is admin-authority, not scope-gated.
+    let facts = bundle["facts"].as_array().unwrap();
+    let arr = facts
+        .iter()
+        .find(|f| f["field"] == "arr")
+        .expect("the subject's fact is in the DSAR bundle");
+    assert_eq!(arr["value"], json!(240000));
+    assert_eq!(
+        arr["visibility"],
+        json!([4242]),
+        "the fact's visibility tokens are disclosed in the export"
+    );
     assert_eq!(bundle["actions"].as_array().unwrap().len(), 1);
     assert_eq!(bundle["actions"][0]["action_type"], "quote.issued");
     assert_eq!(bundle["knowledge"].as_array().unwrap().len(), 1);
@@ -718,4 +751,5 @@ async fn dsar_bundle_contains_expected_rows_with_decrypted_payloads() {
     let empty = adapter.dsar_export(tenant, "user:nobody").await.unwrap();
     assert!(empty["episodes"].as_array().unwrap().is_empty());
     assert!(empty["actions"].as_array().unwrap().is_empty());
+    assert!(empty["facts"].as_array().unwrap().is_empty());
 }

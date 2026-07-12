@@ -112,19 +112,36 @@
     /* --- item 1 · space created ------------------------------------- */
     var i1 = { n: 1, id: "space", title: "Space created", done: false, evidence: "", needsAdmin: false };
     if (dir.status === "ok") {
-      /* A TRUNCATED directory page is not evidence of a ghost: only assert
-         non-existence when the page is complete. An absent-but-real space is
-         confirmed by its own data (a ghost's probes come back as clean zeros). */
       var dirTotal = typeof dir.total === "number" ? dir.total : dir.tenants.length;
-      var pageComplete = dirTotal <= dir.tenants.length;
-      var hasData = principals.length > 0 || knCount > 0 || quCount > 0 || frCount > 0 || auditRows.length > 0;
-      i1.done = inList || (!!tenant && !pageComplete && hasData);
-      if (inList) i1.evidence = "“" + (name || "(unnamed)") + "” exists on this server";
-      else if (!tenant) i1.evidence = "no space yet";
-      else if (pageComplete) i1.evidence = "this tenant id is NOT on this server — showing it as set up would be a lie, so it stays red";
-      else if (hasData) i1.evidence = "answers with data on this server — older than the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + "), loaded by id";
-      else i1.evidence = "not in the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + ") — existence can't be confirmed from this page";
-      i1.ghost = !!tenant && !inList && pageComplete;
+      if (inList) {
+        i1.done = true;
+        i1.evidence = "“" + (name || "(unnamed)") + "” exists on this server";
+      } else if (!tenant) {
+        i1.evidence = "no space yet";
+      } else {
+        /* Off the (possibly truncated) directory page — resolve existence
+           DEFINITIVELY via the point lookup GET /v1/admin/tenants/{id} rather
+           than inferring it from probe data. confirmTenantById is memoized and
+           re-emits on land, so this fire-and-forget re-renders with the truth;
+           until then item 1 stays neutral (never a premature green or a false
+           ghost). */
+        V.confirmTenantById(tenant);
+        var c = V.confirmedTenant(tenant);
+        if (!c) {
+          i1.evidence = "confirming this space by its id…";
+        } else if (c.state === "confirmed") {
+          i1.done = true;
+          i1.evidence = "“" + (c.name || "(unnamed)") + "” exists on this server — older than the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + "), loaded by id";
+        } else if (c.state === "ghost") {
+          i1.ghost = true;
+          i1.evidence = "this tenant id is NOT on this server — showing it as set up would be a lie, so it stays red";
+        } else {
+          i1.needsAdmin = !!c.locked;
+          i1.evidence = c.locked
+            ? "needs the admin token to confirm this space by its id"
+            : "couldn’t confirm this space by its id just now";
+        }
+      }
     } else if (dir.status === "locked") {
       i1.needsAdmin = true;
       i1.evidence = "needs the admin token to verify against GET /v1/admin/tenants";

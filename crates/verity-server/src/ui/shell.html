@@ -204,16 +204,29 @@
       if (dir.status === "ok") {
         var inList = !!t && dir.tenants.some(function (x) { return x.tenant_id === t; });
         // The directory page is TRUNCATED on big servers (newest 500 of
-        // dir.total) — absence from the page proves nothing. Assert
-        // non-existence ONLY when the page holds every space.
-        var truncated = dir.total > dir.tenants.length;
+        // dir.total) — absence from the page proves nothing. Resolve an
+        // off-page active tenant DEFINITIVELY via the point lookup
+        // (GET /v1/admin/tenants/{id}) rather than guessing from page
+        // membership. confirmTenantById is memoized + re-emits on land, so
+        // this fire-and-forget resolves once and re-renders with the truth.
+        var confirmed = null; // set for an off-page active tenant
         if (t && !inList) {
-          if (truncated) {
+          Verity.confirmTenantById(t); // no-op after the first resolve
+          confirmed = Verity.confirmedTenant(t);
+          if (!confirmed) {
             ghostTone = "dim";
-            ghostMsg = "This space isn’t in the newest " + dir.tenants.length +
-              " the picker lists (this server has " + dir.total + " spaces) — loaded by its id.";
-          } else {
+            ghostMsg = "Confirming this space by its id…";
+          } else if (confirmed.state === "confirmed") {
+            ghostTone = "dim";
+            ghostMsg = "“" + (confirmed.name || "(unnamed)") +
+              "” — loaded by its id (older than the newest " + dir.tenants.length +
+              " the picker lists; this server has " + dir.total + ").";
+          } else if (confirmed.state === "ghost") {
             ghostMsg = "This space doesn’t exist on this server. Pick a real one, or set one up.";
+          } else {
+            // Couldn't verify (network/locked) — don't claim either way.
+            ghostTone = "dim";
+            ghostMsg = "Loaded by id; couldn’t confirm it against the directory just now.";
           }
         }
         if (!dir.tenants.length) {
@@ -236,7 +249,12 @@
             // selected space that renders as "— pick a space —" reads as
             // "creation failed" (founder report, 2026-07-12).
             if (t && !inList) {
-              opts += '<option value="' + Verity.esc(t) + '">(current space — loaded by id) ' + Verity.esc(shortId(t)) + "</option>";
+              // Prefer the confirmed human name; fall back to the short id
+              // while the point lookup is still in flight.
+              var offLabel = (confirmed && confirmed.state === "confirmed" && confirmed.name)
+                ? confirmed.name + " (loaded by id)"
+                : "(current space — loaded by id) " + shortId(t);
+              opts += '<option value="' + Verity.esc(t) + '">' + Verity.esc(offLabel) + "</option>";
             }
             if (dir.total > dir.tenants.length) {
               opts += '<option value="" disabled>… showing newest ' + dir.tenants.length + " of " + dir.total + "</option>";

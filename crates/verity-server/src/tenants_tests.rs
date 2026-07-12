@@ -67,6 +67,55 @@ async fn list(state: &Arc<AppState>, headers: HeaderMap, query: serde_json::Valu
 
 type HandlerJson = crate::HandlerResult<Json<serde_json::Value>>;
 
+/// DSN-only: the point lookup GET /v1/admin/tenants/{id} — a real id returns
+/// its name/created_at, a never-born id is a definitive 404 (the wizard's
+/// ghost hard-stop and the picker's off-page confirm both key off this).
+#[tokio::test]
+async fn tenant_by_id_confirms_real_and_404s_ghost() {
+    let Some(state) = test_state(dev_admin()).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let name = format!("by-id-{}", Uuid::now_v7());
+    let id = state.storage.create_tenant(&name).await.expect("create");
+
+    let Json(v) =
+        crate::get_tenant(State(Arc::clone(&state)), HeaderMap::new(), axum::extract::Path(id))
+            .await
+            .expect("real tenant resolves");
+    assert_eq!(v["tenant_id"], json!(id));
+    assert_eq!(v["name"], json!(name));
+    assert!(v["created_at"].as_str().is_some());
+
+    let ghost = Uuid::now_v7();
+    let err = crate::get_tenant(State(state), HeaderMap::new(), axum::extract::Path(ghost))
+        .await
+        .expect_err("never-born id must 404");
+    assert_eq!(err.0, StatusCode::NOT_FOUND);
+}
+
+/// DSN-only: the point lookup is admin-gated exactly like the directory read.
+#[tokio::test]
+async fn tenant_by_id_is_admin_gated() {
+    let key = [9u8; 32];
+    let admin = AdminAuth {
+        expected_tag: Some(AdminAuth::tag(&key, "sekrit")),
+        key,
+    };
+    let Some(state) = test_state(admin).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let err = crate::get_tenant(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        axum::extract::Path(Uuid::now_v7()),
+    )
+    .await
+    .expect_err("no bearer must be rejected before any lookup");
+    assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+}
+
 /// DSN-only: the directory read returns the FTUE contract shape —
 /// `tenants: [{tenant_id, name, created_at}]` — includes freshly created
 /// tenants NEWEST first (a just-created space must land on the first page

@@ -2625,6 +2625,24 @@ impl StorageAdapter for PostgresAdapter {
         Ok(n)
     }
 
+    async fn get_tenant(&self, tenant: TenantId) -> Result<Option<TenantRow>> {
+        let row = sqlx::query(
+            "SELECT id, name, created_at FROM tenants WHERE id = $1",
+        )
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| {
+            Ok(TenantRow {
+                tenant_id: r.try_get("id").map_err(db_err)?,
+                name: r.try_get("name").map_err(db_err)?,
+                created_at: r.try_get("created_at").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
     async fn append_episode(&self, ep: NewEpisode) -> Result<EpisodeId> {
         let id = Uuid::now_v7();
         let mut tx = self.pool.begin().await.map_err(db_err)?;

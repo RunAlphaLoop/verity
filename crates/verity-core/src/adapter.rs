@@ -34,6 +34,16 @@ pub trait StorageAdapter: Send + Sync {
         Err(unsupported("count_tenants"))
     }
 
+    /// One tenant by id (admin plane): the point lookup the console's tenant
+    /// picker and FTUE wizard need to confirm a pasted/deep-linked id names a
+    /// REAL space, even when it falls outside the truncated directory page. A
+    /// `None` (not an error) is a definitive "no such tenant" — the wizard's
+    /// ghost-tenant hard stop and the picker's "loaded by id" label both key
+    /// off this instead of guessing from directory membership.
+    async fn get_tenant(&self, _tenant: TenantId) -> Result<Option<TenantRow>> {
+        Err(unsupported("get_tenant"))
+    }
+
     /// Append to the immutable L0 evidence log.
     async fn append_episode(&self, episode: NewEpisode) -> Result<EpisodeId>;
 

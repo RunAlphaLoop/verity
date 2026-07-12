@@ -487,6 +487,45 @@ impl PostgresAdapter {
         })
         .collect::<Result<Vec<_>>>()?;
 
+        // L1 facts derived from those episodes — linked by provenance exactly
+        // like chunks. DSAR runs under admin authority (SPEC §8e), so this is
+        // deliberately the admin-all view: it exports facts regardless of their
+        // per-principal visibility (migration 0026), because a subject-access
+        // request must return everything attributable to the subject, not only
+        // what some scope could read. The visibility tokens themselves are
+        // included so the export is faithful about who could see each fact.
+        let facts = sqlx::query(
+            "SELECT id, source, entity_id, field, value, valid_from, valid_to,
+                    superseded_by, recorded_at, provenance, acl_provenance,
+                    visibility, confidentiality
+             FROM facts WHERE tenant_id = $1 AND provenance = ANY($2)
+             ORDER BY valid_from",
+        )
+        .bind(tenant)
+        .bind(&episode_ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").map_err(db_err)?,
+                "source": row.try_get::<String, _>("source").map_err(db_err)?,
+                "entity_id": row.try_get::<String, _>("entity_id").map_err(db_err)?,
+                "field": row.try_get::<String, _>("field").map_err(db_err)?,
+                "value": row.try_get::<serde_json::Value, _>("value").map_err(db_err)?,
+                "valid_from": row.try_get::<chrono::DateTime<chrono::Utc>, _>("valid_from").map_err(db_err)?,
+                "valid_to": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("valid_to").map_err(db_err)?,
+                "superseded_by": row.try_get::<Option<Uuid>, _>("superseded_by").map_err(db_err)?,
+                "recorded_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at").map_err(db_err)?,
+                "provenance": row.try_get::<Uuid, _>("provenance").map_err(db_err)?,
+                "acl_provenance": row.try_get::<String, _>("acl_provenance").map_err(db_err)?,
+                "visibility": row.try_get::<Vec<i32>, _>("visibility").map_err(db_err)?,
+                "confidentiality": row.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
         // The subject's actions.
         let actions = sqlx::query(
             "SELECT id, action_id, actor_sub, actor_azp, action_type, entities, summary,
@@ -573,6 +612,7 @@ impl PostgresAdapter {
             "generated_at": chrono::Utc::now(),
             "episodes": episodes,
             "chunks": chunks,
+            "facts": facts,
             "actions": actions,
             "audit_log": audit,
             "knowledge": knowledge,

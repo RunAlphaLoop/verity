@@ -506,6 +506,39 @@ function tenantName(id) {
   return hit ? String(hit.name || "") : "";
 }
 
+/* Off-page confirmation (FTUE §2.1): a tenant id can be REAL yet absent from
+   the truncated directory page. GET /v1/admin/tenants/{id} is the definitive
+   point lookup — a 200 confirms the space (and gives its name), a 404 is a
+   true ghost. Memoized so the picker/wizard resolve each id once, never
+   re-fetching on every synchronous re-render. Result shapes:
+     { state: "confirmed", name }  ·  { state: "ghost" }  ·  { state: "error" }
+   plus the transient "pending" while in flight (absent from the map). */
+const _confirmedById = {};
+/** Verity.confirmedTenant(id) → cached result object, or undefined if not yet resolved. */
+function confirmedTenant(id) { return _confirmedById[id]; }
+/** Verity.confirmTenantById(id) → Promise<result>. One-shot; re-emits the
+    directory subscribers when it lands so a synchronous re-render picks it up. */
+async function confirmTenantById(id) {
+  if (!id) return { state: "ghost" };
+  if (_confirmedById[id]) return _confirmedById[id];
+  // Directory page already proves it — no fetch needed.
+  if (_tenantDir.tenants.some((t) => t.tenant_id === id)) {
+    _confirmedById[id] = { state: "confirmed", name: tenantName(id) };
+    return _confirmedById[id];
+  }
+  try {
+    const res = await api("/v1/admin/tenants/" + encodeURIComponent(id), { admin: true });
+    _confirmedById[id] = { state: "confirmed", name: String((res && res.name) || "") };
+  } catch (e) {
+    const code = (String((e && e.message) || e).match(/HTTP (\d{3})/) || [])[1];
+    _confirmedById[id] = code === "404" ? { state: "ghost" }
+      : (code === "401" || code === "403") ? { state: "error", locked: true }
+      : { state: "error" };
+  }
+  _emitTenantDir();
+  return _confirmedById[id];
+}
+
 /* ---------------------------------------- v3 · working handle (per-session) */
 /* The session's working scope handle — held in sessionStorage ONLY (exactly
    like the admin token: this tab, cleared on close, never disk). Set only by
@@ -1989,6 +2022,7 @@ const Verity = {
   tenant, setTenant, onTenant, buildHash,
   // v3 · FTUE: tenant directory + create-space + working handle + sample label
   tenantDir, onTenantDir, refreshTenantDir, tenantName,
+  confirmTenantById, confirmedTenant,
   openCreateTenant, onTenantCreated,
   workingHandle, setWorkingHandle, onWorkingHandle,
   isSample, sampleBadge,

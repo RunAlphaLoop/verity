@@ -366,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
         .route("/v1/admin/reembed/cutover", post(admin_reembed_cutover))
         .route("/v1/admin/tenants", post(create_tenant).get(list_tenants))
+        .route("/v1/admin/tenants/{tenant_id}", get(get_tenant))
         .route(
             "/v1/admin/erasure/preview",
             post(compliance::admin_erasure_preview),
@@ -2086,6 +2087,36 @@ async fn create_tenant(
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({ "tenant_id": id })))
+}
+
+/// GET /v1/admin/tenants/{id} (admin, FTUE §2.1): confirm one tenant id names a
+/// REAL space. The picker/wizard call this when a pasted or deep-linked id is
+/// absent from the (possibly truncated) directory page — a `200` proves the
+/// space exists and is safe to adopt (returning its human name for the "loaded
+/// by id" label), a `404` is the definitive ghost-tenant hard stop. Gated
+/// exactly like the directory read.
+async fn get_tenant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<TenantId>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    match state
+        .storage
+        .get_tenant(tenant_id)
+        .await
+        .map_err(storage_status)?
+    {
+        Some(t) => Ok(Json(serde_json::json!({
+            "tenant_id": t.tenant_id,
+            "name": t.name,
+            "created_at": t.created_at,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "no tenant with that id on this server".into(),
+        )),
+    }
 }
 
 #[derive(Deserialize)]

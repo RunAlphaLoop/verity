@@ -300,9 +300,10 @@
       '<div class="card">' +
         '<h2>Export instead of erasing <span class="sub">GET /v1/admin/dsar/export · the export self-audits</span></h2>' +
         '<div class="note">One JSON bundle of what is on record about the <b>person</b> — their conversations / events, ' +
-          "the search snippets made from them, their actions, access-log rows, and proposed lessons — for a data-subject " +
-          "access request. <b>Profile facts are not included in this build’s export</b> — erase covers them, export does " +
-          "not (yet). The export writes its own row in the access log, so this read is itself on the record.</div>" +
+          "the search snippets made from them, the profile facts derived from those events, their actions, access-log rows, " +
+          "and proposed lessons — for a data-subject access request. The export runs under admin authority, so it includes " +
+          "every profile fact attributable to the person regardless of who could normally see it. The export writes its own " +
+          "row in the access log, so this read is itself on the record.</div>" +
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight"><button id="er-dsar">Export what is on record about this person</button></div>' +
           '<span class="asof" id="er-dsar-stamp"></span>' +

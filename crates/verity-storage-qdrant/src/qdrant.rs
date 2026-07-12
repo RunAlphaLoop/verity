@@ -549,6 +549,10 @@ impl StorageAdapter for QdrantAdapter {
         self.inner.count_tenants().await
     }
 
+    async fn get_tenant(&self, tenant: TenantId) -> Result<Option<TenantRow>> {
+        self.inner.get_tenant(tenant).await
+    }
+
     async fn append_episode(&self, episode: NewEpisode) -> Result<EpisodeId> {
         self.inner.append_episode(episode).await
     }
