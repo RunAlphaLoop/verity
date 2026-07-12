@@ -343,3 +343,115 @@ One real playground ask per build (single shot, demo tenant): `storage_ms` 53.3m
    HTTP) on a dirty shared dev DB under load — it is *outside the benchmark's stated
    conditions*, which is exactly why the trace shows it. A clean-box re-run of the
    HTTP-path number belongs here before any end-to-end API latency claim ships.
+
+## 2026-07-12 (follow-up) — bisecting the ~40–43ms exact-scan figure: it was state, not SQL
+
+Hunt for a *standing* regression in the isolated dense exact-scan leg after the GIN was
+reindexed and the dev DB cleaned to 18 tenants. Method: direct psql `\timing` + `EXPLAIN
+(ANALYZE, BUFFERS)` against bench tenant `019f496a…` (1,000,005 chunks), token 2 = 10,028
+in-scope rows (~1%), k=10, real bench embedding, single persistent connection (warm shared
+buffers), exact-scan branch reconstructed as `BEGIN; SET LOCAL enable_indexscan=off; …`.
+No Rust build (disk tight, protected servers 7717/7718 up — psql isolation is the honest
+measure). Suspects bisected, not assumed:
+
+- **S1 route probe (31785b2 + a529fe1) — measured, NOT the delta.** The router added two
+  per-call round-trips vs the July-9 single-query path: the `embedding_route` settings
+  SELECT and the `EXPLAIN (FORMAT JSON)` selectivity probe. Timed warm, N=40 each:
+  settings SELECT **0.21ms p50 / 0.27ms p95**, EXPLAIN probe **0.23ms p50 / 0.32ms p95** —
+  combined **~0.45ms p50 / ~0.6ms p95**. Real, and cacheable (route + settings change
+  rarely), but <1ms — cannot account for a ~25–30ms delta.
+- **S2 dual-vector table shape — measured, NOT the delta.** The embedding migration added
+  `embedding_v2` (hnsw idx 88 kB) + `embedding_v2_model` and a partial `…v2_missing_idx`.
+  Both new columns are **100% NULL** (v2 route not cut over): `pg_stats` avg_width = 0 for
+  each, `pg_column_size` empty — they cost one null-bitmap bit, ~zero heap width. Heap is
+  1998 MB / 1.0M rows, **3.9 tuples/page**, the 384-d `embedding` is **1544 B inline** (not
+  toasted; toast rel is 624 kB total). That inline vector already dominated the row on
+  July-9; the second HNSW index is 88 kB and off the exact-scan path. No heap widening.
+- **S3 plan shape — measured, healthy, unchanged.** Warm `EXPLAIN (ANALYZE, BUFFERS)`:
+  Execution **17.5–18.0 ms**, all buffers `shared hit` (0 reads). Bitmap Index Scan on
+  `chunks_visibility_idx` = 0.98 ms / 7 buffers, returns **10,032 rows** (pollution gone;
+  was 18,565). Bitmap Heap Scan = 1.4→16 ms fetching **9,887 exact heap blocks** (~1 page
+  per scattered match) + 10,028 cosine distances; top-N heapsort ~2 ms. Component split
+  (warm, first cold run discarded): heap-fetch-only `count(*)` ≈ **6–8 ms**, add distance +
+  sort ≈ **9.5–12 ms** → distance math adds only ~3–4 ms; heap-page fetch dominates. Row
+  estimate 10,435 vs actual 10,028 (ANALYZE fresh). Same five predicates, same one scan
+  node, no double-distance, no bloat vs the July-9 exact-scan curve.
+
+**Isolated warm exact-scan, current clean box:** Run A (35 warm, one fixed embedding)
+p50 **13.52** / p95 **17.92** / p99 29.13 ms; Run B (37 warm, a different real embedding
+per run) p50 **10.68** / p95 **15.69** / p99 16.51 ms. **This is the July-09 baseline
+(11–15 ms p50), not 40–43 ms.** A single cold-ish `EXPLAIN ANALYZE` still reads ~23 ms
+(colder buffers) — that residual is cache warmth + box load, not plan structure.
+
+**Root cause of the ~40–43 ms in the 07-12 entry:** the two transient conditions that entry
+itself named — cross-tenant `visibility` GIN pollution (18,565 bitmap rows → extra heap
+pages) and a box compiling in parallel. Both are gone: GIN reindexed (10,032 rows for token
+2 across *all* tenants), no cargo/rustc running, load avg ~1.3. **There is no standing
+SQL/plan/schema regression in the exact-scan leg.** Attribution to the ~25–30 ms delta:
+GIN pollution + parallel-build contention ≈ ~25–29 ms (transient, now cleared); route probe
+~0.45 ms (real, cacheable, negligible); dual-vector heap width ~0 ms. **Low-risk fix
+available but not required for correctness:** memoize the per-tenant `embedding_route` (and
+optionally the selectivity decision) so the two extra round-trips drop off the warm p50 —
+saves ~0.45 ms, worth doing for span hygiene, does not recover a regression because there
+isn't one. No code change made to the recall path.
+
+## 2026-07-12 (resolution) — "seems slower?" answered; route lookup memoized off the warm read path
+
+Independent re-verification of the follow-up bisection, then applied the one low-risk fix
+it identified. Same method: direct psql `\timing` + `EXPLAIN (ANALYZE, BUFFERS)` against
+bench tenant `019f496a-c5aa-7073-bc00-64c887084b42` (1,000,005 chunks), token 2 = **10,032**
+in-scope rows (~1%), k=10, real bench embedding, single persistent connection (warm shared
+buffers), exact-scan branch as `SET enable_indexscan=off`. Box quiet (load ~1.3, 0
+cargo/rustc, 12 GB free); `settings` table empty so every tenant resolves to the fail-safe
+`V1` route; `embedding_v2` 0 / 1,000,005 non-null (null_frac=1, avg_width=0).
+
+**The direct answer to "the recall benchmark seems slower":**
+
+- **Was it real?** Yes — the 07-12 entry recorded the isolated dense exact-scan leg at
+  ~40–43 ms warm vs 11–15 ms on 07-09, a genuine ~3x, *separate* from the visibility-GIN
+  pollution that was already cleared (which fixed total recall p50 84→37 ms).
+- **What caused it?** Two **transient** conditions, both named in that entry and both now
+  gone — NOT a standing SQL/schema/plan regression. (1) Cross-tenant `visibility` GIN
+  pollution: 18,565 bitmap rows for token 2 across ~100 test tenants → extra scattered
+  heap-page fetches; reindexed + DB cleaned to 18 tenants, now **10,032** rows. (2) The box
+  compiling HNSW indexes in parallel (buffer/CPU contention). Together ≈ 25–29 ms.
+- **Is it fixed?** Yes — the transient conditions are cleared and the leg is back at the
+  July-9 baseline. Re-measured warm this session: exact-scan leg **p50 7.9 ms / p95
+  14.9 ms** (N=40; a second N=40 run 8.3 / 16.3 ms). `EXPLAIN (ANALYZE, BUFFERS)` warm:
+  Execution **16.16 ms**, all buffers `shared hit=9894` (0 reads), Bitmap Index Scan on
+  `chunks_visibility_idx` 10,032 rows / 7 buffers, Bitmap Heap Scan 9,887 exact heap blocks,
+  top-N heapsort 25 kB — same one scan node, same five predicates, no bloat.
+
+**The one standing (code-level) contributor, now fixed.** The selectivity router (31785b2 +
+a529fe1) added two per-call round-trips to the July-9 single-query dense path: an
+`embedding_route` `settings` SELECT and an `EXPLAIN (FORMAT JSON)` selectivity probe. Timed
+warm this session, N=40: settings SELECT **0.17–0.22 ms p50 / 0.23–0.36 ms p95**; EXPLAIN
+probe **0.37 ms p50 / 0.82 ms p95**. Combined ≈ **0.6 ms p50** — real, but <2% of the delta
+above, never the regression. Of the two, the EXPLAIN probe is genuinely per-query (its
+row-estimate depends on the caller's scope) and stays; the `settings` SELECT resolves a
+per-tenant value that changes only on a cutover, yet was re-queried on **every** dense recall.
+
+**Fix (postgres.rs, recall path only):** memoize `embedding_route` in a bounded
+`moka::sync::Cache<TenantId, EmbeddingRoute>` (same pattern as the existing per-tenant DEK
+cache), populated on MISS with the resolved route — including the fail-safe `V1` default —
+and flushed wholesale in `set_embedding_route` (a GLOBAL/NULL-tenant write changes the route
+for every tenant lacking an own row, so invalidate-all is the correct, cheap move for a rare
+cutover; same rationale as `CachedAdapter::flush_facts`).
+
+- **Before/after (warm dense recall, per tenant after the first call):** the settings SELECT
+  round-trip — **0.17–0.22 ms p50 / 0.23–0.36 ms p95** — drops to an in-process moka hit
+  (sub-µs). Net: ~0.2 ms p50 / ~0.3 ms p95 off the warm dense leg; the EXPLAIN probe
+  (~0.37 ms p50) is unchanged. Span hygiene, not a regression recovery — there is no
+  regression to recover.
+- **Correctness:** unchanged. The cached value is exactly what the SELECT would have
+  resolved (tenant row wins over global, `V1` when absent). `cargo fmt` clean; `cargo clippy
+  -p verity-storage -- -D warnings` clean; `scope_fuzz` **20,292 probes across recall(bm25),
+  recall(hybrid), activity, brief, current_fact, fact_as_of, merged_record — no leaks**; all
+  3 `embedding_migration` tests pass, incl. `cutover_routes_dense_recall_to_v2` and
+  `dual_vectors_coexist`, which do `set_embedding_route → recall` on one adapter and would
+  fail on a stale cache. The scope filter is untouched; the fuzzer stays green.
+
+**Not done (out of scope / needs more than a recall-path edit):** the unused
+`chunks_embedding_v2_missing_idx` (7 MB partial btree) and the 88 kB `chunks_embedding_v2_idx`
+are off the exact-scan path and cost ~0 ms on reads; dropping/keeping them is a migration
+decision for the v2 cutover, not a latency fix. No migration, no schema change made.

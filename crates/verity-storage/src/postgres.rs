@@ -235,6 +235,14 @@ pub struct PostgresAdapter {
     /// Unwrapped per-tenant DEKs, cached after first use (bounded; the DEK is
     /// 32 bytes and provisioning is one row per tenant, ever).
     deks: moka::sync::Cache<TenantId, [u8; crate::crypto::DEK_BYTES]>,
+    /// Per-tenant embedding-route decisions, cached so the dense read path
+    /// (`recall_dense`) does not re-`SELECT` the `settings` row on every call.
+    /// The route changes only on a rare cutover event (`set_embedding_route`),
+    /// which flushes this cache; a warm dense recall spends ~0.2ms on this
+    /// lookup otherwise (docs/BENCHMARKS.md 2026-07-12). A cache MISS resolves
+    /// the tenant vs global (NULL-tenant) default from `settings` exactly as
+    /// before, so the fail-safe default (`V1`) is unchanged.
+    routes: moka::sync::Cache<TenantId, EmbeddingRoute>,
 }
 
 impl PostgresAdapter {
@@ -256,6 +264,7 @@ impl PostgresAdapter {
             pool,
             kek,
             deks: moka::sync::Cache::new(10_000),
+            routes: moka::sync::Cache::new(10_000),
         })
     }
 
@@ -3734,6 +3743,15 @@ impl StorageAdapter for PostgresAdapter {
     }
 
     async fn embedding_route(&self, tenant: TenantId) -> Result<EmbeddingRoute> {
+        // Read-path hot cache: the route is effectively static (changes only on
+        // a cutover, which flushes this cache in `set_embedding_route`), so the
+        // dense leg reads it from memory instead of re-querying `settings` on
+        // every recall. The resolved value — including the fail-safe `V1`
+        // default when no row exists — is what gets cached, so a repeat call
+        // returns the identical decision the SELECT would have.
+        if let Some(route) = self.routes.get(&tenant) {
+            return Ok(route);
+        }
         // Per-tenant row wins over the global (NULL-tenant) default.
         let value: Option<String> = sqlx::query_scalar(
             "SELECT value FROM settings
@@ -3746,9 +3764,11 @@ impl StorageAdapter for PostgresAdapter {
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(value
+        let route = value
             .map(|v| EmbeddingRoute::from_str_lossy(&v))
-            .unwrap_or(EmbeddingRoute::V1))
+            .unwrap_or(EmbeddingRoute::V1);
+        self.routes.insert(tenant, route);
+        Ok(route)
     }
 
     async fn set_embedding_route(
@@ -3769,6 +3789,12 @@ impl StorageAdapter for PostgresAdapter {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        // Flush the whole route cache, not just this key: a GLOBAL
+        // (NULL-tenant) write changes the resolved route for every tenant that
+        // lacks a per-tenant row, and those are cached under their own keys.
+        // Cutovers are rare, the cache is tiny, and correctness beats
+        // bookkeeping — the same rationale as `CachedAdapter::flush_facts`.
+        self.routes.invalidate_all();
         Ok(())
     }
 }
