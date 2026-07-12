@@ -138,9 +138,9 @@
         // ---- 4. why filtered? (admin, audited, off the read path) ------
         '<div class="card">' +
           '<h2>Why were things held back? <span class="sub">POST /v1/admin/debug/recall &middot; admin bearer &middot; audited &middot; OFF the read path</span></h2>' +
-          '<div class="note">Asks the server to re-check every near-miss for the search text above and say, per item, exactly why it was returned or held back &mdash; with the people and groups who <em>can</em> see each item <b>named</b>. Needs the admin token (session bar) and a live handle; every run is written to the audit log (verb <code>debug_recall</code>). It explains the index as of <b>now</b>, never a past read. No LLM, no live permission-graph call &mdash; restricted-class rechecks are flagged, not run.</div>' +
+          '<div class="note">Asks the server to re-check the top candidates for the search text above and say, per item, exactly why it was returned or held back &mdash; with the people and groups who <em>can</em> see each item <b>named</b>. Needs the admin token (session bar) and a live handle; every run is written to the audit log (verb <code>debug_recall</code>). It explains the index as of <b>now</b>, never a past read. No LLM, no live permission-graph call &mdash; restricted-class rechecks are flagged, not run.</div>' +
           '<div class="row" style="margin-top:8px">' +
-            '<div class="tight" style="width:110px"><label for="sc-why-n" title="how many top-N tenant-only candidates to trace (server clamps 1..500)">near-misses</label><input type="number" id="sc-why-n" value="50" min="1" max="500" style="width:110px"></div>' +
+            '<div class="tight" style="width:110px"><label for="sc-why-n" title="how many top-N tenant-only candidates to trace (server clamps 1..500)">candidates to check</label><input type="number" id="sc-why-n" value="50" min="1" max="500" style="width:110px"></div>' +
             '<div class="tight"><button id="sc-why">Explain the filtering</button></div>' +
             '<span class="asof" id="sc-dir-note"></span>' +
           '</div>' +
@@ -159,7 +159,7 @@
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
         '<div class="et-title">No handle to inspect yet</div>' +
-        '<div class="et-body">A scope handle is the signed key an agent reads with — it names who the agent reads as, which entities it is limited to, and its confidentiality ceiling. Mint one from the button in the top bar (or right here), or copy the <span class="ref">vs_&hellip;</span> string printed by <span class="ref">verity-cli dev</span>, then paste it above.</div>' +
+        '<div class="et-body">A scope handle is the signed pass an agent reads with — it names who the agent reads as, which entities it is limited to, and its confidentiality ceiling. Mint one from the button in the top bar (or right here), or copy the <span class="ref">vs_&hellip;</span> string printed by <span class="ref">verity-cli dev</span>, then paste it above.</div>' +
         '<div class="et-actions"><button class="primary" id="sc-teach-mint">Mint a scope handle</button></div>' +
       '</div>';
     var b = el("sc-teach-mint");
@@ -271,7 +271,7 @@
         ' <span class="asof">nothing classified above this will ever be returned — no query can raise it</span>') +
       kvRow("Expires", expiresHtml(p)) +
       (p.actor_sub || p.actor_azp
-        ? kvRow("Minted for", esc((p.actor_sub || "—") + " · " + (p.actor_azp || "—")))
+        ? kvRow("Minted for", actorPairHtml(p.actor_sub, p.actor_azp))
         : "");
     el("sc-claims").innerHTML =
       '<div style="margin-top:10px">' + (expired
@@ -289,6 +289,15 @@
   }
 
   function kvRow(dt, ddHtml) { return "<dt>" + esc(dt) + "</dt><dd>" + ddHtml + "</dd>"; }
+
+  // actor_sub = the person, actor_azp = the app that made the request.
+  // Both halves labeled — a bare "— · audit" reads as noise (LAW: every
+  // value says what it is).
+  function actorPairHtml(sub, azp) {
+    var who = sub ? "<b>" + esc(sub) + "</b>" : '<span style="color:var(--dim)">no person recorded</span>';
+    var app = azp ? "requested by app: " + esc(azp) : '<span style="color:var(--dim)">no app recorded</span>';
+    return who + " · " + app;
+  }
 
   // Names first; tokens as mono-small secondaries. Fail-closed empty set is
   // said out loud. Email-string principals keep the trust-downgrade flag.
@@ -355,10 +364,27 @@
     if (typeof t === "string") return t;
     return (S.dir.map && S.dir.map[t]) || null;
   }
-  // One principal token as a humane chip: name first, #token mono-small.
+  // Directory strings are wire-form ("group:admin") — for prose, use the bare
+  // human name ("admin"); the kind/token stay in chips and the wire block.
+  function tokHumanName(t) {
+    var n = tokName(t);
+    if (!n) return null;
+    var i = String(n).indexOf(":");
+    return i > 0 ? n.slice(i + 1) : n;
+  }
+  // One principal token as a humane chip: name first, kind + #token dimmed —
+  // matches People & groups (bold "admin", secondary "group · #2"). The raw
+  // wire string stays in the wire-form details block only.
   function tokChip(t) {
     var n = tokName(t);
-    if (n) return V.entityChip(n, "#" + t);
+    if (n) {
+      var i = String(n).indexOf(":");
+      if (i > 0) {
+        var kind = n.slice(0, i);
+        return V.entityChip(n.slice(i + 1), (kind === "user" ? "person" : kind) + " · #" + t);
+      }
+      return V.entityChip(n, "#" + t);
+    }
     return '<span class="entity-chip"><b>token #' + esc(t) + '</b><span class="src">name unknown</span></span>';
   }
   function tokChips(list) {
@@ -434,7 +460,9 @@
       if (hits && hits.length) {
         el("sc-recall-out").innerHTML =
           '<div class="note" style="margin-top:8px"><b>' + hits.length + "</b> result" + (hits.length === 1 ? "" : "s") +
-          " came back through this handle:</div>" +
+          " came back through this handle. All results are at or below this handle&rsquo;s ceiling (" +
+          V.confBadge(S.claims ? S.claims.max_confidentiality : null) +
+          ') <span class="asof">— per-item classification is not returned on the read path</span>.</div>' +
           hits.map(function (h, idx) { return hitCard(h, idx + 1); }).join("");
         renderTrace(hits);
       } else {
@@ -468,7 +496,9 @@
     var support = h.support_tier
       ? ' <span class="badge b-kind" title="bucketed cross-customer support — never an exact count (provenance firewall)">support: ' + esc(h.support_tier) + "</span>"
       : "";
-    var ceil = S.claims ? S.claims.max_confidentiality : 1;
+    // NO per-item confidentiality chip: the wire does not return one, and the
+    // handle's ceiling is a bound, not the item's classification. The ceiling
+    // is stated once above the results list instead.
     return (
       '<div class="hit">' +
         '<div class="content" style="margin-top:0">' + esc(h.content) + "</div>" +
@@ -476,7 +506,6 @@
           '<span class="badge b-kind" title="result rank (raw score in the line below)">#' + rank + "</span> " +
           V.kindBadge(h.kind || "content") +
           V.provenanceBadge(h.acl_provenance) +
-          V.confBadge(ceil) +
           V.trustBadge(h.trust_tier) +
           V.tagDerivationBadge(derivation) +
           support +
@@ -628,8 +657,8 @@
     var sc = res.scope || {};
 
     var head =
-      '<div class="note" style="margin-top:8px">Checked <b>' + esc(res.query.candidates_traced) +
-        "</b> near-miss" + (res.query.candidates_traced === 1 ? "" : "es") + " for this search: <b>" + admitted +
+      '<div class="note" style="margin-top:8px">Checked the top <b>' + esc(res.query.candidates_traced) +
+        "</b> candidate" + (res.query.candidates_traced === 1 ? "" : "s") + " for this search: <b>" + admitted +
         "</b> would be returned, <b>" + (cands.length - admitted) + "</b> held back.</div>" +
       '<dl class="kv" style="margin-top:8px">' +
         "<dt>This handle carries</dt><dd>" + tokChips(sc.principals_effective) +
@@ -667,7 +696,8 @@
       "</div>" + cards;
   }
 
-  // One near-miss: plain verdict + plain reasons; who-can-see-it NAMED via
+  // One traced candidate ("near-miss" is reserved for held-back rows only):
+  // plain verdict + plain reasons; who-can-see-it NAMED via
   // visibility_tokens; wire tokens live only in the meta line + tooltips.
   function whyCard(c, sc) {
     var verdict = c.admitted
@@ -690,9 +720,9 @@
       var mine = (sc && sc.principals_effective) || [];
       instruction =
         '<div class="dc-evidence" style="margin-top:6px"><b>Why:</b> it is visible to ' +
-        visTokens.map(function (t) { var n = tokName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") +
+        visTokens.map(function (t) { var n = tokHumanName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") +
         "; this handle carries " +
-        (mine.length ? mine.map(function (t) { var n = tokName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") : "<b>no one</b>") +
+        (mine.length ? mine.map(function (t) { var n = tokHumanName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") : "<b>no one</b>") +
         " — no overlap. To see it, the reader needs one of those groups/people on its handle (granted at mint, never here).</div>";
     }
 
@@ -754,7 +784,10 @@
         " generated " + esc(V.fmtTime(b && b.generated_at)) +
         (b && b.last_synced_at ? " · last synced " + esc(V.fmtTime(b.last_synced_at)) : "") +
         " · " + mem.length + " memory item" + (mem.length === 1 ? "" : "s") +
-        " · " + act.length + " action" + (act.length === 1 ? "" : "s") + "</div>" +
+        " · " + act.length + " action" + (act.length === 1 ? "" : "s") +
+        (mem.length
+          ? " · all at or below this handle&rsquo;s ceiling (" + V.confBadge(S.claims ? S.claims.max_confidentiality : null) + ")"
+          : "") + "</div>" +
         mem.map(function (h, i) { return hitCard(h, i + 1); }).join("") +
         actionRows(act) +
         (mem.length || act.length ? "" :
@@ -788,7 +821,7 @@
       "</tr></thead><tbody>" +
       actions.map(function (a) {
         return "<tr><td>" + esc(V.fmtTime(a.occurred_at)) + "</td><td>" + esc(a.action_type) +
-          "</td><td>" + esc((a.actor_sub || "—") + " · " + (a.actor_azp || "—")) +
+          "</td><td>" + actorPairHtml(a.actor_sub, a.actor_azp) +
           "</td><td>" + esc(a.outcome) +
           "</td><td>" + esc(a.summary) +
           "</td><td>" + V.entityBadges(a.entities) +

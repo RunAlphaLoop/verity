@@ -16,8 +16,9 @@
        • the tenant field is PICKER-FIRST (FTUE §1): #tenantPick lists spaces
          by name from Verity.tenantDir() (GET /v1/admin/tenants, server truth
          on every load); #tenantInput remains the paste fallback for locked /
-         legacy servers; #tenantGhost is the red never-all-clear banner for a
-         uuid the server never birthed. #adminToken stays sessionStorage-ONLY
+         legacy servers; #tenantGhost is red ONLY for a uuid the server
+         confirmably never birthed (complete directory page) — a truncated
+         page renders a neutral dim note instead. #adminToken stays sessionStorage-ONLY
          (never disk); the tenant id is remembered in localStorage (not a
          secret) so returning operators land on live data, not a Load button.
        • #mintBtn opens the global mint dialog (Verity.openMint) — the
@@ -32,7 +33,7 @@
   <div id="topbar">
     <div class="brand"><span class="v">verity</span> console</div>
     <div class="spacer"></div>
-    <button class="primary" id="mintBtn" title="POST /v1/scopes — mint a signed scope handle for probing or agents. Nothing here widens access; empty inputs mint a handle that sees nothing.">+ Mint scope handle</button>
+    <button class="primary" id="mintBtn" title="Create a signed pass that decides exactly what a reader can see (a scope handle) — for testing recalls or handing to an agent. Empty inputs make a pass that sees nothing; nothing here widens access. (POST /v1/scopes)">+ Mint a scope handle</button>
     <div id="sessionBadge" class="session-badge">
       <span class="chip" id="adminChip" title="admin bearer token — held in sessionStorage for this tab only, never written to disk">admin: <b id="adminState">dev-mode (unset)</b></span>
     </div>
@@ -47,13 +48,15 @@
          401       → prod admin plane locked: paste stays for operators
          404/405   → old server: today's paste behavior unchanged
        A remembered/deep-linked uuid NOT in the list shows the red ghost
-       banner below — never a green all-clear. -->
+       banner below ONLY when the directory page is complete (non-existence
+       is provable); a truncated page gets a neutral dim note — never a
+       green all-clear, never a false "doesn't exist". -->
   <div id="sessionbar">
     <span class="sess-field" id="tenantField">
-      <label for="tenantInput">tenant</label>
+      <label for="tenantInput" title="a space = one tenant: the company that owns this memory. Self-hosting means exactly one — yours; your customers live inside it as entities.">space</label>
       <select id="tenantPick" class="field" style="display:none;width:220px;padding:3px 6px;font-size:var(--fs-sm)" title="the tenant is the company that owns this memory space — that's you; your customers live inside it as entities"></select>
       <input type="text" id="tenantInput" placeholder="paste a tenant id — every screen loads itself once this is set" spellcheck="false" title="the active tenant_id — auto-filled from a decoded handle or a mint; remembered in this browser (it is an id, not a secret)">
-      <span class="ref" id="tenantIdLabel" title="the space's raw id — shown for copy/paste, never something you have to type"></span>
+      <span class="ref" id="tenantIdLabel" title="tenant id — the space's raw id, shown for copy/paste, never something you have to type"></span>
       <button id="tenantSetup" style="display:none;padding:3px 10px;font-size:var(--fs-sm)">Set up Verity</button>
     </span>
     <span class="sess-field">
@@ -82,11 +85,11 @@
       <div class="navitem" data-nav="memories">Memories</div>
       <div class="navitem" data-nav="scope">Scope Inspector</div>
       <div class="navitem" data-nav="audit">Access audit</div>
-      <div class="navitem" data-nav="erasure">Erasure &amp; DSAR</div>
+      <div class="navitem" data-nav="erasure">Erasure &amp; data export</div>
 
       <div class="group-label">Operate</div>
       <div class="navitem" data-nav="sources">Sources &amp; freshness</div>
-      <div class="navitem" data-nav="migrations">Migrations</div>
+      <div class="navitem" data-nav="migrations">Search index upgrade</div>
       <div class="navitem" data-nav="principals">People &amp; groups</div>
     </nav>
 
@@ -196,10 +199,21 @@
       if (tenantInput && tenantInput.value !== t && !pasteMode) tenantInput.value = t;
 
       var ghostMsg = "";
+      var ghostTone = "err"; // "err" = confirmed non-existence · "dim" = neutral note
       if (dir.status === "ok") {
         var inList = !!t && dir.tenants.some(function (x) { return x.tenant_id === t; });
+        // The directory page is TRUNCATED on big servers (newest 500 of
+        // dir.total) — absence from the page proves nothing. Assert
+        // non-existence ONLY when the page holds every space.
+        var truncated = dir.total > dir.tenants.length;
         if (t && !inList) {
-          ghostMsg = "This tenant doesn’t exist on this server. Pick a real one, or set one up.";
+          if (truncated) {
+            ghostTone = "dim";
+            ghostMsg = "This space isn’t in the newest " + dir.tenants.length +
+              " the picker lists (this server has " + dir.total + " spaces) — loaded by its id.";
+          } else {
+            ghostMsg = "This space doesn’t exist on this server. Pick a real one, or set one up.";
+          }
         }
         if (!dir.tenants.length) {
           // State A — virgin server: nothing to pick, nothing to paste.
@@ -221,7 +235,7 @@
             // selected space that renders as "— pick a space —" reads as
             // "creation failed" (founder report, 2026-07-12).
             if (t && !inList) {
-              opts += '<option value="' + Verity.esc(t) + '">(current space) ' + Verity.esc(shortId(t)) + "</option>";
+              opts += '<option value="' + Verity.esc(t) + '">(current space — loaded by id) ' + Verity.esc(shortId(t)) + "</option>";
             }
             if (dir.total > dir.tenants.length) {
               opts += '<option value="" disabled>… showing newest ' + dir.tenants.length + " of " + dir.total + "</option>";
@@ -265,8 +279,10 @@
       }
 
       if (tenantGhost) {
-        if (ghostMsg) { tenantGhost.textContent = ghostMsg; tenantGhost.classList.add("on"); }
-        else { tenantGhost.textContent = ""; tenantGhost.classList.remove("on"); }
+        tenantGhost.textContent = ghostMsg;
+        // "err on" = red confirmed non-existence; "asof" = the neutral dim
+        // truncated-directory note (not an error — the space is real).
+        tenantGhost.className = ghostMsg ? (ghostTone === "err" ? "err on" : "asof") : "err";
       }
     }
 

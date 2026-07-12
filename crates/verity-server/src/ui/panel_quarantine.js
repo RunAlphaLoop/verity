@@ -46,6 +46,10 @@
     if (!head) return "(no reason recorded)";
     if (head.indexOf("unmapped acl") >= 0 || head.indexOf("unmappable acl") >= 0) return "unmapped ACL";
     if (head.indexOf("unrecognized shape") >= 0 || head.indexOf("unknown shape") >= 0) return "unrecognized shape";
+    // "payload carries neither content/observation nor facts" is the same
+    // no-recognizable-text refusal — bucket it with the clear group, not the
+    // vague default.
+    if (head.indexOf("neither content") >= 0 || head.indexOf("carries neither") >= 0) return "unrecognized shape";
     if (head.indexOf("invalid json") >= 0) return "invalid JSON";
     if (head.indexOf("draft manifest") >= 0 || head.indexOf("manifest") >= 0) return "draft manifest";
     return head;
@@ -93,6 +97,15 @@
     if (!v) return null;
     var t = new Date(v).getTime();
     return isNaN(t) ? null : t;
+  }
+  // A bare webhook uuid overwhelms the card: show first8…last4, keep the
+  // full id in the tooltip (and verbatim in the JSON export).
+  function webhookRef(id) {
+    if (!id) return V.refSpan("(unknown)");
+    var s = String(id);
+    if (s.length <= 14) return V.refSpan(s);
+    return '<span class="ref" title="' + V.esc(s) + '">' +
+      V.esc(s.slice(0, 8)) + '&hellip;' + V.esc(s.slice(-4)) + '</span>';
   }
   function download(name, mime, text) {
     var blob = new Blob([text], { type: mime });
@@ -175,8 +188,9 @@
             '<input type="text" id="q-f-from" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
           '<div class="tight"><label for="q-f-to">to</label>' +
             '<input type="text" id="q-f-to" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
-          '<div class="tight"><label for="q-limit" title="rows fetched (server clamps 1-500) — changing it refetches">window</label>' +
-            '<input type="number" id="q-limit" value="100" min="1" max="500" style="width:90px"></div>' +
+          '<div class="tight"><label for="q-limit" title="rows fetched (server clamps 1-500) — changing it refetches">load newest</label>' +
+            '<input type="number" id="q-limit" value="100" min="1" max="500" style="width:90px"> ' +
+            '<span class="refreshed">items</span></div>' +
         '</div>' +
 
         '<div class="err" id="q-err"></div>' +
@@ -343,7 +357,7 @@
       BY_ID = {};
       LAST.forEach(function (r) { BY_ID[r.id] = r; });
       el("q-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8) +
-        " · window " + LAST.length + " item" + (LAST.length === 1 ? "" : "s");
+        " · showing the newest " + LAST.length + " item" + (LAST.length === 1 ? "" : "s");
       refreshGroupOptions();
       renderCards();
     } catch (e) {
@@ -431,8 +445,9 @@
         '<span class="asof" title="' + V.esc(V.fmtTime(r.at)) + '">refused ' + V.esc(V.timeAgo(r.at)) + '</span>' +
       '</div>' +
       '<div class="dc-question">Verity refused to index this &mdash; ' + V.esc(groupPlain(g)) + '.</div>' +
-      '<div class="dc-src" style="color:var(--dim);font-size:var(--fs-sm)">delivered by webhook ' +
-        V.refSpan(r.webhook_id || "(unknown)") + '</div>' +
+      '<div class="dc-src" style="color:var(--dim);font-size:var(--fs-sm)">delivered through connected-source inbox ' +
+        webhookRef(r.webhook_id) + ' <span class="refreshed">(a webhook URL minted on Sources &amp; freshness ' +
+        '&mdash; the server can&rsquo;t list webhook names yet, so only the id is shown)</span></div>' +
       '<div class="dc-evidence"><b>Why this is safe:</b> because the permissions could not be verified, ' +
         'this payload <b>never entered the index</b> — no search, brief, or agent can see it. ' +
         'Refusing was the correct answer, not an error. ' + V.esc(groupFix(g)) + '</div>' +
@@ -556,7 +571,7 @@
         allowNew: true,
         emptyBehavior: "teach",
         placeholder: "account:acme",
-        explainer: "these tag the record — they decide which entity views can retrieve it. They do not limit a scope.",
+        explainer: "Optional labels saying who or what this record is ABOUT (e.g. account:acme), so entity pages and entity-filtered searches can find it. They do not change who is allowed to see it — only the permissions above do that.",
         tenantId: function () { return tenantNow || V.tenant(); },
       });
     } else {

@@ -112,10 +112,19 @@
     /* --- item 1 · space created ------------------------------------- */
     var i1 = { n: 1, id: "space", title: "Space created", done: false, evidence: "", needsAdmin: false };
     if (dir.status === "ok") {
-      i1.done = inList;
-      i1.evidence = inList ? "“" + (name || "(unnamed)") + "” exists on this server"
-        : (tenant ? "this tenant id is NOT on this server — a ghost, never all-clear" : "no space yet");
-      i1.ghost = !!tenant && !inList;
+      /* A TRUNCATED directory page is not evidence of a ghost: only assert
+         non-existence when the page is complete. An absent-but-real space is
+         confirmed by its own data (a ghost's probes come back as clean zeros). */
+      var dirTotal = typeof dir.total === "number" ? dir.total : dir.tenants.length;
+      var pageComplete = dirTotal <= dir.tenants.length;
+      var hasData = principals.length > 0 || knCount > 0 || quCount > 0 || frCount > 0 || auditRows.length > 0;
+      i1.done = inList || (!!tenant && !pageComplete && hasData);
+      if (inList) i1.evidence = "“" + (name || "(unnamed)") + "” exists on this server";
+      else if (!tenant) i1.evidence = "no space yet";
+      else if (pageComplete) i1.evidence = "this tenant id is NOT on this server — showing it as set up would be a lie, so it stays red";
+      else if (hasData) i1.evidence = "answers with data on this server — older than the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + "), loaded by id";
+      else i1.evidence = "not in the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + ") — existence can't be confirmed from this page";
+      i1.ghost = !!tenant && !inList && pageComplete;
     } else if (dir.status === "locked") {
       i1.needsAdmin = true;
       i1.evidence = "needs the admin token to verify against GET /v1/admin/tenants";
@@ -156,9 +165,9 @@
 
     /* --- item 4 · memory in ------------------------------------------- */
     var memBits = [];
-    if (frCount) memBits.push(frCount + " source" + (frCount === 1 ? "" : "s") + " measured ingest→queryable (24 h window)");
+    if (frCount) memBits.push(frCount + " source" + (frCount === 1 ? "" : "s") + " delivered memory in the last 24 h");
     if (knCount) memBits.push(knCount + " knowledge item" + (knCount === 1 ? "" : "s"));
-    if (quCount) memBits.push(quCount + " quarantined — that counts: it means the gate works");
+    if (quCount) memBits.push(quCount + " item" + (quCount === 1 ? "" : "s") + " held in quarantine — held on purpose (its permissions couldn’t be mapped), which still proves memory is flowing in");
     var anyMemProbe = kn.ok || qu.ok || fr.ok;
     var i4 = {
       n: 4, id: "memory", title: "Memory in", done: memBits.length > 0,
@@ -197,7 +206,7 @@
         (au.ok ? "has no matching rows yet" : "unavailable") + ")";
     } else {
       i6.needsAdmin = !au.ok && au.needsAdmin;
-      i6.evidence = "no keyless session has been proven blind yet — run the proof step";
+      i6.evidence = "no blind session (a key on no memory’s sharing list) has been proven to see nothing yet — run the proof step";
     }
 
     /* --- optional · benchmark: honestly empty until run ---------------- */
@@ -396,7 +405,7 @@
             (info.dir.status === "ok" && !virgin ? '<button id="wz-have-id">I already have a tenant id</button>' : "") +
           "</div>" +
           '<div id="wz-have-id-row" style="display:none;margin-top:10px;max-width:420px">' +
-            '<label for="wz-have-id-in">tenant id (validated against this server’s list — ghosts are impossible)</label>' +
+            '<label for="wz-have-id-in">tenant id — checked against this server’s list; an id that isn’t on it is rejected, never silently accepted</label>' +
             '<input type="text" id="wz-have-id-in" spellcheck="false" placeholder="paste the id an operator gave you">' +
             '<div class="err" id="wz-have-id-err"></div>' +
           "</div>" +
@@ -448,7 +457,7 @@
       '<div id="wz-keys-note"></div>' +
       '<div class="toolbar" style="margin:12px 0 0">' +
         '<button class="primary" id="wz-keys-create">Create keys</button>' +
-        '<button id="wz-keys-skip">skip — I’ll use the identity panel later</button>' +
+        '<button id="wz-keys-skip">skip — I’ll add people later in People &amp; groups</button>' +
       "</div>";
     html += stepShell(2, "Who can ask", items[1], s2body, V.esc(items[1].evidence));
 
@@ -458,8 +467,8 @@
     info.groups.forEach(function (g) { tokens.push(g.token); });
     var s3body =
       (W.groupNote ? '<div class="note" style="margin-top:0"><em>' + V.esc(W.groupNote) + "</em></div>" : "") +
-      '<div class="dc-question" style="margin-bottom:6px">Mint your working handle</div>' +
-      '<div class="note" style="margin-top:0">A <b>scope handle is your signed session pass</b>: this space + whose ' +
+      '<div class="dc-question" style="margin-bottom:6px">Mint my working handle</div>' +
+      '<div class="note" style="margin-top:0">A <b>scope handle is your signed pass for this session</b>: this space + whose ' +
         "keys are asking + which customers + how sensitive it may go. Every read is filtered through it — a session " +
         "can narrow it, never widen it. It is not an API token: it’s a pre-computed answer to <i>what this session " +
         "may see</i>.</div>" +
@@ -523,7 +532,7 @@
           '<div class="dc-side">' +
             '<div class="dc-name">Explore with sample data ' + V.badge("recommended — fastest to the proof", "b-kind") + "</div>" +
             '<div class="dc-src" style="margin-top:6px">Meet <b>Acme Logistics (sample)</b> — three people, two teams, ' +
-              "one connector, and fourteen memories carrying real sharing rules: some org-visible, some team-only, one " +
+              "two connected systems (a CRM and billing), and fourteen memories carrying real sharing rules: some org-visible, some team-only, one " +
               "restricted, one field that got superseded, and one item that lands in <b>quarantine on purpose</b>. " +
               "Everything is labeled " + V.badge("sample data", "b-kind") + " and removable in one click, using the same " +
               "erasure pipeline you’d use for a real deletion request.</div>" +
@@ -553,10 +562,10 @@
     var s5body =
       '<div class="dc-question" style="margin-bottom:6px">Same question. Two sessions.</div>' +
       '<div class="note" style="margin-top:0">Two ordinary scoped recalls, composed side by side in this page — ' +
-        "nothing new on the read path. Left runs through <b>your working handle</b>; right through a handle for a " +
-        "principal that <b>holds no keys</b>" +
-        (info.sampleSeeded ? " (<span class=\"ref\">user:sample-blind</span> — “holds no keys, sees nothing, ever”)" :
-          " (<span class=\"ref\">user:proof-blind</span> — created by setup, holds no keys)") + ".</div>" +
+        "nothing new on the read path. Left runs through <b>your working handle</b>; right through a session for " +
+        (info.sampleSeeded ? '<span class="ref">user:sample-blind</span>' :
+          '<span class="ref">user:proof-blind</span>') +
+        " — a key that <b>no memory has ever been shared with</b>, so it opens nothing.</div>" +
       '<div class="row" style="margin-top:10px;max-width:640px">' +
         '<div><label for="wz-proof-q">query</label>' +
           '<input type="text" id="wz-proof-q" value="' +
@@ -674,8 +683,9 @@
             var gm = String((ge && ge.message) || ge);
             if (/requires ReBAC/.test(gm)) {
               W.mode = "dev";
-              W.groupNote = "group key " + gk + " created; the membership tuple needs ReBAC " +
-                "(VERITY_SPICEDB_URL) — the shared key itself still works, and setup pre-checks it on your handle";
+              W.groupNote = "group key " + gk + " created — but this server can't record who belongs to it " +
+                "(that needs the permissions engine: ReBAC, set via VERITY_SPICEDB_URL). The shared key itself " +
+                "still works, and setup adds it to your handle for you";
             } else {
               W.groupNote = "group key " + gk + " created, but recording the membership failed (" +
                 gm.slice(0, 90) + ") — the shared key itself still works, and setup pre-checks it on your handle";
@@ -821,7 +831,8 @@
 
   function hitHtml(h) {
     return '<div class="hit">' +
-      '<div class="meta"><span class="score">' + (typeof h.score === "number" ? h.score.toFixed(3) : "") + "</span> " +
+      '<div class="meta"><span class="score" title="how closely this memory matches the question, 0–1">' +
+        (typeof h.score === "number" ? "match " + h.score.toFixed(3) : "") + "</span> " +
         V.kindBadge(h.kind || "content") + V.sampleBadge([h.document_id, h.entity_tags]) +
         (h.acl_provenance ? V.provenanceBadge(h.acl_provenance) : "") + "</div>" +
       '<div class="content">' + V.esc(String(h.content || "").slice(0, 220)) + "</div>" +
@@ -856,9 +867,9 @@
         // one-click fix for the working handle is.
         try { sessionStorage.removeItem(BLIND_KEY); } catch (se) { /* session-only */ }
         V.err("wz-proof-err", new Error(
-          "a held handle didn't verify — a dev-mode server re-keys on every restart, which invalidates " +
-          "old handles (fail closed). Re-mint in step 3 (one click), then run the proof again — the blind " +
-          "session's handle has been dropped and will re-mint itself."));
+          "a held handle didn't verify — a dev-mode server forgets old session passes on every restart " +
+          "(fail closed; your people and group keys are untouched). Re-mint in step 3 (one click), then " +
+          "run the proof again — the blind session's pass will re-mint itself."));
       } else {
         V.err("wz-proof-err", e);
       }
@@ -885,10 +896,10 @@
         '<div class="dc-src" style="margin-top:6px">This is correct. No memory here carries a key this session ' +
           "holds — <b>an empty result is a safety answer, not a bug.</b> Nothing about these memories — not even " +
           "that they exist — reached this session.</div>" +
-        whatsThis("What exactly is guaranteed: the handle’s keys are baked into the query as a <b>mandatory " +
-          "pre-filter, materialized in the index</b> and enforced in one shared layer above the storage adapter — " +
-          "not a post-hoc redaction. A memory outside the filter is never fetched, ranked, or counted. No visibility " +
-          "keys → invisible, always.") +
+        whatsThis("What exactly is guaranteed: the handle’s keys are <b>part of the search itself, applied before " +
+          "anything is ranked</b> — not a redaction after the fact. A memory your keys don’t open is never fetched, " +
+          "never ranked, never even counted. (Internally: a mandatory pre-filter materialized in the index, " +
+          "enforced in one shared layer for every storage backend.)") +
         '<div class="dc-actions"><button id="wz-trace">Show the why-trace</button></div>' +
         '<div class="err" id="wz-trace-err"></div><div id="wz-trace-out"></div>';
     } else {
@@ -896,7 +907,7 @@
         '<div class="dc-name">' + V.esc(blind.principal) + "’s session — " + right.length + " memories</div>" +
         '<div class="note"><em>not a denial:</em> this session’s key appears in the visibility of ' +
           right.length + " memor" + (right.length === 1 ? "y" : "ies") + " — someone granted it. The proof needs a " +
-          "principal that holds no keys.</div>" + right.map(hitHtml).join("");
+          "key that no memory has been shared with.</div>" + right.map(hitHtml).join("");
     }
 
     out.innerHTML =

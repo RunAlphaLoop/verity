@@ -8,9 +8,9 @@
        sectioned People/Groups/Agents, alphabetized, filterable, selected
        viewers as removable chips (admin read; 401 renders honestly and
        falls back to raw tokens, never to a permissive default)
-     • POST /v1/scopes — mints the WRITE PASS (jargon: scope handle) whose
-       principals become the memory's visibility; actor console:ingest;
-       15-minute TTL disclosed (server floor is 60 s)
+     • POST /v1/scopes — mints the SCOPE HANDLE FOR WRITING (a short-lived
+       signed pass) whose principals become the memory's visibility; actor
+       console:ingest; 15-minute TTL disclosed (server floor is 60 s)
      • POST /v1/episodes — paste-text path: { scope_handle, observation,
        entities[] } → { episode_id }
      • POST /v1/files — upload path: multipart scope_handle / file /
@@ -26,9 +26,9 @@
        `verity-cli add <url> --visibility …` command instead.
 
    THE GATE (N2): visibility is required with no default. Adding without a
-   pass sends the request anyway and surfaces the server's own 422 refusal
-   VERBATIM — the teaching refusal is the point. A pass naming no viewers is
-   flagged loudly: it writes memory nobody can ever read (fail-closed).
+   handle sends the request anyway and surfaces the server's own 422 refusal
+   VERBATIM — the teaching refusal is the point. A handle naming no viewers
+   is flagged loudly: it writes memory nobody can ever read (fail-closed).
 
    THE LAW, applied: plain-language primary labels; refs mono-small; the
    directory autoloads once the tenant is known; every empty state teaches;
@@ -46,6 +46,9 @@
   // removable chips. Its value()/tokens() (the chips) are the ONLY
   // named-viewer submission path; the raw-token field stays the dev escape.
   var viewersPicker = null;
+  // token → "user:alice@…" from the last directory load; the receipt maps the
+  // HANDLE's principals through this (never the picker's current chips).
+  var dirByToken = {};
   var pass = { handle: "", claims: null, how: "" };
   var view = "text";    // text | file | url
   var tenantNow = "";
@@ -148,22 +151,22 @@
       /* ---------------------------------------- step 1 · who can see it */
       '<div class="card">' +
         '<h2>1 · Who can see this? <span class="sub">GET /v1/admin/principals · POST /v1/scopes</span></h2>' +
-        '<div class="note" style="margin-top:0">Everything you add is written under a <b>write pass</b> — a short-lived signed key naming exactly who may recall it later. ' +
-          "No pass means no audience, and Verity <b>refuses rather than guesses</b>. There is no “everyone” option, here or anywhere.</div>" +
+        '<div class="note" style="margin-top:0">Everything you add is written under a <b>scope handle for writing</b> — a short-lived signed pass naming exactly who may recall it later. ' +
+          "No handle means no audience, and Verity <b>refuses rather than guesses</b>. There is no “everyone” option, here or anywhere.</div>" +
         '<div id="ing-pass-line" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 4px"></div>' +
         '<div id="ing-pass-meta" class="dc-meta" style="margin-top:2px"></div>' +
         '<div style="margin-top:10px">' +
           '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">' +
-            '<label style="margin-bottom:0">pick viewers — people &amp; groups on record for this tenant</label>' +
+            '<label style="margin-bottom:0">pick viewers — people &amp; groups on record for this space</label>' +
             '<span class="spacer" style="flex:1"></span>' +
             '<button id="ing-dir-refresh">Refresh names</button>' +
           "</div>" +
           '<div id="ing-viewers" style="margin-top:6px"></div>' +
         "</div>" +
         '<div class="row" style="margin-top:10px">' +
-          '<div><label for="ing-raw">or raw principal tokens <span style="font-weight:400">(dev mode; comma-separated, e.g. 1, 11)</span></label>' +
+          '<div><label for="ing-raw">or raw viewer numbers — each person/group&rsquo;s key number, shown as &ldquo;token N&rdquo; in the list above <span style="font-weight:400">(dev mode; comma-separated, e.g. 1, 11)</span></label>' +
             '<input type="text" id="ing-raw" placeholder="e.g. 1" spellcheck="false"></div>' +
-          '<div class="tight"><button class="primary" id="ing-mint">Create write pass</button></div>' +
+          '<div class="tight"><button class="primary" id="ing-mint">Create a scope handle for writing</button></div>' +
         "</div>" +
         '<div class="row" style="margin-top:10px">' +
           '<div><label for="ing-paste">or paste a scope handle you already hold</label>' +
@@ -171,8 +174,8 @@
           '<div class="tight"><button id="ing-use">Use this handle</button></div>' +
         "</div>" +
         '<div class="err" id="ing-pass-err"></div>' +
-        '<div class="note">Write passes expire after <b>15 minutes</b> here (the server enforces a 60&nbsp;s minimum) and are never stored by the console. ' +
-          "A pass naming <b>no viewers</b> still works — and writes memory <b>nobody can ever read</b>. That is fail-closed working, not a bug.</div>" +
+        '<div class="note">Scope handles minted here expire after <b>15 minutes</b> (the server enforces a 60&nbsp;s minimum) and are never stored by the console. ' +
+          "A handle naming <b>no viewers</b> still works — and writes memory <b>nobody can ever read</b>. That is fail-closed working, not a bug.</div>" +
       "</div>" +
 
       /* ---------------------------------------------- step 2 · the memory */
@@ -213,7 +216,7 @@
           '<label for="ing-url-cmd" style="margin-top:8px">run this where verity-cli lives</label>' +
           '<textarea id="ing-url-cmd" readonly class="mono" style="min-height:58px"></textarea>' +
           '<div class="actions" style="justify-content:flex-start;margin-top:6px"><button id="ing-url-copy">Copy CLI command</button></div>' +
-          '<div class="dc-meta">verity-cli add mints its own write pass over exactly your --visibility tokens (same rule as this screen; it refuses without them) · URL downloads cap at 2 MB · agents do the same via the MCP tool memory_ingest_url</div>' +
+          '<div class="dc-meta">verity-cli add mints its own scope handle for writing over exactly your --visibility tokens (same rule as this screen; it refuses without them) · URL downloads cap at 2 MB · agents do the same via the MCP tool memory_ingest_url</div>' +
         "</div>" +
 
         '<div id="ing-ents-wrap" style="margin-top:10px">' +
@@ -242,10 +245,10 @@
       onChange: function () { updateMintLabel(); updateUrlCmd(); },
       onError: function (e) { V.err("ing-pass-err", e); },
       unauthNote: "Listing names is an admin read. Paste an admin token in the session bar to see them &mdash; " +
-        "or use raw principal tokens (dev mode) below. There is no permissive fallback.",
-      emptyBody: "This tenant&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
-        "Create people and groups in <b>People &amp; groups</b>, or type raw principal tokens (dev mode) below.",
-      partialNote: "showing the first 1000 names — the directory is larger; narrow with the filter or use raw tokens.",
+        "or use raw viewer numbers (dev mode) below. There is no permissive fallback.",
+      emptyBody: "This space&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
+        "Create people and groups in <b>People &amp; groups</b>, or type raw viewer numbers (dev mode) below.",
+      partialNote: "showing the first 1000 names — the directory is larger; narrow with the filter or use raw viewer numbers.",
     });
     el("ing-raw").oninput = function () { updateMintLabel(); updateUrlCmd(); };
     el("ing-mint").onclick = mintPass;
@@ -284,14 +287,23 @@
 
   function refreshDir(tenant) {
     V.clearErr("ing-pass-err");
-    return viewersPicker ? viewersPicker.load(tenant) : null;
+    if (!viewersPicker) return null;
+    return viewersPicker.load(tenant).then(function (res) {
+      dirByToken = {};
+      ((res && res.principals) || []).forEach(function (p) {
+        if (p && p.token != null) dirByToken[String(p.token)] = String(p.principal || "");
+      });
+      return res;
+    });
   }
 
   function updateMintLabel() {
     var btn = el("ing-mint");
     if (!btn) return;
     var n = selectedTokens().length;
-    btn.textContent = n ? "Create write pass (" + n + " viewer" + (n === 1 ? "" : "s") + ")" : "Create write pass";
+    btn.textContent = n
+      ? "Create a scope handle for writing (" + n + " " + (n === 1 ? "person or group" : "people & groups") + ")"
+      : "Create a scope handle for writing";
   }
 
   /* ========================================================= write pass */
@@ -299,15 +311,15 @@
   async function mintPass() {
     V.clearErr("ing-pass-err");
     if (!tenantNow) { V.err("ing-pass-err", new Error("no tenant set — paste one in the session bar first")); return; }
-    if (rawIsBad()) { V.err("ing-pass-err", new Error("raw principal tokens must be integers, comma-separated — e.g. 1, 11")); return; }
+    if (rawIsBad()) { V.err("ing-pass-err", new Error("raw viewer numbers must be integers, comma-separated — e.g. 1, 11")); return; }
     var toks = selectedTokens();
     if (!toks.length) {
       // The teaching refusal, client-side edition: we will not mint a
-      // sees-nothing pass by accident. (Adding with NO pass still reaches
+      // sees-nothing handle by accident. (Adding with NO handle still reaches
       // the server and surfaces its 422 verbatim — that path stays open.)
       V.err("ing-pass-err", new Error(
-        "no viewers selected — Verity refuses to guess an audience. Pick at least one name (or a raw token). " +
-        "If you add without any pass, the server will refuse with a 422: that refusal is fail-closed working."
+        "no viewers selected — Verity refuses to guess an audience. Pick at least one name (or a raw viewer number). " +
+        "If you add without any handle, the server will refuse with a 422: that refusal is fail-closed working."
       ));
       return;
     }
@@ -363,8 +375,8 @@
     var meta = el("ing-pass-meta");
     if (!line) return;
     if (!pass.handle) {
-      line.innerHTML = V.stateChip("off", "no write pass yet") +
-        '<span style="color:var(--dim);font-size:var(--fs-sm)">pick viewers below, then create a pass — it becomes the memory’s audience</span>';
+      line.innerHTML = V.stateChip("off", "no write handle yet") +
+        '<span style="color:var(--dim);font-size:var(--fs-sm)">pick viewers below, then create a scope handle for writing — it becomes the memory’s audience</span>';
       meta.textContent = "";
       syncEntsPicker();
       return;
@@ -372,18 +384,20 @@
     var n = passViewerCount();
     var bits = [];
     if (passExpired()) {
-      bits.push(V.stateChip("attn", "pass expired"));
-      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this pass has expired — writes under it will be refused; create a new one</span>');
+      bits.push(V.stateChip("attn", "handle expired"));
+      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle has expired — writes under it will be refused; create a new one</span>');
     } else if (n === 0) {
-      bits.push(V.stateChip("attn", "pass sees nothing"));
-      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this pass names <b>no viewers</b> — anything written under it is stored but can never be read by anyone. Pick viewers and mint again.</span>');
+      bits.push(V.stateChip("attn", "handle sees nothing"));
+      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle names <b>no viewers</b> — anything written under it is stored but can never be read by anyone. Pick viewers and mint again.</span>');
     } else if (pass.claims && pass.claims.tenant_id && tenantNow && pass.claims.tenant_id !== tenantNow) {
-      bits.push(V.stateChip("attn", "different tenant"));
-      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this pass belongs to another tenant — writes will land there, not here</span>');
+      bits.push(V.stateChip("attn", "different space"));
+      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle belongs to another space (tenant) — writes will land there, not here</span>');
     } else {
-      bits.push(V.stateChip("ok", "write pass ready"));
+      bits.push(V.stateChip("ok", "write handle ready"));
       bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">' +
-        (n != null ? "visible to <b>" + n + " viewer" + (n === 1 ? "" : "s") + "</b>" : "viewers unreadable from the handle") +
+        (n != null
+          ? "visible to <b>" + n + " " + (n === 1 ? "person or group" : "people &amp; groups") + "</b>"
+          : "viewers unreadable from the handle") +
         " · " + esc(pass.how) + "</span>");
     }
     line.innerHTML = bits.join("");
@@ -421,7 +435,7 @@
       emptyBehavior: "teach",
       placeholder: "account:acme",
       explainer: restrict
-        ? "your write pass is entity-bound — tags must stay inside its limit; anything outside is refused here, exactly as the server would refuse it."
+        ? "your write handle is entity-bound — tags must stay inside its limit; anything outside is refused here, exactly as the server would refuse it."
         : "tags decide which entity views can find this memory. Known tags are suggested with counts; a new tag creates that entity the moment this lands.",
       // Chips outside a newly-bound pass are dropped, not smuggled: the
       // server would refuse them anyway (fail-closed, same rule).
@@ -463,10 +477,17 @@
     if (!out) return;
     var url = (el("ing-url") ? el("ing-url").value.trim() : "") || "<url>";
     var toks = selectedTokens();
+    if (!toks.length && pass.claims && pass.claims.principals && pass.claims.principals.length &&
+        pass.claims.tenant_id === tenantNow) {
+      // A ready handle counts: nothing picked, so reuse the audience already
+      // on the handle — verity-cli mints its own fresh pass from these
+      // token numbers, so even an expired console handle names them honestly.
+      toks = pass.claims.principals.slice().sort(function (a, b) { return a - b; });
+    }
     var vis = toks.length ? toks.join(",") : "<tokens>";
     var cmd = 'verity-cli add "' + url.replace(/"/g, "") + '" --visibility ' + vis;
     parsedEnts().forEach(function (e) { cmd += " --entity " + e; });
-    if (!toks.length) cmd += "   # --visibility is REQUIRED — the CLI refuses without it";
+    if (!toks.length) cmd += "   # choose people & groups in step 1 (or mint a handle) — verity-cli needs their raw token numbers and mints its own pass from them";
     out.value = cmd;
   }
 
@@ -499,7 +520,7 @@
         res = await V.api("/v1/episodes", { json: body });
         receipt = {
           kind: "text",
-          idLabel: "episode",
+          idLabel: "episode (the stored conversation/event)",
           id: res && res.episode_id,
           line: "Your note is in memory and indexed for recall.",
           endpoint: "POST /v1/episodes",
@@ -553,7 +574,7 @@
       if (startedWithoutPass && /HTTP 4/.test(String(e.message))) {
         el("ing-add-teach").innerHTML =
           '<div class="note">That refusal is the design: <b>no audience, no write</b>. Verity never picks a default. ' +
-          "Create a write pass in step 1 and try again.</div>";
+          "Create a scope handle for writing in step 1 and try again.</div>";
       }
     } finally {
       btn.disabled = false;
@@ -563,18 +584,25 @@
   /* ============================================================= receipt */
 
   function renderReceipt(r) {
-    var n = passViewerCount();
-    var viewers = n == null
-      ? "the viewers on your pass"
-      : (n === 0
-        ? "<b>no one</b> — the pass named no viewers (fail-closed: stored, never readable)"
-        : "<b>" + n + " viewer" + (n === 1 ? "" : "s") + "</b>");
-    var names = viewersPicker
-      ? viewersPicker.value().map(function (x) { return x.principal; }).filter(Boolean)
-      : [];
-    var nameChips = names.slice(0, 4).map(function (p) {
-      return V.entityChip(principalName(p), principalKind(p));
-    }).join(" ") + (names.length > 4 ? ' <span class="asof">+' + (names.length - 4) + " more</span>" : "");
+    // The audience is the HANDLE's own principals (what was actually written)
+    // — never the picker's current chips, which the operator may have changed
+    // since minting. Names come from the loaded directory; a token the
+    // directory can't name stays an honest "token N".
+    var toks = pass.claims && pass.claims.principals ? pass.claims.principals : null;
+    var viewers, nameChips = "";
+    if (toks == null) {
+      viewers = "the people &amp; groups on your handle";
+    } else if (toks.length === 0) {
+      viewers = "<b>no one</b> — the handle named no viewers (fail-closed: stored, never readable)";
+    } else {
+      viewers = "<b>" + toks.length + " " + (toks.length === 1 ? "person or group" : "people &amp; groups") + "</b>";
+      nameChips = toks.slice(0, 4).map(function (tok) {
+        var p = dirByToken[String(tok)];
+        return p
+          ? V.entityChip(principalName(p), principalKind(p) + " · token " + tok)
+          : V.entityChip("token " + tok);
+      }).join(" ") + (toks.length > 4 ? ' <span class="asof">+' + (toks.length - 4) + " more</span>" : "");
+    }
     var handleForProbe = pass.handle;
     var stateChip = (r.kind === "file" && r.chunks === 0)
       ? V.stateChip("attn", (r.extraction && r.extraction.failure) ? "stored, extraction refused" : "stored, not searchable")
@@ -595,21 +623,21 @@
           stateChip +
           '<span class="asof">written ' + nowStamp() + "</span>" +
         "</div>" +
-        '<div style="margin-top:8px">' + r.line + " Readable by " + viewers + "." +
-          (names.length ? '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">' + nameChips + "</div>" : "") +
+        '<div style="margin-top:8px">' + r.line + " Readable by " + viewers + (nameChips ? ":" : ".") +
+          (nameChips ? '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">' + nameChips + "</div>" : "") +
         "</div>" +
         '<div class="dc-meta" style="margin-top:8px">' + esc(r.endpoint) + " · " + esc(r.idLabel) + " " +
           (r.id != null ? '<span class="ref">' + esc(String(r.id)) + "</span>" : "—") +
           (r.filename ? ' · <span class="ref">' + esc(r.filename) + "</span>" : "") +
           extractionMeta +
-          " · visibility inherited from the write pass" +
+          " · visibility inherited from the scope handle" +
         "</div>" +
         '<div class="actions" style="justify-content:flex-start;margin-top:10px">' +
           '<button class="good" id="ing-probe">Recall it now — open Scope Inspector</button>' +
-          '<button id="ing-narrow">Test the boundary — mint a narrower pass</button>' +
+          '<button id="ing-narrow">Test the boundary — mint a narrower handle</button>' +
           '<button id="ing-again">Add another</button>' +
         "</div>" +
-        '<div class="asof" style="display:block;margin-top:6px">The interesting part is the boundary: recall this under a pass that should NOT see it, and watch Verity return nothing — an explained zero, not a bug.</div>' +
+        '<div class="asof" style="display:block;margin-top:6px">The interesting part is the boundary: recall this under a handle that should NOT see it, and watch Verity return nothing — an explained zero, not a bug.</div>' +
       "</div>";
 
     el("ing-probe").onclick = function () {

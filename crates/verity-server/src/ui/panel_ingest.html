@@ -4,13 +4,14 @@
      One screen, two steps, in the order the write path actually enforces:
 
        1 · WHO CAN SEE THIS — required, no default. Memory is written under a
-           short-lived "write pass" (jargon: scope handle); its principals
-           become the memory's visibility. Viewers are picked from the named
-           directory (GET /v1/admin/principals, admin read) or given as raw
-           tokens (dev mode), then a pass is minted (POST /v1/scopes,
-           actor console:ingest) — the same construction verity-cli add uses.
-           Omission refuses: adding with no pass surfaces the server's own
-           422 verbatim, on purpose. There is no permissive shortcut.
+           "scope handle for writing" — a short-lived signed pass whose
+           principals become the memory's visibility. Viewers are picked from
+           the named directory (GET /v1/admin/principals, admin read) or given
+           as raw viewer numbers (dev mode), then a handle is minted
+           (POST /v1/scopes, actor console:ingest) — the same construction
+           verity-cli add uses. Omission refuses: adding with no handle
+           surfaces the server's own 422 verbatim, on purpose. There is no
+           permissive shortcut.
 
        2 · WHAT TO ADD — paste text (POST /v1/episodes), upload a file
            (POST /v1/files, multipart, 32 MB server cap; text-like files are
@@ -20,9 +21,10 @@
            verity-cli add command for you instead.
 
      On success: a receipt with the server-reported ids/chunk count, the
-     viewers echoed back, and the falsification handoff — "recall it now"
-     into the Scope Inspector under the same pass, or mint a narrower pass
-     and watch the memory disappear. The first-run arc ends at the boundary.
+     handle's own viewers echoed back, and the falsification handoff —
+     "recall it now" into the Scope Inspector under the same handle, or mint
+     a narrower handle and watch the memory disappear. The first-run arc
+     ends at the boundary.
 
      Owns ONLY this file + panel_ingest.js; consumes frozen theme/core
      classes and Verity.* helpers. Jargon lives in .sub/.dc-meta mono only.

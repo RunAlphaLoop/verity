@@ -155,15 +155,27 @@ function decodeHandle(str) {
 
 const CONF_NAMES = ["public", "internal", "confidential", "restricted"];
 
-function badge(text, cls, inferred) {
-  return '<span class="badge ' + cls + (inferred ? " b-inferred" : "") + '">' + esc(text) + "</span>";
+function badge(text, cls, inferred, title) {
+  return '<span class="badge ' + cls + (inferred ? " b-inferred" : "") + '"' +
+    (title ? ' title="' + esc(title) + '"' : "") + '>' + esc(text) + "</span>";
 }
+
+/* Hover glosses for the four permission-provenance lanes — a bare word on a
+   row explains nothing to a first-time operator (LAW: label every dimension). */
+const _PROV_TITLES = {
+  approximated: "who can see it was approximated from a container (like workspace membership) because the source has no per-item permission API",
+  mirrored: "the source's own permission list was copied exactly",
+  quarantined: "no permission mapping — held out of the index",
+  "admin-assigned": "permissions were set by an admin, not copied from a source",
+};
 
 /** ACL-provenance badge (solid): mirrored|approximated|admin-assigned|quarantined. */
 function provenanceBadge(p) {
   const name = String(p || "admin-assigned").toLowerCase();
   const known = ["mirrored", "approximated", "admin-assigned", "quarantined"];
-  return badge(name, known.includes(name) ? "b-" + name : "b-admin-assigned");
+  return badge("permissions: " + name,
+    known.includes(name) ? "b-" + name : "b-admin-assigned",
+    false, _PROV_TITLES[name]);
 }
 
 /** Confidentiality badge from a 0-3 int or a name string. */
@@ -200,8 +212,9 @@ function entityBadges(tags) {
 function tagDerivationBadge(derivation) {
   const d = String(derivation || "").toLowerCase();
   return d === "provenance"
-    ? badge("provenance", "b-provenance")
-    : badge("inferred", "b-inferred");
+    ? badge("tag: from source", "b-provenance")
+    : badge("tag: inferred", "b-inferred", false,
+        "this label was inferred by Verity, not sent by the source");
 }
 
 /** Neutral kind/label chip. */
@@ -383,11 +396,13 @@ function boot() {
 
 /* ---------------------------------------------------- v2 · rail counts */
 /**
- * Verity.setCount(navId, n) — live count pill on a rail entry.
+ * Verity.setCount(navId, n, title?) — live count pill on a rail entry.
  * n = 0 / null clears the pill. Counts MUST be derived from the same query
  * as the panel they badge (UI-ACTIONS N3) — never a separate estimate.
+ * Optional `title` labels what the number counts (hover + aria-label) —
+ * every number is labeled with what it counts.
  */
-function setCount(navId, n) {
+function setCount(navId, n, title) {
   const nav = document.querySelector('#rail .navitem[data-nav="' + navId + '"]');
   if (!nav) return;
   let pill = nav.querySelector(".count-pill");
@@ -398,6 +413,10 @@ function setCount(navId, n) {
     nav.appendChild(pill);
   }
   pill.textContent = Number(n) > 99 ? "99+" : String(n);
+  if (title !== undefined && title !== null && title !== "") {
+    pill.title = String(title);
+    pill.setAttribute("aria-label", String(title));
+  }
 }
 
 /* ------------------------------------------------------------- dialog() */
@@ -1291,7 +1310,7 @@ function _buildMintDialog() {
   el.innerHTML =
     '<div class="dialog" style="max-width:600px">' +
       "<h3>Mint a scope handle</h3>" +
-      '<div class="note" style="margin-top:0">A scope handle is a signed key that decides exactly what a reader ' +
+      '<div class="note" style="margin-top:0">A scope handle is a signed pass that decides exactly what a reader ' +
         "can see. Everything below narrows it; nothing widens it. Leave <b>who</b> empty and the handle can see " +
         "<b>nothing</b> — Verity fails closed, on purpose.</div>" +
       '<div class="row" style="margin-top:12px">' +
@@ -1335,7 +1354,7 @@ function _buildMintDialog() {
       '<div id="mint-result"></div>' +
       '<div class="actions">' +
         '<button id="mint-cancel">Close</button>' +
-        '<button class="primary" id="mint-go">Mint handle</button>' +
+        '<button class="primary" id="mint-go">Mint a scope handle</button>' +
       "</div>" +
     "</div>";
   document.body.appendChild(el);
@@ -1378,8 +1397,8 @@ function _buildMintDialog() {
     if (subject && principalsRaw) {
       showErr("mint-err", new Error(
         "Choose one way to say who: EITHER a person (Verity looks up all their keys — " +
-        "needs the identity plane connected) OR raw tokens (you supply the keys yourself). " +
-        "Not both — clear one field."));
+        "needs the permissions engine connected (ReBAC — set VERITY_SPICEDB_URL)) OR raw tokens " +
+        "(you supply the keys yourself). Not both — clear one field."));
       return;
     }
     if (subject) body.subject = subject;
@@ -1433,7 +1452,7 @@ function _buildMintDialog() {
           '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
             '<button id="mint-copy">Copy handle</button>' +
             '<button id="mint-inspect">Inspect in Scope Inspector</button>' +
-            '<button id="mint-keep" title="held in sessionStorage for this tab only — cleared when the tab closes; the setup checklist and proof step run recalls through it">Keep as this tab&rsquo;s working handle</button>' +
+            '<button id="mint-keep" title="held in sessionStorage for this tab only — cleared when the tab closes; the setup checklist and proof step run recalls through it">Keep as this tab&rsquo;s scope handle</button>' +
           "</div>" +
         "</div>";
       $("mint-copy").onclick = () => {
@@ -1470,9 +1489,17 @@ function _mintSyncTenantUi() {
   if (!t) { nameEl.textContent = ""; return; }
   if (dir.status === "ok") {
     const n = tenantName(t);
-    nameEl.innerHTML = n
-      ? "&#10003; " + esc(n)
-      : '<span style="color:var(--red)">this tenant doesn&rsquo;t exist on this server — pick a real one, or set one up</span>';
+    if (n) {
+      nameEl.innerHTML = "&#10003; " + esc(n);
+    } else if (dir.total > dir.tenants.length) {
+      // The directory page is truncated — absence from it proves nothing.
+      // A neutral note, never a red "doesn't exist" false positive.
+      nameEl.innerHTML = '<span style="color:var(--dim)">this space isn&rsquo;t in the newest ' +
+        dir.tenants.length + " the picker lists (this server has " + dir.total +
+        " spaces) — loaded by its id.</span>";
+    } else {
+      nameEl.innerHTML = '<span style="color:var(--red)">this space doesn&rsquo;t exist on this server — pick a real one, or set one up</span>';
+    }
   } else {
     nameEl.textContent = "";
   }

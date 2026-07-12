@@ -78,12 +78,18 @@
 
     if (dir.status === "ok") {
       // State B — spaces exist: the session strip is a picker of names now.
+      // dir.total is the server's real count; the page may be truncated.
+      var listed = dir.tenants.length;
+      var total = typeof dir.total === "number" ? dir.total : listed;
+      var countLine = total === listed
+        ? "This server has " + total + " space" + (total === 1 ? "" : "s") +
+          ". Pick one <b>by name</b> in the bar above — no ids to hunt for — or run setup to create a new one."
+        : "This server has " + total + " spaces (the picker lists the newest " + listed +
+          "). Pick one <b>by name</b> in the bar above, or run setup to create a new one.";
       host.innerHTML =
         '<div class="empty-teach sp-a">' +
           '<div class="et-title">Pick a space to see what needs you</div>' +
-          '<div class="et-body">This server has ' + dir.tenants.length + " space" +
-            (dir.tenants.length === 1 ? "" : "s") + ". Pick one <b>by name</b> in the bar above — no ids to hunt " +
-            "for — or run setup to create a new one.</div>" +
+          '<div class="et-body">' + countLine + "</div>" +
           '<div class="et-actions">' +
             '<button class="primary" id="home-setup">Set up Verity</button>' +
             '<button id="home-newspace">Create a new space</button>' +
@@ -130,12 +136,23 @@
   }
 
   /* ---- ghost tenant (FTUE §1): a uuid the server never birthed ---------- */
+  /* The directory page is truncated (limit=500) — absence from the PAGE is
+     only a confirmed miss when the page holds the whole directory. Returns
+     "listed" | "unlisted" (absent from a truncated page — NOT a ghost) |
+     "ghost" (directory complete AND id absent) | "unknown". */
+  function dirLookup(dir, tenant) {
+    if (dir.status !== "ok") return "unknown";
+    if (dir.tenants.some(function (x) { return x.tenant_id === tenant; })) return "listed";
+    var total = typeof dir.total === "number" ? dir.total : dir.tenants.length;
+    return total > dir.tenants.length ? "unlisted" : "ghost";
+  }
+
   function renderGhost(host, tenant) {
     host.innerHTML =
       '<div class="empty-teach sp-a" style="border-left-color:var(--red)">' +
-        '<div class="et-title">This tenant doesn’t exist on this server</div>' +
+        '<div class="et-title">This space doesn’t exist on this server</div>' +
         '<div class="et-body">The id <span class="ref">' + V.esc(tenant) + "</span> is not in this server’s tenant " +
-          "list (checked live). A made-up or stale id would otherwise show a permanently empty console that looks " +
+          "list (confirmed against the server just now). A made-up or stale id would otherwise show a permanently empty console that looks " +
           "plausible — so this is a loud stop, never a green all-clear. Pick a real space in the bar above, or set " +
           "one up.</div>" +
         '<div class="et-actions">' +
@@ -189,7 +206,7 @@
       state: waiting.length ? V.stateChip("attn") : V.stateChip("ok", "queue clear"),
       count: String(waiting.length),
       desc: waiting.length
-        ? "proposed learning" + (waiting.length === 1 ? "" : "s") + " not yet published — publishing stays a human gate" +
+        ? "lesson" + (waiting.length === 1 ? "" : "s") + " waiting for review — publishing stays a human gate" +
           (oldest ? " · oldest proposed <b>" + V.esc(V.timeAgo(oldest)) + "</b>" : "")
         : "nothing proposed and unpublished — the queue is drained",
       foot: asofNow(),
@@ -233,11 +250,12 @@
     if (!rows.length) {
       desc = "no ingest measured in the last 24 h — nothing to report is a valid answer";
     } else if (slow.length) {
-      desc = "source" + (slow.length === 1 ? "" : "s") + " slower than the console's <b>60 s p95</b> display threshold (not a configured SLO) — slowest: " +
-        '<span class="ref">' + V.esc(slowest.source) + "</span> at <b>" + V.esc(V.fmtMs(slowest.p95_ms)) + "</b> p95";
+      desc = "source" + (slow.length === 1 ? "" : "s") + " where new memories take over <b>60 s</b> to become searchable for 5% of items " +
+        "(p95 — a console display threshold, not a configured target/SLO) — slowest: " +
+        '<span class="ref">' + V.esc(slowest.source) + "</span> at <b>" + V.esc(V.fmtMs(slowest.p95_ms)) + "</b>";
     } else {
-      desc = "all " + rows.length + " source" + (rows.length === 1 ? "" : "s") + " fresh — slowest p95 " +
-        "<b>" + V.esc(V.fmtMs(slowest.p95_ms)) + "</b> (" + '<span class="ref">' + V.esc(slowest.source) + "</span>)";
+      desc = "all " + rows.length + " source" + (rows.length === 1 ? "" : "s") + " fresh — slowest source: 95% of new memories searchable within " +
+        "<b>" + V.esc(V.fmtMs(slowest.p95_ms)) + "</b> (p95, " + '<span class="ref">' + V.esc(slowest.source) + "</span>)";
     }
     return {
       id: "home-card-freshness",
@@ -295,7 +313,7 @@
       if (item.id === "session") action = '<button data-check-mint="1">Mint a handle</button>';
       else if (item.id === "bench") action = "";
       else action = '<button data-check-step="' + item.n + '">' +
-        ({ space: "Create the space", keys: "Add keys", memory: "Put memory in", recall: "Run the proof", denial: "Run the proof" }[item.id] || "Open setup") +
+        ({ space: "Create the space", keys: "Add keys", memory: "Put memory in", recall: "Run the recall proof", denial: "Run the denial proof" }[item.id] || "Open setup") +
         "</button>";
     }
     return '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border)">' +
@@ -346,11 +364,11 @@
     var doneCount = core.filter(function (i) { return i.done; }).length;
     container.innerHTML =
       '<div class="card">' +
-        "<h2>Setup checklist <span class=\"sub\">" + doneCount + " of 6 · derived from the server, never stored</span></h2>" +
+        "<h2>Setup checklist <span class=\"sub\">" + doneCount + " of 6 · checked live against the server just now — nothing here is a saved checkbox</span></h2>" +
         core.map(checklistItemRow).join("") +
         (core[5].done ? checklistItemRow(check.items[6]) : "") +
-        '<div class="asof" style="margin-top:8px">the celebrated finish is a verified <b>denial</b> — a checklist that ' +
-          "greens-up by opening things would teach the opposite of the product · " + asofNow() + "</div>" +
+        '<div class="asof" style="margin-top:8px">the last step is watching Verity correctly tell someone <b>“no”</b> — ' +
+          "a denial you can verify is the finish line, not an error · " + asofNow() + "</div>" +
       "</div>";
     var steps = container.querySelectorAll("[data-check-step]");
     for (var i = 0; i < steps.length; i++) {
@@ -369,9 +387,10 @@
     lastLoadedAt = Date.now();
 
     // Ghost guard (FTUE §1): a tenant id the server never birthed must be a
-    // loud stop, never a plausible, permanently empty console.
+    // loud stop, never a plausible, permanently empty console. Absence from
+    // a TRUNCATED directory page is not evidence of a ghost — load normally.
     var dir = V.tenantDir();
-    if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === tenant; })) {
+    if (dirLookup(dir, tenant) === "ghost") {
       renderGhost(host, tenant);
       return;
     }
@@ -406,13 +425,20 @@
     // Same guard for a tenant switched away from while probes were in flight.
     if (V.tenant() !== tenant) return;
     dir = V.tenantDir();
-    if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === tenant; })) {
+    if (dirLookup(dir, tenant) === "ghost") {
       renderGhost(host, tenant);
       return;
     }
 
     var allClear = results.every(function (c) { return c.tone === "ok"; });
     var anyFail = results.some(function (c) { return c.tone === "fail"; });
+
+    // Absent from the truncated picker page but within the server's total:
+    // a dim disclosure, never a red stop (the probes above answered live).
+    var unlistedNote = dirLookup(dir, tenant) === "unlisted"
+      ? '<span class="asof">this space is older than the newest ' + dir.tenants.length +
+        " this picker lists (this server has " + dir.total + ") — loaded by id</span>"
+      : "";
 
     var grid = results.map(cardHtml).join("");
     var banner = "";
@@ -430,6 +456,7 @@
         V.stateChip(anyFail ? "fail" : allClear ? "ok" : "attn",
           anyFail ? "some checks failed" : allClear ? "all clear" : "decisions waiting") +
         '<span class="asof">counts come from the same queries as the panels they open &middot; ' + asofNow() + "</span>" +
+        unlistedNote +
         '<span class="spacer"></span>' +
         '<button id="home-refresh">Refresh</button>' +
       "</div>" +
@@ -439,10 +466,11 @@
       '<div class="card">' +
         "<h2>Shortcuts</h2>" +
         '<div class="toolbar" style="margin-bottom:0">' +
+          '<button id="home-goingest">Add memory</button>' +
           '<button id="home-mint2">Mint a scope handle</button>' +
           '<button id="home-run-res">Review entity matches</button>' +
           '<button id="home-goaudit">Open the access audit</button>' +
-          '<span class="asof">add memory from the CLI: <span class="ref">verity-cli add &lt;file|url|-&gt;</span></span>' +
+          '<span class="asof">or from a terminal: <span class="ref">verity-cli add &lt;file|url&gt;</span></span>' +
         "</div>" +
       "</div>";
 
@@ -452,6 +480,7 @@
     });
     if (check) renderChecklist(el("home-checklist"), check, tenant);
     el("home-refresh").onclick = function () { refresh(tenant); };
+    el("home-goingest").onclick = function () { V.show("ingest"); };
     el("home-mint2").onclick = function () { V.openMint(); };
     el("home-run-res").onclick = function () { V.show("entities", { view: "queue" }); };
     el("home-goaudit").onclick = function () { V.show("audit"); };
@@ -475,7 +504,7 @@
         if (!t) { renderNoTenant(h); return; }
         // Ghost check must win even if a probe pass just started — a dead
         // uuid must never be left looking like a plausible empty console.
-        if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === t; })) {
+        if (dirLookup(dir, t) === "ghost") {
           renderGhost(h, t);
           return;
         }

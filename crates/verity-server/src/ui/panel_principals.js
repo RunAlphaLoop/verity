@@ -142,7 +142,7 @@
               'autocomplete="off" spellcheck="false"></div>' +
         "</div>" +
         '<div class="note">Names not yet in the directory are added automatically and get their numbers here.</div>' +
-        '<div class="dc-meta">POST /v1/admin/groups · writes a membership tuple · requires ReBAC (503 if unconfigured — surfaced verbatim)</div>' +
+        '<div class="dc-meta">POST /v1/admin/groups · writes a membership tuple · requires the permissions engine (ReBAC); without it the server refuses with a 503, surfaced verbatim</div>' +
         '<div class="err" id="prn-mem-err"></div>' +
         '<div class="actions">' +
           '<button id="prn-mem-cancel">Cancel</button>' +
@@ -383,8 +383,8 @@
       '<span class="sub">user:* rows of GET /v1/admin/principals</span></h2>';
     if (!pShown.length) {
       html += '<div class="note">No people' + (filter ? " match the filter" : " yet") +
-        ". Add one with <b>Add a person or group</b> — or mint a handle for a subject and identity " +
-        "resolution will materialize them.</div>";
+        ". Add one with <b>Add a person or group</b> — or mint a scope handle for a person (top bar) " +
+        "and Verity adds them to this directory automatically.</div>";
     } else {
       html += '<div class="tablewrap"><table><thead><tr><th>person</th><th>number · raw string</th><th class="num">actions</th></tr></thead><tbody>' +
         pShown.map(function (p) {
@@ -395,7 +395,7 @@
               '<button class="prn-rm-open" data-member="' + V.esc(p.principal) + '" ' +
                 'title="DELETE /v1/admin/groups — typed confirm; hides what the group granted on the very next read">Take out of a group&hellip;</button> ' +
               '<button class="prn-see-subject" data-subject="' + V.esc(p.principal) + '" ' +
-                'title="opens the mint dialog with this person as the subject — POST /v1/scopes re-resolves their identity server-side">Mint a handle as this person</button>' +
+                'title="opens the mint dialog with this person as the subject — POST /v1/scopes re-resolves their identity server-side">Mint a scope handle as this person</button>' +
             "</td></tr>";
         }).join("") +
         "</tbody></table></div>";

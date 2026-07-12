@@ -32,7 +32,7 @@
 (function () {
   var V = window.Verity;
 
-  var KIND_LABEL = { chunk: "memory chunk", fact: "fact", action: "action" };
+  var KIND_LABEL = { chunk: "search snippet", fact: "fact", action: "action" };
   var TABLE_COLS = 4;
   var PAGE_LIMIT = 50;
   var HISTORY_WINDOW = 200;
@@ -84,14 +84,23 @@
     return t === 1 ? "authoritative" : t === 2 ? "observation" : String(t);
   }
 
+  // "(principals)" is glossed once per rendered list, then plain
+  // "people & groups" — the flag resets on every render().
+  var visGlossShown = false;
+
   function visiblePhrase(r) {
     if (r.visible_to == null) {
       return r.kind === "fact"
-        ? "tenant-gated at get — L1 rows carry no per-row visibility tokens"
+        ? "visible to the whole space at read time — structured facts carry no per-row visibility list (jargon: L1)"
         : "visibility not recorded";
     }
     if (r.visible_to === 0) return "visible to nobody — fail closed";
-    return "visible to " + r.visible_to + " principal" + (r.visible_to === 1 ? "" : "s");
+    var noun = r.visible_to === 1 ? "person or group" : "people & groups";
+    if (!visGlossShown) {
+      noun += r.visible_to === 1 ? " (a principal)" : " (principals)";
+      visGlossShown = true;
+    }
+    return "visible to " + r.visible_to + " " + noun;
   }
 
   /* ------------------------------------------------------------ register */
@@ -125,7 +134,7 @@
           '<div class="tight"><label>kind</label>' +
             '<div class="seg" id="mem-f-kind">' +
               '<button data-kind="" class="on">all</button>' +
-              '<button data-kind="chunk">chunks</button>' +
+              '<button data-kind="chunk">snippets</button>' +
               '<button data-kind="fact">facts</button>' +
               '<button data-kind="action">actions</button>' +
             '</div></div>' +
@@ -221,10 +230,10 @@
   function renderNoTenant() {
     el("mem-out").innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to browse its memory</div>' +
-        '<div class="et-body">Choose a space in the session bar above &mdash; this browser loads by itself ' +
-          'the moment a tenant is known. Everything the tenant remembers is listed here: memory chunks, ' +
-          'bi-temporal facts, and the action timeline.</div>' +
+        '<div class="et-title">Pick a space to browse its memory</div>' +
+        '<div class="et-body">Choose it in the session bar above &mdash; this browser loads by itself ' +
+          'the moment one is picked. Everything that space remembers is listed here: conversations and ' +
+          'events (episodes), profile facts, and search snippets.</div>' +
       '</div>';
   }
 
@@ -251,9 +260,18 @@
     } catch (e) {
       if (my !== seq) return;
       el("mem-state").innerHTML = V.stateChip("fail");
-      if (/HTTP 401/.test(String(e.message))) {
-        V.err("mem-err", new Error(e.message +
+      var msg = String(e.message);
+      if (/HTTP 401/.test(msg)) {
+        V.err("mem-err", new Error(msg +
           "\nThis read needs the admin token — set it in the session bar (it lives in this tab only)."));
+      } else if (/HTTP 400/.test(msg) && /UUID parsing failed/.test(msg)) {
+        // The server's serde text is honest but unreadable — translate it,
+        // keep the raw refusal dimmed beneath.
+        var box = el("mem-err");
+        box.innerHTML = "This tenant id isn't valid — Verity tenant ids are UUIDs " +
+          "(they look like 019f53b8-…). Pick a real space in the session bar above." +
+          '<div class="ref" style="margin-top:4px">' + V.esc(msg) + "</div>";
+        box.classList.add("on");
       } else {
         V.err("mem-err", e);
       }
@@ -305,11 +323,19 @@
 
   /* ------------------------------------------------------------ rows */
 
+  // Shorten a raw uuid-ish entity id for the dimmed secondary line; the full
+  // id stays on hover and in the drawer. Short human ids pass through whole.
+  function shortEntity(id) {
+    var s = String(id || "");
+    return s.length > 14 ? s.slice(0, 8) + "…" : s;
+  }
+
   function primaryHtml(r) {
     var cut = r.preview_truncated ? '<span class="ref">&hellip;</span>' : "";
     if (r.kind === "fact") {
-      return '<b>' + V.esc((r.entity_id || "") + " · " + (r.field || "")) + '</b> = ' +
-        V.esc(r.preview) + cut;
+      // The FIELD is the human label; the raw entity id is demoted to the
+      // secondary line (no resolved display name in this payload — never guess).
+      return '<b>' + V.esc(r.field || "") + '</b> = ' + V.esc(r.preview) + cut;
     }
     if (r.kind === "action") {
       return '<b>' + V.esc(r.action_type || "action") + '</b> ' + V.esc(r.preview) + cut +
@@ -321,6 +347,10 @@
 
   function secondaryHtml(r) {
     var bits = ['from <b>' + V.esc(r.source) + '</b>'];
+    if (r.kind === "fact" && r.entity_id) {
+      bits.push('on <span class="ref" title="' + V.esc(r.entity_id) + '">' +
+        V.esc(shortEntity(r.entity_id)) + '</span>');
+    }
     if ((r.entities || []).length) bits.push(V.entityBadges(r.entities.slice(0, 4)) +
       (r.entities.length > 4 ? ' <span class="ref">+' + (r.entities.length - 4) + ' more</span>' : ""));
     if (r.acl_provenance) bits.push(V.provenanceBadge(r.acl_provenance));
@@ -334,6 +364,7 @@
 
   function render() {
     var f = activeFilters();
+    visGlossShown = false; // first row of every render carries the gloss
     // summary strip
     el("mem-summary").innerHTML = ROWS.length
       ? '<div class="toolbar" style="margin:2px 0 8px"><span class="asof"><b style="color:var(--text)">' +
@@ -353,7 +384,7 @@
       } else {
         el("mem-out").innerHTML =
           '<div class="empty-teach sp-a">' +
-            '<div class="et-title">Nothing in this tenant&rsquo;s memory yet</div>' +
+            '<div class="et-title">Nothing in this space&rsquo;s memory yet</div>' +
             '<div class="et-body">The moment anything lands &mdash; a pasted note, a document, a CDC event, ' +
               'an agent action &mdash; it appears here with its source, entities, and provenance. ' +
               'Start on <b>Add memory</b>.</div>' +
@@ -390,10 +421,17 @@
   /* ------------------------------------------------------------ drawer */
 
   async function openDrawer(row) {
-    var title = row.kind === "fact"
-      ? "Fact — " + (row.entity_id || "") + " · " + (row.field || "")
-      : "Memory chunk — " + (row.document_id || row.id);
-    el("mem-drawer-title").textContent = title;
+    // Human phrase first; the raw document/entity id is a dimmed ref line
+    // under the title, never the title itself.
+    if (row.kind === "fact") {
+      el("mem-drawer-title").innerHTML = "Fact — " + V.esc(row.field || "") +
+        '<span class="ref" style="display:block;font-weight:400">on entity ' +
+        V.esc(row.entity_id || "") + "</span>";
+    } else {
+      el("mem-drawer-title").innerHTML = "Search snippet from " + V.esc(row.source) +
+        '<span class="ref" style="display:block;font-weight:400">document ' +
+        V.esc(row.document_id || row.id) + "</span>";
+    }
     el("mem-drawer-body").innerHTML = '<div class="asof">loading the full record&hellip;</div>';
     V.dialog("mem-drawer").open();
 
@@ -449,7 +487,7 @@
         V.esc(h.preview) + (h.preview_truncated ? "&hellip;" : "") +
         '<div class="ref">valid ' + V.esc(V.fmtTime(h.valid_from)) + ' &rarr; ' +
           (h.valid_to ? V.esc(V.fmtTime(h.valid_to)) : "now") +
-          ' · episode ' + V.esc(h.provenance) + '</div>' +
+          ' · from conversation/event ' + V.esc(h.provenance) + ' (episode)</div>' +
       '</div>';
     }).join('<div style="color:var(--faint);padding-left:14px">&darr; replaced by</div>');
     return steps +
@@ -461,6 +499,7 @@
   }
 
   function drawerBody(full, chain, capped, histFailed) {
+    visGlossShown = false; // the drawer stands alone — gloss again
     var kindLine = KIND_LABEL[full.kind] || full.kind;
     return '<div class="card" style="margin:6px 0">' +
         '<h2>Full ' + (full.kind === "fact" ? "value" : "content") +
@@ -482,12 +521,12 @@
           '<dt>entities</dt><dd>' + ((full.entities || []).length ? V.entityBadges(full.entities) : '<span class="refreshed">none recorded</span>') + '</dd>' +
           '<dt>who can see it</dt><dd>' + V.esc(visiblePhrase(full)) +
             ' <span class="refreshed">— counted, never listed; retrievability is decided per-scope at read time</span></dd>' +
-          '<dt>confidentiality</dt><dd>' + (full.confidentiality != null ? V.confBadge(full.confidentiality) : '<span class="refreshed">no per-row class (L1)</span>') + '</dd>' +
+          '<dt>confidentiality</dt><dd>' + (full.confidentiality != null ? V.confBadge(full.confidentiality) : '<span class="refreshed">no per-row confidentiality class &mdash; facts inherit the space&rsquo;s gate (L1)</span>') + '</dd>' +
           '<dt>ACL provenance</dt><dd>' + (full.acl_provenance ? V.provenanceBadge(full.acl_provenance) : '<span class="refreshed">not recorded on this kind</span>') + '</dd>' +
           '<dt>trust</dt><dd>' + (full.trust_tier != null ? V.trustBadge(trustName(full.trust_tier)) : '<span class="refreshed">not recorded on this kind</span>') + '</dd>' +
           '<dt>valid</dt><dd>' + V.esc(V.fmtTime(full.valid_from)) + ' &rarr; ' + (full.valid_to ? V.esc(V.fmtTime(full.valid_to)) : '<span class="live">now</span>') + '</dd>' +
           '<dt>recorded</dt><dd>' + V.esc(V.fmtTime(full.recorded_at)) + '</dd>' +
-          '<dt>citation — L0 episode</dt><dd>' + V.refSpan(full.provenance) +
+          '<dt>citation — the original conversation/event it came from (episode)</dt><dd>' + V.refSpan(full.provenance) +
             ' <span class="refreshed">the immutable evidence-log entry this row derives from</span></dd>' +
           '<dt>row id</dt><dd>' + V.refSpan(full.id) + '</dd>' +
         '</dl>' +

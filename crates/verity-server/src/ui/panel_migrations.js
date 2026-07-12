@@ -12,7 +12,7 @@
        button); no-tenant and empty states TEACH with working buttons;
      • honesty kept verbatim: determinate bars only with a known total,
        striped indeterminate otherwise, total==0 its own state, honest ETA,
-       the live-route "unknown from this screen" seam (no GET exists), and
+       the live-route "not known yet" seam (no GET exists), and
        every count painted from a live server response — never fabricated;
      • fail-closed kept: coverage-gated cutover (server 409), force only
        behind an explicit acknowledgment (omission refuses client-side),
@@ -49,10 +49,11 @@
     mount: function () {
       var host = el("migrations-mount");
       if (!host) return;
+      // The backfill chip + as-of live in the backfill card's header (see
+      // buildCards), NOT here — under the panel title they read as the state
+      // of the whole index upgrade.
       host.innerHTML =
         '<div class="toolbar">' +
-          '<span id="mig-state"></span>' +
-          '<span class="asof" id="mig-asof"></span>' +
           '<span class="spacer"></span>' +
           '<button id="mig-refresh">Refresh</button>' +
         "</div>" +
@@ -84,7 +85,7 @@
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight"><label for="mig-model">New model <span class="note">(target model id)</span></label> ' +
             '<input type="text" id="mig-model" class="field" value="' + V.esc(DEFAULT_MODEL) + '" size="24" spellcheck="false"></div>' +
-          '<div class="tight"><label for="mig-batch">Items per batch <span class="note">(1–10000)</span></label> ' +
+          '<div class="tight"><label for="mig-batch">Text chunks per batch <span class="note">(1–10000)</span></label> ' +
             '<input type="number" id="mig-batch" class="field" min="1" max="10000" step="1" value="512"></div>' +
           '<div class="tight"><label style="display:flex;gap:8px;align-items:center;margin-top:18px">' +
             '<input type="checkbox" id="mig-global" style="width:auto;min-width:0">' +
@@ -102,18 +103,21 @@
         '<div class="dc-meta">re-embed → embedding_v2 · model registered idempotently · dims must match (384-d today; a true dim change needs docs/EMBEDDING_MIGRATION.md)</div>' +
       "</div>" +
 
-      /* 2 · backfill (auto-loaded) */
+      /* backfill (auto-loaded) — NOT a numbered step of the index upgrade */
       '<div class="card">' +
-        '<h2>2 · Source history backfill <span class="sub">GET /v1/admin/backfill · latest run per source · auto-loaded</span></h2>' +
-        '<div class="note">How far each connected source has gotten pulling in its history. Progress is posted ' +
+        '<h2>Source history backfill — separate from the index upgrade ' +
+          '<span class="sub">GET /v1/admin/backfill · latest run per source · auto-loaded</span> ' +
+          '<span id="mig-state"></span> <span class="asof" id="mig-asof"></span></h2>' +
+        '<div class="note">This watches connected sources pulling in their history. It is not a step of the ' +
+          "index switch — shown here so you can see data landing while you rebuild. Progress is posted " +
           "best-effort by the ingest side — a <b>progress signal, not an audit ledger</b>; the authoritative " +
           "rows live in the store. A bar is exact only when the source declared a total.</div>" +
         '<div id="mig-bf-out" style="margin-top:8px"></div>' +
       "</div>" +
 
-      /* 3 · cutover */
+      /* 2 · cutover */
       '<div class="card">' +
-        '<h2>3 · Switch searches to the new index <span class="sub">POST /v1/admin/reembed/cutover · coverage-gated</span></h2>' +
+        '<h2>2 · Switch searches to the new index <span class="sub">POST /v1/admin/reembed/cutover · coverage-gated</span></h2>' +
         '<div class="note">Flips recall queries to the rebuilt index. Below 100% readiness the server refuses ' +
           "(409) unless you explicitly force it. Switching back to the old index is always safe — its data " +
           "still exists, so no gate applies.</div>" +
@@ -125,9 +129,9 @@
         '<div class="dc-meta">dense route v1→v2 cutover · embedding_route() has no GET — the live route is not readable over HTTP</div>' +
       "</div>" +
 
-      /* 4 · briefs */
+      /* 3 · briefs */
       '<div class="card">' +
-        '<h2>4 · Refresh entity summaries <span class="sub">POST /v1/admin/briefs/refresh?tenant=</span></h2>' +
+        '<h2>3 · Refresh entity summaries <span class="sub">POST /v1/admin/briefs/refresh?tenant=</span></h2>' +
         '<div class="note">After a rebuild, re-computes every <b>stale</b> entity summary for the active tenant ' +
           "so downstream reads stay fresh. Summaries that are already current are left alone.</div>" +
         '<div class="row" style="margin-top:8px">' +
@@ -189,20 +193,21 @@
     if (!barEl || !statEl) return;
     if (!cov) {
       barEl.innerHTML = '<div class="bar indet"></div>';
-      statEl.innerHTML = '<span class="note">unmeasured — run a batch to measure it. There is no read-only ' +
-        "readiness endpoint; a measuring batch fills at least one pending item. No percentage is invented.</span>";
+      statEl.innerHTML = '<span class="note">unmeasured — readiness is only reported after a rebuild batch runs, ' +
+        "and running a batch does real rebuild work (there is no look-without-touching check). " +
+        "Use “Do one batch” to measure. No percentage is invented.</span>";
       return;
     }
     if (cov.total == null) {
       barEl.innerHTML = '<div class="bar indet"></div>';
       statEl.innerHTML = '<span class="note">' + V.esc(cov.covered == null ? "?" : cov.covered) +
-        " rebuilt · total unknown — no percentage is invented</span>";
+        " text chunks rebuilt · total unknown — no percentage is invented</span>";
       return;
     }
     if (cov.total <= 0) {
       barEl.innerHTML = '<div class="bar completed"><i style="width:100%"></i></div>';
       statEl.innerHTML = V.stateChip("ok", "nothing to rebuild") +
-        ' <span class="note">no items exist for this scope — complete by definition, not 0%</span>';
+        ' <span class="note">no text chunks exist for this scope — complete by definition, not 0%</span>';
       return;
     }
     var pct = Math.max(0, Math.min(100, (cov.covered / cov.total) * 100));
@@ -210,7 +215,7 @@
     barEl.innerHTML = '<div class="bar' + (complete ? " completed" : "") +
       '"><i style="width:' + pct.toFixed(1) + '%"></i></div>';
     statEl.innerHTML =
-      "<b>" + V.esc(cov.covered) + "</b> of <b>" + V.esc(cov.total) + "</b> items rebuilt (" +
+      "<b>" + V.esc(cov.covered) + "</b> of <b>" + V.esc(cov.total) + "</b> text chunks rebuilt (" +
       pct.toFixed(1) + "%)" +
       (complete ? " · " + V.stateChip("ok", "100% — ready to switch") : "") +
       ' <span class="asof">as of the last server response</span>';
@@ -232,10 +237,10 @@
         "</span></dd>";
     } else {
       // The honest seam: no GET exists for the live route; we will not guess.
-      routeLine = "<dt>Live index now</dt><dd>" + V.stateChip("off", "unknown from this screen") +
-        ' <span class="note">the server has no read endpoint for the live route, and this screen will not ' +
-        "guess — it only knows a route it flipped itself this session. (The at-rest default is the old " +
-        "index, but that is not asserted as fact.) " +
+      routeLine = "<dt>Live index now</dt><dd>" + V.stateChip("off", "not known yet") +
+        ' <span class="note">the console only learns which index is live when you switch it from this ' +
+        "screen, and no switch has happened this session. A server that has never been switched serves " +
+        "the old index. " +
         "</span>" + V.refSpan("embedding_route() — storage-only, no HTTP GET") + "</dd>";
     }
 
@@ -436,7 +441,7 @@
             '<div class="et-title">No backfill activity yet</div>' +
             '<div class="et-body">A source appears here once its ingest side posts progress — an empty list ' +
               "is not an error. Connect a source to start pulling in history.</div>" +
-            '<div class="et-actions"><button class="primary" id="mig-open-sources">Open Sources &amp; connectors</button></div>' +
+            '<div class="et-actions"><button class="primary" id="mig-open-sources">Open Sources &amp; freshness</button></div>' +
           "</div>";
         el("mig-open-sources").onclick = function () { V.show("sources"); };
         return;
@@ -457,7 +462,8 @@
           "<th>source</th><th>state</th><th>progress</th><th>time left</th><th>last error</th><th>updated</th>" +
         "</tr></thead><tbody>" + rows + "</tbody></table></div>";
     } catch (e) {
-      el("mig-state").innerHTML = V.stateChip("fail");
+      // Label the failure: only the backfill check failed, not the upgrade.
+      el("mig-state").innerHTML = V.stateChip("fail", "backfill check failed");
       V.err("mig-err", e);
     }
   }

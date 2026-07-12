@@ -39,6 +39,11 @@ body {
 /* mono is RESERVED for verbatim machine text */
 code, pre, .ref, .mono { font-family: var(--mono); }
 
+/* raw anchors otherwise fall through to the UA's dark-blue default —
+   near-unreadable on the near-black ground */
+a { color: var(--accent); }
+a:hover { color: var(--accent); text-decoration: underline; }
+
 /* ---------------------------------------------------------------- app shell */
 #app { min-height: 100vh; }
 

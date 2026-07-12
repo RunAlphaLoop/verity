@@ -126,14 +126,22 @@ acl_policy:
   }
 
   // One plain-words liveness verdict per source (the ten-second read).
-  function liveness(evAge, hbAge, bfError) {
+  function liveness(evAge, hbAge, bfError, hasFresh) {
     if (bfError) {
       return { chip: V.stateChip("fail"), text: "catch-up import failed — see notes" };
     }
     var a = evAge != null ? evAge : hbAge;
     if (a == null) {
-      // Honest fallback: a source that reports no event time never shows
-      // fake-fresh green.
+      if (hasFresh) {
+        // Live freshness samples prove data is flowing — the missing
+        // heartbeat is a telemetry gap (called out in notes), not a dead source.
+        return {
+          chip: V.stateChip("ok", "delivering"),
+          text: "data is arriving and becoming searchable — the source hasn't sent a status report yet",
+        };
+      }
+      // "age unknown" is reserved for a source with neither a heartbeat nor
+      // freshness samples — never shows fake-fresh green.
       return { chip: V.stateChip("off", "age unknown"), text: "no event time reported yet" };
     }
     if (a < FRESH_MS) {
@@ -163,6 +171,27 @@ acl_policy:
     if (!f) return null;
     var v = parseInt(f.value, 10);
     return isNaN(v) || v < 0 ? null : v;
+  }
+
+  // Friendly threshold unit — ONE formatter feeds both the input-side echo
+  // and the freshness footer, so the two can never disagree on units again.
+  function fmtThreshold(ms) {
+    if (ms == null) return null;
+    if (ms < 1000) return Math.round(ms) + " ms";
+    if (ms < 60000) { var s = ms / 1000; return (s % 1 ? s.toFixed(1) : s) + " s"; }
+    if (ms < 3600000) { var m = ms / 60000; return (m % 1 ? m.toFixed(1) : m) + " min"; }
+    var h = ms / 3600000;
+    return (h % 1 ? h.toFixed(1) : h) + " h";
+  }
+
+  // Live conversion beside the ms input, e.g. "900000 ms = 15 min".
+  function reflectTarget() {
+    var echo = el("src-target-echo");
+    if (!echo) return;
+    var t = targetMs();
+    echo.textContent = t == null ? "no threshold set — rows are never flagged"
+      : t < 1000 ? "" // sub-second ms needs no conversion
+      : t + " ms = " + fmtThreshold(t);
   }
 
   function windowHours() {
@@ -244,7 +273,8 @@ acl_policy:
               '<input type="number" id="src-window" value="24" min="1" max="2160" style="width:110px"></div>' +
             '<div class="tight"><label for="src-target">alert me over (ms) <span style="font-weight:400">— your setting, not a server SLO</span></label>' +
               '<input type="number" id="src-target" value="900000" min="0" step="1000" style="width:130px" ' +
-              'title="Set in this console for display highlighting only. The server enforces no SLO here; a red chip means a REAL measured percentile exceeded the number you typed."></div>' +
+              'title="Set in this console for display highlighting only. The server enforces no SLO here; a red chip means a REAL measured percentile exceeded the number you typed.">' +
+              '<div class="ref" id="src-target-echo"></div></div>' +
           "</div>" +
           '<div id="src-fresh"></div>' +
         "</div>" +
@@ -317,9 +347,8 @@ acl_policy:
         /* ---- install manifest (draft) ---- */
         '<div class="dialog-backdrop" id="src-manifest-dialog"><div class="dialog" style="max-width:640px">' +
           "<h3>Install a manifest (draft)</h3>" +
-          '<div class="note" style="margin-top:0"><b>When you need one:</b> free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest. ' +
-            "It is the recipe that tells Verity, per event: which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item — YAML because connectors are config you can review, diff, and approve.</div>" +
-          '<div class="note">Paste (or start from the example below) — it is validated and stored as a <b>draft — it never runs</b> until a named human approves it in the separate activate step. ' +
+          /* the what-is-a-manifest explainer lives ONCE, on the card intro */
+          '<div class="note" style="margin-top:0">Paste (or start from the example below) — it is validated and stored as a <b>draft — it never runs</b> until a named human approves it in the separate activate step. ' +
             "Re-installing an existing name replaces its YAML and <b>demotes it back to draft</b>: every change re-crosses the human gate.</div>" +
           '<div style="margin-top:12px"><label for="src-manifest-yaml">manifest YAML</label>' +
             '<div style="margin:4px 0 6px"><button id="src-manifest-example" title="fills the box with a trimmed, commented Linear manifest — edit freely; nothing is sent until you click Install, and even then it is only a draft">Start from the Linear example</button></div>' +
@@ -375,7 +404,8 @@ acl_policy:
       el("src-activate-who").oninput = reflectActivateTyped;
 
       el("src-window").addEventListener("change", function () { V.reload("sources"); });
-      el("src-target").addEventListener("input", renderFreshness);
+      el("src-target").addEventListener("input", function () { reflectTarget(); renderFreshness(); });
+      reflectTarget();
 
       if (!V.tenant()) renderNoTenant();
     },
@@ -444,7 +474,17 @@ acl_policy:
                    data.manifests.length || pendingLocal.length;
     if (data.errs.length) {
       el("src-state").innerHTML = V.stateChip("fail", "couldn't load");
-      V.err("src-err", new Error(data.errs.join("  |  ")));
+      // Four reads failing the same way is ONE problem — dedupe before showing.
+      var uniq = data.errs.filter(function (m, i) { return data.errs.indexOf(m) === i; });
+      if (uniq.some(function (m) { return /HTTP 400/.test(m) && /UUID parsing failed/.test(m); })) {
+        var ebox = el("src-err");
+        ebox.innerHTML = "This tenant id isn't valid — Verity tenant ids are UUIDs " +
+          "(they look like 019f53b8-…). Pick a real space in the session bar above." +
+          '<div class="ref" style="margin-top:4px">' + V.esc(uniq.join("\n")) + "</div>";
+        ebox.classList.add("on");
+      } else {
+        V.err("src-err", new Error(uniq.join("  |  ")));
+      }
       el("src-hint").innerHTML = hint401(data.errs);
     } else if (needs) {
       el("src-state").innerHTML = V.stateChip("attn", needs + " need" + (needs === 1 ? "s" : "") + " you");
@@ -510,7 +550,7 @@ acl_policy:
         stateCell = V.stateChip("wait", "waiting for first delivery");
         liveText = "minted this session — nothing has arrived yet";
       } else {
-        var lv = liveness(evAge, hbAge, bfError);
+        var lv = liveness(evAge, hbAge, bfError, !!(fr && (fr.samples || fr.p50_ms != null)));
         stateCell = lv.chip;
         liveText = lv.text;
       }
@@ -520,11 +560,14 @@ acl_policy:
         : '<span class="ref">not measured in this window</span>';
 
       var notes = [];
+      // Prose notes get word-break:normal inline — .ref's break-all is for
+      // raw ids and would split words mid-word here (core.css stays frozen).
+      var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
       if (mintedOnly) {
-        notes.push('<span class="ref">client-side row — shown here until the first payload or heartbeat arrives; refresh to re-check</span>');
+        notes.push(proseRef + 'client-side row — shown here until the first payload or heartbeat arrives; refresh to re-check</span>');
       }
       if (!hb && fr && !mintedOnly) {
-        notes.push('<span class="ref">alive per freshness; no heartbeat yet (connectors push those) — a telemetry gap, not a dead source</span>');
+        notes.push(proseRef + 'no status report from this source yet — freshness is measured from the data itself</span>');
       }
       if (bfError) {
         notes.push(V.badge("catch-up failed", "b-conf-3") + ' <span class="note" style="margin-top:0">' + V.esc(bfError) + "</span>");
@@ -542,7 +585,10 @@ acl_policy:
         "<td>" + V.esc(liveText) + "</td>" +
         "<td>" + searchable + "</td>" +
         '<td class="num">' + fmtCount(hb ? hb.items_synced : null) + "</td>" +
-        "<td>" + (notes.length ? notes.join("<br>") : '<span class="ref">—</span>') + "</td>" +
+        // overflow-wrap keeps long notes wrapping at word boundaries — never
+        // mid-word (word-break:normal beats any inherited break-all).
+        '<td style="overflow-wrap:break-word;word-break:normal;max-width:340px">' +
+          (notes.length ? notes.join("<br>") : '<span class="ref">—</span>') + "</td>" +
       "</tr>";
     }).join("");
 
@@ -565,9 +611,9 @@ acl_policy:
       host.innerHTML =
         '<div class="empty-teach sp-a">' +
           '<div class="et-title">No manifests installed</div>' +
-          '<div class="et-body">Free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest: ' +
-            "the recipe that tells Verity, per event, which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item. " +
-            "Installing one creates a draft that never runs; a named human approves it in a separate step, on the record.</div>" +
+          '<div class="et-body">None yet. If a source sends structured records you want queryable field-by-field ' +
+            "with the right permissions, install one — what a manifest is and does is explained above. " +
+            "Installing only creates a draft; nothing runs until a named person approves it.</div>" +
           '<div class="et-actions"><button class="primary" id="src-m-teach">Install a manifest</button></div>' +
         "</div>";
       el("src-m-teach").onclick = openManifestDialog;
@@ -656,7 +702,7 @@ acl_policy:
       "</tr></thead><tbody>" + body + "</tbody></table></div>" +
       '<div class="note">Every number is computed from real samples on <b>this deployment</b> over the last ' + windowHours() +
       " hours — session-local measurements, <em>not the published benchmark</em>. A red row means a real p95 exceeded " +
-      (tgt != null ? "your " + V.esc(V.fmtMs(tgt)) + " threshold" : "your threshold (unset)") +
+      (tgt != null ? "your threshold of " + V.esc(fmtThreshold(tgt)) : "your threshold (unset)") +
       " — a console display setting, not a server-enforced SLO.</div>";
   }
 

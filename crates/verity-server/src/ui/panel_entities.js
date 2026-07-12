@@ -102,6 +102,21 @@
 
   function displayName(sum) { return (sum && sum.name) || null; }
 
+  // A truthful, distinct label for a source record when no name is in the
+  // payload: never a raw ref as the primary text, never a fabricated name.
+  function describeRef(ref) {
+    return "the " + refSource(ref) + " record (" + String(ref || "") + ")";
+  }
+
+  // First member record whose payload actually carries a name — the summary
+  // endpoint can return name:null even when member facts have one.
+  function memberWithName(members) {
+    for (var i = 0; i < (members || []).length; i++) {
+      if (members[i] && members[i].name) return members[i];
+    }
+    return null;
+  }
+
   /* ------------------------------------------------------------ state */
 
   var data = { queue: [], entities: [], loadedAt: 0 };
@@ -182,7 +197,7 @@
               '<div><label for="ent-scope-handle">scope handle</label>' +
                 '<input type="text" id="ent-scope-handle" placeholder="vs_…" autocomplete="off" spellcheck="false"></div>' +
               '<div class="tight"><button class="primary" id="ent-load-merged">Load fields</button></div>' +
-              '<div class="tight"><button id="ent-mint-here" title="mint a fresh probe handle for this tenant — it fills in here automatically">Mint a handle</button></div>' +
+              '<div class="tight"><button id="ent-mint-here" title="mint a fresh scope handle for this space — it fills in here automatically">Mint a scope handle</button></div>' +
             "</div>" +
             '<div class="err" id="ent-merged-err"></div>' +
             '<div id="ent-merged-out"></div>' +
@@ -242,8 +257,8 @@
     el("ent-state").innerHTML = V.stateChip("off", "no tenant");
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see its entities</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle — the tenant fills in automatically and this screen loads itself.</div>' +
+        '<div class="et-title">Pick a space to see its entities</div>' +
+        '<div class="et-body">Pick a space in the session bar above (or paste its tenant id), or mint a scope handle — the space fills in automatically and this screen loads itself.</div>' +
         '<div class="et-actions"><button class="primary" id="ent-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("ent-teach-mint").onclick = function () { V.openMint(); };
@@ -263,11 +278,22 @@
       data.queue = results[0] || [];
       data.entities = results[1] || [];
       data.loadedAt = Date.now();
-      V.setCount("entities", data.queue.length);
+      V.setCount("entities", data.queue.length, "decisions waiting for you");
       renderAll();
     } catch (e) {
       el("ent-state").innerHTML = V.stateChip("fail");
-      V.err("ent-err", e);
+      var msg = String((e && e.message) || e);
+      if (msg.indexOf("400") >= 0 && msg.indexOf("UUID parsing failed") >= 0) {
+        // A space NAME was pasted where a uuid belongs — teach, don't parrot serde.
+        var box = el("ent-err");
+        box.innerHTML =
+          "That looks like the space&rsquo;s name, not its id. Pick the space from the list " +
+          "in the bar above &mdash; ids look like 019f53b8-&hellip;." +
+          '<div class="ref" style="margin-top:4px">' + V.esc(msg) + "</div>";
+        box.classList.add("on");
+      } else {
+        V.err("ent-err", e);
+      }
     }
   }
 
@@ -378,7 +404,7 @@
       '<div class="dc-question">' + question + "</div>" +
       '<div class="dc-sides">' +
         sideCol(c.left_ref, c.left_summary) +
-        '<div class="dc-vs">=?</div>' +
+        '<div class="dc-vs" style="font-size:var(--fs-sm)" title="are these the same? that\'s your decision">same?</div>' +
         sideCol(c.right_ref, c.right_summary) +
       "</div>" +
       '<div class="dc-evidence">' + evidence + "</div>" +
@@ -387,7 +413,7 @@
         (c.rationale ? " · rationale: " + V.esc(c.rationale) : "") + "</div>" +
       '<div class="dc-actions">' +
         '<button class="good ent-cand-confirm" ' + refAttrs(c, lName, rName) +
-          ' title="records a person-confirmed link and re-runs matching immediately (reversible later by splitting)">Yes, same &mdash; merge</button>' +
+          ' title="records a person-confirmed link and re-runs matching immediately (you can split them later — but a split is itself permanent)">Yes, same &mdash; merge</button>' +
         '<button class="danger ent-cand-reject" ' + refAttrs(c, lName, rName) +
           ' title="records a PERMANENT do-not-link — matching will keep these apart forever">No, keep separate</button>' +
       "</div>" +
@@ -402,9 +428,11 @@
   // One side of the question: name FIRST, source plain, ref mono-small.
   function sideCol(ref, sum) {
     sum = sum || {};
+    // A null summary name is NOT proof the record is nameless (the summary
+    // lookup can miss names the member facts carry) — say "not loaded".
     var name = sum.name
       ? '<div class="dc-name">' + V.esc(sum.name) + "</div>"
-      : '<div class="dc-name" style="color:var(--dim);font-weight:400">no name on record</div>';
+      : '<div class="dc-name" style="color:var(--dim);font-weight:400">name not loaded</div>';
     return '<div class="dc-side">' + name +
       '<div class="dc-src">in <b>' + V.esc(refSource(ref)) + "</b>" +
         (sum.domain ? " · " + V.esc(sum.domain) : "") + "</div>" +
@@ -420,23 +448,27 @@
     el("ent-decide-note").value = "";
     el("ent-decide-word").value = "";
     var confirming = decision === "confirm";
-    var lLabel = leftName || left, rLabel = rightName || right;
+    // Distinct, truthful labels: a real name when the payload has one,
+    // otherwise "the {source} record ({ref})" — never a bare raw ref.
+    var lLabel = leftName || describeRef(left), rLabel = rightName || describeRef(right);
 
     el("ent-decide-title").textContent = confirming
       ? "Merge these two?"
       : "Keep these separate — permanently?";
     el("ent-decide-summary").innerHTML =
-      V.entityChip(leftName || null, refSource(left)) +
+      V.entityChip(lLabel, refSource(left)) +
       '<span style="color:var(--dim)"> and </span>' +
-      V.entityChip(rightName || null, refSource(right)) +
+      V.entityChip(rLabel, refSource(right)) +
       '<div style="margin-top:4px">' + V.refSpan(left + "  ·  " + right) + "</div>";
     el("ent-decide-explain").innerHTML = confirming
       ? "<b>" + V.esc(lLabel) + "</b> and <b>" + V.esc(rLabel) + "</b> become one entity everywhere — recall, briefs, " +
-        "and the merged record. Your confirmation is recorded and matching re-runs immediately. You can split them " +
-        'later from the entity&rsquo;s page. <span class="ref">records a human_confirmed link (tier 2, +1)</span>'
-      : "Verity will record a <b>permanent do-not-link rule</b> between these two: matching will keep them apart forever, " +
-        "even if stronger evidence appears later, and will split them if they are currently merged. " +
-        '<b>This cannot be undone.</b> <span class="ref">records a human_rejected anti-link (tier 2, −1)</span>';
+        "and the merged record. Your confirmation is saved as evidence and outranks automatic matching, and matching " +
+        "re-runs immediately. You can split them later from the entity&rsquo;s page, though a split permanently " +
+        'forbids re-merging. <span class="ref">human_confirmed · tier 2, +1</span>'
+      : "Verity will record a <b>permanent do-not-link rule</b> between <b>" + V.esc(lLabel) + "</b> and <b>" +
+        V.esc(rLabel) + "</b>: matching will keep them apart forever, even if stronger evidence appears later, and " +
+        "will split them if they are currently merged. Your rejection is saved so these are never re-matched. " +
+        '<b>This cannot be undone.</b> <span class="ref">human_rejected · tier 2, −1</span>';
     el("ent-decide-typed").style.display = confirming ? "none" : "block";
     var go = el("ent-decide-go");
     go.textContent = confirming ? "Merge them" : "Keep separate forever";
@@ -484,8 +516,8 @@
     var m = res.materialize || {};
     var same = res.left_canonical && res.left_canonical === res.right_canonical;
     var verdict = pending.decision === "confirm" ? "Merged" : "Kept separate";
-    var lLabel = pending.leftName || pending.left;
-    var rLabel = pending.rightName || pending.right;
+    var lLabel = pending.leftName || describeRef(pending.left);
+    var rLabel = pending.rightName || describeRef(pending.right);
     el("ent-receipt").innerHTML =
       '<div class="card" style="border-left:3px solid var(--green)">' +
         '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
@@ -550,6 +582,14 @@
 
     host.innerHTML = rows.map(function (row, i) {
       var name = displayName(row.summary);
+      // The summary can miss names the member payloads carry — prefer a
+      // member's real name (source dimmed beside it) over asserting absence.
+      var named = name ? null : memberWithName(row.members);
+      var title = name
+        ? V.esc(name)
+        : named
+          ? V.esc(named.name) + ' <span style="color:var(--dim);font-weight:400;font-size:var(--fs-sm)">from ' + V.esc(named.source) + "</span>"
+          : '<span style="color:var(--dim);font-weight:400">name not loaded</span>';
       var conf = confidencePlain(row.badge);
       var n = (row.members || []).length;
       var memberChips = (row.members || []).map(function (m) {
@@ -557,8 +597,7 @@
       }).join(" ");
       return '<div class="card ent-card" data-i="' + i + '" style="cursor:pointer">' +
         '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">' +
-          '<span style="font-size:var(--fs-md);font-weight:650;color:var(--bright)">' +
-            (name ? V.esc(name) : '<span style="color:var(--dim);font-weight:400">no name on record</span>') + "</span>" +
+          '<span style="font-size:var(--fs-md);font-weight:650;color:var(--bright)">' + title + "</span>" +
           (row.summary && row.summary.domain ? '<span class="badge b-kind">' + V.esc(row.summary.domain) + "</span>" : "") +
           conf.chip +
           '<span class="spacer" style="flex:1"></span>' +
@@ -579,10 +618,12 @@
   /* ------------------------------------------------------- detail drawer */
 
   function openDetail(row) {
-    var name = displayName(row.summary);
+    var named = memberWithName(row.members);
+    var name = displayName(row.summary) || (named ? named.name : null);
     current = { canonical: row.canonical_entity, members: row.members || [], name: name || "", row: row };
     var conf = confidencePlain(row.badge);
-    el("ent-drawer-title").textContent = name || "Unnamed entity";
+    // A missing summary name is a lookup gap, not proof of namelessness.
+    el("ent-drawer-title").textContent = name || "Entity (name not loaded)";
     el("ent-drawer-head").innerHTML =
       '<div>' + V.refSpan(row.canonical_entity) + "</div>" +
       '<div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + conf.chip +
@@ -620,12 +661,21 @@
       '<div class="err" id="ent-split-err"></div>';
     var rsel = el("ent-split-right");
     if (rsel.options.length > 1) rsel.selectedIndex = 1;
+    // Each side of the permanent dialog gets its OWN label — the two source
+    // records being split, never the merged entity's one name twice.
+    function splitLabel(ref) {
+      for (var i = 0; i < current.members.length; i++) {
+        var m = current.members[i];
+        if (m.source + ":" + m.entity_id === ref && m.name) return m.name + " — " + m.source;
+      }
+      return describeRef(ref);
+    }
     el("ent-split-go").onclick = function () {
       V.clearErr("ent-split-err");
       var l = el("ent-split-left").value;
       var r = el("ent-split-right").value;
       if (l === r) { V.err("ent-split-err", new Error("pick two different records to split apart")); return; }
-      openDecide(l, r, "reject", current.name, current.name);
+      openDecide(l, r, "reject", splitLabel(l), splitLabel(r));
     };
   }
 

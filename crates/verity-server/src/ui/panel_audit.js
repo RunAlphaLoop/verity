@@ -53,14 +53,20 @@
   };
   function verbPlain(v) { return VERB_PLAIN[v] || String(v || "unknown action"); }
 
-  // Who acted, name first. fold_link rows are worker-plane (no actor);
-  // quarantine dispositions carry azp='admin'.
-  function actorPlain(r) {
-    if (r.actor_sub) return r.actor_sub;
-    if (r.verb === "fold_link") return "Verity's matching worker";
-    if (r.actor_azp === "admin") return "an admin";
-    if (r.actor_azp) return r.actor_azp;
-    return "actor not recorded";
+  // Who acted, name first, rendered as escaped HTML (callers must not
+  // re-escape). fold_link rows are worker-plane (no actor); quarantine
+  // dispositions carry azp='admin'. An azp alone is an APP's key, not a
+  // person — it never sits unmarked in the person slot.
+  function actorHtml(r, bold) {
+    var b0 = bold ? "<b>" : "", b1 = bold ? "</b>" : "";
+    if (r.actor_sub) return b0 + V.esc(r.actor_sub) + b1;
+    if (r.verb === "fold_link") return b0 + "Verity’s matching worker" + b1;
+    if (r.actor_azp === "admin") return b0 + "an admin" + b1;
+    if (r.actor_azp) {
+      return b0 + V.esc(r.actor_azp) + b1 +
+        ' <span class="refreshed">(app — no person recorded)</span>';
+    }
+    return b0 + "actor not recorded" + b1;
   }
   function actorSecondary(r) {
     var bits = [];
@@ -299,8 +305,9 @@
             '<input type="text" id="au-f-from" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
           '<div class="tight"><label for="au-f-to">to</label>' +
             '<input type="text" id="au-f-to" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
-          '<div class="tight"><label for="au-limit" title="rows fetched from the server (1-1000) — changing it refetches">window</label>' +
-            '<input type="number" id="au-limit" value="200" min="1" max="1000" style="width:90px"></div>' +
+          '<div class="tight"><label for="au-limit" title="rows fetched from the server (1-1000) — changing it refetches">load newest</label>' +
+            '<input type="number" id="au-limit" value="200" min="1" max="1000" style="width:90px"> ' +
+            '<span class="refreshed">rows</span></div>' +
         '</div>' +
 
         '<div class="err" id="au-err"></div>' +
@@ -412,7 +419,7 @@
         ? V.stateChip("ok", LAST.length + " read" + (LAST.length === 1 ? "" : "s") + " on the record")
         : V.stateChip("ok", "no reads yet");
       el("au-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8) +
-        " · window " + LAST.length + " row" + (LAST.length === 1 ? "" : "s");
+        " · showing the newest " + LAST.length + " row" + (LAST.length === 1 ? "" : "s");
       rerender();
     } catch (e) {
       el("au-state").innerHTML = V.stateChip("fail");
@@ -444,9 +451,10 @@
           ? V.stateChip("ok", probes + " blocked probe" + (probes === 1 ? "" : "s") + " · 0 leaked — fail-closed held")
           : V.stateChip("fail", leaked + " leaked item" + (leaked === 1 ? "" : "s") + " — investigate now"));
     } else {
-      defense = V.stateChip("off", "no injection-defense signal recorded") +
-        ' <span class="refreshed">this endpoint does not yet emit a blocked-probe flag — ' +
-        'probes are not inferred; an honest gap, not a fabricated zero</span>';
+      defense = V.stateChip("off", "blocked attacks: not counted yet") +
+        ' <span class="refreshed">Verity doesn’t yet record whether a read was a blocked injection ' +
+        'attempt, so this page can’t count them. When it does, a real count will appear here — ' +
+        'until then we show nothing rather than a fake 0.</span>';
     }
     el("au-summary").innerHTML =
       '<div class="toolbar" style="margin:2px 0 10px">' +
@@ -465,7 +473,7 @@
 
   function sentence(r) {
     var about = aboutPhrase(r);
-    var html = '<b>' + V.esc(actorPlain(r)) + '</b> ' + V.esc(verbPlain(r.verb)) +
+    var html = actorHtml(r, true) + ' ' + V.esc(verbPlain(r.verb)) +
       ' · <b>' + V.esc(resultPhrase(r)) + '</b>' +
       (about ? ' · ' + V.esc(about) : '') +
       ' · ' + V.esc(confName(r.confidentiality)) + ' ceiling';
@@ -601,7 +609,7 @@
     var ps = r.principals || [];
     var who = ps.length
       ? ps.map(principalHtml).join('<br>')
-      : '<span class="refreshed">nobody — an empty principal set sees nothing (fail closed)</span>';
+      : '<span class="refreshed">nobody — the read carried no keys, and an empty key set sees nothing (fail closed)</span>';
 
     var ents = (r.entity_scope || []).length
       ? V.esc((r.entity_scope || []).join(", "))
@@ -615,12 +623,13 @@
         '<div class="note" style="margin:0 0 6px">Read straight off this audit row — fields the row ' +
           'does not carry are said so, never guessed. Names come from the tenant’s principal directory.</div>' +
         '<dl class="kv">' +
-          '<dt>who (as)</dt><dd>' + V.esc(actorPlain(r)) +
-            (r.actor_azp ? ' <span class="ref">azp: ' + V.esc(r.actor_azp) + '</span>' : '') + '</dd>' +
-          '<dt>could see</dt><dd>' + who + '</dd>' +
+          '<dt>acting as</dt><dd>' + actorHtml(r, false) +
+            // azp-only rows already show the app id via actorHtml — don't repeat it
+            (r.actor_sub && r.actor_azp ? ' <span class="ref">azp: ' + V.esc(r.actor_azp) + '</span>' : '') + '</dd>' +
+          '<dt>held these keys (visibility tokens)</dt><dd>' + who + '</dd>' +
           '<dt>limited to entities</dt><dd>' + ents + '</dd>' +
           '<dt>confidentiality ceiling</dt><dd>' + V.confBadge(r.confidentiality) + '</dd>' +
-          '<dt>purpose policy</dt><dd><span class="refreshed">not recorded on this row</span></dd>' +
+          '<dt>purpose limits</dt><dd><span class="refreshed">none recorded — this server doesn’t record a purpose on reads yet</span></dd>' +
           '<dt>action</dt><dd>' + V.esc(verbPlain(r.verb)) + ' <span class="ref">' + V.esc(r.verb) + '</span></dd>' +
           '<dt>audit row</dt><dd>' + V.refSpan(r.id || "") + '</dd>' +
         '</dl>' +

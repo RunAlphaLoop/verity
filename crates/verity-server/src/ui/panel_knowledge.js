@@ -4,8 +4,9 @@
    --------------------------------------------------------------------------
    Reads / writes:
      • GET  /v1/knowledge?tenant_id            — every lesson (admin-token);
-       the rail count is derived from THIS query (candidate+eligible), the
-       same one the list below renders — never a separate estimate.
+       the rail count is derived from THIS query (eligible, plus candidates
+       at/above the support floor — the same predicate the cards' "awaiting
+       your review" chip uses) — never a separate estimate.
      • GET  /v1/admin/knowledge/{id}?tenant_id — one lesson's full story:
        support, de-identification gate, evidence lineage (audit-scope-only).
      • GET  /v1/admin/principals?tenant_id&after_token&limit — the NAMED
@@ -58,6 +59,14 @@
     return s === "candidate" || s === "eligible";
   }
 
+  // A decision is actually possible — the SAME predicate lifeChip uses for
+  // "awaiting your review". The rail badge, tab count, and state chip all
+  // count with this, so the number never promises a decision the cards refuse.
+  function isActionable(it) {
+    var s = String(it.status || "").toLowerCase();
+    return s === "eligible" || (s === "candidate" && kSupport(it).pass);
+  }
+
   // k-support gate math — DISPLAY only; the server is the authority.
   function kSupport(it) {
     var d = it.distinct_entities, w = it.writer_count;
@@ -66,6 +75,13 @@
     var catOk = (it.categories || []).length >= 1;
     return { entOk: entOk, writerOk: writerOk, catOk: catOk, pass: entOk && writerOk && catOk,
       d: d == null ? 0 : Number(d), w: w == null ? 0 : Number(w) };
+  }
+
+  // Tooltip for a publish button the privacy floor keeps disabled — built
+  // from the live numbers, so it never contradicts the card's own sentence.
+  function subFloorTitle(k) {
+    return "Cannot publish yet — only " + k.d + " customer" + (k.d === 1 ? " supports" : "s support") +
+      " this and 3 are required (privacy floor). Reject is still available.";
   }
 
   // The coarse bucket an agent would see (provenance firewall) — exact
@@ -185,7 +201,7 @@
           '<div class="note" id="know-pub-support" style="margin-top:6px"></div>' +
           '<div class="note" style="margin-top:8px"><b>Publishing is one-way.</b> Everyone you pick below will see this ' +
             "lesson in their scoped recalls, and there is <b>no un-publish</b> — retraction happens only through " +
-            "Erasure / forget.</div>" +
+            "Erasure &amp; data export.</div>" +
           '<div class="card" style="margin-top:10px">' +
             '<h2>Who can see it <span class="sub">required · GET /v1/admin/principals</span></h2>' +
             '<div class="note" style="margin-top:0">Pick the people and groups this lesson becomes visible to. ' +
@@ -215,7 +231,7 @@
           '<div id="know-rej-stmt" style="font-size:var(--fs-md);font-weight:650;color:var(--bright)"></div>' +
           '<div class="note" style="margin-top:8px">Rejecting is <b>remembered</b>: the same lesson will not be proposed ' +
             "again. Only a lesson still waiting for review can be rejected — a published one is refused (retraction is " +
-            "Erasure / forget&rsquo;s job). " +
+            "Erasure &amp; data export&rsquo;s job). " +
             '<span class="ref">POST /v1/admin/knowledge/{id}/reject</span></div>' +
           '<div style="margin-top:10px"><label for="know-rej-reason">why <span style="font-weight:400">(required &mdash; stored with the decision, on the record)</span></label>' +
             '<input type="text" id="know-rej-reason" placeholder="e.g. too specific to one industry to generalize" autocomplete="off"></div>' +
@@ -265,7 +281,7 @@
     el("know-state").innerHTML = V.stateChip("off", "no tenant");
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see its lessons</div>' +
+        '<div class="et-title">Pick a space to see its lessons</div>' +
         '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle &mdash; the tenant ' +
           "fills in automatically and this screen loads itself.</div>" +
         '<div class="et-actions"><button class="primary" id="know-teach-mint">Mint a scope handle</button></div>' +
@@ -284,13 +300,27 @@
       data.byId = {};
       data.items.forEach(function (it) { data.byId[it.id] = it; });
       data.loadedAt = Date.now();
-      // Rail count = the SAME query + filter this panel's review view renders.
-      V.setCount("knowledge", data.items.filter(isWaiting).length);
+      // Rail count = the SAME query + predicate the cards' "awaiting your
+      // review" chip uses — never a number the buttons then refuse.
+      V.setCount("knowledge", data.items.filter(isActionable).length);
       renderAll();
     } catch (e) {
       el("know-state").innerHTML = V.stateChip("fail");
-      V.err("know-err", e);
-      if (String(e && e.message).indexOf("401") !== -1) {
+      var msg = String((e && e.message) || e);
+      if (msg.indexOf("400") !== -1 && msg.indexOf("UUID parsing failed") !== -1) {
+        // A space NAME was pasted where the id belongs — say so in plain
+        // words first; the verbatim server error stays, dimmed, below.
+        var errEl = el("know-err");
+        errEl.innerHTML =
+          "That looks like a space name, not a tenant id &mdash; Verity needs the id " +
+          "(it looks like 019f53b8-&hellip;). Pick the space from the menu in the session bar " +
+          "and this screen reloads itself." +
+          '<div style="color:var(--dim);margin-top:4px">' + V.esc(msg) + "</div>";
+        errEl.classList.add("on");
+      } else {
+        V.err("know-err", e);
+      }
+      if (msg.indexOf("401") !== -1) {
         el("know-teach").innerHTML =
           '<div class="note">This read needs the admin token &mdash; paste it in the session bar above ' +
           "(it lives in this tab only and is never stored).</div>";
@@ -299,14 +329,21 @@
   }
 
   function renderAll() {
-    var waiting = data.items.filter(isWaiting);
-    el("know-state").innerHTML = waiting.length
-      ? V.stateChip("attn", waiting.length + " lesson" + (waiting.length === 1 ? "" : "s") + " awaiting review")
-      : V.stateChip("ok", "queue clear");
+    var actionable = data.items.filter(isActionable);
+    var gathering = data.items.filter(function (it) { return isWaiting(it) && !isActionable(it); });
+    if (actionable.length) {
+      el("know-state").innerHTML = V.stateChip("attn",
+        actionable.length + " lesson" + (actionable.length === 1 ? "" : "s") + " awaiting review");
+    } else if (gathering.length) {
+      el("know-state").innerHTML = V.stateChip("wait",
+        "0 need a decision · " + gathering.length + " still gathering support");
+    } else {
+      el("know-state").innerHTML = V.stateChip("ok", "queue clear");
+    }
     el("know-asof").textContent =
-      waiting.length + " awaiting · " + data.items.length + " total · checked " +
+      actionable.length + " need a decision · " + data.items.length + " total · checked " +
       new Date().toTimeString().slice(0, 8);
-    el("know-view-review").textContent = "Needs your review" + (waiting.length ? " (" + waiting.length + ")" : "");
+    el("know-view-review").textContent = "Needs your review" + (actionable.length ? " (" + actionable.length + ")" : "");
     el("know-view-all").textContent = "All lessons" + (data.items.length ? " (" + data.items.length + ")" : "");
     renderList();
   }
@@ -322,7 +359,11 @@
 
   function renderList() {
     var host = el("know-out");
-    var rows = view === "review" ? data.items.filter(isWaiting) : data.items;
+    var actionable = data.items.filter(isActionable);
+    var gathering = data.items.filter(function (it) { return isWaiting(it) && !isActionable(it); });
+    // Review view = decidable lessons first, sub-floor waiters below a
+    // dimmed divider — visible, but never counted as needing a decision.
+    var rows = view === "review" ? actionable.concat(gathering) : data.items;
 
     if (!rows.length) {
       if (!data.items.length) {
@@ -330,10 +371,11 @@
         host.innerHTML =
           '<div class="empty-teach sp-a">' +
             '<div class="et-title">No lessons proposed yet</div>' +
-            '<div class="et-body">A lesson is a cross-customer generalization an agent or the consolidation worker ' +
-              "proposes from the conversations Verity has ingested <span class=\"ref\">POST /v1/knowledge</span>. " +
-              "Every proposal stops here for a person &mdash; nothing publishes itself. Once something is proposed " +
-              "for this tenant, it appears here on its own.</div>" +
+            '<div class="et-body">A lesson is a pattern Verity notices across several customers&rsquo; ' +
+              "conversations. Verity proposes them automatically in the background (agents can also propose one " +
+              "&mdash; <span class=\"ref\">POST /v1/knowledge</span>); every proposal stops here for a person " +
+              "&mdash; nothing publishes itself. To give Verity something to learn from, start with " +
+              "<b>Add memory</b>.</div>" +
             '<div class="et-actions"><button class="primary" id="know-empty-check">Check again</button></div>' +
           "</div>";
         el("know-empty-check").onclick = function () { V.reload("knowledge"); };
@@ -374,7 +416,15 @@
     });
     var flagActive = maxWait >= 86400; // amber only past 1 day — disclosed below
 
-    host.innerHTML = rows.map(function (it) { return lessonCard(it, flagActive, maxWait); }).join("");
+    var card = function (it) { return lessonCard(it, flagActive, maxWait); };
+    if (view === "review" && gathering.length) {
+      host.innerHTML = actionable.map(card).join("") +
+        '<div style="margin:14px 0 8px;padding-top:8px;border-top:1px solid var(--border);color:var(--dim)">' +
+          "Gathering support &mdash; no decision possible yet (" + gathering.length + ")</div>" +
+        gathering.map(card).join("");
+    } else {
+      host.innerHTML = rows.map(card).join("");
+    }
     wire(host, ".know-detail", function (btn) { openDetail(btn.getAttribute("data-id")); });
     wire(host, ".know-pub-open", function (btn) { openPublish(btn.getAttribute("data-id")); });
     wire(host, ".know-rej-open", function (btn) { openReject(btn.getAttribute("data-id")); });
@@ -399,10 +449,16 @@
     }
     chips += (it.categories || []).map(function (c) { return " " + V.kindBadge(c); }).join("");
 
-    var actions = actionable
+    // The publish button obeys the same floor the support sentence states:
+    // sub-floor candidate/eligible lessons render it disabled, never green-lit.
+    var k = kSupport(it);
+    var pubBtn = k.pass
       ? '<button class="good know-pub-open" data-id="' + V.esc(it.id) + '" ' +
           'title="opens the publish gate — you pick the named people and groups; there is no default audience">' +
-          "Publish to people&hellip;</button>" +
+          "Publish to people&hellip;</button>"
+      : '<button class="good" disabled title="' + V.esc(subFloorTitle(k)) + '">Publish to people&hellip;</button>';
+    var actions = actionable
+      ? pubBtn +
         '<button class="danger know-rej-open" data-id="' + V.esc(it.id) + '" ' +
           'title="refuses this lesson with a reason — remembered so it will not be proposed again">' +
           "Reject&hellip;</button>" +
@@ -419,26 +475,41 @@
         " · customers: " + V.esc(it.distinct_entities == null ? "—" : it.distinct_entities) +
         " · independent writers: " + V.esc(it.writer_count == null ? "—" : it.writer_count) +
         " · evidence tier: " + V.esc(it.support_tier || "—") +
+        seenAtMeta(it) +
         (it.merge_reason ? " · merged because: " + V.esc(it.merge_reason) : "") +
         " · GET /v1/admin/knowledge/{id}</div>" +
       '<div class="dc-actions">' + actions + "</div>" +
     "</div>";
   }
 
+  // Byte-identical statements are told apart by where they were seen —
+  // "account:acme" renders name-first as "seen at: acme (account)".
+  function seenAtMeta(it) {
+    var e = (it.evidence && it.evidence[0] && it.evidence[0].entity) || "";
+    if (!e) return "";
+    var p = String(e), i = p.indexOf(":");
+    return " · seen at: " + (i < 0 ? V.esc(p) : V.esc(p.slice(i + 1)) + " (" + V.esc(p.slice(0, i)) + ")");
+  }
+
   /* =========================================================== detail drawer */
 
-  function setDrawerActions(status) {
-    var s = status == null ? null : String(status).toLowerCase();
+  function setDrawerActions(item) {
+    var s = item == null ? null : String(item.status || "").toLowerCase();
     var actionable = s === "candidate" || s === "eligible";
+    var k = item == null ? null : kSupport(item);
     var pub = el("know-drawer-publish"), rej = el("know-drawer-reject");
-    pub.disabled = !actionable;
+    pub.disabled = !actionable || !(k && k.pass);
     rej.disabled = !actionable;
     if (s === "published") {
-      pub.title = "Already published — there is no un-publish; retraction is Erasure / forget.";
-      rej.title = "A published lesson cannot be rejected — retraction is Erasure / forget's job.";
+      pub.title = "Already published — there is no un-publish; retraction is Erasure & data export.";
+      rej.title = "A published lesson cannot be rejected — retraction is Erasure & data export's job.";
     } else if (!actionable && s != null) {
       pub.title = "Only a lesson still waiting for review can be published (this one is " + s + ").";
       rej.title = "Only a lesson still waiting for review can be rejected (this one is " + s + ").";
+    } else if (actionable && !k.pass) {
+      // Same privacy-floor guard the cards apply — Reject stays available.
+      pub.title = subFloorTitle(k);
+      rej.title = "refuses this lesson with a reason — remembered so it will not be proposed again";
     } else {
       pub.title = "opens the publish gate — you pick the named people and groups; there is no default audience";
       rej.title = "refuses this lesson with a reason — remembered so it will not be proposed again";
@@ -457,7 +528,7 @@
         "/v1/admin/knowledge/" + encodeURIComponent(id) + "?tenant_id=" + encodeURIComponent(tenantNow),
         { admin: true });
       current = { id: id, statement: item.statement || "", status: item.status, item: item };
-      setDrawerActions(item.status);
+      setDrawerActions(item);
       renderDetail(item);
     } catch (e) {
       body.innerHTML = '<div class="err on">' + V.esc((e && e.message) || String(e)) + "</div>";
@@ -572,10 +643,10 @@
     var retraction = s === "published"
       ? '<div class="card" style="margin-top:8px"><h2>Taking it back <span class="sub">no un-publish endpoint exists</span></h2>' +
         '<div class="note" style="margin-top:0">Publishing is one-way here. Retracting a published lesson is ' +
-          "<b>Erasure / forget</b>&rsquo;s job &mdash; when its source conversations are forgotten, the lesson is " +
+          "<b>Erasure &amp; data export</b>&rsquo;s job &mdash; when its source conversations are forgotten, the lesson is " +
           "invalidated automatically. This button is a designed seam, not a fake:</div>" +
-        '<div class="actions"><button disabled title="No un-publish endpoint exists — retraction is Erasure / forget. This seam is designed, never faked.">' +
-          "Retract via Erasure / forget (no endpoint yet)</button></div></div>"
+        '<div class="actions"><button disabled title="No un-publish endpoint exists — retraction is Erasure &amp; data export. This seam is designed, never faked.">' +
+          "Retract via Erasure &amp; data export (no endpoint yet)</button></div></div>"
       : "";
 
     body.innerHTML = head + support + deid + evidence + retraction;
@@ -715,15 +786,14 @@
     } else {
       var shown = names.slice(0, 5).map(function (n) { return principalChip(n); }).join(" ");
       var extra = sel.tokens.length - Math.min(names.length, 5);
-      line = "will be visible to <b>" + sel.tokens.length + "</b> principal" +
-        (sel.tokens.length === 1 ? "" : "s") + ": " + shown +
+      line = "will be seen by <b>" + sel.tokens.length + "</b> people &amp; groups: " + shown +
         (extra > 0 ? ' <span class="note" style="margin-top:0">+ ' + extra + " more</span>" : "");
     }
     el("know-pub-count").innerHTML = line;
     var go = el("know-pub-go");
     go.disabled = !sel.tokens.length;
     go.textContent = sel.tokens.length
-      ? "Publish to " + sel.tokens.length + " principal" + (sel.tokens.length === 1 ? "" : "s")
+      ? "Publish to " + sel.tokens.length + " people & groups"
       : "Publish";
   }
 
@@ -758,11 +828,10 @@
             V.stateChip("ok", "published") +
             "<b>" + V.esc(current.statement || current.id) + "</b>" +
           "</div>" +
-          '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> principal" +
-            (sel.tokens.length === 1 ? "" : "s") + ": " + named +
+          '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> people &amp; groups (principals): " + named +
             (names.length > 6 ? " + " + (names.length - 6) + " more named" : "") +
             (unnamed > 0 ? " + " + unnamed + " raw token" + (unnamed === 1 ? "" : "s") : "") +
-            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure / forget. " +
+            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure &amp; data export. " +
             '<span class="ref">POST /v1/knowledge/' + V.esc(current.id) + "/publish</span></div>" +
         "</div>";
       await loadAll(tenantNow);

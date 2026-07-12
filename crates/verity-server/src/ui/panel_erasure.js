@@ -38,11 +38,11 @@
     { key: "actions", noun: ["recorded action", "recorded actions"],
       meaning: "actions they took, or actions targeting the record",
       jargon: "actions + provenance episodes" },
-    { key: "knowledge_evidence", noun: ["learning-evidence row", "learning-evidence rows"],
-      meaning: "their evidence withdrawn from shared learnings",
+    { key: "knowledge_evidence", noun: ["piece of evidence behind a shared lesson", "pieces of evidence behind shared lessons"],
+      meaning: "their evidence withdrawn from shared lessons",
       jargon: "knowledge_evidence" },
-    { key: "knowledge_invalidated", noun: ["shared learning taken down", "shared learnings taken down"],
-      meaning: "published learnings left with fewer than 3 supporting entities get unpublished",
+    { key: "knowledge_invalidated", noun: ["published lesson taken down", "published lessons taken down"],
+      meaning: "published lessons left with fewer than 3 supporting entities get unpublished",
       jargon: "knowledge_invalidated · k=3 cascade" },
     { key: "quarantine_preview", noun: ["quarantined preview", "quarantined previews"],
       meaning: "refused webhook payloads that mention them",
@@ -124,16 +124,31 @@
       V.esc(JSON.stringify(obj, null, 2)) + "</pre></div></details>";
   }
 
-  function nowStamp() { return new Date().toTimeString().slice(0, 8); }
+  // One clock for the whole panel: same UTC format as V.fmtTime, so a
+  // "previewed/erased/exported HH:MM:SSZ" stamp never disagrees with a
+  // server "generated …Z" timestamp shown beside it.
+  function nowStamp() { return new Date().toISOString().slice(11, 19) + "Z"; }
   function el(id) { return V.$(id); }
+
+  // Human name first, raw uuid dimmed — the id alone is never the primary
+  // label at the irreversible moment. Falls back to the raw id when the
+  // tenant directory has no name for it (never fabricate a name).
+  function tenantLabel(id) {
+    var name = V.tenantName(id);
+    if (!name) return "tenant " + V.refSpan(id);
+    var short = id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id;
+    return "<b>" + V.esc(name) + "</b> " + V.refSpan("(tenant id " + short + ")");
+  }
 
   /* ------------------------------------------------------------- state */
   var gateKey = null;           // "locked|" / "admin|<tenant>" — rebuild trigger
   var files = [];               // GET /v1/admin/media rows (auto-loaded)
-  // Last dry run: when + for exactly which target body + total rows found.
-  // The confirm step keys off THIS target (a preview of a different target
-  // proves nothing), and the free-entry 0-match gate keys off `total`.
-  var lastPreview = { at: 0, key: "", total: 0 };
+  // Last dry run: when + for exactly which target body + total rows found +
+  // the built headline sentence. The confirm step keys off THIS target (a
+  // preview of a different target proves nothing), the free-entry 0-match
+  // gate keys off `total`, and the confirm dialog repeats `headline` so the
+  // counts are visible where the decision happens — never re-typed.
+  var lastPreview = { at: 0, key: "", total: 0, headline: "" };
   // Soft format lint (ENTITY-PICKER.md §1) — convention, never a hard block.
   var TAG_LINT = /^[a-z0-9_-]+:[a-z0-9._@-]+$/;
   var entPicker = null;         // entity target picker — rebuilt with the surface
@@ -220,9 +235,9 @@
 
   /* ---------------------------------------------------- the admin surface */
   function buildTools(body, tenant) {
-    lastPreview = { at: 0, key: "", total: 0 };
+    lastPreview = { at: 0, key: "", total: 0, headline: "" };
     body.innerHTML =
-      '<div class="note" style="margin-bottom:4px">Acting on tenant ' + V.refSpan(tenant) +
+      '<div class="note" style="margin-bottom:4px">Acting on ' + tenantLabel(tenant) +
         " — change it in the session bar.</div>" +
 
       /* Step 1 — who */
@@ -284,10 +299,12 @@
       /* DSAR export */
       '<div class="card">' +
         '<h2>Export instead of erasing <span class="sub">GET /v1/admin/dsar/export · the export self-audits</span></h2>' +
-        '<div class="note">One JSON bundle of everything on record about the <b>person</b> — for a data-subject ' +
-          "access request. The export writes its own row in the access log, so this read is itself on the record.</div>" +
+        '<div class="note">One JSON bundle of what is on record about the <b>person</b> — their conversations / events, ' +
+          "the search snippets made from them, their actions, access-log rows, and proposed lessons — for a data-subject " +
+          "access request. <b>Profile facts are not included in this build’s export</b> — erase covers them, export does " +
+          "not (yet). The export writes its own row in the access log, so this read is itself on the record.</div>" +
         '<div class="row" style="margin-top:8px">' +
-          '<div class="tight"><button id="er-dsar">Export everything about this person</button></div>' +
+          '<div class="tight"><button id="er-dsar">Export what is on record about this person</button></div>' +
           '<span class="asof" id="er-dsar-stamp"></span>' +
         "</div>" +
         '<div class="err" id="er-dsar-err"></div>' +
@@ -300,7 +317,9 @@
         '<div class="note">' + V.badge("reversible — not a delete", "b-inferred") +
           " Marks a single item expired instead of deleting it — history is kept and it can be reversed. " +
           "It runs under a <b>scope handle</b> (the tenant comes from the signed handle, never this page), " +
-          "so paste the handle it should run under.</div>" +
+          "so paste the handle it should run under — mint one with “+ Mint a scope handle” in the top bar " +
+          "if you don’t have one. Copy the item id from the Memories panel (every conversation and snippet " +
+          "shows its id).</div>" +
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight" style="flex:1 1 100%"><label for="er-fg-handle">Scope handle</label> ' +
             '<input type="text" id="er-fg-handle" class="field" placeholder="vs_…" style="width:100%" autocomplete="off"></div>' +
@@ -442,7 +461,14 @@
         var res = await V.api("/v1/admin/erasure/preview", { admin: true, json: t.body }) || {};
         var report = res.would_erase || {};
         var total = REPORT_ROWS.reduce(function (a, r) { return a + Number(report[r.key] || 0); }, 0);
-        lastPreview = { at: Date.now(), key: JSON.stringify(t.body), total: total };
+        lastPreview = { at: Date.now(), key: JSON.stringify(t.body), total: total,
+          headline: headline(report, "Would remove") };
+        // The free-entry id this preview just ran for is no longer unchecked;
+        // the oninput handler resets this to the unchecked wording on edit.
+        if (entIsFree()) {
+          el("er-entity-free-lint").textContent =
+            "previewed ✓ — the dry run below is what this id matches. Edit the id and you must preview again.";
+        }
         var rebac = res.rebac_tuples_would_delete === true
           ? V.badge("their access grants would also be deleted", "b-provenance")
           : V.badge("no access-grant delete", "b-inferred") +
@@ -508,10 +534,15 @@
       var needsZeroAck = freeTarget && lastPreview.total === 0;
       el("er-confirm-summary").innerHTML =
         "You are about to permanently erase everything for " + targetSentence(t) +
-        " on tenant " + V.refSpan(tenant) + ".";
+        " on " + tenantLabel(tenant) + ".";
+      // Repeat the stored preview headline INSIDE the dialog — the counts
+      // table sits behind the dimmed backdrop, so the numbers must be
+      // visible where the decision happens. Never re-typed: `headline` is
+      // the exact string built from the dry-run report.
       el("er-confirm-preview").innerHTML = previewMatches
         ? V.stateChip("ok", "previewed") + ' <span class="note">last dry run ' +
-          V.esc(V.timeAgo(lastPreview.at)) + " — the counts above are what goes.</span>"
+          V.esc(V.timeAgo(lastPreview.at)) + ". " +
+          lastPreview.headline.replace(/\.\s*$/, "") + " — this is exactly what goes.</span>"
         : (lastPreview.at
           ? V.stateChip("attn", "previewed a different target") + ' <span class="note">the last dry run was for ' +
             "a different target — Cancel and preview exactly this one (previewing removes nothing).</span>"
@@ -562,13 +593,13 @@
 
       var invalidated = Number(report.knowledge_invalidated || 0);
       var cascade =
-        '<div class="note" style="margin-top:10px"><b>Shared-learning cascade.</b> ' +
+        '<div class="note" style="margin-top:10px"><b>Published-lesson cascade.</b> ' +
         (invalidated > 0
-          ? "<b>" + invalidated + "</b> published learning" + (invalidated === 1 ? "" : "s") +
+          ? "<b>" + invalidated + "</b> published lesson" + (invalidated === 1 ? "" : "s") +
             " lost too much support (below the 3-entity floor) and " +
-            (invalidated === 1 ? "was" : "were") + " taken down — the learning text itself carries no " +
+            (invalidated === 1 ? "was" : "were") + " taken down — the lesson text itself carries no " +
             "personal data, so it is unpublished, not shredded. "
-          : "No published learning fell below the 3-entity support floor. ") +
+          : "No published lesson fell below the 3-entity support floor. ") +
         "Evidence rows withdrawn: <b>" + Number(report.knowledge_evidence || 0) + "</b>. " +
         V.refSpan("k=3 · knowledge_invalidated / knowledge_evidence") + "</div>";
 
@@ -657,7 +688,7 @@
         var bundleJson = JSON.stringify(b, null, 2);
         out.innerHTML =
           '<div class="card" style="margin-top:10px">' +
-            "<h2>Everything on record about <b>" + V.esc(b.subject || s) + "</b> " +
+            "<h2>What is on record about <b>" + V.esc(b.subject || s) + "</b> " +
               '<span class="sub">dsar_export · generated ' +
               V.esc(b.generated_at ? V.fmtTime(b.generated_at) : "—") + "</span></h2>" +
             '<div class="note">' + V.stateChip("ok", "on the record") +
@@ -668,13 +699,15 @@
               '<tr><td>search snippets ' + V.refSpan("chunks") + '</td><td class="num">' + counts.chunks + "</td></tr>" +
               '<tr><td>recorded actions ' + V.refSpan("actions") + '</td><td class="num">' + counts.actions + "</td></tr>" +
               '<tr><td>access-log rows ' + V.refSpan("audit_log") + '</td><td class="num">' + counts.audit_log + "</td></tr>" +
-              '<tr><td>proposed learnings ' + V.refSpan("knowledge") + '</td><td class="num">' + counts.knowledge + "</td></tr>" +
+              '<tr><td>proposed lessons ' + V.refSpan("knowledge") + '</td><td class="num">' + counts.knowledge + "</td></tr>" +
             "</tbody></table></div>" +
+            '<div class="note" style="margin-top:6px">Profile facts are not included in this build’s export — ' +
+              "erase covers them, export does not (yet).</div>" +
             jsonDetails("conversations / events", counts.episodes, b.episodes || []) +
             jsonDetails("search snippets", counts.chunks, b.chunks || []) +
             jsonDetails("recorded actions", counts.actions, b.actions || []) +
             jsonDetails("access-log rows", counts.audit_log, b.audit_log || []) +
-            jsonDetails("proposed learnings", counts.knowledge, b.knowledge || []) +
+            jsonDetails("proposed lessons", counts.knowledge, b.knowledge || []) +
             '<div class="actions" style="margin-top:8px">' +
               '<button class="primary" id="er-dsar-dl">Download bundle (JSON)</button>' +
             "</div>" +

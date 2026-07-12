@@ -158,7 +158,8 @@
       await api("/v1/admin/groups", { tenant_id: tenant, group: "group:sales", member: "user:jordan" });
       await api("/v1/admin/groups", { tenant_id: tenant, group: "group:support", member: "user:taylor" });
     } catch (e) {
-      membershipNote = "group membership tuples need ReBAC (VERITY_SPICEDB_URL) — the shared keys still work";
+      membershipNote = "this server can't record group membership yet (needs the permissions engine: " +
+        "ReBAC, set via VERITY_SPICEDB_URL) — the shared group keys still work";
     }
 
     // 3. The connector: CDC upserts under source `verity-sample-crm:*`,
