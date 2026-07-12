@@ -397,12 +397,19 @@ function boot() {
   // Adopt the tenant BEFORE first show so autoload fires (#3):
   // 1. `?tenant=<uuid>` deep link (what the CLI/demo print) wins;
   // 2. else the tenant remembered in localStorage from a previous visit.
-  const deepLink = new URLSearchParams(location.search).get("tenant");
-  if (deepLink) setTenant(deepLink.trim());
+  // Only a uuid-shaped value may be adopted: templated links render literal
+  // "undefined"/"{id}" garbage (?tenant=undefined), and adopting it made
+  // every panel fire tenant_id=undefined and surface raw serde 400s (cold
+  // reviewer, 2026-07-12). A malformed deep link is dropped with a console
+  // note, never adopted, never remembered.
+  const uuidish = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+  const deepLink = (new URLSearchParams(location.search).get("tenant") || "").trim();
+  if (deepLink && uuidish(deepLink)) setTenant(deepLink);
+  else if (deepLink) console.warn("ignoring ?tenant= deep link (not a tenant id):", deepLink);
   if (!_tenant) {
     let saved = "";
     try { saved = localStorage.getItem(TENANT_KEY) || ""; } catch (e) { /* private mode */ }
-    if (saved) setTenant(saved);
+    if (saved && uuidish(saved)) setTenant(saved);
   }
   // FTUE §1: first-run detection is derived from server truth on EVERY load —
   // the shell + panels re-render when the directory answer lands.
