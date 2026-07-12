@@ -504,6 +504,14 @@ function _buildMintDialog() {
     $("mint-result").innerHTML = "";
     const t = $("mint-tenant").value.trim();
     if (!t) { showErr("mint-err", new Error("tenant is required — paste a tenant id (uuid)")); return; }
+    // Refuse a malformed id in plain language BEFORE the server's serde
+    // error can (it says things like "invalid character `m` at column 26").
+    if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(t)) {
+      showErr("mint-err", new Error(
+        "that doesn't look like a tenant id — it's a uuid like 019f53b8-6f10-71b2-b308-83a025f1cf67. " +
+        "Find yours where the server/demo printed it, or in the tenant box at the top of this page."));
+      return;
+    }
     const body = { tenant_id: t, actor_azp: "console:mint" };
     const subject = $("mint-subject").value.trim();
     const principalsRaw = $("mint-principals").value.trim();
