@@ -21,10 +21,19 @@
 //!
 //! Honesty contract: every displayed number is measured — one
 //! `std::time::Instant` span per model round-trip (`llm_ms`, includes network
-//! to Anthropic), one per tool execution (`storage_ms`, includes the local
-//! encode() dense leg the public handler also performs), one around the whole
-//! handler (`wall_ms`). Token counts are copied from the Anthropic response's
-//! `usage` block, never estimated. No dollar figures anywhere.
+//! to Anthropic), and per tool execution a decomposed set of `Instant` spans:
+//! `encode_ms` (the local ONNX dense encode of the query text; `search_memory`
+//! only) and `storage_ms` (the scoped read: `scope_for` incl. revocation
+//! subtraction → the storage read → restricted-class enforcement → the audit
+//! spawn), itself broken into `scope_ms` + `read_ms` + `enforce_ms` so no
+//! phase can hide inside another. One span around the whole handler
+//! (`wall_ms`). Every ask's `totals` block and the status body carry
+//! `build_profile` (`"debug"`/`"release"`, from `cfg!(debug_assertions)`) so
+//! a dev-build number can never masquerade as a benchmark number downstream —
+//! the published latency claims are defined by `verity-bench` on a release
+//! build only (docs/BENCHMARKS.md). Token counts are copied from the
+//! Anthropic response's `usage` block, never estimated. No dollar figures
+//! anywhere.
 //!
 //! Key handling: the Anthropic key is read from the file named by
 //! `VERITY_ANTHROPIC_KEY_FILE` **per request** (rotation works without a
@@ -175,6 +184,20 @@ fn key_file_path() -> Option<String> {
     std::env::var(KEY_FILE_ENV).ok()
 }
 
+// ---------- build-profile disclosure -----------------------------------------
+
+/// `"debug"` or `"release"`, from `cfg!(debug_assertions)`. Stamped on the
+/// status body and every ask's `totals` so a number measured on an
+/// unoptimized dev build can never be mistaken for a benchmark number
+/// (which is defined by `verity-bench` on release only — docs/BENCHMARKS.md).
+const fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
 // ---------- GET /v1/playground/status ---------------------------------------
 
 fn status_body(probe: KeyProbe) -> Value {
@@ -186,11 +209,13 @@ fn status_body(probe: KeyProbe) -> Value {
                 { "id": MODEL_SONNET, "label": "Sonnet 4.6 — smarter, slower", "default": false },
             ],
             "max_turns": MAX_TURNS_CAP,
+            "build_profile": build_profile(),
         }),
         not_ready => json!({
             "ready": false,
             "reason": not_ready.reason(),
             "env_var": KEY_FILE_ENV,
+            "build_profile": build_profile(),
         }),
     }
 }
@@ -236,8 +261,25 @@ struct ToolCallRecord {
     tool: String,
     /// The model's tool input, verbatim.
     input: Value,
-    /// Measured around the whole in-process read (includes the encode leg).
+    /// Measured around the scoped read: scope compilation → storage read →
+    /// restricted-class enforcement → audit spawn. Does NOT include the local
+    /// query encode — that is `encode_ms`, measured separately, so the total
+    /// tool time is `encode_ms + storage_ms`.
     storage_ms: f64,
+    /// `search_memory` only: the local ONNX (MiniLM) dense encode of the
+    /// query text. 0.0 for `get_fact` (nothing to embed) and refused calls.
+    encode_ms: f64,
+    /// Scope compilation via `scope_for`, including revocation-tombstone
+    /// subtraction (SQL). Part of `storage_ms`.
+    scope_ms: f64,
+    /// The storage read itself: hybrid recall (dense ∥ BM25, RRF-fused) for
+    /// `search_memory`; the bi-temporal point read for `get_fact`. Part of
+    /// `storage_ms`.
+    read_ms: f64,
+    /// Restricted-class recheck after the read (`search_memory` only —
+    /// `get_fact` has no post-read enforcement pass, so 0.0 there). Part of
+    /// `storage_ms`.
+    enforce_ms: f64,
     hits: u64,
     /// Evidence numbers assigned to this call's hits (empty for `get_fact`).
     evidence_ns: Vec<usize>,
@@ -274,12 +316,18 @@ struct Totals {
     wall_ms: f64,
     llm_ms: f64,
     llm_calls: usize,
+    /// Sum of per-call `encode_ms` (local ONNX query encodes).
+    encode_ms: f64,
+    /// Sum of per-call `storage_ms` (scoped reads, encode excluded).
     storage_ms: f64,
     storage_calls: usize,
     visible_hits_total: u64,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_input_tokens: u64,
+    /// `"debug"` or `"release"` — the profile this server binary was built
+    /// with. A debug number is a dev-console number, never a benchmark number.
+    build_profile: &'static str,
 }
 
 #[derive(Serialize)]
@@ -325,6 +373,7 @@ fn err_internal((status, msg): (StatusCode, String)) -> AskErr {
 struct RunTally {
     llm_ms: f64,
     llm_calls: usize,
+    encode_ms: f64,
     storage_ms: f64,
     storage_calls: usize,
     visible_hits_total: u64,
@@ -339,12 +388,14 @@ impl RunTally {
             wall_ms,
             llm_ms: round1(self.llm_ms),
             llm_calls: self.llm_calls,
+            encode_ms: round1(self.encode_ms),
             storage_ms: round1(self.storage_ms),
             storage_calls: self.storage_calls,
             visible_hits_total: self.visible_hits_total,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            build_profile: build_profile(),
         }
     }
 }
@@ -543,6 +594,10 @@ async fn execute_tool(
                 tool: other.to_string(),
                 input,
                 storage_ms: 0.0,
+                encode_ms: 0.0,
+                scope_ms: 0.0,
+                read_ms: 0.0,
+                enforce_ms: 0.0,
                 hits: 0,
                 evidence_ns: vec![],
                 fact: None,
@@ -562,6 +617,10 @@ fn refused_tool(tool: &str, input: Value, message: &str) -> (ToolCallRecord, Str
             tool: tool.to_string(),
             input,
             storage_ms: 0.0,
+            encode_ms: 0.0,
+            scope_ms: 0.0,
+            read_ms: 0.0,
+            enforce_ms: 0.0,
             hits: 0,
             evidence_ns: vec![],
             fact: None,
@@ -574,8 +633,11 @@ fn refused_tool(tool: &str, input: Value, message: &str) -> (ToolCallRecord, Str
 
 /// `search_memory` — the recall pipeline verbatim (same functions the public
 /// `POST /v1/recall` handler calls): encode → scope_for (revocation
-/// subtraction) → storage.recall → enforce_restricted → spawn_audit. The
-/// `storage_ms` span covers the whole in-process read, encode leg included.
+/// subtraction) → storage.recall → enforce_restricted → spawn_audit. Timed in
+/// two top-level spans — `encode_ms` (the local ONNX encode) and `storage_ms`
+/// (everything after it) — with `storage_ms` further decomposed into
+/// `scope_ms` + `read_ms` + `enforce_ms` (the audit spawn is the sub-µs
+/// remainder). Total tool time is `encode_ms + storage_ms`.
 async fn execute_search(
     state: &Arc<AppState>,
     payload: &ScopePayload,
@@ -596,23 +658,32 @@ async fn execute_search(
         .unwrap_or(DEFAULT_SEARCH_K)
         .clamp(1, 20) as usize;
 
-    let t0 = Instant::now();
+    let t_encode = Instant::now();
     let embedding = state.encode(&text).await.map_err(err_internal)?;
+    let encode_ms = elapsed_ms(t_encode);
+
+    let t0 = Instant::now();
+    let scope = state.scope_for(payload).await.map_err(err_internal)?;
+    let scope_ms = elapsed_ms(t0);
     let query = RecallQuery {
-        scope: state.scope_for(payload).await.map_err(err_internal)?,
+        scope,
         embedding,
         text: Some(text.clone()),
         k,
     };
+    let t_read = Instant::now();
     let hits = state
         .storage
         .recall(query)
         .await
         .map_err(crate::internal)
         .map_err(err_internal)?;
+    let read_ms = elapsed_ms(t_read);
+    let t_enforce = Instant::now();
     let hits = revocation::enforce_restricted(state, payload, hits)
         .await
         .map_err(err_internal)?;
+    let enforce_ms = elapsed_ms(t_enforce);
     spawn_audit(
         state,
         payload,
@@ -623,6 +694,7 @@ async fn execute_search(
     let storage_ms = elapsed_ms(t0);
 
     let evidence_ns: Vec<usize> = hits.iter().map(|h| evidence.assign(h)).collect();
+    tally.encode_ms += encode_ms;
     tally.storage_ms += storage_ms;
     tally.storage_calls += 1;
     tally.visible_hits_total += hits.len() as u64;
@@ -649,6 +721,10 @@ async fn execute_search(
             tool: "search_memory".to_string(),
             input,
             storage_ms,
+            encode_ms,
+            scope_ms,
+            read_ms,
+            enforce_ms,
             hits: numbered.len() as u64,
             evidence_ns,
             fact: None,
@@ -660,9 +736,12 @@ async fn execute_search(
 }
 
 /// `get_fact` — the get pipeline verbatim (same functions the public
-/// `GET /v1/records/...` handler calls): current_fact / fact_as_of →
-/// spawn_audit. A missing key is a normal `tool_result` ("no value for that
-/// key/time"), not an error block — an empty answer is a correct answer.
+/// `GET /v1/records/...` handler calls): scope_for → current_fact /
+/// fact_as_of → spawn_audit. `storage_ms` covers the whole pipeline
+/// (`scope_ms` + `read_ms`; there is no encode and no post-read enforcement
+/// pass here, so `encode_ms`/`enforce_ms` are 0.0). A missing key is a normal
+/// `tool_result` ("no value for that key/time"), not an error block — an
+/// empty answer is a correct answer.
 async fn execute_get_fact(
     state: &Arc<AppState>,
     payload: &ScopePayload,
@@ -703,8 +782,10 @@ async fn execute_get_fact(
     // The denial demo depends on this: get_fact passes the SAME scoped gate as
     // the public GET /v1/records/... handler (SPEC §7e — the documented leak came
     // through unguarded get-by-id). scope_for compiles visibility + revocations.
-    let scope = state.scope_for(payload).await.map_err(err_internal)?;
     let t0 = Instant::now();
+    let scope = state.scope_for(payload).await.map_err(err_internal)?;
+    let scope_ms = elapsed_ms(t0);
+    let t_read = Instant::now();
     let result = match as_of {
         Some(at) => state.storage.fact_as_of(&scope, &key, at).await,
         None => state.storage.current_fact(&scope, &key).await,
@@ -721,6 +802,7 @@ async fn execute_get_fact(
             vec![fact.id],
         );
     }
+    let read_ms = elapsed_ms(t_read);
     let storage_ms = elapsed_ms(t0);
     tally.storage_ms += storage_ms;
     tally.storage_calls += 1;
@@ -735,6 +817,10 @@ async fn execute_get_fact(
                     tool: "get_fact".to_string(),
                     input,
                     storage_ms,
+                    encode_ms: 0.0,
+                    scope_ms,
+                    read_ms,
+                    enforce_ms: 0.0,
                     hits: 1,
                     evidence_ns: vec![],
                     fact: Some(fact),
@@ -749,6 +835,10 @@ async fn execute_get_fact(
                 tool: "get_fact".to_string(),
                 input,
                 storage_ms,
+                encode_ms: 0.0,
+                scope_ms,
+                read_ms,
+                enforce_ms: 0.0,
                 hits: 0,
                 evidence_ns: vec![],
                 fact: None,
@@ -1096,10 +1186,23 @@ mod tests {
     // -- status bodies --
 
     #[test]
+    fn build_profile_matches_the_compiled_profile() {
+        // cfg!(debug_assertions) is the ground truth — the string can never
+        // disagree with how this binary was actually compiled.
+        let expected = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        assert_eq!(build_profile(), expected);
+    }
+
+    #[test]
     fn status_ready_lists_the_two_models_with_haiku_default() {
         let body = status_body(KeyProbe::Ready);
         assert_eq!(body["ready"], true);
         assert_eq!(body["max_turns"], MAX_TURNS_CAP);
+        assert_eq!(body["build_profile"], build_profile());
         let models = body["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["id"], MODEL_HAIKU);
@@ -1119,6 +1222,8 @@ mod tests {
             assert_eq!(body["ready"], false);
             assert_eq!(body["reason"], reason);
             assert_eq!(body["env_var"], KEY_FILE_ENV);
+            // Even the degraded state discloses the build profile.
+            assert_eq!(body["build_profile"], build_profile());
             // The filesystem path never appears in any response.
             assert!(!body.to_string().contains('/'));
         }
@@ -1263,6 +1368,10 @@ mod tests {
             tool: "delete_everything".into(),
             input: json!({}),
             storage_ms: 0.0,
+            encode_ms: 0.0,
+            scope_ms: 0.0,
+            read_ms: 0.0,
+            enforce_ms: 0.0,
             hits: 0,
             evidence_ns: vec![],
             fact: None,
@@ -1279,6 +1388,7 @@ mod tests {
         let tally = RunTally {
             llm_ms: 812.4 + 1594.0,
             llm_calls: 2,
+            encode_ms: 11.2,
             storage_ms: 6.3,
             storage_calls: 1,
             visible_hits_total: 6,
@@ -1291,6 +1401,7 @@ mod tests {
         assert_eq!(v["wall_ms"], 2412.7);
         assert_eq!(v["llm_ms"], 2406.4);
         assert_eq!(v["llm_calls"], 2);
+        assert_eq!(v["encode_ms"], 11.2);
         assert_eq!(v["storage_ms"], 6.3);
         assert_eq!(v["storage_calls"], 1);
         assert_eq!(v["visible_hits_total"], 6);

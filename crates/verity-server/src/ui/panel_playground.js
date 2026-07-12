@@ -33,6 +33,14 @@
      • GET  /v1/admin/principals  — token→name directory (names beside
        tokens in claims; a 401 degrades honestly to "token #N · name
        unknown"). Admin-plane read, OFF the read path, panel_scope pattern.
+       Verity.principalPicker makes the same read for the section-1 chooser.
+     • POST /v1/scopes            — the pick-path auto-mint. Picking a
+       person mints with `subject` (the identity plane assembles the whole
+       keyring server-side); picking a shared key mints with that one token
+       (what that key ALONE can see — a legitimate demo). If a subject mint
+       is refused because ReBAC is absent, the panel falls back to the
+       person's own token and SAYS SO in the receipt — degrade disclosed,
+       never silent. Server TTL default (3600 s) applies; nothing widened.
 
    Handles live in panel memory + the sessionStorage "recently asked as"
    chips only (this tab, gone on close, labeled as such) — never
@@ -47,8 +55,12 @@
   var S = {
     status: null,        // GET /v1/playground/status result
     statusErr: null,     // status fetch failure (network / not built yet)
-    mode: "paste",       // "working" | "paste" — which radio is active
+    mode: "paste",       // "pick" | "working" | "paste" — which chooser owns the receipt
     active: null,        // { handle, claims, source } — the adopted scope
+    picker: null,        // Verity.principalPicker instance (section 1's primary control)
+    pickGuard: false,    // suppress onChange while we normalize to single-select
+    minted: null,        // { principal, token, handle, fallback } — last pick-path mint
+    mintSeq: 0,          // stale-mint guard: a newer pick discards older responses
     dir: { tenant: null, map: null, error: null, promise: null },
     runs: [],            // session-local run records (die with this tab)
     latest: null,        // last successful ask response + client span
@@ -229,23 +241,19 @@
       renderScopeModes();
       renderRecent();
       renderGate();
-      // default adoption: this tab's working handle, when live (§3.1)
-      var wh = V.workingHandle();
-      if (wh) {
-        try {
-          if (!isExpired(V.decodeHandle(wh))) setMode("working");
-        } catch (e) { /* undecodable working handle — paste stands */ }
-      }
-      renderScopeModes();
+      // NO default selection, ever: nothing picked ⇒ section 2 stays gated.
+      // (The working handle is one click away under "more ways to choose".)
       if (!S.active) renderNoHandleTeach();
       fetchStatus();
     },
 
     // AUTOLOAD: a known tenant warms the token→name directory so claims and
-    // chips can carry names. The panel's real input is a HANDLE — with none,
-    // the teach states stand in; nothing here fires an ask.
+    // chips can carry names, and fills the section-1 chooser. The panel's
+    // real input is a PICK — with none, the teach states stand in; nothing
+    // here fires a mint or an ask.
     load: function (_s, tenant) {
       renderNoTenant();
+      if (S.picker) S.picker.load(tenant);
       return ensureDirectory(tenant).then(function () {
         renderScopeModes();
         renderActiveClaims();
@@ -258,6 +266,8 @@
       var p = V.navParams();
       if (p && p.handle) {
         el("pg-paste").value = p.handle;
+        var more = el("pg-more");
+        if (more) more.open = true; // show where the handle landed
         setMode("paste");
         adoptPaste(p.handle);
       }
@@ -271,29 +281,38 @@
 
       // ---- 1 · WHO IS ASKING -------------------------------------------
       '<div class="card">' +
-        '<h2>1 &middot; Who is asking? <span class="sub">a key (principal) is one identity; the person carrying the keyring holds several; a shared key stands in for a whole team</span></h2>' +
-        '<div id="pg-mode-working" style="display:none;margin-top:6px">' +
-          '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
-            '<input type="radio" name="pg-src" id="pg-r-working" value="working">' +
-            '<span>This tab&rsquo;s working scope handle <span class="asof">(kept in this tab only, gone on close)</span></span>' +
-          '</label>' +
-          '<div id="pg-working-claims" style="margin:4px 0 8px 24px"></div>' +
-        '</div>' +
-        '<div style="margin-top:6px">' +
-          '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
-            '<input type="radio" name="pg-src" id="pg-r-paste" value="paste" checked>' +
-            '<span>Paste a scope handle <span class="asof">(it decodes as you type)</span></span>' +
-          '</label>' +
-          '<div style="margin:4px 0 0 24px">' +
-            '<input type="text" id="pg-paste" placeholder="vs_&hellip;" spellcheck="false" autocomplete="off">' +
-            '<div class="err" id="pg-paste-err"></div>' +
-          '</div>' +
-        '</div>' +
-        '<div style="margin-top:10px;margin-left:24px">' +
-          '<button id="pg-mint">Mint a handle &rarr;</button> ' +
-          '<span class="asof">opens the one mint dialog &mdash; the fresh handle lands here automatically</span>' +
-        '</div>' +
+        '<h2>1 &middot; Who is asking? <span class="sub">pick a person or a shared key &mdash; Verity mints the scope handle (the signed key it reads with) for your pick automatically</span></h2>' +
+        '<div id="pg-picker" style="margin-top:6px"></div>' +
+        '<div class="asof" style="margin-top:4px">one at a time &mdash; picking another switches to it &middot; nothing is ' +
+          'picked by default, and section 2 stays locked until you choose' +
+          '<span class="api-crumb"> &middot; POST /v1/scopes</span></div>' +
+        '<div class="err" id="pg-mint-err"></div>' +
         '<div id="pg-claims" style="margin-top:10px"></div>' +
+        '<details id="pg-more" style="margin-top:10px">' +
+          '<summary style="cursor:pointer;color:var(--dim);font-size:var(--fs-sm)">more ways to choose &mdash; ' +
+            'this tab&rsquo;s working handle, paste one, or mint by hand</summary>' +
+          '<div id="pg-mode-working" style="display:none;margin-top:6px">' +
+            '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
+              '<input type="radio" name="pg-src" id="pg-r-working" value="working">' +
+              '<span>This tab&rsquo;s working scope handle <span class="asof">(kept in this tab only, gone on close)</span></span>' +
+            '</label>' +
+            '<div id="pg-working-claims" style="margin:4px 0 8px 24px"></div>' +
+          '</div>' +
+          '<div style="margin-top:6px">' +
+            '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
+              '<input type="radio" name="pg-src" id="pg-r-paste" value="paste">' +
+              '<span>Paste a scope handle <span class="asof">(it decodes as you type)</span></span>' +
+            '</label>' +
+            '<div style="margin:4px 0 0 24px">' +
+              '<input type="text" id="pg-paste" placeholder="vs_&hellip;" spellcheck="false" autocomplete="off">' +
+              '<div class="err" id="pg-paste-err"></div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="margin-top:10px;margin-left:24px">' +
+            '<button id="pg-mint">Mint a handle &rarr;</button> ' +
+            '<span class="asof">opens the one mint dialog &mdash; the fresh handle lands here automatically</span>' +
+          '</div>' +
+        '</details>' +
         '<div id="pg-recent" style="margin-top:10px"></div>' +
       '</div>' +
 
@@ -328,6 +347,13 @@
 
   /* --------------------------------------------------------------- wiring */
   function wire() {
+    // THE primary chooser — core's ONE sectioned principal picker, held to
+    // single-select here (an ask reads as one pick; the newest pick wins).
+    S.picker = V.principalPicker(el("pg-picker"), {
+      placeholder: "type to filter people and shared keys — picking mints the key",
+      maxHeight: "170px",
+      onChange: onPick,
+    });
     el("pg-mint").onclick = function () { V.openMint(); };
     el("pg-r-working").onchange = function () { if (this.checked) setMode("working"); };
     el("pg-r-paste").onchange = function () { if (this.checked) setMode("paste"); };
@@ -345,6 +371,8 @@
     V.onMint(function (m) {
       if (!S.mounted || !m || !m.handle) return;
       el("pg-paste").value = m.handle;
+      var more = el("pg-more");
+      if (more) more.open = true; // show where the handle landed
       setMode("paste");
       adoptPaste(m.handle);
     });
@@ -382,13 +410,16 @@
         V.show("scope", S.active ? { handle: S.active.handle } : undefined);
       }
       if (t.classList.contains("pg-diffkey")) {
-        var r = el("pg-recent");
+        var r = el(recentGet().length ? "pg-recent" : "pg-picker");
         if (r) { r.scrollIntoView({ behavior: "smooth", block: "center" }); }
-        var pi = el("pg-paste");
-        if (pi && !recentGet().length) pi.focus();
+        if (!recentGet().length && S.picker) S.picker.focus();
       }
       if (t.classList.contains("pg-goto-quar")) V.show("quarantine");
       if (t.classList.contains("pg-mint2")) V.openMint();
+      if (t.classList.contains("pg-remint")) {
+        // the pick-path expired mid-session — same pick, fresh mint
+        if (S.minted) mintFor({ principal: S.minted.principal, token: S.minted.token }, true);
+      }
       if (t.classList.contains("pg-retry-status")) fetchStatus();
     });
   }
@@ -407,22 +438,129 @@
   }
 
   /* ===================================================================
-     SCOPE ADOPTION (§3) — adopt, never mint. The playground owns no mint
-     form and no principal picker; Verity.openMint() is the one ceremony.
+     WHO IS ASKING (§3) — pick-first. Picking a person or shared key in
+     the principalPicker mints the scope handle automatically (POST
+     /v1/scopes); the working-handle radio, the paste field, and the mint
+     dialog live on unchanged behind "more ways to choose". Exactly ONE
+     chooser owns the receipt at a time — S.mode says which.
      =================================================================== */
+
+  // The picker's onChange. Held to single-select: the NEWEST pick wins and
+  // the older chip is dropped (picking another key IS switching to it).
+  function onPick(sel) {
+    if (S.pickGuard) return;
+    if (sel.length > 1) {
+      S.pickGuard = true;
+      S.picker.set([sel[sel.length - 1]]);
+      S.pickGuard = false;
+      sel = S.picker.value();
+    }
+    if (!sel.length) {
+      // un-picked ⇒ nothing is asking — fail closed, section 2 re-gates.
+      // S.minted stays as a memo: re-checking the same row reuses its
+      // still-live handle instead of minting again (nothing is ACTIVE
+      // meanwhile, so nothing can ask as it).
+      if (S.mode === "pick") {
+        S.active = null;
+        renderActiveClaims();
+      }
+      return;
+    }
+    mintFor(sel[0]);
+  }
+
+  // The pick-path auto-mint. A person (user:*) mints by `subject` so the
+  // identity plane assembles their whole keyring server-side ("grants can
+  // be groups; actors must be people"); a shared key mints with that one
+  // token — asking AS a bare shared key demonstrates what that key alone
+  // can see. If the subject mint is refused because ReBAC is absent, fall
+  // back to the person's own token and disclose it in the receipt.
+  async function mintFor(pick, force) {
+    V.clearErr("pg-mint-err");
+    setMode("pick");
+    // a re-pick of the same principal reuses the still-live handle — the
+    // panel never spams mints for the same "who" (an uncheck/recheck of the
+    // same row included: S.minted survives the uncheck as a memo)
+    if (!force && S.minted && S.minted.principal === String(pick.principal || "")) {
+      try {
+        if (!isExpired(V.decodeHandle(S.minted.handle))) {
+          adopt(S.minted.handle, "pick"); // re-adopt, no new POST /v1/scopes
+          return;
+        }
+      } catch (e) { /* undecodable memo — fall through to a fresh mint */ }
+    }
+    var tenant = V.tenant();
+    if (!tenant) {
+      S.active = null;
+      renderActiveClaims();
+      V.err("pg-mint-err", "pick a space in the bar above first — a mint needs to know which space the key opens");
+      return;
+    }
+    var principal = String(pick.principal || "");
+    var seq = ++S.mintSeq;
+    var host = el("pg-claims");
+    if (host) {
+      host.innerHTML = V.stateChip("wait", "minting a scope handle for " + humanName(principal) + "…") +
+        ' <span class="asof">held in this tab only &mdash; the console never stores handles</span>';
+    }
+    var fallback = false;
+    try {
+      var res;
+      if (principal.indexOf("user:") === 0) {
+        try {
+          res = await V.api("/v1/scopes", { json: {
+            tenant_id: tenant, subject: principal, actor_azp: "console:playground",
+          } });
+        } catch (e) {
+          if (String((e && e.message) || e).indexOf("subject-based scopes require ReBAC") >= 0) {
+            // identity plane absent — degrade honestly to the person's OWN key
+            fallback = true;
+            res = await V.api("/v1/scopes", { json: {
+              tenant_id: tenant, principals: [Number(pick.token)], actor_azp: "console:playground",
+            } });
+          } else {
+            throw e;
+          }
+        }
+      } else {
+        res = await V.api("/v1/scopes", { json: {
+          tenant_id: tenant, principals: [Number(pick.token)], actor_azp: "console:playground",
+        } });
+      }
+      if (seq !== S.mintSeq || S.mode !== "pick") return; // a newer choice won
+      var handle = res && res.scope_handle;
+      if (!handle) throw new Error("mint returned no scope handle");
+      S.minted = { principal: principal, token: pick.token, handle: handle, fallback: fallback };
+      adopt(handle, "pick");
+    } catch (e) {
+      if (seq !== S.mintSeq) return;
+      S.minted = null;
+      if (S.mode === "pick") { S.active = null; renderActiveClaims(); }
+      V.err("pg-mint-err", e); // the server's message, verbatim — never invented
+    }
+  }
+
   function setMode(mode) {
     S.mode = mode;
     var rw = el("pg-r-working"), rp = el("pg-r-paste");
     if (rw) rw.checked = mode === "working";
     if (rp) rp.checked = mode === "paste";
+    if (mode !== "pick" && S.picker) {
+      // one chooser owns the receipt — a manual path un-picks the picker
+      S.pickGuard = true;
+      S.picker.clear();
+      S.pickGuard = false;
+      S.minted = null;
+    }
     if (mode === "working") {
       var wh = V.workingHandle();
       if (wh) adopt(wh, "working");
-    } else {
+    } else if (mode === "paste") {
       var raw = (el("pg-paste").value || "").trim();
       if (raw) adoptPaste(raw);
       else { S.active = null; renderActiveClaims(); }
     }
+    // mode === "pick": mintFor drives adoption once the mint lands
   }
 
   function adoptPaste(raw) {
@@ -472,12 +610,12 @@
           ' <span class="asof">the server will refuse it &mdash; re-mint from the top bar</span>';
         if (S.mode === "working") setMode("paste");
       } else {
-        var left = expiresLeft(p);
-        claimsHtml =
-          V.stateChip(seesNothing(p) ? "attn" : "ok",
-            seesNothing(p) ? "live — but it sees nothing"
-              : "live" + (left != null ? " — expires in " + V.fmtAge(left) : "")) +
-          '<div style="margin-top:4px">reads as ' + principalChips(p) + "</div>";
+        // status lives in ONE place — the receipt block below the chooser.
+        claimsHtml = '<span class="asof">' +
+          (S.mode === "working"
+            ? "picked — its receipt is below"
+            : "pick it to see its receipt below") +
+          "</span>";
       }
     } catch (e) {
       claimsHtml = V.stateChip("fail", "undecodable") +
@@ -523,16 +661,30 @@
   function renderActiveClaims() {
     var host = el("pg-claims");
     if (!host) return;
+    // the "pick who is asking first" teach stands only while nothing is
+    // adopted — a landed pick clears it; un-picking brings it back. Run
+    // results and failure cards are never wiped (measured work stays).
+    var runHost = el("pg-run");
+    if (runHost) {
+      var teachShown = !!runHost.querySelector("#pg-teach");
+      if (S.active && teachShown) runHost.innerHTML = "";
+      else if (!S.active && !runHost.innerHTML.trim()) renderNoHandleTeach();
+    }
     if (!S.active) { host.innerHTML = ""; renderAskingAs(); updateAskEnabled(); return; }
     var p = S.active.claims;
     var expired = isExpired(p);
+    var fromPick = S.active.source === "pick" && S.minted;
     var head;
     if (expired) {
+      var remint = fromPick
+        ? '<button class="pg-remint" style="padding:1px 7px;font-size:11px">Mint a fresh key for ' +
+          esc(humanName(S.minted.principal)) + "</button>"
+        : '<button class="pg-mint2" style="padding:1px 7px;font-size:11px">Mint a fresh handle</button>';
       head = V.stateChip("fail", "expired") +
         '<div class="note" style="margin-top:6px">This handle expired &mdash; the server will refuse it, and refuses it ' +
-        "<em>before</em> spending any tokens. Handles expire on purpose; re-mint from the top bar &mdash; renewal never " +
+        "<em>before</em> spending any tokens. Handles expire on purpose &mdash; renewal never " +
         "widens anything. Runs already in the session table keep their numbers. " +
-        '<button class="pg-mint2" style="padding:1px 7px;font-size:11px">Mint a fresh handle</button></div>';
+        remint + "</div>";
     } else if (seesNothing(p)) {
       head = V.stateChip("attn", "sees nothing — no keys on this handle") +
         ' <span class="asof">Ask stays enabled &mdash; the denial is the demo</span>';
@@ -540,8 +692,21 @@
       var left = expiresLeft(p);
       head = V.stateChip("ok", "live" + (left != null ? " — expires in " + V.fmtAge(left) : ""));
     }
+    // pick-path disclosure: the mint happened FOR the pick, and any degrade
+    // (identity plane absent → the person's own key only) is said out loud.
+    var pickNote = "";
+    if (fromPick && !expired) {
+      pickNote = '<div class="asof" style="margin-top:4px">minted automatically for your pick &mdash; held in this ' +
+        'tab only, never stored<span class="api-crumb"> &middot; POST /v1/scopes</span></div>';
+      if (S.minted.fallback) {
+        pickNote += '<div style="margin-top:4px">' + V.stateChip("attn", "this person’s own key only") +
+          ' <span class="asof">this server runs without the identity plane, so the handle carries only ' +
+          "this person&rsquo;s own key &mdash; not their shared keys</span></div>";
+      }
+    }
     host.innerHTML =
       '<div>' + head + "</div>" +
+      pickNote +
       '<dl class="kv" style="margin-top:8px">' +
         "<dt>reads as</dt><dd>" + principalChips(p) + "</dd>" +
         "<dt>limited to</dt><dd>" + entityLimitHtml(p) + "</dd>" +
@@ -696,12 +861,14 @@
   /* ------------------------------------------------- no-handle teach (D) */
   function renderNoHandleTeach() {
     el("pg-run").innerHTML =
-      '<div class="empty-teach sp-a">' +
+      '<div class="empty-teach sp-a" id="pg-teach">' +
         '<div class="et-title">Pick who is asking first</div>' +
-        '<div class="et-body">The agent reads with a scope handle &mdash; the signed key an agent reads with ' +
-          "&mdash; and there is no default. An unscoped ask does not exist; Verity fails closed. Paste one above " +
-          '(<span class="ref">verity-cli dev</span> prints one at bootstrap), or mint one.</div>' +
-        '<div class="et-actions"><button class="primary pg-mint2">Mint a handle &rarr;</button></div>' +
+        '<div class="et-body">Choose a person or a shared key in section 1 &mdash; Verity mints the scope handle ' +
+          "(the signed key an agent reads with) for your pick automatically. There is no default; an unscoped ask " +
+          "does not exist &mdash; Verity fails closed. Brought your own handle? Open <b>more ways to choose</b> above " +
+          'to use this tab&rsquo;s working handle or paste one (<span class="ref">verity-cli dev</span> prints one at ' +
+          "bootstrap).</div>" +
+        '<div class="et-actions"><button class="primary pg-mint2">Mint a handle by hand &rarr;</button></div>' +
       "</div>";
   }
 

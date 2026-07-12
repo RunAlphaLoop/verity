@@ -288,3 +288,58 @@ p=0.01 (1%).
 4. Caveats: single-query latency only (no QPS-under-load for this profile yet); hybrid
    recall in this profile still runs its BM25 leg in Postgres (pg_search) + local RRF, so
    its sparse numbers are the Postgres profile's; the machine also hosted both containers.
+
+---
+
+## 2026-07-12 — why the playground trace shows ~50–120ms: span composition + dev-DB state, not a regression
+
+**Trigger:** a playground trace line reading "94.3 ms storage" looked like it broke the
+<50ms p95 claim. It does not — but only because the two numbers measure different spans
+under different conditions, so this entry pins both down.
+
+**What the playground `storage_ms` span actually wraps** (playground.rs `execute_search`,
+one `Instant` around the whole in-process read): local ONNX query encode → `scope_for`
+(scope compilation incl. revocation-tombstone subtraction, SQL) → `storage.recall`
+(HYBRID: dense leg — with its per-call `EXPLAIN` routing probe and `embedding_route`
+settings lookup — joined with the BM25 leg, RRF-fused) → `revocation::enforce_restricted`
+(restricted-class recheck) → `spawn_audit` (spawn only; the write is async). The
+benchmark entries above measure `StorageAdapter::recall` alone, in-process, single-leg,
+no encoder (+~12ms separately). The playground span is a strict superset.
+
+**Measured** (HTTP round-trip to `POST /v1/recall`, text query so the server encodes,
+k=8, N=50 per cell, dev box under concurrent cargo builds — load avg ~2.2–2.7, dev
+Postgres shared with ~100 test tenants):
+
+| Case | build | run1 (cold) | p50 | p95 | max |
+|---|---|---|---|---|---|
+| bench tenant, 1,000,005 chunks, token-2 (~1%) | debug (7717) | 296.7ms | 84.0ms | 104.5ms | 296.7ms |
+| bench tenant, same scope | release (7721) | 183.4ms | 83.0ms | 162.6ms | 190.4ms |
+| bench, interleaved re-run (25 ea.) | debug / release | — | 85.0 / 83.7–85.5ms | 106.0 / 103.7–103.9ms | — |
+| demo tenant (6 chunks) | debug (7717) | 80.8ms | 18.4ms | 24.4ms | 80.8ms |
+| demo tenant (6 chunks) | release (7721) | 77.2ms | 17.8ms | 25.2ms | 77.2ms |
+
+One real playground ask per build (single shot, demo tenant): `storage_ms` 53.3ms
+(debug) / 118.3ms (release) — single-shot spread brackets the founder's 94.3ms.
+
+**Findings:**
+
+1. **Debug-vs-release is NOT the story:** interleaved p50s are identical within noise
+   (85.0 debug vs 83.7–85.5 release). The span is dominated by Postgres + ONNX native
+   code, which compile the same either way.
+2. **Cold first shots run 2–4x the p50** (e.g. 296.7ms cold vs 84.0ms p50 on bench). A
+   single screenshotted trace number is quite likely a cold shot.
+3. **No regression from the L1 fact-visibility change (ba383e4):** its postgres.rs diff
+   touches zero recall/chunks query lines (facts only); `EXPLAIN ANALYZE` of the live
+   recall SQL shows the same five predicates and no new per-row work on chunks.
+4. **What did drift: dev-DB state.** The dense exact-scan leg alone now measures
+   ~40–43ms warm at 1% (vs 11–15ms in the 07-09 entries). The shared `visibility` GIN
+   index returns 18,565 bitmap rows for token 2 across ALL tenants against 10,028
+   in-tenant matches — the ~100 accumulated test tenants pollute the posting list — and
+   the box was compiling in parallel. The a529fe1 route cutover also added one settings
+   SELECT + an `EXPLAIN` probe per dense call (small, but part of the span).
+5. **Conclusion for the claim:** the ~37ms p95 end-to-end number stands as measured on
+   its stated conditions (verity-bench, adapter span, quiet box, clean 1M corpus). The
+   playground number is a different span (adds scope_for, restricted recheck, BM25 leg,
+   HTTP) on a dirty shared dev DB under load — it is *outside the benchmark's stated
+   conditions*, which is exactly why the trace shows it. A clean-box re-run of the
+   HTTP-path number belongs here before any end-to-end API latency claim ships.
