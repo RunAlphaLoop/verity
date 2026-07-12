@@ -1260,6 +1260,14 @@ impl PostgresAdapter {
     /// own implicit canonical and are intentionally NOT listed here (there is no
     /// `entity_aliases` row to enumerate them from — the browser lists MERGED
     /// entities).
+    ///
+    /// ADMIN-PLANE read (SPEC §7e): the ONLY caller is the bearer-gated admin
+    /// entities browser (`admin_list_entities`), which legitimately sees every
+    /// entity. The name/domain summary it fetches (`member_field_summary`) is
+    /// therefore admin-all — it may surface a value from a fact no agent scope
+    /// could see. There is no scope-handle path into this method, so no
+    /// visibility pre-filter is applied; a scoped caller would go through
+    /// `merged_record` (visible-only) instead.
     pub async fn list_canonical_entities(
         &self,
         tenant: TenantId,
@@ -2094,22 +2102,76 @@ impl PostgresAdapter {
     /// A source absent from the resolved order ranks after all listed sources;
     /// ties (including the no-precedence-config case) break by most-recent
     /// `valid_from`, then by source name — fully deterministic.
-    pub async fn merged_record(&self, tenant: TenantId, canonical: &str) -> Result<MergedRecord> {
+    /// Scoped cross-source merged view (SPEC §7f). Precedence resolves over
+    /// caller-VISIBLE facts ONLY — an invisible higher-precedence fact must never
+    /// win a field (its winning value would leak) nor appear as a
+    /// `superseded_alternative`. Two callers with different scopes may therefore
+    /// see a different winning source for the same field: correct, if surprising.
+    /// The admin plane calls `merged_record_admin` (no visibility predicate).
+    pub async fn merged_record(&self, scope: &Scope, canonical: &str) -> Result<MergedRecord> {
+        self.merged_record_inner(scope.tenant_id, canonical, Some(scope))
+            .await
+    }
+
+    /// Admin-plane merged view: resolves over EVERY fact regardless of
+    /// visibility. Bearer-gated at the handler; NEVER reachable from an agent
+    /// scope handle (there is no scope argument to smuggle a bypass through).
+    /// For DSAR export / the admin entities browser / audit.
+    pub async fn merged_record_admin(
+        &self,
+        tenant: TenantId,
+        canonical: &str,
+    ) -> Result<MergedRecord> {
+        self.merged_record_inner(tenant, canonical, None).await
+    }
+
+    /// Shared merged-view body. `scope = Some` applies the visibility
+    /// pre-filter (scoped handler); `None` is the admin-all plane. All three
+    /// fact-gather queries filter BEFORE precedence runs so an invisible fact
+    /// influences neither the winner nor the alternatives list.
+    async fn merged_record_inner(
+        &self,
+        tenant: TenantId,
+        canonical: &str,
+        scope: Option<&Scope>,
+    ) -> Result<MergedRecord> {
+        // A scoped read with no principals is fail-closed: nothing is visible.
+        if let Some(s) = scope {
+            if s.principals.is_empty() {
+                return Ok(MergedRecord {
+                    tenant_id: tenant,
+                    canonical_entity: canonical.to_string(),
+                    members: Vec::new(),
+                    fields: std::collections::BTreeMap::new(),
+                });
+            }
+        }
+
         // 1. Resolve members. Explicit aliases win; else the unmapped fallback
         //    (any facts keyed directly on `canonical` as entity_id).
         let members = self.list_entity_aliases(tenant, canonical).await?;
 
-        // 2. Gather current facts for those members (or the unmapped fallback).
-        let fact_rows: Vec<FactRow> = if members.is_empty() {
-            let rows = sqlx::query(
+        // 2. Gather current facts for those members (or the unmapped fallback),
+        //    filtered to caller-visible rows when scoped.
+        let mut fact_rows: Vec<FactRow> = if members.is_empty() {
+            let (vis_pred, entity_ids) = match scope {
+                Some(s) => (
+                    "AND visibility && $3 AND confidentiality <= $4",
+                    Some((s.principals.clone(), s.max_confidentiality as i16)),
+                ),
+                None => ("", None),
+            };
+            let sql = format!(
                 "SELECT * FROM facts
-                 WHERE tenant_id = $1 AND entity_id = $2 AND valid_to IS NULL",
-            )
-            .bind(tenant)
-            .bind(canonical)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
+                 WHERE tenant_id = $1 AND entity_id = $2 AND valid_to IS NULL {vis_pred}"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(tenant)
+                .bind(canonical);
+            if let Some((principals, max_conf)) = &entity_ids {
+                q = q.bind(principals).bind(max_conf);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
             rows.iter().map(row_to_fact).collect::<Result<_>>()?
         } else {
             let sources: Vec<String> = members.iter().map(|m| m.source.clone()).collect();
@@ -2123,20 +2185,35 @@ impl PostgresAdapter {
             // however the split fell — see member_field_summary for the full
             // story. Without this, the MERGED record silently dropped every
             // colon-source member's fields.
-            let rows = sqlx::query(
+            let vis_pred = match scope {
+                Some(_) => "AND f.visibility && $4 AND f.confidentiality <= $5",
+                None => "",
+            };
+            let sql = format!(
                 "SELECT f.* FROM facts f
                  JOIN unnest($2::text[], $3::text[]) AS m(source, entity_id)
                    ON f.source || ':' || f.entity_id = m.source || ':' || m.entity_id
-                 WHERE f.tenant_id = $1 AND f.valid_to IS NULL",
-            )
-            .bind(tenant)
-            .bind(&sources)
-            .bind(&entity_ids)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
+                 WHERE f.tenant_id = $1 AND f.valid_to IS NULL {vis_pred}"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(tenant)
+                .bind(&sources)
+                .bind(&entity_ids);
+            if let Some(s) = scope {
+                q = q.bind(&s.principals).bind(s.max_confidentiality as i16);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
             rows.iter().map(row_to_fact).collect::<Result<_>>()?
         };
+
+        // Entity-scope fence (scoped only): a fact's entity IS its key, so drop
+        // any gathered row whose entity_id is outside a non-empty entity_scope.
+        // Mirrors the Rust short-circuit in current_fact/fact_as_of.
+        if let Some(s) = scope {
+            if !s.entity_scope.is_empty() {
+                fact_rows.retain(|f| s.entity_scope.contains(&f.key.entity_id));
+            }
+        }
 
         // 3. Load precedence config for this canonical + the defaults.
         let prec = self.load_precedence(tenant, canonical).await?;
@@ -2629,16 +2706,31 @@ impl StorageAdapter for PostgresAdapter {
         Ok(outcome)
     }
 
-    async fn current_fact(&self, tenant: TenantId, key: &FactKey) -> Result<Option<FactRow>> {
+    async fn current_fact(&self, scope: &Scope, key: &FactKey) -> Result<Option<FactRow>> {
+        // Fail closed: no principals, nothing visible. Also short-circuits the
+        // query so an empty `&&` bind never even runs.
+        if scope.principals.is_empty() {
+            return Ok(None);
+        }
+        // Entity-scope fence: a fact's entity IS its key, so this is a cheap Rust
+        // membership check rather than the tag-subset `entity_scope_predicate`
+        // (which is chunk-shaped). Out-of-scope entity → invisible.
+        if !scope.entity_scope.is_empty() && !scope.entity_scope.contains(&key.entity_id) {
+            return Ok(None);
+        }
         let row = sqlx::query(
             "SELECT * FROM facts
              WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
-               AND valid_to IS NULL",
+               AND valid_to IS NULL
+               AND visibility && $5
+               AND confidentiality <= $6",
         )
-        .bind(tenant)
+        .bind(scope.tenant_id)
         .bind(&key.source)
         .bind(&key.entity_id)
         .bind(&key.field)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2647,22 +2739,36 @@ impl StorageAdapter for PostgresAdapter {
 
     async fn fact_as_of(
         &self,
-        tenant: TenantId,
+        scope: &Scope,
         key: &FactKey,
         as_of: DateTime<Utc>,
     ) -> Result<Option<FactRow>> {
+        if scope.principals.is_empty() {
+            return Ok(None);
+        }
+        if !scope.entity_scope.is_empty() && !scope.entity_scope.contains(&key.entity_id) {
+            return Ok(None);
+        }
+        // The visibility/confidentiality predicate filters on the row's CURRENT
+        // ACL column (corrections are applied in place across all rows of a key,
+        // §5e.6b), so a historical value is gated by now-ACL: an un-shared
+        // principal cannot reach it via `as_of`.
         let row = sqlx::query(
             "SELECT * FROM facts
              WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
                AND valid_from <= $5 AND (valid_to IS NULL OR valid_to > $5)
+               AND visibility && $6
+               AND confidentiality <= $7
              ORDER BY valid_from DESC
              LIMIT 1",
         )
-        .bind(tenant)
+        .bind(scope.tenant_id)
         .bind(&key.source)
         .bind(&key.entity_id)
         .bind(&key.field)
         .bind(as_of)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3646,7 +3752,127 @@ impl StorageAdapter for PostgresAdapter {
     }
 }
 
+/// The reason an ACL correction was applied, stamped on the `fact_acl_audit`
+/// row (migration 0026). Mirrors the CHECK-free `reason` vocabulary the audit
+/// table documents; kept as a Rust enum so callers cannot free-type a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclCorrectionReason {
+    SourceReshare,
+    SourceUnshare,
+    AdminCorrection,
+    RebacWatchDelete,
+}
+
+impl AclCorrectionReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::SourceReshare => "source_reshare",
+            Self::SourceUnshare => "source_unshare",
+            Self::AdminCorrection => "admin_correction",
+            Self::RebacWatchDelete => "rebac_watch_delete",
+        }
+    }
+}
+
 impl PostgresAdapter {
+    /// ACL-correction-in-place (SPEC §5e.6b, the append-only carve-out). Value
+    /// changes stay append-only (valid_to + superseded_by); an ACL change does
+    /// NOT — a re-share/un-share UPDATEs `visibility`/`confidentiality` across
+    /// EVERY row of the key (current + superseded history) in one transaction
+    /// and appends exactly one `fact_acl_audit` row. It takes effect immediately,
+    /// like a revocation tombstone: were the new ACL appended as a fresh value
+    /// row, the old permissive ACL would sit behind `valid_to IS NULL` until the
+    /// next value write — a leak window. Because history rows are touched too,
+    /// `fact_as_of` enforces NOW-ACL: an un-shared principal cannot reach a
+    /// historical value via `?as_of=`.
+    ///
+    /// Admin/connector plane only — reachable from admin correction handlers and
+    /// the rebac-watch `group#member` DELETE path, NEVER from an agent scope.
+    /// Returns the number of fact rows whose ACL was updated (0 = unknown key).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn correct_fact_acl(
+        &self,
+        tenant: TenantId,
+        key: &FactKey,
+        new_visibility: &[PrincipalToken],
+        new_confidentiality: Confidentiality,
+        reason: AclCorrectionReason,
+        acl_provenance: AclProvenance,
+        changed_by: Option<&str>,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Snapshot the CURRENT row's old ACL for the audit trail (the current
+        // row is the one whose "who could see the live value" is forensically
+        // interesting). NULL old_* when the key has no current row.
+        let current = sqlx::query(
+            "SELECT id, visibility, confidentiality FROM facts
+             WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
+               AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(&key.source)
+        .bind(&key.entity_id)
+        .bind(&key.field)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        let (fact_id, old_vis, old_conf): (Option<Uuid>, Option<Vec<i32>>, Option<i16>) =
+            match &current {
+                Some(r) => (
+                    Some(r.try_get("id").map_err(db_err)?),
+                    Some(r.try_get("visibility").map_err(db_err)?),
+                    Some(r.try_get("confidentiality").map_err(db_err)?),
+                ),
+                None => (None, None, None),
+            };
+
+        // In-place UPDATE across ALL rows of the key (current + superseded).
+        let updated = sqlx::query(
+            "UPDATE facts SET visibility = $5, confidentiality = $6
+             WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4",
+        )
+        .bind(tenant)
+        .bind(&key.source)
+        .bind(&key.entity_id)
+        .bind(&key.field)
+        .bind(new_visibility)
+        .bind(new_confidentiality as i16)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        // One append-only audit row (old -> new).
+        sqlx::query(
+            "INSERT INTO fact_acl_audit
+                (id, tenant_id, source, entity_id, field, fact_id,
+                 old_visibility, new_visibility, old_confidentiality, new_confidentiality,
+                 reason, acl_provenance, changed_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(&key.source)
+        .bind(&key.entity_id)
+        .bind(&key.field)
+        .bind(fact_id)
+        .bind(old_vis)
+        .bind(new_visibility)
+        .bind(old_conf)
+        .bind(new_confidentiality as i16)
+        .bind(reason.as_str())
+        .bind(acl_provenance.as_str())
+        .bind(changed_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
+    }
+
     /// The ONE L0 episode insert path (SPEC §8a): every episode row — agent
     /// observations, CDC envelopes, doc versions, action provenance,
     /// knowledge-publish provenance — is written here, so envelope encryption
@@ -3743,8 +3969,9 @@ async fn insert_fact_row(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO facts (id, tenant_id, source, entity_id, field, value,
-                            valid_from, valid_to, provenance, acl_provenance)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                            valid_from, valid_to, visibility, confidentiality,
+                            provenance, acl_provenance)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(fact.tenant_id)
@@ -3754,6 +3981,8 @@ async fn insert_fact_row(
     .bind(&fact.value)
     .bind(fact.valid_from)
     .bind(valid_to)
+    .bind(&fact.visibility)
+    .bind(fact.confidentiality as i16)
     .bind(fact.provenance)
     .bind(fact.acl_provenance.as_str())
     .execute(&mut **tx)
@@ -3965,6 +4194,10 @@ fn row_to_fact(row: &PgRow) -> Result<FactRow> {
         valid_to: row.try_get("valid_to").map_err(db_err)?,
         superseded_by: row.try_get("superseded_by").map_err(db_err)?,
         recorded_at: row.try_get("recorded_at").map_err(db_err)?,
+        visibility: row.try_get("visibility").map_err(db_err)?,
+        confidentiality: Confidentiality::from_i16(
+            row.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+        ),
         provenance: row.try_get("provenance").map_err(db_err)?,
         acl_provenance: AclProvenance::from_str_lossy(
             &row.try_get::<String, _>("acl_provenance").map_err(db_err)?,

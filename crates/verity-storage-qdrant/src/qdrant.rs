@@ -557,17 +557,19 @@ impl StorageAdapter for QdrantAdapter {
         self.inner.upsert_fact(fact).await
     }
 
-    async fn current_fact(&self, tenant: TenantId, key: &FactKey) -> Result<Option<FactRow>> {
-        self.inner.current_fact(tenant, key).await
+    async fn current_fact(&self, scope: &Scope, key: &FactKey) -> Result<Option<FactRow>> {
+        // Pure delegator: L1 facts live in Postgres (the inner adapter), which
+        // applies the scope visibility pre-filter. Just forward the scope.
+        self.inner.current_fact(scope, key).await
     }
 
     async fn fact_as_of(
         &self,
-        tenant: TenantId,
+        scope: &Scope,
         key: &FactKey,
         as_of: DateTime<Utc>,
     ) -> Result<Option<FactRow>> {
-        self.inner.fact_as_of(tenant, key, as_of).await
+        self.inner.fact_as_of(scope, key, as_of).await
     }
 
     /// Dual write: Postgres first (system of record, BM25 leg, bi-temporal

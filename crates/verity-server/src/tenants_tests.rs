@@ -125,10 +125,21 @@ async fn tenant_directory_lists_created_tenants_newest_first() {
         row["created_at"].as_str().is_some(),
         "created_at serialized"
     );
-    assert_eq!(
-        row["tenant_id"],
-        json!(rows[0].tenant_id),
-        "same order as storage"
+    // Handler returns newest-first: the single row must be at least as new as
+    // `b`, the newest tenant THIS test created. Asserted as a `>=` invariant,
+    // not identity against `rows[0]` — the shared dev DB has other tests
+    // creating tenants concurrently, and a newer one legitimately takes the top
+    // slot between the two list calls (that identity check flaked under
+    // parallel `cargo test`). Newest-first ordering itself is pinned race-free
+    // by the storage-level windows() assertion above.
+    let b_created = rows[pb].created_at;
+    let top_created = row["created_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("created_at parses");
+    assert!(
+        top_created >= b_created,
+        "handler's newest-first row must be >= the newest tenant we created"
     );
 
     // An absent limit defaults sanely (no panic, contract shape intact).

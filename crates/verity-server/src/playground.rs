@@ -700,10 +700,14 @@ async fn execute_get_fact(
         entity_id,
         field,
     };
+    // The denial demo depends on this: get_fact passes the SAME scoped gate as
+    // the public GET /v1/records/... handler (SPEC §7e — the documented leak came
+    // through unguarded get-by-id). scope_for compiles visibility + revocations.
+    let scope = state.scope_for(payload).await.map_err(err_internal)?;
     let t0 = Instant::now();
     let result = match as_of {
-        Some(at) => state.storage.fact_as_of(payload.tenant_id, &key, at).await,
-        None => state.storage.current_fact(payload.tenant_id, &key).await,
+        Some(at) => state.storage.fact_as_of(&scope, &key, at).await,
+        None => state.storage.current_fact(&scope, &key).await,
     }
     .map_err(crate::internal)
     .map_err(err_internal)?;

@@ -51,6 +51,20 @@ pub enum Confidentiality {
     Restricted = 3,
 }
 
+impl Confidentiality {
+    /// Parse the stored `smallint` column back into the enum. Unknown/negative
+    /// values fail closed to the strictest class (`Restricted`) so a malformed
+    /// row is never treated as more visible than it should be.
+    pub fn from_i16(v: i16) -> Self {
+        match v {
+            0 => Self::Public,
+            1 => Self::Internal,
+            2 => Self::Confidential,
+            _ => Self::Restricted,
+        }
+    }
+}
+
 /// How a memory's visibility was determined (SPEC §5e.6). Surfaced on every
 /// read so the convenience lane and the truth lane are labeled in-product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +155,13 @@ pub struct FactWrite {
     pub key: FactKey,
     pub value: serde_json::Value,
     pub valid_from: DateTime<Utc>,
+    /// Materialized principal-token set, mirrors `ChunkWrite::visibility`.
+    /// Resolved at the write-time ACL choke point (SPEC §5e); empty = REFUSAL /
+    /// invisible to scoped reads, never "visible to all" (fail closed).
+    pub visibility: Vec<PrincipalToken>,
+    /// Confidentiality class, mirrors `ChunkWrite::confidentiality`; the read
+    /// path enforces `confidentiality <= scope.max_confidentiality`.
+    pub confidentiality: Confidentiality,
     pub provenance: EpisodeId,
     pub acl_provenance: AclProvenance,
 }
@@ -155,6 +176,12 @@ pub struct FactRow {
     pub valid_to: Option<DateTime<Utc>>,
     pub superseded_by: Option<FactId>,
     pub recorded_at: DateTime<Utc>,
+    /// Materialized principal-token set surfaced on reads for the SPEC §5e.6
+    /// "display visibility label" requirement. The scoped read predicate has
+    /// already filtered on this column; it is exposed for the label, not for
+    /// caller-side re-enforcement.
+    pub visibility: Vec<PrincipalToken>,
+    pub confidentiality: Confidentiality,
     pub provenance: EpisodeId,
     pub acl_provenance: AclProvenance,
 }
@@ -202,6 +229,21 @@ pub struct Scope {
     pub entity_scope: Vec<String>,
     /// Highest confidentiality class this scope may retrieve.
     pub max_confidentiality: Confidentiality,
+}
+
+/// The ONE point-read enforcement predicate for L1 facts, expressed in Rust.
+/// The Postgres adapter additionally pushes the equivalent SQL
+/// (`visibility && $tokens AND confidentiality <= $M`) for selectivity;
+/// `CachedAdapter` applies THIS function above the cache. Both must agree.
+/// The scope fuzzer's client-side oracle also calls this exact function so no
+/// second copy can drift. Fail-closed: an empty `scope.principals` (or an empty
+/// row `visibility`) yields `false`.
+pub fn fact_visible(scope: &Scope, row: &FactRow) -> bool {
+    let overlap = scope.principals.iter().any(|p| row.visibility.contains(p));
+    let conf_ok = row.confidentiality <= scope.max_confidentiality;
+    let entity_ok =
+        scope.entity_scope.is_empty() || scope.entity_scope.contains(&row.key.entity_id);
+    overlap && conf_ok && entity_ok
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -66,6 +66,8 @@ async fn fact(
             },
             value,
             valid_from: chrono::Utc::now(),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
         })

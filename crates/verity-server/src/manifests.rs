@@ -390,6 +390,11 @@ pub(crate) async fn deliver(
                     },
                     value: value.clone(),
                     valid_from: write.valid_from,
+                    // The materialized ACL the manifest resolved for this write,
+                    // identical to the sibling chunk's — facts carry the same
+                    // visibility the chunk enforces (the L1 leak was dropping it).
+                    visibility: visibility.clone(),
+                    confidentiality: hook.confidentiality,
                     provenance: episode_id,
                     acl_provenance,
                 })

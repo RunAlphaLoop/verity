@@ -330,6 +330,16 @@ pub(crate) async fn complete(
             .await
             .map_err(internal)?;
 
+    // Derived-scope inheritance (SPEC §2, fail-closed): an L2 fact is a
+    // generalization OVER the source episode's material, so it may be visible to
+    // no more than the INTERSECTION of that material's visibility. We take the
+    // intersection of the visibilities of the chunks the episode produced, and
+    // the MAX (strictest) confidentiality among them. Empty corpus / empty
+    // intersection => visible to nobody — the L2 fact is written but unreadable,
+    // never defaulted permissive. This is the same rule briefs use.
+    let (l2_visibility, l2_confidentiality) =
+        derive_l2_acl(&state, req.tenant_id, req.episode_id).await?;
+
     // --- L2 facts: keyed upserts, supersession for free (SPEC §2 L2). ---
     let (mut inserted, mut superseded, mut unchanged) = (0u64, 0u64, 0u64);
     for fact in &req.l2_facts {
@@ -353,6 +363,8 @@ pub(crate) async fn complete(
                 },
                 value: fact.object.clone(),
                 valid_from: fact.valid_from.unwrap_or(recorded_at),
+                visibility: l2_visibility.clone(),
+                confidentiality: l2_confidentiality,
                 provenance: req.episode_id,
                 acl_provenance: AclProvenance::AdminAssigned,
             })
@@ -815,6 +827,53 @@ async fn promote_if_eligible(
             }))
         }
     }
+}
+
+/// Fail-closed derived visibility + confidentiality for an L2 fact, inherited
+/// from the source episode's contributing chunks (SPEC §2 derived-scope
+/// inheritance): the INTERSECTION of every current chunk's visibility, and the
+/// strictest (MAX) confidentiality among them. If the episode produced no chunks
+/// (structured-only source, or none yet current), the intersection is empty and
+/// the L2 fact is written visible to NOBODY — a truth-lane record that surfaces
+/// on the admin plane but never leaks to a scoped read. We never widen to a
+/// permissive default here; an operator who wants the L2 fact readable must
+/// re-share it through `correct_fact_acl` (admin plane).
+async fn derive_l2_acl(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    episode_id: EpisodeId,
+) -> HandlerResult<(Vec<PrincipalToken>, Confidentiality)> {
+    let rows = sqlx::query(
+        "SELECT visibility, confidentiality FROM chunks
+         WHERE tenant_id = $1 AND provenance = $2 AND valid_to IS NULL",
+    )
+    .bind(tenant)
+    .bind(episode_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(internal)?;
+
+    // No contributing chunks => empty intersection => visible to nobody.
+    if rows.is_empty() {
+        return Ok((Vec::new(), Confidentiality::Restricted));
+    }
+
+    let mut intersection: Option<std::collections::HashSet<PrincipalToken>> = None;
+    let mut max_conf: i16 = 0;
+    for r in &rows {
+        let vis: Vec<PrincipalToken> = r.try_get("visibility").map_err(internal)?;
+        let conf: i16 = r.try_get("confidentiality").map_err(internal)?;
+        max_conf = max_conf.max(conf);
+        let set: std::collections::HashSet<PrincipalToken> = vis.into_iter().collect();
+        intersection = Some(match intersection {
+            None => set,
+            Some(acc) => acc.intersection(&set).copied().collect(),
+        });
+    }
+    let mut visibility: Vec<PrincipalToken> =
+        intersection.unwrap_or_default().into_iter().collect();
+    visibility.sort_unstable();
+    Ok((visibility, Confidentiality::from_i16(max_conf)))
 }
 
 /// The tenant's configured default publish visibility for the auto-publish

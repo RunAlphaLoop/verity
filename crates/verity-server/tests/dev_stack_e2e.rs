@@ -498,11 +498,16 @@ async fn resolution_welds_cross_source_strong_key_pair_into_one_canonical() {
         return;
     };
     let ts = chrono::Utc::now().timestamp_millis();
+    // Inline verity_acl at the §5e choke point: since migration 0026 every L1
+    // fact must carry a resolvable visibility or the CDC lane refuses it
+    // (fail-closed, `facts_refused_no_acl`). Grant the token this test later
+    // mints with (`principals: [1]`) so the welded canonical is readable back.
     let envelope = |connector: &str, table: &str, id: &str| {
         json!({
             "op": "c",
             "after": { "id": id, "email": "e2e@corp-acme.com", "external_id": "crm-42" },
             "source": { "connector": connector, "db": "crm", "table": table, "ts_ms": ts },
+            "verity_acl": { "visibility": [1], "confidentiality": "internal" },
         })
     };
     let ingested = s

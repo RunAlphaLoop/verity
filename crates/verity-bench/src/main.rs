@@ -328,6 +328,10 @@ async fn seed(
                 },
                 value: serde_json::json!(i),
                 valid_from: Utc::now(),
+                // Bench facts get a single fixed principal token so scoped point
+                // reads in the latency harness resolve against a real visibility.
+                visibility: vec![1],
+                confidentiality: Confidentiality::Internal,
                 provenance: episode,
                 acl_provenance: AclProvenance::AdminAssigned,
             })
@@ -486,7 +490,14 @@ async fn run_suite(
         ));
     }
 
-    // L1 point reads: the ~ms `get` path.
+    // L1 point reads: the ~ms `get` path. Facts are seeded visibility [1]; the
+    // scoped read applies the same visibility pre-filter the get handler does.
+    let fact_scope = Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Confidential,
+    };
     let mut hist = Histogram::<u64>::new(3)?;
     for i in 0..n_queries {
         let key = FactKey {
@@ -495,7 +506,7 @@ async fn run_suite(
             field: "field-0".into(),
         };
         let t = Instant::now();
-        adapter.current_fact(tenant, &key).await?;
+        adapter.current_fact(&fact_scope, &key).await?;
         hist.record(t.elapsed().as_micros() as u64)?;
     }
     report.push(print_case("L1 point read (current_fact)", &hist, 1.0, 1));
@@ -590,7 +601,14 @@ async fn load_at(
                         field: "field-0".into(),
                     };
                     let t = Instant::now();
-                    adapter.current_fact(tenant, &key).await?;
+                    // Facts are seeded visibility [1]; scoped read pre-filters.
+                    let scope = Scope {
+                        tenant_id: tenant,
+                        principals: vec![1],
+                        entity_scope: vec![],
+                        max_confidentiality: Confidentiality::Confidential,
+                    };
+                    adapter.current_fact(&scope, &key).await?;
                     (1, t)
                 } else {
                     let query = ActivityQuery {

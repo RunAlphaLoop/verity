@@ -5,20 +5,26 @@
 //! Soundness only (no result may leak); completeness is a quality metric
 //! measured elsewhere. Requires VERITY_TEST_DSN; skips when absent.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rand::prelude::*;
 use serde_json::json;
 
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
-use verity_storage::PostgresAdapter;
+use verity_storage::{AclCorrectionReason, PostgresAdapter};
 
 const ENTITIES: &[&str] = &["e:acme", "e:globex", "e:initech", "e:umbrella"];
 const N_CHUNKS: usize = 200;
 const N_ACTIONS: usize = 60;
+const N_FACTS: usize = 120;
 const N_SCOPES: usize = 120;
 /// Every chunk carries this token so BM25 recall has a full-corpus match set.
 const MAGIC: &str = "quantum";
+
+/// The FIELDS a fact key can carry — a small fixed set so multiple sources map
+/// onto the same canonical field and `merged_record` precedence is exercised.
+const FIELDS: &[&str] = &["name", "domain", "stage", "amount"];
+const SOURCES: &[&str] = &["hubspot", "salesforce"];
 
 struct ChunkModel {
     doc: String,
@@ -33,6 +39,67 @@ struct ActionModel {
     visibility: Vec<i32>,
     entities: Vec<String>,
     confidentiality: i16,
+}
+
+/// The client-side model of one L1 fact KEY (source, entity, field), tracking
+/// its value history and its CURRENT (post-correction) ACL — the independent
+/// oracle for the point-read/merged probes. Visibility/confidentiality here are
+/// what the DB column holds NOW (corrections are in-place across all rows of the
+/// key), so the same values gate both the current row and every historical row.
+struct FactModel {
+    source: String,
+    entity: String,
+    field: String,
+    /// (valid_from, value) in ascending event-time order. The last is current.
+    history: Vec<(DateTime<Utc>, serde_json::Value)>,
+    /// Current materialized visibility (after any replayed ACL correction).
+    visibility: Vec<i32>,
+    /// Current confidentiality (after any replayed correction).
+    confidentiality: i16,
+}
+
+impl FactModel {
+    fn key(&self) -> FactKey {
+        FactKey {
+            source: self.source.clone(),
+            entity_id: self.entity.clone(),
+            field: self.field.clone(),
+        }
+    }
+    /// The current value = the latest history entry.
+    fn current_value(&self) -> &serde_json::Value {
+        &self.history.last().unwrap().1
+    }
+    /// The value that was current as of `at` (bi-temporal), or None if `at`
+    /// predates the first write.
+    fn value_as_of(&self, at: DateTime<Utc>) -> Option<&serde_json::Value> {
+        self.history
+            .iter()
+            .rev()
+            .find(|(vf, _)| *vf <= at)
+            .map(|(_, v)| v)
+    }
+}
+
+/// The ONE shared oracle: build a synthetic `FactRow` carrying the model's
+/// CURRENT ACL and ask verity-core's `fact_visible`. This is the exact predicate
+/// the adapter enforces — no second copy that can drift.
+fn fact_oracle(scope: &Scope, m: &FactModel) -> bool {
+    let row = FactRow {
+        id: uuid::Uuid::nil(),
+        tenant_id: scope.tenant_id,
+        key: m.key(),
+        value: serde_json::Value::Null,
+        valid_from: Utc::now(),
+        valid_to: None,
+        superseded_by: None,
+        recorded_at: Utc::now(),
+        visibility: m.visibility.clone(),
+        confidentiality: conf_from(m.confidentiality),
+        provenance: uuid::Uuid::nil(),
+        acl_provenance: AclProvenance::AdminAssigned,
+    };
+    fact_visible(scope, &row)
 }
 
 fn random_subset<T: Clone>(rng: &mut impl Rng, pool: &[T], max_len: usize) -> Vec<T> {
@@ -193,6 +260,80 @@ async fn no_read_path_leaks_across_scopes() {
         action_models.push(model);
     }
 
+    // --- Seed L1 FACTS over the full (source × entity × field) grid so every
+    // KEY is unique (one FactModel per key — no aliasing that would desync the
+    // oracle) while two sources still share each (entity, field) so
+    // `merged_record` precedence + the visible-only carve-out are exercised.
+    // Each key gets randomized (visibility, confidentiality), 1..=3 value
+    // versions (superseded history), and — on ~1/3 of keys — a replayed IN-PLACE
+    // ACL correction that rewrites the ACL across ALL rows of the key.
+    let mut fact_models: Vec<FactModel> = Vec::new();
+    let mut idx = 0usize;
+    for source in SOURCES {
+        for entity in ENTITIES {
+            for field in FIELDS {
+                idx += 1;
+                if idx > N_FACTS {
+                    break;
+                }
+                let key = FactKey {
+                    source: (*source).to_string(),
+                    entity_id: (*entity).to_string(),
+                    field: (*field).to_string(),
+                };
+                let mut visibility = random_subset(&mut rng, &principal_pool, 3);
+                let mut confidentiality = rng.random_range(0..=3);
+                // Value history: 1..=3 versions at strictly increasing event time.
+                let versions = rng.random_range(1..=3);
+                let mut history = Vec::new();
+                for v in 0..versions {
+                    let vf = now - Duration::hours((versions - v) as i64);
+                    // Value unique per key+version so merged_record winners map
+                    // back to exactly one seeded fact.
+                    let value = json!(format!("{source}-{entity}-{field}-v{v}"));
+                    adapter
+                        .upsert_fact(FactWrite {
+                            tenant_id: tenant,
+                            key: key.clone(),
+                            value: value.clone(),
+                            valid_from: vf,
+                            visibility: visibility.clone(),
+                            confidentiality: conf_from(confidentiality),
+                            provenance: episode,
+                            acl_provenance: AclProvenance::AdminAssigned,
+                        })
+                        .await
+                        .unwrap();
+                    history.push((vf, value));
+                }
+                if rng.random_bool(0.33) {
+                    visibility = random_subset(&mut rng, &principal_pool, 3);
+                    confidentiality = rng.random_range(0..=3);
+                    adapter
+                        .correct_fact_acl(
+                            tenant,
+                            &key,
+                            &visibility,
+                            conf_from(confidentiality),
+                            AclCorrectionReason::SourceReshare,
+                            AclProvenance::Mirrored,
+                            Some("fuzz"),
+                        )
+                        .await
+                        .unwrap();
+                }
+                fact_models.push(FactModel {
+                    source: (*source).to_string(),
+                    entity: (*entity).to_string(),
+                    field: (*field).to_string(),
+                    history,
+                    visibility,
+                    confidentiality,
+                });
+            }
+        }
+    }
+
     // Materialize an L3 brief per entity under the BROAD materialization scope
     // (this is what the sleep-time worker does). Its body sees everything; the
     // point of the brief probe below is that materializing it must NOT change
@@ -202,6 +343,323 @@ async fn no_read_path_leaks_across_scopes() {
     for entity in ENTITIES {
         adapter.refresh_brief(tenant, entity).await.unwrap();
     }
+
+    // --- DETERMINISTIC ADVERSARIAL SCENARIOS -------------------------------
+    // The randomized grid above exercises the point-read/merged oracle broadly,
+    // but three high-value shapes deserve a fixed, always-run probe so a
+    // regression can't hide behind an unlucky seed:
+    //
+    //   (A) colon-in-source Debezium keys under a MULTI-MEMBER canonical whose
+    //       members carry DIFFERENT visibility — the merged view must resolve
+    //       precedence over caller-visible members only, and a scope that sees
+    //       one member must never see the other member's value win.
+    //   (B) the EXACT playground denial scenario — a principal whose tokens do
+    //       NOT include a fact's visibility must get None from current_fact and
+    //       must not see that fact's value win in merged_record.
+    //   (C) legacy-style empty-visibility rows — invisible to EVERY scope,
+    //       including a broad all-principal / restricted-ceiling scope.
+    //
+    // A distinct canonical + entity namespace ("det:*") keeps these out of the
+    // ENTITIES/SOURCES grid so the randomized oracle above is undisturbed.
+    let det_conf = Confidentiality::Internal;
+
+    // (A) Two members of ONE canonical, one keyed on a colon-bearing Debezium
+    // source ("connector1:db.public.deals"). Member LO is visible to token 11;
+    // member HI (colon source, higher precedence by recency) is visible ONLY to
+    // token 12. A scope holding token 11 alone must see LO's value win, never
+    // HI's — even though HI is the more-recent (would-win) fact.
+    let det_canonical = "det:canon-acme";
+    let member_lo_source = "hubspot"; // no colon
+    let member_lo_entity = "det:acme-lo";
+    let member_hi_source = "connector1:db.public.deals"; // COLON in source (Debezium)
+    let member_hi_entity = "det:acme-hi";
+    let tok_lo: i32 = 11;
+    let tok_hi: i32 = 12;
+    adapter
+        .upsert_entity_alias(tenant, member_lo_source, member_lo_entity, det_canonical)
+        .await
+        .unwrap();
+    adapter
+        .upsert_entity_alias(tenant, member_hi_source, member_hi_entity, det_canonical)
+        .await
+        .unwrap();
+    // Both members supply the SAME field "name" so they contend on precedence.
+    let det_lo_value = json!("acme-name-LO");
+    let det_hi_value = json!("acme-name-HI");
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: FactKey {
+                source: member_lo_source.into(),
+                entity_id: member_lo_entity.into(),
+                field: "name".into(),
+            },
+            value: det_lo_value.clone(),
+            valid_from: now - Duration::hours(3),
+            visibility: vec![tok_lo],
+            confidentiality: det_conf,
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: FactKey {
+                source: member_hi_source.into(),
+                entity_id: member_hi_entity.into(),
+                field: "name".into(),
+            },
+            value: det_hi_value.clone(),
+            // More recent than LO → wins on the recency tie-break when visible.
+            valid_from: now - Duration::hours(1),
+            visibility: vec![tok_hi],
+            confidentiality: det_conf,
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
+
+    // (B) The playground denial fact: visible ONLY to token 20. A caller holding
+    // token 21 (which is NOT in the fact's visibility) is the exact shape the
+    // documented playground get-by-id leak hit.
+    let denial_source = "hubspot";
+    let denial_entity = "det:denial";
+    let denial_field = "secret";
+    let denial_value = json!("classified-denial-value");
+    let denial_tok: i32 = 20;
+    let denial_caller_tok: i32 = 21;
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: FactKey {
+                source: denial_source.into(),
+                entity_id: denial_entity.into(),
+                field: denial_field.into(),
+            },
+            value: denial_value.clone(),
+            valid_from: now - Duration::hours(2),
+            visibility: vec![denial_tok],
+            confidentiality: det_conf,
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
+
+    // (C) Legacy-style empty-visibility row: seed with a real token, then correct
+    // its ACL to '{}' (models the 0026 fail-closed backfill / a full un-share).
+    // Must be invisible to EVERY scope, including a broad all-principal one.
+    let legacy_source = "salesforce";
+    let legacy_entity = "det:legacy";
+    let legacy_field = "name";
+    let legacy_key = FactKey {
+        source: legacy_source.into(),
+        entity_id: legacy_entity.into(),
+        field: legacy_field.into(),
+    };
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: legacy_key.clone(),
+            value: json!("legacy-name"),
+            valid_from: now - Duration::hours(2),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Public,
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
+    let emptied = adapter
+        .correct_fact_acl(
+            tenant,
+            &legacy_key,
+            &[], // empty visibility — the fail-closed / legacy shape
+            Confidentiality::Public,
+            AclCorrectionReason::SourceUnshare,
+            AclProvenance::AdminAssigned,
+            Some("fuzz-legacy"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        emptied >= 1,
+        "correct_fact_acl should have rewritten the legacy row's ACL in place"
+    );
+
+    // Probe (A): a scope holding ONLY tok_lo (+ the det conf ceiling, + the
+    // canonical in entity_scope range via empty entity_scope) must see LO win
+    // and never HI.
+    {
+        let lo_only = Scope {
+            tenant_id: tenant,
+            principals: vec![tok_lo],
+            entity_scope: vec![],
+            max_confidentiality: det_conf,
+        };
+        let merged = adapter
+            .merged_record(&lo_only, det_canonical)
+            .await
+            .unwrap();
+        let name = merged
+            .fields
+            .get("name")
+            .expect("lo_only should see the LO member's name");
+        assert_eq!(
+            name.value, det_lo_value,
+            "merged_record leaked the HI (invisible) member's value to a LO-only scope"
+        );
+        assert!(
+            name.superseded_alternatives
+                .iter()
+                .all(|a| a.value != det_hi_value),
+            "merged_record surfaced the invisible HI member as a superseded_alternative"
+        );
+        // current_fact on the HI member itself must be None for this scope.
+        let hi_key = FactKey {
+            source: member_hi_source.into(),
+            entity_id: member_hi_entity.into(),
+            field: "name".into(),
+        };
+        assert!(
+            adapter
+                .current_fact(&lo_only, &hi_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "current_fact leaked the colon-source HI member to a LO-only scope"
+        );
+
+        // The mirror scope (tok_hi only) sees HI win — proves the colon-source
+        // member is reachable at all (guards against a silent colon-drop making
+        // the test vacuous).
+        let hi_only = Scope {
+            tenant_id: tenant,
+            principals: vec![tok_hi],
+            entity_scope: vec![],
+            max_confidentiality: det_conf,
+        };
+        let merged_hi = adapter
+            .merged_record(&hi_only, det_canonical)
+            .await
+            .unwrap();
+        assert_eq!(
+            merged_hi.fields.get("name").expect("hi sees name").value,
+            det_hi_value,
+            "colon-source HI member should win for a scope that can see it"
+        );
+        // Admin plane sees HI win (higher recency) over EVERYTHING.
+        let merged_admin = adapter
+            .merged_record_admin(tenant, det_canonical)
+            .await
+            .unwrap();
+        assert_eq!(
+            merged_admin
+                .fields
+                .get("name")
+                .expect("admin sees name")
+                .value,
+            det_hi_value,
+            "admin merged_record should resolve over all members"
+        );
+    }
+
+    // Probe (B): the playground denial scenario. A caller with denial_caller_tok
+    // (not in the fact's visibility) gets None from current_fact + fact_as_of,
+    // and the value never wins in merged_record over the denial entity.
+    {
+        let denied = Scope {
+            tenant_id: tenant,
+            principals: vec![denial_caller_tok],
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted, // ceiling can't rescue it
+        };
+        let denial_key = FactKey {
+            source: denial_source.into(),
+            entity_id: denial_entity.into(),
+            field: denial_field.into(),
+        };
+        assert!(
+            adapter
+                .current_fact(&denied, &denial_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "DENIAL LEAK: current_fact returned the fact to a caller whose tokens exclude it"
+        );
+        assert!(
+            adapter
+                .fact_as_of(&denied, &denial_key, now)
+                .await
+                .unwrap()
+                .is_none(),
+            "DENIAL LEAK: fact_as_of returned the fact to a caller whose tokens exclude it"
+        );
+        let merged = adapter.merged_record(&denied, denial_entity).await.unwrap();
+        assert!(
+            merged
+                .fields
+                .get(denial_field)
+                .map(|f| f.value != denial_value)
+                .unwrap_or(true),
+            "DENIAL LEAK: merged_record surfaced the denied fact's value"
+        );
+        // The authorized caller (token 20) DOES see it — proves the fact exists
+        // and the denial above is real, not vacuous.
+        let allowed = Scope {
+            tenant_id: tenant,
+            principals: vec![denial_tok],
+            entity_scope: vec![],
+            max_confidentiality: det_conf,
+        };
+        let ok = adapter.current_fact(&allowed, &denial_key).await.unwrap();
+        assert_eq!(
+            ok.expect("authorized caller must see the denial fact")
+                .value,
+            denial_value,
+            "authorized caller saw the wrong value"
+        );
+    }
+
+    // Probe (C): the emptied legacy row is invisible to a broad all-principal,
+    // top-ceiling scope — the strongest possible reader.
+    {
+        let broad = Scope {
+            tenant_id: tenant,
+            principals: (0..=63).collect(),
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted,
+        };
+        assert!(
+            adapter
+                .current_fact(&broad, &legacy_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "LEGACY LEAK: an empty-visibility fact was visible to a broad scope"
+        );
+        assert!(
+            adapter
+                .fact_as_of(&broad, &legacy_key, now)
+                .await
+                .unwrap()
+                .is_none(),
+            "LEGACY LEAK: empty-visibility fact reachable via fact_as_of"
+        );
+        // Admin plane still sees it (remediation path).
+        let admin = adapter
+            .merged_record_admin(tenant, legacy_entity)
+            .await
+            .unwrap();
+        assert!(
+            admin.fields.contains_key(legacy_field),
+            "admin plane should still see the emptied legacy row for remediation"
+        );
+    }
+    let det_probes = 12usize; // fixed deterministic scope assertions above
 
     // --- Probe every read path with randomized scopes.
     let chunk_by_doc = |doc: &str| chunk_models.iter().find(|c| c.doc == doc);
@@ -382,8 +840,128 @@ async fn no_read_path_leaks_across_scopes() {
                 );
             }
         }
+
+        // Path 6: L1 POINT READS — current_fact + fact_as_of. This is the exact
+        // gap the fuzzer previously did not cover (it probed only recall), which
+        // is why the L1 fact-visibility leak survived. For every seeded key, the
+        // scoped read must return the row IFF the shared oracle admits it — and
+        // when it returns, it must carry the right value (current, or as-of).
+        for m in &fact_models {
+            let key = m.key();
+            let oracle = fact_oracle(&scope, m);
+
+            let got = adapter.current_fact(&scope, &key).await.unwrap();
+            probes += 1;
+            match &got {
+                Some(row) => {
+                    assert!(
+                        oracle,
+                        "LEAK via current_fact: scope {scope:?} read {key:?} (vis {:?}, conf {}) the oracle forbids",
+                        m.visibility, m.confidentiality
+                    );
+                    assert_eq!(
+                        &row.value,
+                        m.current_value(),
+                        "current_fact returned a non-current value for {key:?}"
+                    );
+                    // Defense in depth: the returned row must itself pass the oracle.
+                    assert!(fact_visible(&scope, row), "current_fact row fails fact_visible");
+                }
+                None => assert!(
+                    !oracle,
+                    "COMPLETENESS GAP via current_fact: scope {scope:?} should see {key:?} (vis {:?}, conf {}) but got None",
+                    m.visibility, m.confidentiality
+                ),
+            }
+
+            // fact_as_of at several points, incl. before the first write and
+            // between versions. Because ACL corrections are in-place across all
+            // rows, the CURRENT ACL gates every historical read too — the oracle
+            // is the same regardless of `at`.
+            let firstvf = m.history.first().unwrap().0;
+            for at in [
+                firstvf - Duration::minutes(30), // before any value existed
+                firstvf + Duration::minutes(1),
+                now - Duration::minutes(1),
+                now + Duration::hours(1),
+            ] {
+                let got = adapter.fact_as_of(&scope, &key, at).await.unwrap();
+                probes += 1;
+                let expected_value = m.value_as_of(at);
+                match (&got, expected_value) {
+                    (Some(row), Some(val)) => {
+                        assert!(
+                            oracle,
+                            "LEAK via fact_as_of: scope {scope:?} read {key:?} @ {at} the oracle forbids"
+                        );
+                        assert_eq!(&row.value, val, "fact_as_of wrong value for {key:?} @ {at}");
+                        assert!(
+                            fact_visible(&scope, row),
+                            "fact_as_of row fails fact_visible"
+                        );
+                    }
+                    (Some(_), None) => panic!(
+                        "fact_as_of returned a row for {key:?} @ {at} before its first write"
+                    ),
+                    (None, _) => {
+                        // None is correct when EITHER the oracle forbids OR there
+                        // was no value at `at`. A leak would be Some-when-forbidden,
+                        // caught above.
+                    }
+                }
+            }
+        }
+
+        // Path 7: merged_record — precedence resolves over caller-VISIBLE facts
+        // only. For each canonical entity, the winning value of every resolved
+        // field must come from an oracle-VISIBLE fact, and no superseded
+        // alternative may be oracle-invisible. Compare against merged_record_admin
+        // (all-seeing) to confirm the scoped view is a strict subset.
+        for entity in ENTITIES {
+            let merged = adapter.merged_record(&scope, entity).await.unwrap();
+            probes += 1;
+            for (field, mf) in &merged.fields {
+                // The winning (source, entity, field, value) must be an
+                // oracle-visible seeded fact.
+                let winner = fact_models.iter().find(|m| {
+                    m.source == mf.winning_source
+                        && &m.entity == entity
+                        && &m.field == field
+                        && m.current_value() == &mf.value
+                });
+                let winner = winner.unwrap_or_else(|| {
+                    panic!(
+                        "merged_record winner {field}={:?} maps to no seeded fact",
+                        mf.value
+                    )
+                });
+                assert!(
+                    fact_oracle(&scope, winner),
+                    "LEAK via merged_record: scope {scope:?} field {field} won by an INVISIBLE fact (source {}, vis {:?})",
+                    winner.source, winner.visibility
+                );
+                for alt in &mf.superseded_alternatives {
+                    let am = fact_models
+                        .iter()
+                        .find(|m| {
+                            m.source == alt.source
+                                && &m.entity == entity
+                                && &m.field == field
+                                && m.current_value() == &alt.value
+                        })
+                        .expect("alternative maps to a seeded fact");
+                    assert!(
+                        fact_oracle(&scope, am),
+                        "LEAK via merged_record: an INVISIBLE fact surfaced as a superseded_alternative for {field}"
+                    );
+                }
+            }
+        }
     }
+    probes += det_probes;
     println!(
-        "scope fuzz: {probes} probes across recall(bm25), recall(hybrid), activity, brief — no leaks"
+        "scope fuzz: {probes} probes ({det_probes} deterministic: colon-source multi-member \
+         canonical, playground denial, legacy empty-visibility) across recall(bm25), \
+         recall(hybrid), activity, brief, current_fact, fact_as_of, merged_record — no leaks"
     );
 }

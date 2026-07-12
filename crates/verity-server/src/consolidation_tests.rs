@@ -164,6 +164,57 @@ async fn lease_ids(state: &Arc<AppState>, tenant: TenantId) -> Vec<Uuid> {
         .collect()
 }
 
+/// Read the CURRENT value of an L1 key straight from `facts` (bypassing the
+/// scoped `current_fact` pre-filter). These L2 consolidation tests use
+/// chunkless observation episodes, so `derive_l2_acl` intersects an empty chunk
+/// set → the fact is visible to NOBODY (fail-closed derived-scope inheritance).
+/// That is CORRECT — the scoped read would (rightly) return None — so a test of
+/// bi-temporal supersession mechanics reads the value from the admin-plane
+/// projection (raw SQL), exactly like the sibling row-count assertions.
+async fn current_value_raw(
+    state: &AppState,
+    tenant: TenantId,
+    key: &FactKey,
+) -> Option<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT value FROM facts
+         WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
+           AND valid_to IS NULL",
+    )
+    .bind(tenant)
+    .bind(&key.source)
+    .bind(&key.entity_id)
+    .bind(&key.field)
+    .fetch_optional(state.pool())
+    .await
+    .expect("raw current read")
+}
+
+/// Value as-of a point in event time, from the admin-plane projection (see
+/// `current_value_raw` for why the scoped read cannot serve these invisible
+/// L2 facts).
+async fn value_as_of_raw(
+    state: &AppState,
+    tenant: TenantId,
+    key: &FactKey,
+    as_of: chrono::DateTime<Utc>,
+) -> Option<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT value FROM facts
+         WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
+           AND valid_from <= $5 AND (valid_to IS NULL OR valid_to > $5)
+         ORDER BY valid_from DESC LIMIT 1",
+    )
+    .bind(tenant)
+    .bind(&key.source)
+    .bind(&key.entity_id)
+    .bind(&key.field)
+    .bind(as_of)
+    .fetch_optional(state.pool())
+    .await
+    .expect("raw as-of read")
+}
+
 async fn expire_leases(state: &AppState, tenant: TenantId) {
     sqlx::query(
         "UPDATE episode_processing SET leased_until = now() - interval '1 second'
@@ -285,13 +336,29 @@ async fn complete_writes_l2_facts_with_subject_relation_supersession() {
         entity_id: "acme corp".into(),
         field: "renewal stage".into(),
     };
-    let current = state
-        .storage
-        .current_fact(tenant, &key)
+    let current = current_value_raw(&state, tenant, &key)
         .await
-        .expect("read")
         .expect("current fact");
-    assert_eq!(current.value, json!("closed_won"));
+    assert_eq!(current, json!("closed_won"));
+
+    // The scoped read (any scope) sees NOTHING: this L2 fact was derived from a
+    // chunkless episode, so its materialized visibility is empty — invisible by
+    // fail-closed derived-scope inheritance.
+    let broad = Scope {
+        tenant_id: tenant,
+        principals: (0..=64).collect(),
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+    assert!(
+        state
+            .storage
+            .current_fact(&broad, &key)
+            .await
+            .expect("read")
+            .is_none(),
+        "a chunkless-episode L2 fact is visible to nobody"
+    );
 
     let current_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM facts
@@ -304,16 +371,15 @@ async fn complete_writes_l2_facts_with_subject_relation_supersession() {
     .expect("count");
     assert_eq!(current_rows, 1, "supersession must leave one current row");
 
-    // Bi-temporal history intact: the superseded value is as-of queryable.
-    let asof = state
-        .storage
-        .fact_as_of(
-            tenant,
-            &key,
-            Utc::now() - chrono::Duration::milliseconds(15),
-        )
-        .await
-        .expect("as-of");
+    // Bi-temporal history intact: the superseded value is as-of queryable
+    // (admin-plane projection; the fact is invisible to scoped reads).
+    let asof = value_as_of_raw(
+        &state,
+        tenant,
+        &key,
+        Utc::now() - chrono::Duration::milliseconds(15),
+    )
+    .await;
     assert!(asof.is_some());
 }
 
@@ -837,13 +903,10 @@ async fn l2_canonical_predicate_aligns_supersession_across_relations() {
         entity_id: "acme corp".into(),
         field: "requires_before".into(),
     };
-    let current = state
-        .storage
-        .current_fact(tenant, &key)
+    let current = current_value_raw(&state, tenant, &key)
         .await
-        .expect("read")
         .expect("current fact");
-    assert_eq!(current.value, json!("signed_dpa"));
+    assert_eq!(current, json!("signed_dpa"));
 
     let current_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM facts

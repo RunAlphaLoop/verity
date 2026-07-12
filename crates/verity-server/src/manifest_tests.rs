@@ -209,10 +209,27 @@ async fn manifest_webhook_end_to_end() {
     assert_eq!(resp["facts_written"], 6);
     assert_eq!(resp["chunks_indexed"], 0);
     assert_eq!(resp["acl_provenance"], "approximated");
+    // Map mode (Tier B): the fact's visibility is the MAPPED organization
+    // principal (`organizationId` → registry token), NOT the webhook's static
+    // [999] fallback. Resolve that token and scope the read to it — the scoped
+    // read now enforces `visibility && principals`.
+    let org_token: i32 =
+        sqlx::query_scalar("SELECT token FROM principals WHERE tenant_id = $1 AND principal = $2")
+            .bind(tenant)
+            .bind("linear:0a2f6c4e-9d31-4b8a-b7e2-5c1d8f6a3e90")
+            .fetch_one(state.pool())
+            .await
+            .expect("mapped org principal allocated a registry token");
+    let hook_scope = Scope {
+        tenant_id: tenant,
+        principals: vec![org_token],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Internal,
+    };
     let fact = state
         .storage
         .current_fact(
-            tenant,
+            &hook_scope,
             &FactKey {
                 source: "linear".into(),
                 entity_id: "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21".into(),
@@ -307,7 +324,12 @@ async fn manifest_webhook_end_to_end() {
         state
             .storage
             .current_fact(
-                tenant,
+                &Scope {
+                    tenant_id: tenant,
+                    principals: vec![999],
+                    entity_scope: vec![],
+                    max_confidentiality: Confidentiality::Internal,
+                },
                 &FactKey {
                     source: "linear".into(),
                     entity_id: "prj-5d6e7f80-0003-4abc-9def-555555555555".into(),

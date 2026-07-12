@@ -41,12 +41,24 @@ pub trait StorageAdapter: Send + Sync {
     async fn upsert_fact(&self, fact: FactWrite) -> Result<FactUpsertOutcome>;
 
     /// Current value for a key (valid_to IS NULL). The hot path behind `get`.
-    async fn current_fact(&self, tenant: TenantId, key: &FactKey) -> Result<Option<FactRow>>;
+    ///
+    /// Scoped read: the caller's `Scope` is a MANDATORY pre-filter — the visible
+    /// row is returned only if it overlaps `scope.principals`, sits at/below
+    /// `scope.max_confidentiality`, and satisfies the entity-scope fence. Empty
+    /// principals → `None` (fail closed). `scope.tenant_id` carries the tenant
+    /// partition. Enforcement is the shared `fact_visible` predicate (types.rs)
+    /// pushed into SQL by the Postgres profile and applied above the cache by
+    /// `CachedAdapter`; no adapter may serve an out-of-scope fact.
+    async fn current_fact(&self, scope: &Scope, key: &FactKey) -> Result<Option<FactRow>>;
 
-    /// Value as of a point in event time (bi-temporal read).
+    /// Value as of a point in event time (bi-temporal read). Same mandatory
+    /// scope pre-filter as `current_fact`. Because ACL corrections are applied
+    /// in place across every row of a key (SPEC §5e.6b), the visibility filter
+    /// here reflects NOW-ACL even for a historical value — an un-shared principal
+    /// cannot reach a superseded value via `as_of`.
     async fn fact_as_of(
         &self,
-        tenant: TenantId,
+        scope: &Scope,
         key: &FactKey,
         as_of: DateTime<Utc>,
     ) -> Result<Option<FactRow>>;

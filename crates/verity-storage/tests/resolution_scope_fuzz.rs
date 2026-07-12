@@ -127,6 +127,8 @@ async fn name_fact(a: &PostgresAdapter, t: TenantId, source: &str, entity_id: &s
         },
         value: json!(name),
         valid_from: Utc::now(),
+        visibility: vec![1],
+        confidentiality: Confidentiality::Internal,
         provenance: episode,
         acl_provenance: AclProvenance::Mirrored,
     })
@@ -322,7 +324,9 @@ async fn no_resolution_cross_entity_scope_leak() {
         }
 
         // ---- merged_record through B's canonical must not carry A. ----
-        let merged_b = a.merged_record(t, &canon_b1).await.unwrap();
+        // Use the admin-all plane: entity-resolution isolation must hold even
+        // when NO visibility filter can mask a cross-entity member leak.
+        let merged_b = a.merged_record_admin(t, &canon_b1).await.unwrap();
         for m in &merged_b.members {
             assert!(
                 !m.entity_id.starts_with("A1-") && !m.entity_id.starts_with("A2-"),

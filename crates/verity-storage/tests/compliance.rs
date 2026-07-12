@@ -378,6 +378,8 @@ async fn subject_erasure_hard_deletes_and_cascades_knowledge() {
             },
             value: json!("negotiation"),
             valid_from: Utc::now(),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: e1,
             acl_provenance: AclProvenance::AdminAssigned,
         })
@@ -506,6 +508,8 @@ async fn entity_erasure_deletes_facts_and_multitag_chunks() {
             },
             value: json!("jane@example.com"),
             valid_from: Utc::now(),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
         })

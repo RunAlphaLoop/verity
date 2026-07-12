@@ -84,6 +84,8 @@ async fn fact(
             },
             value,
             valid_from: Utc::now(),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
         })
@@ -95,7 +97,10 @@ fn handle(state: &AppState, tenant: TenantId) -> String {
     let (h, _) = state.minter.mint(
         ScopePayload {
             tenant_id: tenant,
-            principals: vec![7],
+            // Match the seeded fact visibility ([1]); the scoped merged read now
+            // enforces `visibility && principals`, so a mismatched scope would
+            // (correctly) resolve over zero visible facts.
+            principals: vec![1],
             entity_scope: vec![],
             max_confidentiality: Confidentiality::Restricted,
             actor_sub: None,
@@ -367,8 +372,15 @@ async fn live_tier1_resolution_merges_company_across_sources_and_fences_others()
         entity_id: "hs-acme".into()
     }));
 
-    // merged_record reflects the same two members (the read-path view is unchanged).
-    let merged = storage.merged_record(tenant, &acme_canon).await.unwrap();
+    // merged_record reflects the same two members (the read-path view is
+    // unchanged). Facts are seeded visibility [1]; scope the read to match.
+    let scope = Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+    let merged = storage.merged_record(&scope, &acme_canon).await.unwrap();
     assert_eq!(
         merged.members.len(),
         2,

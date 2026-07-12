@@ -347,6 +347,12 @@ pub(crate) async fn webhook_post(
                 },
                 value: fact.value.clone(),
                 valid_from: fact.valid_from.unwrap_or_else(Utc::now),
+                // Same materialized visibility the sibling chunk carries: bound
+                // at mint time by an admin, narrowable by the payload but never
+                // widenable (checked above). Facts must not drop what the chunk
+                // enforces — that asymmetry was the L1 leak.
+                visibility: visibility.clone(),
+                confidentiality: hook.confidentiality,
                 provenance: episode_id,
                 acl_provenance: AclProvenance::AdminAssigned,
             })

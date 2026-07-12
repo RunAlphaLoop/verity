@@ -46,8 +46,22 @@ async fn cached_read_never_serves_superseded_value() {
         key: key.clone(),
         value,
         valid_from: at,
+        visibility: vec![1],
+        confidentiality: Confidentiality::Internal,
         provenance: episode,
         acl_provenance: AclProvenance::AdminAssigned,
+    };
+
+    // Scope admitting the fact (visibility [1]); an adversary scope that does not.
+    let ok = Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+    let denied = Scope {
+        principals: vec![2],
+        ..ok.clone()
     };
 
     adapter
@@ -55,17 +69,20 @@ async fn cached_read_never_serves_superseded_value() {
         .await
         .unwrap();
     // Populate the cache.
-    let v1 = adapter.current_fact(tenant, &key).await.unwrap().unwrap();
+    let v1 = adapter.current_fact(&ok, &key).await.unwrap().unwrap();
     assert_eq!(v1.value, json!("negotiation"));
     // Cache hit returns the same row.
     assert_eq!(
-        adapter
-            .current_fact(tenant, &key)
-            .await
-            .unwrap()
-            .unwrap()
-            .id,
+        adapter.current_fact(&ok, &key).await.unwrap().unwrap().id,
         v1.id
+    );
+
+    // The cache is keyed scope-independently, but visibility is enforced ABOVE
+    // it: a scope that does not overlap the row's visibility gets nothing on a
+    // cache HIT — the warmed cache must never leak across scopes.
+    assert!(
+        adapter.current_fact(&denied, &key).await.unwrap().is_none(),
+        "cached row must not leak to a scope that cannot see it"
     );
 
     // Supersede through the SAME adapter: invalidation must evict the entry.
@@ -73,7 +90,7 @@ async fn cached_read_never_serves_superseded_value() {
         .upsert_fact(write(json!("closed_won"), t0 + Duration::minutes(5)))
         .await
         .unwrap();
-    let v2 = adapter.current_fact(tenant, &key).await.unwrap().unwrap();
+    let v2 = adapter.current_fact(&ok, &key).await.unwrap().unwrap();
     assert_eq!(v2.value, json!("closed_won"));
     assert_ne!(v2.id, v1.id);
 }

@@ -80,6 +80,8 @@ fn fact(
         },
         value: json!(value),
         valid_from: at,
+        visibility: vec![1],
+        confidentiality: Confidentiality::Internal,
         provenance: ep,
         acl_provenance: AclProvenance::Mirrored,
     }

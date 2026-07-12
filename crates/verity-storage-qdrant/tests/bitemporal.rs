@@ -47,6 +47,16 @@ fn key() -> FactKey {
     }
 }
 
+/// A scope admitting the facts these tests seed (visibility `[1]`).
+fn read_scope(tenant: TenantId) -> Scope {
+    Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    }
+}
+
 fn unit_vec() -> Vec<f32> {
     let mut rng = rand::rng();
     let v: Vec<f32> = (0..384).map(|_| rng.random_range(-1.0..1.0)).collect();
@@ -66,6 +76,8 @@ async fn supersession_lifecycle() {
         key: key(),
         value,
         valid_from: at,
+        visibility: vec![1],
+        confidentiality: Confidentiality::Internal,
         provenance: episode,
         acl_provenance: AclProvenance::AdminAssigned,
     };
@@ -83,14 +95,18 @@ async fn supersession_lifecycle() {
     let outcome = adapter.upsert_fact(write(json!(84_000), t1)).await.unwrap();
     assert_eq!(outcome, FactUpsertOutcome::Superseded);
 
-    let current = adapter.current_fact(tenant, &key()).await.unwrap().unwrap();
+    let current = adapter
+        .current_fact(&read_scope(tenant), &key())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(current.value, json!(84_000));
     assert_eq!(current.valid_to, None);
 
     // Bi-temporal read: the world as of t0 still shows the old value,
     // with its supersession recorded.
     let as_of = adapter
-        .fact_as_of(tenant, &key(), t0 + Duration::minutes(1))
+        .fact_as_of(&read_scope(tenant), &key(), t0 + Duration::minutes(1))
         .await
         .unwrap()
         .unwrap();
@@ -104,7 +120,11 @@ async fn supersession_lifecycle() {
         .await
         .unwrap();
     assert_eq!(outcome, FactUpsertOutcome::StaleEvent);
-    let current = adapter.current_fact(tenant, &key()).await.unwrap().unwrap();
+    let current = adapter
+        .current_fact(&read_scope(tenant), &key())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(current.value, json!(84_000));
 }
 
@@ -195,6 +215,8 @@ async fn retire_entity_retires_chunks_too() {
             },
             value: json!("active"),
             valid_from: Utc::now() - Duration::hours(1),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
         })
@@ -244,7 +266,13 @@ async fn retire_entity_retires_chunks_too() {
         entity_id: "account:doomed".into(),
         field: "stage".into(),
     };
-    assert!(adapter.current_fact(tenant, &key).await.unwrap().is_none());
+    // Scope admits the fact's visibility (`[1]`), so a None here proves the row
+    // was RETIRED, not merely filtered out by scope.
+    assert!(adapter
+        .current_fact(&read_scope(tenant), &key)
+        .await
+        .unwrap()
+        .is_none());
     assert!(
         adapter
             .recall(query())

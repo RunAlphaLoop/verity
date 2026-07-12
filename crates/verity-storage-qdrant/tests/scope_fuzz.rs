@@ -12,16 +12,23 @@ use chrono::{Duration, Utc};
 use rand::prelude::*;
 use serde_json::json;
 
+use chrono::DateTime;
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
+use verity_storage::AclCorrectionReason;
 use verity_storage_qdrant::QdrantAdapter;
 
 const ENTITIES: &[&str] = &["e:acme", "e:globex", "e:initech", "e:umbrella"];
 const N_CHUNKS: usize = 200;
 const N_ACTIONS: usize = 60;
+const N_FACTS: usize = 120;
 const N_SCOPES: usize = 120;
 /// Every chunk carries this token so BM25 recall has a full-corpus match set.
 const MAGIC: &str = "quantum";
+/// The FIELDS a fact key can carry — a small fixed set so multiple sources map
+/// onto the same canonical field and `merged_record` precedence is exercised.
+const FIELDS: &[&str] = &["name", "domain", "stage", "amount"];
+const SOURCES: &[&str] = &["hubspot", "salesforce"];
 
 struct ChunkModel {
     doc: String,
@@ -36,6 +43,59 @@ struct ActionModel {
     visibility: Vec<i32>,
     entities: Vec<String>,
     confidentiality: i16,
+}
+
+/// The client-side model of one L1 fact KEY — mirror of the Postgres fuzzer's
+/// `FactModel`. Since QdrantAdapter delegates every fact read to inner Postgres,
+/// probing here proves the delegators thread `scope` (no bypass).
+struct FactModel {
+    source: String,
+    entity: String,
+    field: String,
+    history: Vec<(DateTime<chrono::Utc>, serde_json::Value)>,
+    visibility: Vec<i32>,
+    confidentiality: i16,
+}
+
+impl FactModel {
+    fn key(&self) -> FactKey {
+        FactKey {
+            source: self.source.clone(),
+            entity_id: self.entity.clone(),
+            field: self.field.clone(),
+        }
+    }
+    fn current_value(&self) -> &serde_json::Value {
+        &self.history.last().unwrap().1
+    }
+    fn value_as_of(&self, at: DateTime<chrono::Utc>) -> Option<&serde_json::Value> {
+        self.history
+            .iter()
+            .rev()
+            .find(|(vf, _)| *vf <= at)
+            .map(|(_, v)| v)
+    }
+}
+
+/// The ONE shared oracle: build a synthetic `FactRow` carrying the model's
+/// CURRENT ACL and ask verity-core's `fact_visible` — the exact predicate the
+/// adapter enforces, no drifting copy.
+fn fact_oracle(scope: &Scope, m: &FactModel) -> bool {
+    let row = FactRow {
+        id: uuid::Uuid::nil(),
+        tenant_id: scope.tenant_id,
+        key: m.key(),
+        value: serde_json::Value::Null,
+        valid_from: Utc::now(),
+        valid_to: None,
+        superseded_by: None,
+        recorded_at: Utc::now(),
+        visibility: m.visibility.clone(),
+        confidentiality: conf_from(m.confidentiality),
+        provenance: uuid::Uuid::nil(),
+        acl_provenance: AclProvenance::AdminAssigned,
+    };
+    fact_visible(scope, &row)
 }
 
 fn random_subset<T: Clone>(rng: &mut impl Rng, pool: &[T], max_len: usize) -> Vec<T> {
@@ -199,9 +259,154 @@ async fn no_read_path_leaks_across_scopes() {
         action_models.push(model);
     }
 
+    // --- Seed L1 FACTS over the (source × entity × field) grid (mirror of the
+    // Postgres fuzzer). QdrantAdapter delegates every fact read to inner
+    // Postgres, so this proves the delegators forward `scope` — a delegator that
+    // dropped the scope arg would leak here. Each key gets 1..=3 value versions
+    // and, on ~1/3 of keys, a replayed in-place ACL correction.
+    let mut fact_models: Vec<FactModel> = Vec::new();
+    let mut idx = 0usize;
+    for source in SOURCES {
+        for entity in ENTITIES {
+            for field in FIELDS {
+                idx += 1;
+                if idx > N_FACTS {
+                    break;
+                }
+                let key = FactKey {
+                    source: (*source).to_string(),
+                    entity_id: (*entity).to_string(),
+                    field: (*field).to_string(),
+                };
+                let mut visibility = random_subset(&mut rng, &principal_pool, 3);
+                let mut confidentiality = rng.random_range(0..=3);
+                let versions = rng.random_range(1..=3);
+                let mut history = Vec::new();
+                for v in 0..versions {
+                    let vf = now - Duration::hours((versions - v) as i64);
+                    let value = json!(format!("{source}-{entity}-{field}-v{v}"));
+                    adapter
+                        .upsert_fact(FactWrite {
+                            tenant_id: tenant,
+                            key: key.clone(),
+                            value: value.clone(),
+                            valid_from: vf,
+                            visibility: visibility.clone(),
+                            confidentiality: conf_from(confidentiality),
+                            provenance: episode,
+                            acl_provenance: AclProvenance::AdminAssigned,
+                        })
+                        .await
+                        .unwrap();
+                    history.push((vf, value));
+                }
+                if rng.random_bool(0.33) {
+                    visibility = random_subset(&mut rng, &principal_pool, 3);
+                    confidentiality = rng.random_range(0..=3);
+                    adapter
+                        .inner()
+                        .correct_fact_acl(
+                            tenant,
+                            &key,
+                            &visibility,
+                            conf_from(confidentiality),
+                            AclCorrectionReason::SourceReshare,
+                            AclProvenance::Mirrored,
+                            Some("qfuzz"),
+                        )
+                        .await
+                        .unwrap();
+                }
+                fact_models.push(FactModel {
+                    source: (*source).to_string(),
+                    entity: (*entity).to_string(),
+                    field: (*field).to_string(),
+                    history,
+                    visibility,
+                    confidentiality,
+                });
+            }
+        }
+    }
+
+    // --- DETERMINISTIC ADVERSARIAL SCENARIO: the playground denial. A fact
+    // visible ONLY to token 20; a caller with token 21 must get None from the
+    // delegated current_fact/fact_as_of and must not see it win in merged_record.
+    let denial_key = FactKey {
+        source: "hubspot".into(),
+        entity_id: "qdet:denial".into(),
+        field: "secret".into(),
+    };
+    let denial_value = json!("classified-denial-value");
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: denial_key.clone(),
+            value: denial_value.clone(),
+            valid_from: now - Duration::hours(2),
+            visibility: vec![20],
+            confidentiality: Confidentiality::Internal,
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        })
+        .await
+        .unwrap();
+    {
+        let denied = Scope {
+            tenant_id: tenant,
+            principals: vec![21],
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted,
+        };
+        assert!(
+            adapter
+                .current_fact(&denied, &denial_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "DENIAL LEAK (qdrant): current_fact returned the fact to an excluded caller"
+        );
+        assert!(
+            adapter
+                .fact_as_of(&denied, &denial_key, now)
+                .await
+                .unwrap()
+                .is_none(),
+            "DENIAL LEAK (qdrant): fact_as_of returned the fact to an excluded caller"
+        );
+        let merged = adapter
+            .inner()
+            .merged_record(&denied, "qdet:denial")
+            .await
+            .unwrap();
+        assert!(
+            merged
+                .fields
+                .get("secret")
+                .map(|f| f.value != denial_value)
+                .unwrap_or(true),
+            "DENIAL LEAK (qdrant): merged_record surfaced the denied value"
+        );
+        let allowed = Scope {
+            tenant_id: tenant,
+            principals: vec![20],
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Internal,
+        };
+        assert_eq!(
+            adapter
+                .current_fact(&allowed, &denial_key)
+                .await
+                .unwrap()
+                .expect("authorized caller must see the denial fact")
+                .value,
+            denial_value,
+        );
+    }
+
     // --- Probe every read path with randomized scopes.
     let chunk_by_doc = |doc: &str| chunk_models.iter().find(|c| c.doc == doc);
-    let mut probes = 0usize;
+    let mut probes = 3usize; // deterministic denial assertions above
     for _ in 0..N_SCOPES {
         let scope = Scope {
             tenant_id: tenant,
@@ -340,8 +545,102 @@ async fn no_read_path_leaks_across_scopes() {
                 act.action_id, model.visibility, model.confidentiality
             );
         }
+
+        // Path 5: L1 POINT READS — current_fact + fact_as_of (delegated to inner
+        // Postgres). Returned IFF the shared oracle admits; value must be
+        // current / as-of. A delegator that dropped `scope` leaks here.
+        for m in &fact_models {
+            let key = m.key();
+            let oracle = fact_oracle(&scope, m);
+
+            let got = adapter.current_fact(&scope, &key).await.unwrap();
+            probes += 1;
+            match &got {
+                Some(row) => {
+                    assert!(
+                        oracle,
+                        "LEAK via current_fact (qdrant): scope {scope:?} read {key:?} the oracle forbids"
+                    );
+                    assert_eq!(&row.value, m.current_value(), "wrong current value {key:?}");
+                    assert!(fact_visible(&scope, row), "current_fact row fails fact_visible");
+                }
+                None => assert!(
+                    !oracle,
+                    "COMPLETENESS GAP via current_fact (qdrant): scope {scope:?} should see {key:?} but got None"
+                ),
+            }
+
+            let firstvf = m.history.first().unwrap().0;
+            for at in [
+                firstvf - Duration::minutes(30),
+                firstvf + Duration::minutes(1),
+                now - Duration::minutes(1),
+                now + Duration::hours(1),
+            ] {
+                let got = adapter.fact_as_of(&scope, &key, at).await.unwrap();
+                probes += 1;
+                let expected_value = m.value_as_of(at);
+                match (&got, expected_value) {
+                    (Some(row), Some(val)) => {
+                        assert!(
+                            oracle,
+                            "LEAK via fact_as_of (qdrant): scope {scope:?} read {key:?} @ {at} the oracle forbids"
+                        );
+                        assert_eq!(&row.value, val, "fact_as_of wrong value {key:?} @ {at}");
+                        assert!(fact_visible(&scope, row), "fact_as_of row fails fact_visible");
+                    }
+                    (Some(_), None) => panic!(
+                        "fact_as_of (qdrant) returned a row for {key:?} @ {at} before its first write"
+                    ),
+                    (None, _) => {}
+                }
+            }
+        }
+
+        // Path 6: merged_record (inner) — precedence over caller-VISIBLE facts.
+        for entity in ENTITIES {
+            let merged = adapter.inner().merged_record(&scope, entity).await.unwrap();
+            probes += 1;
+            for (field, mf) in &merged.fields {
+                let winner = fact_models
+                    .iter()
+                    .find(|m| {
+                        m.source == mf.winning_source
+                            && &m.entity == entity
+                            && &m.field == field
+                            && m.current_value() == &mf.value
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "merged_record winner {field}={:?} maps to no seeded fact",
+                            mf.value
+                        )
+                    });
+                assert!(
+                    fact_oracle(&scope, winner),
+                    "LEAK via merged_record (qdrant): field {field} won by an INVISIBLE fact (source {}, vis {:?})",
+                    winner.source, winner.visibility
+                );
+                for alt in &mf.superseded_alternatives {
+                    let am = fact_models
+                        .iter()
+                        .find(|m| {
+                            m.source == alt.source
+                                && &m.entity == entity
+                                && &m.field == field
+                                && m.current_value() == &alt.value
+                        })
+                        .expect("alternative maps to a seeded fact");
+                    assert!(
+                        fact_oracle(&scope, am),
+                        "LEAK via merged_record (qdrant): an INVISIBLE fact surfaced as a superseded_alternative for {field}"
+                    );
+                }
+            }
+        }
     }
     println!(
-        "qdrant scope fuzz: {probes} probes across recall(bm25), recall(hybrid: qdrant dense + bm25), latest_chunks(qdrant), activity — no leaks"
+        "qdrant scope fuzz: {probes} probes across recall(bm25), recall(hybrid: qdrant dense + bm25), \
+         latest_chunks(qdrant), activity, current_fact, fact_as_of, merged_record — no leaks"
     );
 }

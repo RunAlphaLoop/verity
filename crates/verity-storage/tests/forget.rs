@@ -193,6 +193,8 @@ async fn episode_forget_cascades_published_knowledge() {
             },
             value: json!("negotiation"),
             valid_from: Utc::now(),
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
             provenance: e1,
             acl_provenance: AclProvenance::AdminAssigned,
         })
@@ -234,8 +236,16 @@ async fn episode_forget_cascades_published_knowledge() {
         entity_id: "account:medcore".into(),
         field: "stage".into(),
     };
+    // Scope admits the fact's visibility (`[1]`) and entity, so a None proves
+    // the row was RETIRED by the cascade, not filtered out by scope.
+    let read = Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
     assert!(
-        adapter.current_fact(tenant, &key).await.unwrap().is_none(),
+        adapter.current_fact(&read, &key).await.unwrap().is_none(),
         "episode-derived fact must be retired (and not cached)"
     );
 

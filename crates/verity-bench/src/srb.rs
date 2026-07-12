@@ -788,6 +788,8 @@ async fn staleness_suite(adapter: &PostgresAdapter, cycles: usize) -> Result<Val
                     },
                     value: value.clone(),
                     valid_from: t_event,
+                    visibility: vec![1],
+                    confidentiality: Confidentiality::Internal,
                     provenance: episode,
                     acl_provenance: AclProvenance::Mirrored,
                 })
@@ -828,9 +830,17 @@ async fn staleness_suite(adapter: &PostgresAdapter, cycles: usize) -> Result<Val
             entity_id: entity.clone(),
             field: "amount".into(),
         };
+        // The stale-read fact is seeded visibility [1]; scope the read-back with
+        // that principal so the visibility pre-filter admits it.
+        let fact_scope = Scope {
+            tenant_id: tenant,
+            principals: vec![1],
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted,
+        };
         loop {
             fact_reads += 1;
-            let row = adapter.current_fact(tenant, &key).await?;
+            let row = adapter.current_fact(&fact_scope, &key).await?;
             match row {
                 Some(r) if r.value == v2 => {
                     fact_gap.record(write_done.elapsed().as_micros() as u64)?;

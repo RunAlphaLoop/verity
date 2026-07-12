@@ -739,19 +739,18 @@ async fn get_record(
     axum::extract::Query(q): axum::extract::Query<RecordQuery>,
 ) -> HandlerResult<Json<FactRow>> {
     let payload = state.verify_scope(&q.scope_handle)?;
+    // Compile the enforcement scope (visibility + revocations) — previously this
+    // handler read with the bare tenant, applying NEITHER, which was the L1
+    // fact-visibility leak AND a revocation gap. scope_for closes both.
+    let scope = state.scope_for(&payload).await?;
     let key = FactKey {
         source,
         entity_id: entity,
         field,
     };
     let result = match q.as_of {
-        Some(as_of) => {
-            state
-                .storage
-                .fact_as_of(payload.tenant_id, &key, as_of)
-                .await
-        }
-        None => state.storage.current_fact(payload.tenant_id, &key).await,
+        Some(as_of) => state.storage.fact_as_of(&scope, &key, as_of).await,
+        None => state.storage.current_fact(&scope, &key).await,
     };
     match result {
         Ok(Some(fact)) => {
@@ -1066,11 +1065,14 @@ async fn get_merged_entity(
     axum::extract::Query(q): axum::extract::Query<MergedRecordQuery>,
 ) -> HandlerResult<Json<MergedEntityResponse>> {
     let payload = state.verify_scope(&q.scope_handle)?;
-    // Field-resolution is untouched: merged_record runs exactly as before.
+    // Merged precedence resolves over caller-VISIBLE facts only (SPEC §7f/§7e):
+    // an invisible higher-precedence fact must not win a field nor leak as an
+    // alternative. scope_for compiles visibility + revocations.
+    let scope = state.scope_for(&payload).await?;
     let merged = state
         .storage
         .inner()
-        .merged_record(payload.tenant_id, &canonical)
+        .merged_record(&scope, &canonical)
         .await
         .map_err(internal)?;
     // Additive: read the pre-materialized badge (None => unbadged, still serves).
@@ -1540,6 +1542,17 @@ struct IngestParams {
     /// Primary-key field within the row image.
     #[serde(default = "default_pk")]
     pk: String,
+    /// The static visibility policy bound to this connector at ingest time
+    /// (SPEC §5e). Debezium envelopes carry no native per-row ACL, so unless a
+    /// row declares an inline `verity_acl` block, its facts materialize against
+    /// THIS admin-supplied token set. Absent here AND absent inline => the fact
+    /// is REFUSED (fail closed), never indexed at a permissive default. Empty
+    /// (`visibility=[]`) is a deliberate "writes memory nobody can read", still
+    /// a policy, distinct from "no policy".
+    #[serde(default)]
+    visibility: Option<Vec<PrincipalToken>>,
+    #[serde(default)]
+    confidentiality: Option<Confidentiality>,
 }
 
 fn default_pk() -> String {
@@ -1558,9 +1571,20 @@ async fn ingest_debezium(
         one => vec![one],
     };
 
-    let (mut written, mut superseded, mut retired, mut unchanged) = (0u64, 0u64, 0u64, 0u64);
+    // The connector-bound static ACL policy (SPEC §5e). Present only when the
+    // admin bound one on the ingest call; otherwise rows must declare their own
+    // inline `verity_acl` block or be refused. A bound policy with an empty
+    // token set is a deliberate "nobody can read this", still a policy.
+    let bound_policy = p.visibility.as_ref().map(|vis| ingest::ResolvedAcl {
+        visibility: vis.clone(),
+        confidentiality: p.confidentiality.unwrap_or(Confidentiality::Internal),
+        provenance: AclProvenance::AdminAssigned,
+    });
+
+    let (mut written, mut superseded, mut retired, mut unchanged, mut refused) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for envelope in envelopes {
-        let ev = ingest::parse_envelope(envelope, &p.pk)
+        let ev = ingest::parse_envelope(envelope, &p.pk, bound_policy.as_ref())
             .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
 
         let episode = state
@@ -1588,6 +1612,15 @@ async fn ingest_debezium(
                     .map_err(internal)?;
             }
             ingest::Op::Upsert => {
+                // Fail-closed choke point: an upsert with no resolvable ACL
+                // (no inline block, no bound policy) writes NO readable fact.
+                // The L0 episode above is already durable for audit/re-ingest;
+                // we skip the L1 upsert rather than default to permissive.
+                let Some(acl) = ev.acl.clone() else {
+                    refused += ev.fields.len() as u64;
+                    slo::record_sample(state.pool(), p.tenant_id, &ev.source, ev.occurred_at).await;
+                    continue;
+                };
                 for (field, value) in ev.fields {
                     let outcome = state
                         .storage
@@ -1600,8 +1633,10 @@ async fn ingest_debezium(
                             },
                             value,
                             valid_from: ev.occurred_at,
+                            visibility: acl.visibility.clone(),
+                            confidentiality: acl.confidentiality,
                             provenance: episode,
-                            acl_provenance: AclProvenance::Mirrored,
+                            acl_provenance: acl.provenance,
                         })
                         .await
                         .map_err(internal)?;
@@ -1631,6 +1666,11 @@ async fn ingest_debezium(
         "facts_superseded": superseded,
         "facts_unchanged": unchanged,
         "facts_retired": retired,
+        // Upsert fields dropped for want of a resolvable ACL (fail closed). A
+        // non-zero count means the connector is missing a bound visibility
+        // policy (or its rows an inline `verity_acl` block) — the L0 events are
+        // preserved for re-ingest once a policy is supplied.
+        "facts_refused_no_acl": refused,
     })))
 }
 
@@ -3447,6 +3487,11 @@ async fn admin_quarantine_reingest(
                     },
                     value: fact.value.clone(),
                     valid_from: fact.valid_from.unwrap_or_else(Utc::now),
+                    // The corrected ACL the admin supplied for the re-ingest —
+                    // the same explicit policy the sibling chunk got. This is
+                    // the ONLY way a quarantined payload re-enters L1.
+                    visibility: req.visibility.clone(),
+                    confidentiality: req.confidentiality,
                     provenance: episode_id,
                     acl_provenance: AclProvenance::AdminAssigned,
                 })

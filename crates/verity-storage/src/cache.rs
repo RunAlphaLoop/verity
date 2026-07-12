@@ -6,11 +6,15 @@
 //! coherence arrives with the changelog stream in Milestone B, at which point
 //! this cache is fed by changelog events instead of local invalidation.
 //!
-//! Enforcement note: `current_fact` carries no visibility filtering yet (L1
-//! records are tenant-partitioned only until the scope engine lands); the
-//! cache therefore never has to answer a scoped read from memory. When brief
-//! scoping lands, cached reads pass the same enforcement gate as everything
-//! else — the cache sits BELOW the gate, keyed by tenant.
+//! Enforcement note: the cache sits BELOW the scope gate. Its key is
+//! scope-INDEPENDENT (`(tenant, FactKey)`) so every principal shares one cached
+//! row and the hit rate is not fragmented per-scope. Visibility is enforced
+//! ABOVE the cache — on both a HIT and a MISS — by applying the shared
+//! `fact_visible` predicate (verity-core) to whatever the cache/store yields.
+//! This is the "one shared layer above StorageAdapter" the non-negotiables
+//! require: the SQL predicate the Postgres profile pushes and this Rust check
+//! are the same rule, and must agree. The cache never stores a scope, so it can
+//! never leak a row across scopes.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -77,26 +81,44 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         Ok(outcome)
     }
 
-    async fn current_fact(&self, tenant: TenantId, key: &FactKey) -> Result<Option<FactRow>> {
-        let cache_key = (tenant, key.clone());
+    async fn current_fact(&self, scope: &Scope, key: &FactKey) -> Result<Option<FactRow>> {
+        // The cache key is scope-independent (preserves hit rate across
+        // principals); the scope gate is applied ABOVE the cache to the row it
+        // yields — on both HIT and MISS — via the shared `fact_visible`.
+        let cache_key = (scope.tenant_id, key.clone());
         if let Some(hit) = self.facts.get(&cache_key) {
-            return Ok(Some(hit));
+            // Re-gate the cached row against THIS scope: the row was cached by
+            // whichever principal populated it, but visibility is decided here,
+            // not by who warmed the cache.
+            return Ok(fact_visible(scope, &hit).then_some(hit));
         }
-        let row = self.inner.current_fact(tenant, key).await?;
+        // MISS: the inner adapter applies the SQL visibility pre-filter, so it
+        // only returns a row this scope may see. That row is a real, current
+        // fact — safe to cache under the scope-independent key. A narrower scope
+        // that can't see the fact simply gets None, caches nothing, and a wider
+        // scope re-fetches: a missed caching opportunity, never a leak. We still
+        // re-check `fact_visible` above (defense in depth; the SQL already
+        // filtered).
+        let row = self.inner.current_fact(scope, key).await?;
         if let Some(ref fact) = row {
             self.facts.insert(cache_key, fact.clone());
         }
-        Ok(row)
+        Ok(row.filter(|r| fact_visible(scope, r)))
     }
 
     async fn fact_as_of(
         &self,
-        tenant: TenantId,
+        scope: &Scope,
         key: &FactKey,
         as_of: DateTime<Utc>,
     ) -> Result<Option<FactRow>> {
-        // Historical reads always go to the store.
-        self.inner.fact_as_of(tenant, key, as_of).await
+        // Historical reads always go to the store; the store applies the SQL
+        // visibility pre-filter, and we re-check above for defense in depth.
+        Ok(self
+            .inner
+            .fact_as_of(scope, key, as_of)
+            .await?
+            .filter(|r| fact_visible(scope, r)))
     }
 
     async fn upsert_chunks(&self, chunks: Vec<ChunkWrite>) -> Result<usize> {

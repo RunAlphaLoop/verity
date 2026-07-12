@@ -23,6 +23,19 @@ async fn setup() -> Option<(PostgresAdapter, TenantId)> {
     Some((adapter, tenant))
 }
 
+/// A scope admitting the facts these tests seed (visibility `[1]`), so
+/// `merged_record`'s precedence resolution is exercised over the full set. The
+/// visible-only carve-out is exercised separately (see the invisible-fact test
+/// and scope_fuzz.rs).
+fn merge_scope(tenant: TenantId) -> Scope {
+    Scope {
+        tenant_id: tenant,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    }
+}
+
 /// Write one current L1 fact for (source, entity_id, field)=value, event-time
 /// `valid_from`. Each carries its own L0 episode as provenance.
 async fn fact(
@@ -58,6 +71,55 @@ async fn fact(
             },
             value,
             valid_from,
+            visibility: vec![1],
+            confidentiality: Confidentiality::Internal,
+            provenance: episode,
+            acl_provenance: AclProvenance::Mirrored,
+        })
+        .await
+        .unwrap();
+    episode
+}
+
+/// Like `fact`, but with an explicit visibility token set — for the
+/// visible-only merge carve-out test.
+#[allow(clippy::too_many_arguments)]
+async fn fact_vis(
+    adapter: &PostgresAdapter,
+    tenant: TenantId,
+    source: &str,
+    entity_id: &str,
+    field: &str,
+    value: serde_json::Value,
+    valid_from: chrono::DateTime<Utc>,
+    visibility: Vec<PrincipalToken>,
+) -> EpisodeId {
+    let episode = adapter
+        .append_episode(NewEpisode {
+            tenant_id: tenant,
+            source: source.into(),
+            source_entity: Some(entity_id.into()),
+            kind: EpisodeKind::CdcEvent,
+            payload: json!({ "field": field, "value": value }),
+            content_hash: format!("hv-{source}-{entity_id}-{field}-{value}"),
+            trust_tier: TrustTier::Authoritative,
+            writer_sub: None,
+            writer_azp: None,
+        })
+        .await
+        .unwrap();
+    adapter
+        .upsert_fact(FactWrite {
+            tenant_id: tenant,
+            key: FactKey {
+                source: source.into(),
+                entity_id: entity_id.into(),
+                field: field.into(),
+            },
+            value,
+            valid_from,
+            visibility,
+            confidentiality: Confidentiality::Internal,
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
         })
@@ -94,7 +156,10 @@ async fn two_sources_precedence_winner_and_alternative() {
     .await
     .unwrap();
 
-    let merged = a.merged_record(t, "account:acme").await.unwrap();
+    let merged = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     assert_eq!(merged.members.len(), 2);
     let name = &merged.fields["name"];
     assert_eq!(name.winning_source, "salesforce");
@@ -140,7 +205,10 @@ async fn per_field_precedence_independent() {
     .await
     .unwrap();
 
-    let merged = a.merged_record(t, "account:acme").await.unwrap();
+    let merged = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     assert_eq!(merged.fields["name"].winning_source, "hubspot");
     assert_eq!(merged.fields["name"].value, json!("Acme HS"));
     assert_eq!(merged.fields["amount"].winning_source, "salesforce");
@@ -173,7 +241,10 @@ async fn precedence_change_flips_winner() {
     )
     .await
     .unwrap();
-    let m1 = a.merged_record(t, "account:acme").await.unwrap();
+    let m1 = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     assert_eq!(m1.fields["phone"].winning_source, "hubspot");
     assert_eq!(m1.fields["phone"].value, json!("111"));
 
@@ -186,7 +257,10 @@ async fn precedence_change_flips_winner() {
     )
     .await
     .unwrap();
-    let m2 = a.merged_record(t, "account:acme").await.unwrap();
+    let m2 = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     assert_eq!(m2.fields["phone"].winning_source, "salesforce");
     assert_eq!(m2.fields["phone"].value, json!("222"));
 }
@@ -203,7 +277,7 @@ async fn unmapped_entity_returns_own_facts() {
     fact(&a, t, "hubspot", "solo-1", "name", json!("Solo Co"), now).await;
     fact(&a, t, "hubspot", "solo-1", "amount", json!(42), now).await;
 
-    let merged = a.merged_record(t, "solo-1").await.unwrap();
+    let merged = a.merged_record(&merge_scope(t), "solo-1").await.unwrap();
     assert!(merged.members.is_empty(), "unmapped: no alias members");
     assert_eq!(merged.fields["name"].winning_source, "hubspot");
     assert_eq!(merged.fields["name"].value, json!("Solo Co"));
@@ -243,7 +317,10 @@ async fn field_in_one_source_wins_regardless() {
     .await
     .unwrap();
 
-    let merged = a.merged_record(t, "account:acme").await.unwrap();
+    let merged = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     let website = &merged.fields["website"];
     assert_eq!(website.winning_source, "hubspot");
     assert_eq!(website.value, json!("acme.com"));
@@ -279,7 +356,10 @@ async fn entity_default_and_unlisted_source_ranking() {
         .await
         .unwrap();
 
-    let merged = a.merged_record(t, "account:acme").await.unwrap();
+    let merged = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     let name = &merged.fields["name"];
     assert_eq!(name.winning_source, "hubspot", "listed source wins");
     // Alternatives are ranked: the more-recent unlisted source (salesforce)
@@ -310,7 +390,10 @@ async fn global_default_precedence() {
         .await
         .unwrap();
 
-    let merged = a.merged_record(t, "account:acme").await.unwrap();
+    let merged = a
+        .merged_record(&merge_scope(t), "account:acme")
+        .await
+        .unwrap();
     assert_eq!(merged.fields["name"].winning_source, "salesforce");
 }
 
@@ -354,4 +437,89 @@ async fn alias_listing_and_reverse_lookup() {
             .len(),
         1
     );
+}
+
+/// SPEC §7f/§7e visible-only carve-out: precedence resolves over caller-VISIBLE
+/// facts only. A higher-precedence fact the caller cannot see must NOT win the
+/// field (its value would leak) NOR appear as a `superseded_alternative`; the
+/// visible lower-precedence value wins instead. The admin plane, resolving over
+/// everything, still sees the higher-precedence value.
+#[tokio::test]
+async fn merged_record_resolves_over_visible_facts_only() {
+    let Some((a, t)) = setup().await else {
+        return;
+    };
+    let now = Utc::now();
+    // salesforce holds `name` but only principal 2 may see it (invisible to 1).
+    fact_vis(
+        &a,
+        t,
+        "salesforce",
+        "sf-1",
+        "name",
+        json!("Acme (SF secret)"),
+        now,
+        vec![2],
+    )
+    .await;
+    // hubspot holds `name`, visible to principal 1.
+    fact_vis(
+        &a,
+        t,
+        "hubspot",
+        "hs-1",
+        "name",
+        json!("Acme (HS)"),
+        now,
+        vec![1],
+    )
+    .await;
+
+    a.upsert_entity_alias(t, "salesforce", "sf-1", "account:acme")
+        .await
+        .unwrap();
+    a.upsert_entity_alias(t, "hubspot", "hs-1", "account:acme")
+        .await
+        .unwrap();
+    // salesforce is the higher-precedence source for `name`.
+    a.set_entity_precedence(
+        t,
+        "account:acme",
+        "name",
+        &["salesforce".into(), "hubspot".into()],
+    )
+    .await
+    .unwrap();
+
+    // Principal 1 cannot see the salesforce fact: the visible hubspot value wins,
+    // and the invisible salesforce value never surfaces as an alternative.
+    let scope1 = Scope {
+        tenant_id: t,
+        principals: vec![1],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+    let merged = a.merged_record(&scope1, "account:acme").await.unwrap();
+    let name = &merged.fields["name"];
+    assert_eq!(name.winning_source, "hubspot");
+    assert_eq!(name.value, json!("Acme (HS)"));
+    assert!(
+        name.superseded_alternatives
+            .iter()
+            .all(|alt| alt.source != "salesforce"),
+        "an invisible higher-precedence fact must not leak as an alternative"
+    );
+
+    // Principal 2 sees the salesforce fact: it wins as configured.
+    let scope2 = Scope {
+        principals: vec![2],
+        ..scope1.clone()
+    };
+    let merged2 = a.merged_record(&scope2, "account:acme").await.unwrap();
+    assert_eq!(merged2.fields["name"].winning_source, "salesforce");
+
+    // The admin plane resolves over EVERYTHING regardless of visibility.
+    let admin = a.merged_record_admin(t, "account:acme").await.unwrap();
+    assert_eq!(admin.fields["name"].winning_source, "salesforce");
+    assert_eq!(admin.fields["name"].value, json!("Acme (SF secret)"));
 }
