@@ -20,11 +20,18 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Tenant directory for the admin plane (FTUE §2.1): the data source for
     /// the console's tenant picker and first-run detection (empty list =
-    /// virgin server). Ordered by creation time ascending, capped at `limit`.
+    /// virgin server). Ordered by creation time DESCENDING (a just-created
+    /// tenant must land on the first page), capped at `limit`.
     /// Default fails explicit — a profile that hasn't built the admin plane
     /// must never masquerade as a virgin server by returning an empty list.
     async fn list_tenants(&self, _limit: i64) -> Result<Vec<TenantRow>> {
         Err(unsupported("list_tenants"))
+    }
+
+    /// Total tenant count, so a capped directory page can disclose its own
+    /// truncation ("showing 500 of 5,500") instead of passing as complete.
+    async fn count_tenants(&self) -> Result<i64> {
+        Err(unsupported("count_tenants"))
     }
 
     /// Append to the immutable L0 evidence log.

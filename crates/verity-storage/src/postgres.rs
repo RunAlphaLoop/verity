@@ -2503,7 +2503,11 @@ impl StorageAdapter for PostgresAdapter {
     /// heads the console picker; id is the tiebreak for a stable order.
     async fn list_tenants(&self, limit: i64) -> Result<Vec<TenantRow>> {
         let rows = sqlx::query(
-            "SELECT id, name, created_at FROM tenants ORDER BY created_at, id LIMIT $1",
+            // Newest FIRST: a picker on a long-lived dev db (5,500 test tenants
+            // observed) must surface what was just created, not 2-month-old
+            // suite debris. Found via founder report: "created a tenant, it
+            // doesn't show up in the menu" — it was row 5,500 of an ASC page.
+            "SELECT id, name, created_at FROM tenants ORDER BY created_at DESC, id DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -2518,6 +2522,14 @@ impl StorageAdapter for PostgresAdapter {
                 })
             })
             .collect()
+    }
+
+    async fn count_tenants(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenants")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(n)
     }
 
     async fn append_episode(&self, ep: NewEpisode) -> Result<EpisodeId> {

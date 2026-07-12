@@ -216,10 +216,20 @@
               var x = dir.tenants[i];
               opts += '<option value="' + Verity.esc(x.tenant_id) + '">' + Verity.esc(x.name || "(unnamed)") + "</option>";
             }
+            // The ACTIVE tenant must always be pickable/visible even when the
+            // directory page is truncated (5,500-tenant dev dbs exist) — a
+            // selected space that renders as "— pick a space —" reads as
+            // "creation failed" (founder report, 2026-07-12).
+            if (t && !inList) {
+              opts += '<option value="' + Verity.esc(t) + '">(current space) ' + Verity.esc(shortId(t)) + "</option>";
+            }
+            if (dir.total > dir.tenants.length) {
+              opts += '<option value="" disabled>… showing newest ' + dir.tenants.length + " of " + dir.total + "</option>";
+            }
             opts += '<option value="__paste">paste a tenant id…</option>';
             opts += '<option value="__new">+ create a new space</option>';
             tenantPick.innerHTML = opts;
-            tenantPick.value = inList ? t : "";
+            tenantPick.value = t || "";
             tenantPick.style.display = "";
           }
           if (tenantInput) tenantInput.style.display = pasteMode ? "" : "none";

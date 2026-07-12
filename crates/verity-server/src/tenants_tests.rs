@@ -6,7 +6,8 @@
 //!
 //! What these tests pin down:
 //! - the GET returns `{tenants:[{tenant_id,name,created_at}],count}` with the
-//!   exact field names the FTUE contract specifies, ordered oldest-first, and
+//!   exact field names the FTUE contract specifies, ordered NEWEST-first (a
+//!   picker must surface what was just created — amended 2026-07-12), and
 //!   respects/clamps `limit`;
 //! - the GET is admin-gated exactly like the POST (401 without/with a bad
 //!   bearer when VERITY_ADMIN_TOKEN semantics are active);
@@ -68,9 +69,10 @@ type HandlerJson = crate::HandlerResult<Json<serde_json::Value>>;
 
 /// DSN-only: the directory read returns the FTUE contract shape —
 /// `tenants: [{tenant_id, name, created_at}]` — includes freshly created
-/// tenants in creation order (oldest first), and honors `limit`.
+/// tenants NEWEST first (a just-created space must land on the first page
+/// of a long-lived dev db), and honors `limit`.
 #[tokio::test]
-async fn tenant_directory_lists_created_tenants_in_creation_order() {
+async fn tenant_directory_lists_created_tenants_newest_first() {
     let Some(state) = test_state(dev_admin()).await else {
         eprintln!("VERITY_TEST_DSN not set; skipping");
         return;
@@ -88,8 +90,8 @@ async fn tenant_directory_lists_created_tenants_in_creation_order() {
         .await
         .expect("tenant b");
 
-    // Storage-level read with a huge limit: both tenants present, a before b,
-    // every row fully populated, order ascending by created_at throughout.
+    // Storage-level read with a huge limit: both tenants present, b (newer)
+    // BEFORE a, every row fully populated, order descending throughout.
     let rows = state
         .storage
         .list_tenants(i64::MAX)
@@ -97,12 +99,15 @@ async fn tenant_directory_lists_created_tenants_in_creation_order() {
         .expect("list_tenants");
     let pos = |id| rows.iter().position(|r| r.tenant_id == id);
     let (pa, pb) = (pos(id_a).expect("a listed"), pos(id_b).expect("b listed"));
-    assert!(pa < pb, "creation order: a was born before b");
+    assert!(
+        pb < pa,
+        "newest first: b was born after a, so b lists first"
+    );
     assert_eq!(rows[pa].name, name_a);
     assert_eq!(rows[pb].name, name_b);
     assert!(
-        rows.windows(2).all(|w| w[0].created_at <= w[1].created_at),
-        "directory must be ordered oldest-first"
+        rows.windows(2).all(|w| w[0].created_at >= w[1].created_at),
+        "directory must be ordered newest-first"
     );
 
     // Handler-level read: contract shape + limit honored. limit=1 ⇒ exactly

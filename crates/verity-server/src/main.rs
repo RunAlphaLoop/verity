@@ -2070,9 +2070,17 @@ async fn list_tenants(
         .await
         .map_err(storage_status)?;
     let count = tenants.len();
+    // `count` is the page size (FTUE contract); `total` is the whole table,
+    // so the picker can disclose truncation instead of passing as complete.
+    let total = state
+        .storage
+        .count_tenants()
+        .await
+        .map_err(storage_status)?;
     Ok(Json(serde_json::json!({
         "tenants": tenants,
         "count": count,
+        "total": total,
     })))
 }
 

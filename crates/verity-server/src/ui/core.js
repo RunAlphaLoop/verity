@@ -460,9 +460,11 @@ function _emitTenantDir() {
 /** Verity.refreshTenantDir() → Promise<dir>. Re-reads the tenant list. */
 async function refreshTenantDir() {
   try {
-    const res = await api("/v1/admin/tenants", { admin: true });
+    const res = await api("/v1/admin/tenants?limit=500", { admin: true });
     _tenantDir.status = "ok";
     _tenantDir.tenants = (res && res.tenants) || [];
+    // Server total (may exceed the page) — the picker discloses truncation.
+    _tenantDir.total = (res && typeof res.total === "number") ? res.total : _tenantDir.tenants.length;
     _tenantDir.error = "";
   } catch (e) {
     const msg = String((e && e.message) || e);
@@ -559,6 +561,12 @@ function _buildCreateTenantDialog() {
       const id = res && res.tenant_id;
       if (!id) throw new Error("the server returned no tenant_id");
       await refreshTenantDir();
+      // Belt-and-suspenders: whatever the page ordering, the tenant the user
+      // JUST created must be in the dropdown. Prepend if the refresh missed it.
+      if (!_tenantDir.tenants.some((x) => x.tenant_id === id)) {
+        _tenantDir.tenants.unshift({ tenant_id: id, name: name, created_at: null });
+        _emitTenantDir();
+      }
       setTenant(id);
       $("newtenant-result").innerHTML =
         '<div class="card" style="margin-top:12px;margin-bottom:0">' +
