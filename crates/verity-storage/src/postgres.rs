@@ -36,6 +36,49 @@ pub struct ReviewQueueItem {
     pub entity_value: i64,
 }
 
+/// One observed entity tag in the picker directory
+/// (docs/design/ENTITY-PICKER.md §4): a DISTINCT member of
+/// `chunks.entity_tags ∪ actions.entities` — exactly the vocabulary the scope
+/// filter enforces on — with honest per-source counts and the display-only
+/// merged badge. Serialized verbatim by `GET /v1/admin/entity-tags`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntityTagRow {
+    pub tag: String,
+    /// LIVE chunk rows (`valid_to IS NULL`) carrying the tag: the same rows
+    /// `entity_scope_predicate` can return.
+    pub chunk_count: i64,
+    /// Action rows carrying the tag (the activity containment filter's rows).
+    pub action_count: i64,
+    /// ALL chunk rows including invalidated ones; populated only when
+    /// `live_only = false` (erasure targets physical rows —
+    /// invalidate-don't-delete means superseded rows persist until the §8
+    /// crypto-shredding pipeline runs).
+    pub total_chunk_count: Option<i64>,
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Display hint only (drives the `merged` badge): the canonical this
+    /// source-native tag resolves to, when an `entity_aliases` row exists.
+    /// Null for unmerged tags — the common case.
+    pub canonical_entity: Option<String>,
+    /// `entity_link_meta` confidence for the alias link, when materialized.
+    pub link_confidence: Option<String>,
+}
+
+/// The picker directory response ([`PostgresAdapter::list_entity_tags`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntityTagDirectory {
+    /// Distinct tags for the tenant under `live_only`, IGNORING `q` and
+    /// `limit` — the Emptiness Law keys off this; a filtered page must not
+    /// fake emptiness.
+    pub total_distinct: i64,
+    /// True when more tags matched `q` than `limit` returned.
+    pub truncated: bool,
+    /// Observed namespace prefixes (`account`, `deal`, …) across the whole
+    /// directory (ignoring `q`/`limit`), sorted — derived from data, never a
+    /// hardcoded list, so the console teaches the tenant's actual vocabulary.
+    pub namespaces: Vec<String>,
+    pub tags: Vec<EntityTagRow>,
+}
+
 /// One tenant-only-filtered candidate for the ADMIN debug-recall "why-out"
 /// trace ([`PostgresAdapter::debug_recall_candidates`]). Carries the RAW
 /// enforcement inputs (visibility tokens, confidentiality class, entity tags,
@@ -1173,6 +1216,150 @@ impl PostgresAdapter {
             });
         }
         Ok(out)
+    }
+
+    /// The entity-tag DIRECTORY for the console's entity picker
+    /// (docs/design/ENTITY-PICKER.md §4): DISTINCT tags observed on
+    /// `chunks.entity_tags ∪ actions.entities` and NOTHING else — the exact
+    /// union the enforcement predicates scan (`entity_scope_predicate`, the
+    /// activity `entities @>` containment), so the picker never offers an
+    /// entity the scope filter cannot see. (The de-id lexicon additionally
+    /// unions `facts.entity_id` — correct for leak-screening, noise here.)
+    ///
+    /// - `chunk_count` is always LIVE rows (`valid_to IS NULL`). With
+    ///   `live_only = false`, invalidated chunk rows also ADMIT their tags to
+    ///   the directory and `total_chunk_count` is populated — a tag carried
+    ///   only by superseded rows is a legitimate erasure target that a
+    ///   live-only directory would hide.
+    /// - `total_distinct` and `namespaces` ignore `q`/`limit` (Emptiness Law).
+    /// - `q` is a case-insensitive substring over the tag; ordering is total
+    ///   memories carrying the tag (desc) then tag; `limit` clamps 1..=500
+    ///   with `truncated` set when more matched.
+    /// - The `entity_aliases`/`entity_link_meta` LEFT JOINs are display hints
+    ///   only (the `merged` badge); both are at-most-one by primary key, so
+    ///   they can never fan a tag row out.
+    ///
+    /// Worker/admin plane only — never consulted by `recall`/`get` (read-path
+    /// purity: zero LLM, zero live ReBAC). Performance honesty: unnest
+    /// aggregation is a per-tenant seq scan (the GIN indexes serve
+    /// containment, not this) — fine for an admin dialog at current corpus
+    /// sizes; if it ever hurts, materialize a tag summary rather than count a
+    /// different (dishonest) source.
+    pub async fn list_entity_tags(
+        &self,
+        tenant: TenantId,
+        q: Option<&str>,
+        live_only: bool,
+        limit: i64,
+    ) -> Result<EntityTagDirectory> {
+        let limit = limit.clamp(1, 500);
+        // $2 = NOT live_only ("include invalidated chunk rows").
+        let include_invalidated = !live_only;
+
+        let head = sqlx::query(
+            "SELECT count(*) AS total_distinct,
+                    array_agg(DISTINCT split_part(tag, ':', 1)
+                              ORDER BY split_part(tag, ':', 1))
+                        FILTER (WHERE strpos(tag, ':') > 0) AS namespaces
+             FROM (
+                 SELECT DISTINCT tag FROM (
+                     SELECT unnest(entity_tags) AS tag FROM chunks
+                      WHERE tenant_id = $1 AND ($2 OR valid_to IS NULL)
+                     UNION ALL
+                     SELECT unnest(entities) FROM actions WHERE tenant_id = $1
+                 ) u
+             ) t",
+        )
+        .bind(tenant)
+        .bind(include_invalidated)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let total_distinct: i64 = head.try_get("total_distinct").map_err(db_err)?;
+        let namespaces: Vec<String> = head
+            .try_get::<Option<Vec<String>>, _>("namespaces")
+            .map_err(db_err)?
+            .unwrap_or_default();
+
+        // Page: fetch limit+1 to detect truncation without a second count.
+        let rows = sqlx::query(
+            "SELECT agg.tag,
+                    agg.chunk_count,
+                    agg.total_chunk_count,
+                    agg.action_count,
+                    agg.last_seen,
+                    ea.canonical_entity,
+                    elm.confidence AS link_confidence
+             FROM (
+                 SELECT tag,
+                        sum(live_chunks)::bigint AS chunk_count,
+                        sum(all_chunks)::bigint  AS total_chunk_count,
+                        sum(actions)::bigint     AS action_count,
+                        max(last_seen)           AS last_seen
+                 FROM (
+                     SELECT unnest(entity_tags) AS tag,
+                            count(*) FILTER (WHERE valid_to IS NULL) AS live_chunks,
+                            count(*)  AS all_chunks,
+                            0::bigint AS actions,
+                            max(valid_from) AS last_seen
+                       FROM chunks
+                      WHERE tenant_id = $1 AND ($2 OR valid_to IS NULL)
+                      GROUP BY 1
+                     UNION ALL
+                     SELECT unnest(entities), 0::bigint, 0::bigint, count(*),
+                            max(occurred_at)
+                       FROM actions
+                      WHERE tenant_id = $1
+                      GROUP BY 1
+                 ) t
+                 WHERE ($3::text IS NULL OR tag ILIKE '%' || $3 || '%')
+                 GROUP BY tag
+             ) agg
+             LEFT JOIN entity_aliases ea
+                    ON ea.tenant_id = $1
+                   AND ea.source || ':' || ea.entity_id = agg.tag
+             LEFT JOIN entity_link_meta elm
+                    ON elm.tenant_id = $1
+                   AND elm.subject_kind = 'alias_member'
+                   AND elm.subject_ref = agg.tag
+                   AND elm.canonical_entity = ea.canonical_entity
+             ORDER BY agg.total_chunk_count + agg.action_count DESC, agg.tag
+             LIMIT $4",
+        )
+        .bind(tenant)
+        .bind(include_invalidated)
+        .bind(q)
+        .bind(limit + 1)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let truncated = rows.len() as i64 > limit;
+        let tags = rows
+            .iter()
+            .take(limit as usize)
+            .map(|r| {
+                Ok(EntityTagRow {
+                    tag: r.try_get("tag").map_err(db_err)?,
+                    chunk_count: r.try_get("chunk_count").map_err(db_err)?,
+                    action_count: r.try_get("action_count").map_err(db_err)?,
+                    total_chunk_count: if live_only {
+                        None
+                    } else {
+                        r.try_get("total_chunk_count").map_err(db_err)?
+                    },
+                    last_seen: r.try_get("last_seen").map_err(db_err)?,
+                    canonical_entity: r.try_get("canonical_entity").map_err(db_err)?,
+                    link_confidence: r.try_get("link_confidence").map_err(db_err)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(EntityTagDirectory {
+            total_distinct,
+            truncated,
+            namespaces,
+            tags,
+        })
     }
 
     /// The COMPLETE set of DISTINCT canonical keys folded for a tenant, in

@@ -24,6 +24,11 @@
        in localStorage so returning operators land on live data. The admin
        token stays sessionStorage-ONLY, as before.
 
+   v4 ADDS (additive, docs/design/ENTITY-PICKER.md): Verity.entityDirectory
+   (cached admin read of GET /v1/admin/entity-tags) + Verity.entityPicker —
+   the ONE chips+typeahead component for every field that names an entity;
+   the mint dialog's "limit to entities" field is its first surface.
+
    READ-PATH PURITY: nothing here makes an LLM or live-ReBAC call. api() is a
    thin fetch wrapper; decodeHandle() is pure client-side base64url→JSON.
    ============================================================================ */
@@ -581,6 +586,670 @@ function openCreateTenant() {
 function buildHash() { return document.body.getAttribute("data-build-hash") || "unknown"; }
 
 /* ============================================================================
+   v4 · ENTITY DIRECTORY + ENTITY PICKER (docs/design/ENTITY-PICKER.md §2–§4)
+   ----------------------------------------------------------------------------
+   ONE shared component for every field that names an entity. Honesty rules:
+     • the picker OFFERS what exists and NEVER invents — every suggestion and
+       every count comes from GET /v1/admin/entity-tags, which reads the same
+       rows the enforcement predicates scan;
+     • fail-closed untouched — an empty picker submits an ABSENT field, adds
+       no defaults, and scope copy says "limit", never "grant";
+     • value() is the ONLY submission path — callers never read the inner
+       <input>; a tag reaches a payload only as an explicitly committed chip;
+     • the Emptiness Law (§3) — zero entities ⇒ a limiting field collapses to
+       a teaching line ("hide"); a tagging field teaches birth ("teach");
+     • directory-unavailable ≠ empty — degraded lint-only free entry with an
+       honest note, never the "no entities yet" line, never fabricated counts.
+   Zero external requests; zero LLM/ReBAC; admin-plane read only, never on
+   the recall path. All additive — no frozen signature changes.
+   ============================================================================ */
+
+const _entDirCache = new Map();      // tenant + "|" + liveOnly → {at, promise}
+const _ENT_DIR_TTL = 30000;          // 30 s per-tenant cache, shared by pickers
+
+/**
+ * Verity.entityDirectory(tenantId, opts?) → Promise<directory>
+ *   opts: { liveOnly=true, q, force }
+ * Cached admin fetch of GET /v1/admin/entity-tags (30 s per tenant+liveOnly,
+ * in-flight deduped; `q` bypasses the cache; `force` refreshes it). The
+ * response is { total_distinct, truncated, tags:[{tag, chunk_count,
+ * action_count, total_chunk_count, last_seen, canonical_entity, …}] }.
+ */
+function entityDirectory(tenantId, opts) {
+  opts = opts || {};
+  const liveOnly = opts.liveOnly !== false;
+  const t = String(tenantId || "").trim();
+  if (!t) return Promise.reject(new Error("no space selected yet"));
+  const path = "/v1/admin/entity-tags?tenant_id=" + encodeURIComponent(t) +
+    "&live_only=" + liveOnly + "&limit=500" +
+    (opts.q ? "&q=" + encodeURIComponent(String(opts.q)) : "");
+  if (opts.q) return api(path, { admin: true });
+  const key = t + "|" + liveOnly;
+  const hit = _entDirCache.get(key);
+  if (!opts.force && hit && Date.now() - hit.at < _ENT_DIR_TTL) return hit.promise;
+  const promise = api(path, { admin: true });
+  _entDirCache.set(key, { at: Date.now(), promise });
+  promise.catch(() => {
+    const cur = _entDirCache.get(key);
+    if (cur && cur.promise === promise) _entDirCache.delete(key);
+  });
+  return promise;
+}
+
+/* The type:name lint (§1) — a SOFT warning with explicit confirm, never a
+   hard block: born-by-usage means an operator may need a shape we didn't
+   predict. The server binds tags verbatim; this is a console affordance. */
+const _EPK_SHAPE = /^[a-z0-9_-]+:[a-z0-9._@-]+$/;
+
+/** The ONE tokenizer (§2.2) — unifies the comma-vs-whitespace parsing split.
+    Tokenization happens at commit time, inside the component, nowhere else. */
+function _epkTokens(v) {
+  if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
+  return String(v == null ? "" : v).split(/[\s,]+/).filter(Boolean);
+}
+
+/** Bounded Levenshtein for the near-miss guard (≤2 or it reports 3). */
+function _epkLev(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  const n = b.length;
+  let prev = [], cur = [];
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    const t = prev; prev = cur; cur = t;
+  }
+  return prev[n];
+}
+
+/* Mode packs (§2.4) — wording + rules. Copy is contractual (ENTITY-PICKER.md);
+   change it there first. */
+const _EPK_MODES = {
+  scope: {
+    teach: (t) => "new — no memory carries this tag yet. A handle limited to it sees nothing until data arrives tagged " + t + ".",
+    warn: "this limit includes a tag with 0 memories — reads through this handle will return nothing for it until data carries it.",
+    emptyHide: "No entities yet — nothing to limit to. Entity tags appear as your data carries them (like account:acme).",
+    reveal: "limit to a future entity anyway →",
+  },
+  tags: {
+    teach: () => "new — this entity starts existing when this record lands. 0 memories carry it today.",
+    emptyTeach: "No entities yet — tagging is how one is born. Type a tag like account:acme and it exists once this record lands.",
+  },
+  target: {
+    // allowNew defaults false — inventing an entity to erase is never correct.
+    refuse: (t) => t + " isn't a known entity tag — inventing an entity to target is never correct. Pick an observed tag.",
+    emptyHide: "No entities yet — nothing to target. Entity tags appear as your data carries them (like account:acme).",
+  },
+  probe: {
+    teach: () => "not a known tag — the probe will return an honest zero. Checking a boundary? That's the point. Expecting data? Check the spelling.",
+    emptyTeach: "no entities yet — the brief of any entity you type will be an honest zero.",
+  },
+};
+
+/**
+ * Verity.entityPicker(mountEl, opts) → picker  (ENTITY-PICKER.md §2.1)
+ *
+ * opts:
+ *   mode          "scope"|"tags"|"target"|"probe"   REQUIRED — wording pack
+ *   multiple      true       false → single value (replaces on commit)
+ *   allowNew      true       ("target" defaults false); false → known-only
+ *   restrictTo    null       string[] closed set; outside tokens are refused
+ *                            with "refusing to widen" copy; forces allowNew=false
+ *   liveOnly      true       directory param (erasure passes false)
+ *   placeholder   "account:acme"
+ *   explainer     ""         one plain-language line under the field
+ *   emptyBehavior "hide"|"teach"  REQUIRED — the Emptiness Law (§3)
+ *   emptyLabel    ""         override for the collapsed/teaching line
+ *   prefill       []         string[] rendered as chips on mount (no onChange)
+ *   tenantId      () => Verity.tenant()   re-read on each directory fetch
+ *   onChange      (values) => {}          fires on every chip add/remove
+ *
+ * picker.value()     → string[] — the chips, and ONLY the chips. In-progress
+ *                      typed text is NEVER part of value(). THE submission path.
+ * picker.set(vals)     replace chips (string[] or separated string)
+ * picker.clear()
+ * picker.refresh()     re-fetch the directory (cache-busting)
+ * picker.collapsed() → bool — true when the Emptiness Law hid the field
+ * picker.destroy()
+ * Aliases: getValue()/setValue(); picker.onChange(fn) subscribes another fn.
+ */
+function entityPicker(mountEl, opts) {
+  if (!mountEl) throw new Error("entityPicker: mount element required");
+  opts = opts || {};
+  const pack = _EPK_MODES[opts.mode];
+  if (!pack) throw new Error('entityPicker: mode must be "scope" | "tags" | "target" | "probe"');
+  if (opts.emptyBehavior !== "hide" && opts.emptyBehavior !== "teach") {
+    throw new Error('entityPicker: emptyBehavior must be "hide" | "teach"');
+  }
+  const mode = opts.mode;
+  const multiple = opts.multiple !== false;
+  const restrictTo = Array.isArray(opts.restrictTo) && opts.restrictTo.length
+    ? opts.restrictTo.slice() : null;
+  const allowNew = restrictTo ? false
+    : (opts.allowNew !== undefined ? !!opts.allowNew : mode !== "target");
+  const liveOnly = opts.liveOnly !== false;
+  const tenantFn = typeof opts.tenantId === "function" ? opts.tenantId : tenant;
+  const changeSubs = typeof opts.onChange === "function" ? [opts.onChange] : [];
+
+  const st = {
+    chips: [],          // [{tag, isNew}] — the value, nothing else
+    dir: null,          // {ok:true, data} | {ok:false, msg}
+    fetched: false,
+    fetching: null,
+    collapsed: false,   // Emptiness Law engaged
+    forcedOpen: false,  // "limit to a future entity anyway" reveal taken
+    open: false,        // suggestion list visible
+    hl: -1,             // highlighted row (-1 = none; Enter commits typed text)
+    rows: [],           // current selectable rows
+    ask: null,          // pending interposition (near-miss / lint / notice)
+    queue: [],          // pasted/committed tokens awaiting the pipeline
+    destroyed: false,
+  };
+
+  /* ------------------------------------------------------------- DOM */
+  mountEl.classList.add("epk");
+  mountEl.innerHTML = "";
+  const elCollapsed = document.createElement("div");
+  elCollapsed.className = "epk-collapsed";
+  elCollapsed.style.display = "none";
+  const elMain = document.createElement("div");
+  elMain.className = "epk-main";
+  elMain.innerHTML =
+    '<div class="epk-box"><input type="text" class="epk-input" spellcheck="false" ' +
+      'autocomplete="off" aria-autocomplete="list"></div>' +
+    '<div class="epk-pop" style="display:none"></div>' +
+    '<div class="epk-ask" style="display:none"></div>' +
+    '<div class="epk-teach" style="display:none"></div>' +
+    '<div class="epk-warn" style="display:none"></div>' +
+    '<div class="epk-deg" style="display:none"></div>' +
+    (opts.explainer ? '<div class="epk-explain">' + esc(opts.explainer) + "</div>" : "");
+  mountEl.appendChild(elCollapsed);
+  mountEl.appendChild(elMain);
+  const box = elMain.querySelector(".epk-box");
+  const input = elMain.querySelector(".epk-input");
+  const pop = elMain.querySelector(".epk-pop");
+  const elAsk = elMain.querySelector(".epk-ask");
+  const elTeach = elMain.querySelector(".epk-teach");
+  const elWarn = elMain.querySelector(".epk-warn");
+  const elDeg = elMain.querySelector(".epk-deg");
+  input.placeholder = opts.placeholder || "account:acme";
+
+  /* ------------------------------------------------- directory access */
+  function dirTags() { return st.dir && st.dir.ok ? (st.dir.data.tags || []) : []; }
+  function findTag(t) { return dirTags().find((x) => x.tag === t) || null; }
+  function totalDistinct() {
+    return st.dir && st.dir.ok ? Number(st.dir.data.total_distinct || 0) : null;
+  }
+  function degraded() { return st.fetched && st.dir && !st.dir.ok; }
+
+  function ensureDir(force) {
+    if (st.fetching) return st.fetching;
+    if (st.fetched && !force) return Promise.resolve(st.dir);
+    const p = entityDirectory(tenantFn(), { liveOnly, force })
+      .then((d) => { st.dir = { ok: true, data: d || { total_distinct: 0, tags: [] } }; })
+      .catch((e) => { st.dir = { ok: false, msg: String((e && e.message) || e) }; })
+      .then(() => { st.fetched = true; st.fetching = null; recompute(); return st.dir; });
+    st.fetching = p;
+    recompute();
+    return p;
+  }
+
+  /* --------------------------------------------------- count honesty */
+  function cntLabel(r) {
+    const live = (r.chunk_count || 0) + (r.action_count || 0);
+    if (!liveOnly) {
+      const tot = (r.total_chunk_count != null ? r.total_chunk_count : (r.chunk_count || 0)) +
+        (r.action_count || 0);
+      return live + " live / " + tot + " total";
+    }
+    return live + (live === 1 ? " memory" : " memories");
+  }
+  function cntTitle(r) {
+    return (r.chunk_count || 0) + " chunks · " + (r.action_count || 0) + " actions" +
+      (r.last_seen ? " · last seen " + r.last_seen : "");
+  }
+
+  /* ------------------------------------------------------- rendering */
+  function emit() {
+    const v = value();
+    changeSubs.forEach((f) => { try { f(v); } catch (e) { console.error(e); } });
+  }
+
+  function renderChips() {
+    elMain.querySelectorAll(".epk-chip").forEach((c) => c.remove());
+    st.chips.forEach((c, i) => {
+      const s = document.createElement("span");
+      s.className = "epk-chip" + (c.isNew ? " epk-new" : "");
+      if (c.isNew) s.title = "new — 0 memories carry this tag yet";
+      s.appendChild(document.createTextNode(c.tag));
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "epk-x";
+      x.setAttribute("aria-label", "remove " + c.tag);
+      x.innerHTML = "&times;";
+      x.onclick = () => removeChip(i);
+      s.appendChild(x);
+      box.insertBefore(s, input);
+    });
+    renderWarn();
+  }
+
+  function renderWarn() {
+    const hasNew = st.chips.some((c) => c.isNew);
+    if (pack.warn && hasNew) { elWarn.textContent = pack.warn; elWarn.style.display = ""; }
+    else elWarn.style.display = "none";
+    if (!hasNew) elTeach.style.display = "none";
+  }
+
+  function showTeach(txt) { elTeach.textContent = txt; elTeach.style.display = ""; }
+
+  function renderCollapsed() {
+    if (opts.emptyBehavior === "hide" && !st.fetched && !st.chips.length && !st.forcedOpen) {
+      // resolving emptiness — never flash an input that may then vanish
+      elCollapsed.innerHTML = '<span class="asof">checking known entities&hellip;</span>';
+      elCollapsed.style.display = "";
+      elMain.style.display = "none";
+      return;
+    }
+    if (st.collapsed) {
+      const line = opts.emptyLabel || pack.emptyHide ||
+        "No entities yet. Entity tags appear as your data carries them (like account:acme).";
+      elCollapsed.textContent = line;
+      if (allowNew) {
+        elCollapsed.appendChild(document.createTextNode(" "));
+        const a = document.createElement("a");
+        a.className = "epk-reveal";
+        a.textContent = pack.reveal || "add a future entity anyway →";
+        a.onclick = () => { st.forcedOpen = true; recompute(); input.focus(); };
+        elCollapsed.appendChild(a);
+      }
+      elCollapsed.style.display = "";
+      elMain.style.display = "none";
+    } else {
+      elCollapsed.style.display = "none";
+      elMain.style.display = "";
+    }
+  }
+
+  function recompute() {
+    if (st.dir && st.dir.ok) st.chips.forEach((c) => { c.isNew = !findTag(c.tag); });
+    // The Emptiness Law applies ONLY to an honestly-empty directory — never
+    // to our own fetch failure, never over committed chips.
+    st.collapsed = opts.emptyBehavior === "hide" && st.fetched && st.dir && st.dir.ok &&
+      totalDistinct() === 0 && !st.forcedOpen && st.chips.length === 0;
+    renderCollapsed();
+    if (degraded()) {
+      const reason = /no space selected/.test(st.dir.msg) ? "no space selected yet" : "admin read failed";
+      elDeg.textContent = "couldn't load known entities (" + reason + ") — typed tags are unchecked.";
+      elDeg.title = st.dir.msg;
+      elDeg.style.display = "";
+    } else {
+      elDeg.style.display = "none";
+    }
+    renderChips();
+    if (st.open) renderList();
+  }
+
+  /* --------------------------------------------------- suggestion list */
+  function buildRows(qtext) {
+    const qq = qtext.toLowerCase();
+    const base = restrictTo
+      ? restrictTo.map((t) => findTag(t) || { tag: t, chunk_count: 0, action_count: 0 })
+      : dirTags();
+    const chipSet = new Set(st.chips.map((c) => c.tag));
+    const rows = (qq ? base.filter((r) => r.tag.toLowerCase().indexOf(qq) >= 0) : base.slice())
+      .filter((r) => !chipSet.has(r.tag))
+      .slice(0, 200)
+      .map((r) => ({ kind: "tag", r }));
+    if (allowNew && qtext && !base.some((r) => r.tag === qtext) && !chipSet.has(qtext)) {
+      rows.push({ kind: "new", tok: qtext });
+    }
+    return rows;
+  }
+
+  function rowHtml(row, i) {
+    const hl = i === st.hl ? " hl" : "";
+    if (row.kind === "new") {
+      return '<div class="epk-row epk-newrow' + hl + '" data-i="' + i + '">' + esc(row.tok) +
+        '<span class="epk-cnt">new &middot; 0 memories carry this tag yet</span></div>';
+    }
+    const r = row.r;
+    return '<div class="epk-row' + hl + '" data-i="' + i + '" title="' + esc(cntTitle(r)) + '">' +
+      esc(r.tag) +
+      (r.canonical_entity ? ' <span class="epk-mg">merged</span>' : "") +
+      '<span class="epk-cnt">' + esc(cntLabel(r)) + "</span></div>";
+  }
+
+  function openList() { st.open = true; renderList(); }
+  function closeList() { st.open = false; st.hl = -1; pop.style.display = "none"; }
+
+  function renderList() {
+    if (!st.open || st.collapsed) return;
+    if (degraded()) { pop.style.display = "none"; return; }   // free entry — no invented list
+    if (!st.fetched) {
+      st.rows = [];
+      pop.innerHTML = '<div class="epk-ns" style="text-transform:none;letter-spacing:0">checking known entities&hellip;</div>';
+      pop.style.display = "";
+      return;
+    }
+    const qtext = input.value.trim();
+    const rows = buildRows(qtext);
+    if (st.hl >= rows.length) st.hl = rows.length - 1;
+    let html = "";
+    if (totalDistinct() === 0 && !restrictTo && !qtext) {
+      const t = opts.emptyLabel || pack.emptyTeach || pack.emptyHide ||
+        "No entities yet. Type a tag like account:acme.";
+      html += '<div class="epk-ns epk-teachline">' + esc(t) + "</div>";
+    }
+    if (!qtext && rows.length) {
+      // namespace hinting: the tenant's OBSERVED namespaces as group headers
+      const groups = []; const seen = {};
+      rows.forEach((row) => {
+        const c = row.r.tag.indexOf(":");
+        const ns = c > 0 ? row.r.tag.slice(0, c + 1) : "(no namespace)";
+        if (!(ns in seen)) { seen[ns] = groups.length; groups.push({ ns, rows: [] }); }
+        groups[seen[ns]].rows.push(row);
+      });
+      st.rows = [];
+      let i = 0;
+      groups.forEach((g) => {
+        html += '<div class="epk-ns">' + esc(g.ns) + "</div>";
+        g.rows.forEach((row) => { html += rowHtml(row, i); st.rows.push(row); i++; });
+      });
+    } else {
+      st.rows = rows;
+      rows.forEach((row, i) => { html += rowHtml(row, i); });
+    }
+    if (!html) { pop.style.display = "none"; return; }
+    pop.innerHTML = html;
+    pop.style.display = "";
+    const hlEl = pop.querySelector(".epk-row.hl");
+    if (hlEl) hlEl.scrollIntoView({ block: "nearest" });
+  }
+
+  function pickRow(i) {
+    const row = st.rows[i];
+    if (!row) return;
+    if (row.kind === "tag") { addChip(row.r.tag, false); }
+    else { input.value = ""; st.queue.push(row.tok); drain(); }
+  }
+
+  /* ------------------------------------------------ the commit pipeline */
+  function addChip(tag, isNew) {
+    if (!multiple) st.chips = [];
+    if (!st.chips.some((c) => c.tag === tag)) {
+      st.chips.push({ tag, isNew: !!isNew });
+      if (isNew && pack.teach) showTeach(pack.teach(tag));
+    }
+    input.value = "";
+    closeList();
+    renderChips();
+    emit();
+  }
+
+  function removeChip(i) {
+    st.chips.splice(i, 1);
+    recompute();
+    emit();
+    input.focus();
+  }
+
+  function replaceChip(oldTag, newTag) {
+    const i = st.chips.findIndex((c) => c.tag === oldTag);
+    if (i < 0) return;
+    if (st.chips.some((c) => c.tag === newTag)) st.chips.splice(i, 1);
+    else st.chips[i] = { tag: newTag, isNew: !findTag(newTag) };
+    renderChips();
+    emit();
+  }
+
+  /* Near-miss guard (§2.2): case-insensitive equality is a MUST-interpose;
+     edit distance ≤ 2 in the same namespace is a non-blocking suggestion. */
+  function ciExact(tok) {
+    const lc = tok.toLowerCase();
+    return dirTags().find((r) => r.tag.toLowerCase() === lc && r.tag !== tok) || null;
+  }
+  function editNear(tok) {
+    const ci = tok.indexOf(":");
+    if (ci <= 0) return null;
+    const ns = tok.slice(0, ci).toLowerCase();
+    const name = tok.slice(ci + 1).toLowerCase();
+    let best = null, bd = 3;
+    dirTags().forEach((r) => {
+      const rc = r.tag.indexOf(":");
+      if (rc <= 0 || r.tag === tok) return;
+      if (r.tag.slice(0, rc).toLowerCase() !== ns) return;
+      const d = _epkLev(r.tag.slice(rc + 1).toLowerCase(), name);
+      if (d > 0 && d <= 2 && d < bd) { bd = d; best = r; }
+    });
+    return best;
+  }
+
+  /** Commit one token. Returns true when handled (continue the queue),
+      false when an interposition is waiting on the operator. */
+  function commitText(tok) {
+    tok = String(tok).trim();
+    if (!tok) return true;
+    if (st.chips.some((c) => c.tag === tok)) { input.value = ""; return true; }
+    if (restrictTo) {
+      if (restrictTo.indexOf(tok) >= 0) { addChip(tok, false); return true; }
+      askShow({ type: "notice", text: "refusing to widen: " + tok + " is not in the source handle's entity limit" });
+      return true;
+    }
+    if (!st.fetched && !degraded()) {
+      // directory still loading — hold the token, check it when truth lands
+      st.queue.unshift(tok);
+      ensureDir(false).then(() => drain());
+      return false;
+    }
+    if (degraded()) {
+      // free entry never blocks — but the format lint still teaches
+      if (!_EPK_SHAPE.test(tok)) { askShow({ type: "shape", tok }); return false; }
+      addChip(tok, false);
+      return true;
+    }
+    if (findTag(tok)) { addChip(tok, false); return true; }
+    const ci = ciExact(tok);
+    if (ci) { askShow({ type: "near", tok, match: ci }); return false; }
+    if (!allowNew) {
+      const near = editNear(tok);
+      askShow({
+        type: "notice",
+        text: pack.refuse ? pack.refuse(tok)
+          : tok + " isn't a known entity tag — this field only accepts tags your data already carries.",
+        match: near,
+      });
+      return true;
+    }
+    if (!_EPK_SHAPE.test(tok)) { askShow({ type: "shape", tok }); return false; }
+    addChip(tok, true);
+    const near = editNear(tok);
+    if (near) askShow({ type: "soft", tok, match: near });
+    return true;
+  }
+
+  function drain() {
+    while (st.queue.length) {
+      const tok = st.queue.shift();
+      if (!commitText(tok)) return;
+    }
+    if (st.open) renderList();
+  }
+
+  /* -------------------------------------------- interposition prompts */
+  function askShow(a) {
+    st.ask = a;
+    renderAsk();
+    if (a.type === "near" || a.type === "shape") closeList();
+  }
+  function askClear(refocus) {
+    st.ask = null;
+    renderAsk();
+    if (refocus) input.focus();
+  }
+  function renderAsk() {
+    if (!st.ask) { elAsk.style.display = "none"; elAsk.innerHTML = ""; return; }
+    const a = st.ask;
+    let html = "";
+    const acts = [];
+    if (a.type === "near") {
+      html = "did you mean <code>" + esc(a.match.tag) + "</code> (" + esc(cntLabel(a.match)) +
+        ")? Matching is exact — <code>" + esc(a.tok) + "</code> matches nothing.";
+      acts.push({ label: "use " + a.match.tag, cb: () => { askClear(true); addChip(a.match.tag, false); drain(); } });
+      if (allowNew) {
+        acts.push({
+          label: "add " + a.tok + " as typed", cb: () => {
+            askClear(true);
+            if (!_EPK_SHAPE.test(a.tok)) askShow({ type: "shape", tok: a.tok });
+            else { addChip(a.tok, true); drain(); }
+          },
+        });
+      }
+      acts.push({ label: "cancel", cb: () => { st.queue = []; askClear(true); } });
+    } else if (a.type === "shape") {
+      html = "<code>" + esc(a.tok) + "</code> doesn't look like <code>type:name</code> — entity tags " +
+        "are lowercase like <code>account:acme</code>. Add anyway?";
+      acts.push({ label: "add anyway", cb: () => { askClear(true); addChip(a.tok, degraded() ? false : true); drain(); } });
+      acts.push({ label: "cancel", cb: () => { st.queue = []; askClear(true); } });
+    } else if (a.type === "soft") {
+      html = "<code>" + esc(a.tok) + "</code> added — similar to known <code>" + esc(a.match.tag) +
+        "</code> (" + esc(cntLabel(a.match)) + "). Matching is exact.";
+      acts.push({ label: "replace with " + a.match.tag, cb: () => { replaceChip(a.tok, a.match.tag); askClear(true); } });
+      acts.push({ label: "keep " + a.tok, cb: () => askClear(true) });
+    } else { // notice
+      html = esc(a.text);
+      if (a.match) {
+        html += " Did you mean <code>" + esc(a.match.tag) + "</code> (" + esc(cntLabel(a.match)) + ")?";
+        acts.push({ label: "use " + a.match.tag, cb: () => { askClear(true); addChip(a.match.tag, false); drain(); } });
+      }
+      acts.push({ label: "ok", cb: () => askClear(true) });
+    }
+    elAsk.innerHTML = html + '<div class="epk-ask-actions"></div>';
+    const bar = elAsk.querySelector(".epk-ask-actions");
+    acts.forEach((x) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = x.label;
+      b.onclick = x.cb;
+      bar.appendChild(b);
+    });
+    elAsk.style.display = "";
+  }
+
+  /* ------------------------------------------------------- wiring */
+  function commitTyped() {
+    const toks = _epkTokens(input.value);
+    if (!toks.length) return;
+    input.value = "";
+    st.queue = st.queue.concat(toks);
+    drain();
+  }
+
+  input.addEventListener("focus", () => { ensureDir(false); openList(); });
+  input.addEventListener("input", () => {
+    if (st.ask && (st.ask.type === "soft" || st.ask.type === "notice")) askClear(false);
+    st.hl = -1;
+    if (!st.open) st.open = true;
+    renderList();
+  });
+  input.addEventListener("blur", () => {
+    setTimeout(() => {
+      if (!st.destroyed && document.activeElement !== input) closeList();
+    }, 150);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!st.open) openList();
+      if (st.rows.length) { st.hl = Math.min(st.hl + 1, st.rows.length - 1); renderList(); }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (st.rows.length) { st.hl = Math.max(st.hl - 1, -1); renderList(); }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (st.open && st.hl >= 0 && st.rows[st.hl]) pickRow(st.hl);
+      else commitTyped();
+    } else if (e.key === "," || e.key === " ") {
+      if (input.value.trim()) { e.preventDefault(); commitTyped(); }
+      else if (e.key === ",") e.preventDefault();
+    } else if (e.key === "Escape") {
+      if (st.open) { e.preventDefault(); e.stopPropagation(); closeList(); }
+    } else if (e.key === "Backspace") {
+      if (!input.value && st.chips.length) removeChip(st.chips.length - 1);
+    } else if (e.key === "Tab") {
+      closeList(); // leaves the field without committing partial text
+    }
+  });
+  input.addEventListener("paste", (e) => {
+    let txt = "";
+    try { txt = (e.clipboardData || window.clipboardData).getData("text"); } catch (err) { /* no access */ }
+    if (!txt || !/[\s,]/.test(txt)) return; // single token: type-through
+    e.preventDefault();
+    st.queue = st.queue.concat(_epkTokens(input.value)).concat(_epkTokens(txt));
+    input.value = "";
+    drain();
+  });
+  box.addEventListener("mousedown", (e) => {
+    if (e.target === box) { e.preventDefault(); input.focus(); if (!st.open) openList(); }
+  });
+  pop.addEventListener("mousedown", (e) => {
+    e.preventDefault(); // keep focus in the input
+    const rowEl = e.target.closest(".epk-row");
+    if (rowEl) pickRow(parseInt(rowEl.getAttribute("data-i"), 10));
+  });
+
+  /* -------------------------------------------------------- public API */
+  function value() { return st.chips.map((c) => c.tag); }
+  function set(values) {
+    const toks = _epkTokens(values);
+    const uniq = toks.filter((t, i) => toks.indexOf(t) === i);
+    st.chips = (multiple ? uniq : uniq.slice(0, 1)).map((t) => ({
+      tag: t,
+      isNew: st.dir && st.dir.ok ? !findTag(t) : false,
+    }));
+    st.queue = [];
+    st.ask = null;
+    renderAsk();
+    input.value = "";
+    recompute();
+    emit();
+  }
+  function clear() { set([]); }
+  function refresh() { st.fetched = false; return ensureDir(true); }
+  function destroy() {
+    st.destroyed = true;
+    mountEl.innerHTML = "";
+    mountEl.classList.remove("epk");
+  }
+
+  /* ----------------------------------------------------------- mount */
+  if (Array.isArray(opts.prefill) && opts.prefill.length) {
+    st.chips = opts.prefill.map((t) => String(t).trim()).filter(Boolean)
+      .filter((t, i, a) => a.indexOf(t) === i)
+      .slice(0, multiple ? Infinity : 1)
+      .map((t) => ({ tag: t, isNew: false }));
+  }
+  recompute();
+  if (opts.emptyBehavior === "hide") {
+    // Emptiness needs total_distinct before first paint (§2.2): hide-surfaces
+    // mount at dialog-open, so this is the one cheap admin GET per open —
+    // deduped with any caller-side Verity.entityDirectory pre-warm.
+    ensureDir(false);
+  }
+
+  const pub = {
+    value, set, clear, refresh, destroy,
+    collapsed: () => st.collapsed,
+    getValue: value, setValue: set,
+    onChange: (fn) => { if (typeof fn === "function") changeSubs.push(fn); },
+    focus: () => input.focus(),
+  };
+  return pub;
+}
+
+/* ============================================================================
    v2 · GLOBAL MINT DIALOG — the console's front door (UI-ACTIONS N1)
    ----------------------------------------------------------------------------
    POST /v1/scopes is public; this dialog makes it reachable from anywhere
@@ -596,6 +1265,10 @@ function buildHash() { return document.body.getAttribute("data-build-hash") || "
    ============================================================================ */
 const _mintSubs = [];
 function onMint(fn) { _mintSubs.push(fn); }
+
+/* The mint dialog's entity limit is an entityPicker (ENTITY-PICKER.md §5.4,
+   the founder's screenshot field): chips are the ONLY submitted values. */
+let _mintEntPicker = null;
 
 function _buildMintDialog() {
   if ($("core-mint")) return;
@@ -621,8 +1294,8 @@ function _buildMintDialog() {
           '<input type="text" id="mint-principals" placeholder="e.g. 11, 1001" spellcheck="false"></div>' +
       "</div>" +
       '<div class="row" style="margin-top:10px">' +
-        '<div><label for="mint-entities">limit to entities <span style="font-weight:400">(optional, comma-separated)</span></label>' +
-          '<input type="text" id="mint-entities" placeholder="account:acme" spellcheck="false"></div>' +
+        '<div><label>limit to entities <span style="font-weight:400">(optional)</span></label>' +
+          '<div id="mint-entities"></div></div>' +
         '<div class="tight" style="min-width:170px"><label for="mint-conf">confidentiality ceiling</label>' +
           '<select class="field" id="mint-conf">' +
             '<option value="public">public</option>' +
@@ -653,6 +1326,21 @@ function _buildMintDialog() {
       "</div>" +
     "</div>";
   document.body.appendChild(el);
+  // scope mode + Emptiness Law "hide": at zero entities this collapses to a
+  // teaching line (nothing to limit to) — day-zero operators never see a
+  // limiter for a tenant with nothing to limit. Empty picker ⇒ ABSENT field.
+  _mintEntPicker = entityPicker($("mint-entities"), {
+    mode: "scope",
+    multiple: true,
+    allowNew: true,
+    emptyBehavior: "hide",
+    placeholder: "account:acme",
+    explainer: "only memories tagged with these entities can come back through this handle. Empty = no entity limit.",
+    tenantId: () => {
+      const f = $("mint-tenant");
+      return (f && f.value.trim()) || _tenant;
+    },
+  });
   const dlg = dialog("core-mint");
   $("mint-cancel").onclick = dlg.close;
   $("mint-go").onclick = async () => {
@@ -690,8 +1378,11 @@ function _buildMintDialog() {
       }
       body.principals = toks;
     }
-    const ents = $("mint-entities").value.trim();
-    if (ents) body.entity_scope = ents.split(",").map((s) => s.trim()).filter(Boolean);
+    // Chips are the only submitted values — the picker's value() is the ONE
+    // path into entity_scope; empty ⇒ the field is omitted (fail-closed shape
+    // unchanged: no limit means UNBOUND, and omission elsewhere still refuses).
+    const ents = _mintEntPicker ? _mintEntPicker.value() : [];
+    if (ents.length) body.entity_scope = ents;
     body.max_confidentiality = $("mint-conf").value;
     const ttl = parseInt($("mint-ttl").value, 10);
     if (!isNaN(ttl)) body.ttl_seconds = ttl;
@@ -804,6 +1495,9 @@ function openMint(prefill) {
         if (pick.value) { tin.value = pick.value; tin.style.display = "none"; }
         else { tin.value = ""; tin.style.display = ""; tin.focus(); }
         _mintSyncTenantUi();
+        // the entity directory is per-tenant — re-resolve the picker's
+        // suggestions + Emptiness Law for the newly chosen space
+        if (_mintEntPicker) _mintEntPicker.refresh();
       };
     } else {
       pick.style.display = "none";
@@ -813,6 +1507,7 @@ function openMint(prefill) {
   }
   tin.readOnly = locked;
   tin.oninput = _mintSyncTenantUi;
+  tin.onchange = () => { if (_mintEntPicker) _mintEntPicker.refresh(); };
   _mintSyncTenantUi();
   if (locked) {
     const n = tenantName(tin.value.trim());
@@ -821,7 +1516,14 @@ function openMint(prefill) {
   }
   if (prefill.subject !== undefined) $("mint-subject").value = prefill.subject;
   if (prefill.principals !== undefined) $("mint-principals").value = prefill.principals;
-  if (prefill.entities !== undefined) $("mint-entities").value = prefill.entities;
+  if (_mintEntPicker) {
+    // prefill.entities keeps its frozen openMint shape (string) — set()
+    // tokenizes through the component's ONE pipeline; string[] also accepted.
+    _mintEntPicker.set(prefill.entities !== undefined ? prefill.entities : []);
+    // §2.2: emptiness needs total_distinct before first paint — one cheap
+    // admin GET at dialog-open (deduped/cached with every other picker).
+    _mintEntPicker.refresh();
+  }
   if (prefill.purpose !== undefined) $("mint-purpose").value = prefill.purpose;
   if (prefill.confidentiality) $("mint-conf").value = prefill.confidentiality;
   if (prefill.ttl) $("mint-ttl").value = prefill.ttl;
@@ -847,6 +1549,8 @@ const Verity = {
   setCount,
   // global mint
   openMint, onMint,
+  // v4 · entity directory + picker (docs/design/ENTITY-PICKER.md)
+  entityDirectory, entityPicker,
   // shared state
   tenant, setTenant, onTenant, buildHash,
   // v3 · FTUE: tenant directory + create-space + working handle + sample label

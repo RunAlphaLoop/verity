@@ -44,6 +44,10 @@
   var pass = { handle: "", claims: null, how: "" };
   var view = "text";    // text | file | url
   var tenantNow = "";
+  // Entity-tag picker (Verity.entityPicker, ENTITY-PICKER.md §5.1): chips are
+  // the ONLY submission path — no comma-split free text rides into a POST.
+  var entsPicker = null;
+  var entsRestrictKey = null;
 
   function el(id) { return V.$(id); }
   function nowStamp() { return new Date().toTimeString().slice(0, 8); }
@@ -104,6 +108,7 @@
     load: function (_section, tenant) {
       if (tenantNow && tenantNow !== tenant) {
         sel = {};
+        if (entsPicker) entsPicker.clear(); // another tenant's tags don't carry over
         if (pass.claims && pass.claims.tenant_id !== tenant) {
           pass = { handle: "", claims: null, how: "" };
         }
@@ -204,10 +209,8 @@
         "</div>" +
 
         '<div id="ing-ents-wrap" style="margin-top:10px">' +
-          '<label for="ing-ents">which customer or account is this about? <span style="font-weight:400">(optional, comma-separated)</span></label>' +
-          '<input type="text" id="ing-ents" placeholder="e.g. account:acme" spellcheck="false">' +
-          '<div class="asof" style="display:block;margin-top:3px">Tags decide which entity views can retrieve this memory. Leave empty if it is not about a specific one.</div>' +
-          '<div id="ing-ents-hint"></div>' +
+          '<label>which customer or account is this about? <span style="font-weight:400">(optional)</span></label>' +
+          '<div id="ing-ents"></div>' +
         "</div>" +
 
         '<div class="actions" style="justify-content:flex-start;margin-top:12px">' +
@@ -237,7 +240,6 @@
     el("ing-tab-file").onclick = function () { switchView("file"); };
     el("ing-tab-url").onclick = function () { switchView("url"); };
     el("ing-url").oninput = updateUrlCmd;
-    el("ing-ents").oninput = updateUrlCmd;
     el("ing-url-copy").onclick = function () {
       var ta = el("ing-url-cmd");
       ta.select();
@@ -422,7 +424,7 @@
       line.innerHTML = V.stateChip("off", "no write pass yet") +
         '<span style="color:var(--dim);font-size:var(--fs-sm)">pick viewers below, then create a pass — it becomes the memory’s audience</span>';
       meta.textContent = "";
-      renderEntsHint();
+      syncEntsPicker();
       return;
     }
     var n = passViewerCount();
@@ -452,19 +454,42 @@
     }
     var shown = pass.handle.length > 34 ? pass.handle.slice(0, 30) + "…" : pass.handle;
     meta.innerHTML = "scope_handle " + esc(shown) + (metaBits.length ? " · " + esc(metaBits.join(" · ")) : "");
-    renderEntsHint();
+    syncEntsPicker();
   }
 
-  function renderEntsHint() {
-    var hint = el("ing-ents-hint");
-    if (!hint) return;
-    if (pass.claims && pass.claims.entity_scope && pass.claims.entity_scope.length) {
-      hint.innerHTML = '<div class="asof" style="display:block;margin-top:3px">Your pass is limited to: <b>' +
-        pass.claims.entity_scope.map(function (e) { return esc(e); }).join(", ") +
-        "</b> — tags must stay inside that list (leave empty to inherit all of it; outside tags are refused).</div>";
-    } else {
-      hint.innerHTML = "";
-    }
+  // ENTITY-PICKER.md §5.1: mode "tags" (tagging is how entities are born —
+  // emptyBehavior "teach"), and when the write pass is entity-bound the picker
+  // is rebuilt with restrictTo = the pass's entity set, so outside tags are
+  // refused inline — the same subset rule the server enforces on write.
+  function syncEntsPicker() {
+    var mount = el("ing-ents");
+    if (!mount) return;
+    var restrict = (pass.claims && pass.claims.entity_scope && pass.claims.entity_scope.length)
+      ? pass.claims.entity_scope.slice() : null;
+    var key = restrict ? restrict.join("\u0000") : "";
+    if (entsPicker && key === entsRestrictKey) return;
+    entsRestrictKey = key;
+    var keep = entsPicker ? entsPicker.value() : [];
+    if (entsPicker) { entsPicker.destroy(); entsPicker = null; }
+    mount.innerHTML = "";
+    var opts = {
+      mode: "tags",
+      multiple: true,
+      allowNew: true, // forced false by the component when restrictTo is set
+      emptyBehavior: "teach",
+      placeholder: "account:acme",
+      explainer: restrict
+        ? "your write pass is entity-bound — tags must stay inside its limit; anything outside is refused here, exactly as the server would refuse it."
+        : "tags decide which entity views can find this memory. Known tags are suggested with counts; a new tag creates that entity the moment this lands.",
+      // Chips outside a newly-bound pass are dropped, not smuggled: the
+      // server would refuse them anyway (fail-closed, same rule).
+      prefill: restrict ? keep.filter(function (t) { return restrict.indexOf(t) >= 0; }) : keep,
+      tenantId: function () { return tenantNow || V.tenant(); },
+      onChange: function () { updateUrlCmd(); },
+    };
+    if (restrict) opts.restrictTo = restrict;
+    entsPicker = V.entityPicker(mount, opts);
+    updateUrlCmd();
   }
 
   /* ============================================================== views */
@@ -485,9 +510,10 @@
     if (v === "url") updateUrlCmd();
   }
 
+  // The cardinal rule (ENTITY-PICKER.md §2.1): value() is the ONLY submission
+  // path — committed chips, never in-progress typed text, never a comma split.
   function parsedEnts() {
-    return (el("ing-ents").value || "").split(",")
-      .map(function (s) { return s.trim(); }).filter(Boolean);
+    return entsPicker ? entsPicker.value() : [];
   }
 
   function updateUrlCmd() {
@@ -558,6 +584,9 @@
       }
       el("ing-add-state").innerHTML = V.stateChip("ok", "written");
       renderReceipt(receipt);
+      // Born-by-usage, made visible: a new tag committed above now exists —
+      // re-fetch the directory so it appears with its count immediately.
+      if (entsPicker) entsPicker.refresh();
       if (view === "text") el("ing-text").value = "";
       else el("ing-file").value = "";
     } catch (e) {

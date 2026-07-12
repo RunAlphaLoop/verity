@@ -458,8 +458,8 @@
         "can narrow it, never widen it. It is not an API token: it’s a pre-computed answer to <i>what this session " +
         "may see</i>.</div>" +
       whatsThis("The four fields: <b>tenant</b> — the space (locked to yours) · <b>who</b> — the keys asking (you + " +
-        "your groups; empty = sees nothing, on purpose) · <b>entities</b> — which customers (empty = all your " +
-        "customers) · <b>ceiling</b> — how sensitive it may go: public &lt; internal &lt; confidential &lt; restricted " +
+        "your groups; empty = sees nothing, on purpose) · <b>entities</b> — entity limits appear here once your " +
+        "data carries tags — nothing to limit to yet · <b>ceiling</b> — how sensitive it may go: public &lt; internal &lt; confidential &lt; restricted " +
         "(defaults to internal).") +
       '<div class="note">Setup keeps the minted handle <b>for this tab only</b> (cleared when the tab closes) so the ' +
         "proof step can run recalls through it. The console never writes handles to disk.</div>" +
@@ -484,7 +484,9 @@
           (info.sampleSeeded
             ? "Sample data is in — <b>Acme Logistics (sample)</b>: memories with real sharing rules, one lesson, " +
               "and one item Verity <b>refused to index on purpose</b> (that quarantine is the safety gate working, " +
-              "not an error). Everything is labeled " + V.badge("sample data", "b-kind") + " and removable in one click."
+              "not an error). It also matched <b>one company across two systems</b> automatically and left one " +
+              "look-alike <b>waiting for your decision</b> on Entities &amp; merges. Everything is labeled " +
+              V.badge("sample data", "b-kind") + " and removable in one click."
             : "Your memory is in — stored with exactly the visibility you chose, nothing more.") +
         "</div>" +
         '<div class="dc-actions" style="margin-top:10px">' +

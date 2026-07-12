@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
         .route("/v1/entities/{canonical}", get(get_merged_entity))
         .route("/v1/admin/entities", get(admin_list_entities))
+        .route("/v1/admin/entity-tags", get(admin_entity_tags))
         .route("/v1/admin/entity-aliases", post(admin_entity_aliases))
         .route("/v1/admin/entity-precedence", post(admin_entity_precedence))
         .route("/v1/admin/entity-evidence", post(admin_evidence_insert))
@@ -840,6 +841,50 @@ async fn admin_list_entities(
         .await
         .map_err(internal)?;
     Ok(Json(entities))
+}
+
+#[derive(Deserialize)]
+struct EntityTagsQuery {
+    tenant_id: TenantId,
+    /// Case-insensitive substring over the tag. Substring only — near-miss
+    /// logic is client-side (ENTITY-PICKER.md §6: no server-side fuzz).
+    q: Option<String>,
+    /// Default true: count only rows the scope filter can return. Erasure
+    /// passes false (invalidated rows are legitimate erasure targets).
+    #[serde(default = "default_live_only")]
+    live_only: bool,
+    /// Default 100, clamped 1..=500 in storage.
+    #[serde(default = "default_entities_limit")]
+    limit: i64,
+}
+
+fn default_live_only() -> bool {
+    true
+}
+
+/// GET /v1/admin/entity-tags (admin): the entity-tag DIRECTORY behind the
+/// console's entity picker (docs/design/ENTITY-PICKER.md §4). Distinct tags
+/// observed on `chunks.entity_tags ∪ actions.entities` — the SAME rows the
+/// scope filter enforces on — with per-tag chunk/action counts, `last_seen`,
+/// the observed namespace prefixes, and a display-only merged badge
+/// (`canonical_entity`/`link_confidence`). `total_distinct` and `namespaces`
+/// ignore `q`/`limit` so a filtered page can never fake emptiness (the
+/// Emptiness Law). Complements `GET /v1/admin/entities`, which lists MERGED
+/// canonicals only — a usage-born tag with no alias row is invisible there.
+/// Admin plane; never consulted by `recall`/`get` (read-path purity holds).
+async fn admin_entity_tags(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<EntityTagsQuery>,
+) -> HandlerResult<Json<verity_storage::EntityTagDirectory>> {
+    state.admin.check(&headers)?;
+    let directory = state
+        .storage
+        .inner()
+        .list_entity_tags(q.tenant_id, q.q.as_deref(), q.live_only, q.limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(directory))
 }
 
 #[derive(Deserialize)]

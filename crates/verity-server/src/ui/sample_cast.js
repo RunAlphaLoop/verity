@@ -164,11 +164,14 @@
     // 3. The connector: CDC upserts under source `verity-sample-crm:*`,
     //    including one superseded field (amount 48k → 61k) so record detail
     //    shows the bi-temporal exemplar (old row valid_to + superseded_by).
-    //    Event times are SECONDS ago, not days: the freshness SLO measures
-    //    event→queryable from these stamps, and a back-dated sample would
-    //    paint an honest-but-misleading "slow source needs you" on Home.
-    var t1 = Date.now() - 45000;
-    var t2 = Date.now() - 5000;
+    //    Event times are NOW (milliseconds apart only for the supersession
+    //    ordering): the freshness SLO measures event→queryable from these
+    //    stamps, so ANY backdating fabricates ingest lag the pipeline never
+    //    had — founder-caught 2026-07-11 (sample rows showed 22-44s "lag"
+    //    that was really the 45s-ago stamp itself). Real events measure real
+    //    lag; sample events must not invent any.
+    var t1 = Date.now() - 2;
+    var t2 = Date.now() - 1;
     await api(
       "/v1/ingest/debezium?tenant_id=" + encodeURIComponent(tenant) + "&pk=id",
       [
@@ -187,8 +190,42 @@
           after: { id: "acme-renewal", account: "acme-freight", stage: "negotiation", amount: 61000 },
           source: { connector: "verity-sample-crm", table: "opportunities", ts_ms: t2 },
         },
+        // 3b. A SECOND system (billing) so entity resolution has a story:
+        //     cust-311 shares acme-freight's DUNS → Tier-1 auto-merge (one
+        //     company across two systems); cust-412 is name-similar with NO
+        //     shared identifier → stays separate until a human decides.
+        {
+          op: "u",
+          after: { id: "acme-freight", name: "Acme Freight Co (sample)", plan: "enterprise", region: "NA-East", csm: "jordan", duns: "98-765-4321" },
+          source: { connector: "verity-sample-crm", table: "accounts", ts_ms: t2 },
+        },
+        {
+          op: "c",
+          after: { id: "cust-311", name: "Acme Freight Company", duns: "98-765-4321", plan_code: "ENT-12" },
+          source: { connector: "verity-sample-billing", table: "customers", ts_ms: t2 },
+        },
+        {
+          op: "c",
+          after: { id: "cust-412", name: "Acme Freight Logistics (sample)" },
+          source: { connector: "verity-sample-billing", table: "customers", ts_ms: t2 },
+        },
       ]
     );
+
+    // 3c. The near-miss candidate (name-only, no shared key) + run matching so
+    //     Entities & merges is alive on first visit: one auto-merge with a
+    //     visible reason, one decision genuinely waiting for a human.
+    await api("/v1/admin/entity-evidence", {
+      tenant_id: tenant,
+      left_ref: "verity-sample-crm:accounts:acme-freight",
+      right_ref: "verity-sample-billing:customers:cust-412",
+      tier: 2,
+      method: "name_domain_fuzzy",
+      key_value: "Acme Freight ~ Acme Freight Logistics",
+      score: 0.89,
+      evidence_l0_ref: "sample: similar names, no shared identifier — needs a human decision",
+    });
+    await api("/v1/admin/entity-resolution/run", { tenant_id: tenant });
 
     // 4. Notes with real sharing rules: two org-visible, one team-only.
     var dir = await directory(tenant);

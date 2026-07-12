@@ -46,6 +46,11 @@
   var pendingLocal = [];
   var tenantNow = "";
   var pendingActivate = null; // { id, name, laneWords, ready }
+  // Entity-scope picker for the mint dialog (ENTITY-PICKER.md §5.2): scope
+  // mode, hidden by the Emptiness Law at zero entities. Highest blast radius
+  // in the console — a webhook's entity limit binds standing infrastructure
+  // that cannot be listed or edited afterward; only revoked and re-minted.
+  var mintEntPicker = null;
 
   function el(id) { return V.$(id); }
 
@@ -210,8 +215,8 @@
           '<div style="margin-top:8px"><label for="src-mint-raw">raw principal tokens <span style="font-weight:400">(dev mode; comma-separated ints — added to any picks above)</span></label>' +
             '<input type="text" id="src-mint-raw" placeholder="e.g. 11, 1001" autocomplete="off" spellcheck="false"></div>' +
           '<div class="row" style="margin-top:10px">' +
-            '<div><label for="src-mint-entities">limit to entities <span style="font-weight:400">(optional, comma-separated)</span></label>' +
-              '<input type="text" id="src-mint-entities" placeholder="account:acme" autocomplete="off" spellcheck="false"></div>' +
+            '<div><label>limit to entities <span style="font-weight:400">(optional)</span></label>' +
+              '<div id="src-mint-entities"></div></div>' +
             '<div class="tight" style="min-width:170px"><label for="src-mint-conf">confidentiality ceiling</label>' +
               // No preselection — the ceiling is an explicit choice, same
               // no-default stance as every other dialog (audit advisory fix).
@@ -668,6 +673,27 @@
 
     V.dialog("src-mint-dialog").open();
 
+    // Entity-scope picker: emptyBehavior "hide" needs total_distinct before
+    // first paint, so prime the shared directory cache at dialog-open (one
+    // cheap admin GET — ENTITY-PICKER.md §2.2/§3). A fetch failure is the
+    // picker's problem: it degrades to lint-only free entry with an honest
+    // note, never a hidden field and never a fabricated count.
+    try { await V.entityDirectory(tenantNow, {}); } catch (e) { /* degraded mode renders */ }
+    if (!mintEntPicker) {
+      mintEntPicker = V.entityPicker(el("src-mint-entities"), {
+        mode: "scope",
+        multiple: true,
+        allowNew: true,
+        emptyBehavior: "hide",
+        placeholder: "account:acme",
+        explainer: "every future payload from this source will be limited to these entities — for the life of the webhook. There is no edit later; only revoke and re-mint.",
+        tenantId: function () { return tenantNow || V.tenant(); },
+      });
+    } else {
+      mintEntPicker.clear();     // each mint starts from an explicit, empty limit
+      mintEntPicker.refresh();
+    }
+
     // Who-can-see picker: names from the principal directory, not bare ints.
     var box = el("src-mint-principals");
     box.innerHTML = '<span class="ref">loading the principal directory&hellip;</span>';
@@ -729,8 +755,11 @@
       visibility: tokens,
       confidentiality: conf,
     };
-    var ents = el("src-mint-entities").value.trim();
-    if (ents) body.entity_scope = ents.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    // Chips are the only submission path (ENTITY-PICKER.md §2.1). Empty
+    // picker ⇒ field omitted — unbound, exactly as the bare input submitted
+    // (fail-closed shape untouched: entity scope narrows, never grants).
+    var ents = mintEntPicker ? mintEntPicker.value() : [];
+    if (ents.length) body.entity_scope = ents;
     var mid = el("src-mint-manifest").value;
     if (mid) body.manifest_id = mid;
 

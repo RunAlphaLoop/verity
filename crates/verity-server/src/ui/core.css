@@ -403,6 +403,89 @@ tr.flag td { background: var(--red-soft); }        /* compliance/defense rows */
 .dialog h3 { font-size: var(--fs-md); font-weight: 650; color: var(--bright); margin-bottom: var(--sp-3); }
 .dialog .actions { display: flex; gap: var(--sp-2); justify-content: flex-end; margin-top: var(--sp-4); }
 
+/* ============================================================== v4 · entity
+   picker (Verity.entityPicker — docs/design/ENTITY-PICKER.md §2). Chips echo
+   the .badge.b-entity look for continuity with Scope Inspector; dashed =
+   the shared "not yet real / inferred" encoding (a new tag has 0 memories). */
+.epk { position: relative; }
+.epk-main { position: relative; }
+.epk-box {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 4px 6px; min-height: 33px; cursor: text;
+}
+.epk-box:focus-within { border-color: var(--accent); }
+.epk-box input.epk-input {
+  flex: 1 1 90px; width: auto; min-width: 90px;
+  border: none; background: transparent; padding: 3px;
+}
+.epk-box input.epk-input:focus { outline: none; border: none; }
+.epk-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 1px 3px 1px 8px; border-radius: var(--r-pill);
+  font-size: 11px; font-family: var(--mono); white-space: nowrap; max-width: 100%;
+  color: var(--accent); border: 1px solid var(--accent); background: var(--accent-soft);
+}
+/* explicit new-tag chip: dashed, unfilled — "exists only once data lands" */
+.epk-chip.epk-new { border-style: dashed; background: transparent; color: var(--violet); border-color: var(--violet); }
+.epk-chip .epk-x {
+  border: none; background: transparent; color: inherit; opacity: .75;
+  padding: 0 4px; font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+}
+.epk-chip .epk-x:hover { border: none; color: var(--red); opacity: 1; }
+/* suggestion list — scrolls inside a cap; never grows the dialog */
+.epk-pop {
+  position: absolute; left: 0; right: 0; top: 100%; z-index: 60;
+  margin-top: 3px; max-height: 200px; overflow-y: auto;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: var(--r-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+}
+.epk-row {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--text);
+}
+.epk-row:hover, .epk-row.hl { background: var(--panel3); }
+.epk-row .epk-cnt { margin-left: auto; color: var(--dim); font-family: var(--sans); font-size: var(--fs-xs); white-space: nowrap; }
+.epk-row.epk-newrow { border-top: 1px dashed var(--border); color: var(--violet); }
+.epk-row .epk-mg {
+  font-size: var(--fs-xs); font-family: var(--sans); color: var(--dim);
+  border: 1px solid var(--border); border-radius: var(--r-pill); padding: 0 5px;
+}
+/* observed-namespace group headers (never a hardcoded vocabulary) */
+.epk-ns {
+  padding: 5px 10px 2px; color: var(--faint); font-size: var(--fs-xs);
+  text-transform: uppercase; letter-spacing: .08em; font-family: var(--mono);
+}
+.epk-ns.epk-teachline {
+  text-transform: none; letter-spacing: 0; white-space: normal;
+  color: var(--dim); font-family: var(--sans); font-size: var(--fs-sm);
+  padding: 7px 10px;
+}
+/* under-field lines: explainer (quiet), new-tag teaching (violet = inferred
+   family), standing 0-memory scope warning (amber = needs attention) */
+.epk-explain { color: var(--dim); font-size: var(--fs-sm); margin-top: 4px; }
+.epk-teach { color: var(--violet); font-size: var(--fs-sm); margin-top: 4px; }
+.epk-warn {
+  margin-top: 6px; padding: 6px 9px; border: 1px solid var(--amber-line);
+  background: var(--amber-soft); border-radius: var(--r-sm);
+  color: var(--amber); font-size: var(--fs-sm);
+}
+/* interposition prompt (near-miss / format lint) — asks, never silently acts */
+.epk-ask {
+  margin-top: 6px; padding: 7px 9px; border: 1px solid var(--blue-line);
+  background: var(--blue-soft); border-radius: var(--r-sm);
+  color: var(--text); font-size: var(--fs-sm);
+}
+.epk-ask code { color: var(--bright); }
+.epk-ask .epk-ask-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.epk-ask button { padding: 3px 9px; font-size: var(--fs-sm); }
+/* directory unavailable ≠ empty: honest degraded note, amber */
+.epk-deg { color: var(--amber); font-size: var(--fs-sm); margin-top: 4px; }
+/* the Emptiness Law's collapsed line (hide surfaces) */
+.epk-collapsed { color: var(--dim); font-size: var(--fs-sm); padding: 6px 0; }
+.epk-collapsed a.epk-reveal { color: var(--accent); cursor: pointer; text-decoration: none; }
+.epk-collapsed a.epk-reveal:hover { text-decoration: underline; }
+
 /* ---------------------------------------------------- responsive collapse */
 @media (max-width: 720px) {
   #shell { flex-direction: column; }

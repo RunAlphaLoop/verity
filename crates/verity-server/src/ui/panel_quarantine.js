@@ -116,9 +116,6 @@
     }
     return out;
   }
-  function parseTags(raw) {
-    return String(raw || "").split(/[\s,]+/).filter(function (s) { return s.length; });
-  }
   // "… already resolved (dismissed)" → "dismissed".
   function priorDisposition(message) {
     var m = /already resolved(?:\s*\(([^)]+)\))?/.exec(String(message || ""));
@@ -133,6 +130,11 @@
   var DIR = null;       // [{principal, token}] directory (null = unavailable)
   var ACTIVE = null;    // row a dialog is open for
   var tenantNow = "";
+  // Entity-tag picker for re-ingest (ENTITY-PICKER.md §5.5): tags mode —
+  // whatever is committed here is immortalized on the audit row, so the
+  // near-miss guard and the explicit new-tag flow are the protection inside
+  // this careful-correction dialog. Chips are the only submission path.
+  var qrTagsPicker = null;
 
   function el(id) { return V.$(id); }
   function waitingRows() {
@@ -205,8 +207,10 @@
               '<option value="Confidential">confidential</option>' +
               '<option value="Restricted">restricted</option>' +
             '</select></div>' +
-          '<div style="margin-top:10px"><label>limit to entities <span style="font-weight:400">(optional, comma-separated)</span></label>' +
-            '<input type="text" id="qr-tags" placeholder="account:acme, deal:renewal-2026" spellcheck="false"></div>' +
+          // Label fixed per ENTITY-PICKER.md §5.5: this field TAGS the
+          // re-ingested record (entity_tags); it never limits a scope.
+          '<div style="margin-top:10px"><label>entity tags for the corrected record <span style="font-weight:400">(optional)</span></label>' +
+            '<div id="qr-tags"></div></div>' +
           '<div style="margin-top:10px"><label>corrected text extraction <span style="font-weight:400">(optional)</span></label>' +
             '<textarea id="qr-content" placeholder="Only if the text lives somewhere the parser doesn\'t know. Blank = use the payload\'s own text. Re-ingest never invents content — a payload with nothing ingestible is refused (422)."></textarea></div>' +
           '<div style="margin-top:10px"><label>note for the record <span style="font-weight:400">(optional — stored with the audit row)</span></label>' +
@@ -545,7 +549,20 @@
     el("qr-vis").value = "";
     el("qr-vis-empty").checked = false;
     el("qr-conf").value = "";
-    el("qr-tags").value = "";
+    if (!qrTagsPicker) {
+      qrTagsPicker = V.entityPicker(el("qr-tags"), {
+        mode: "tags",           // emptyBehavior "teach": tagging is how an entity is born
+        multiple: true,
+        allowNew: true,
+        emptyBehavior: "teach",
+        placeholder: "account:acme",
+        explainer: "these tag the record — they decide which entity views can retrieve it. They do not limit a scope.",
+        tenantId: function () { return tenantNow || V.tenant(); },
+      });
+    } else {
+      qrTagsPicker.clear();
+      qrTagsPicker.refresh();
+    }
     el("qr-content").value = "";
     el("qr-note").value = "";
     el("qr-result").innerHTML = "";
@@ -583,7 +600,9 @@
       visibility: tokens,
       confidentiality: el("qr-conf").value,
     };
-    var tags = parseTags(el("qr-tags").value);
+    // value() = committed chips only — never in-progress typed text, never a
+    // whitespace/comma split (ENTITY-PICKER.md §2.1). Empty ⇒ field omitted.
+    var tags = qrTagsPicker ? qrTagsPicker.value() : [];
     if (tags.length) body.entity_tags = tags;
     var content = el("qr-content").value.trim();
     if (content) body.content = content;
@@ -598,6 +617,9 @@
         { admin: true, json: body });
       RESOLVED[ACTIVE.id] = "reingested";
       renderCards();
+      // The corrected record just landed — any new tag committed above now
+      // exists; re-fetch so the directory shows it (born by usage).
+      if (qrTagsPicker) qrTagsPicker.refresh();
       // Receipt — including the server's honesty flags: what the re-ingest
       // could NOT carry over is disclosed, never glossed.
       var flags = [];

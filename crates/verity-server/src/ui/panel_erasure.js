@@ -130,7 +130,13 @@
   /* ------------------------------------------------------------- state */
   var gateKey = null;           // "locked|" / "admin|<tenant>" — rebuild trigger
   var files = [];               // GET /v1/admin/media rows (auto-loaded)
-  var previewedAt = 0;          // last dry-run time (honest nudge in confirm)
+  // Last dry run: when + for exactly which target body + total rows found.
+  // The confirm step keys off THIS target (a preview of a different target
+  // proves nothing), and the free-entry 0-match gate keys off `total`.
+  var lastPreview = { at: 0, key: "", total: 0 };
+  // Soft format lint (ENTITY-PICKER.md §1) — convention, never a hard block.
+  var TAG_LINT = /^[a-z0-9_-]+:[a-z0-9._@-]+$/;
+  var entPicker = null;         // entity target picker — rebuilt with the surface
 
   /* ------------------------------------------------------------ register */
   V.register({
@@ -214,7 +220,7 @@
 
   /* ---------------------------------------------------- the admin surface */
   function buildTools(body, tenant) {
-    previewedAt = 0;
+    lastPreview = { at: 0, key: "", total: 0 };
     body.innerHTML =
       '<div class="note" style="margin-bottom:4px">Acting on tenant ' + V.refSpan(tenant) +
         " — change it in the session bar.</div>" +
@@ -223,12 +229,19 @@
       '<div class="card">' +
         '<h2>Step 1 · Who is this about? <span class="sub">exact-string match · subject / entity / media_ids</span></h2>' +
         '<div class="note">Fill in at least one. Matching is <b>exact</b> — a nickname, alias, or different ' +
-          "casing will not be found, so double-check the identifier before acting on the counts.</div>" +
+          "casing will not be found, so double-check the identifier before acting on the counts. " +
+          "For any hand-typed identifier, run the preview first: <b>0 everywhere usually means a mistyped id</b>, not clean data.</div>" +
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight"><label for="er-subject">Person <span class="note">(subject id, e.g. user:alice@acme)</span></label> ' +
-            '<input type="text" id="er-subject" class="field" placeholder="user:alice@acme" size="28" autocomplete="off"></div>' +
-          '<div class="tight"><label for="er-entity">Company or record <span class="note">(entity id, e.g. account:acme-inc)</span></label> ' +
-            '<input type="text" id="er-entity" class="field" placeholder="account:acme-inc" size="24" autocomplete="off"></div>' +
+            '<input type="text" id="er-subject" class="field" placeholder="user:alice@acme" size="28" autocomplete="off">' +
+            '<div class="asof" id="er-subject-lint" style="display:block;margin-top:2px"></div></div>' +
+          '<div class="tight" style="min-width:280px"><label>Company or record <span class="note">(entity tag)</span></label>' +
+            '<div id="er-entity"></div>' +
+            '<div class="asof" style="display:block;margin-top:3px"><a href="#" id="er-entity-reveal">target an unlisted id (exact string match) →</a></div>' +
+            '<div id="er-entity-free-wrap" style="display:none;margin-top:4px">' +
+              '<input type="text" id="er-entity-free" class="field" placeholder="account:acme-inc" size="24" autocomplete="off">' +
+              '<div class="asof" id="er-entity-free-lint" style="display:block;margin-top:2px"></div>' +
+            "</div></div>" +
         "</div>" +
         '<div class="row" style="margin-top:6px">' +
           '<div class="tight" style="flex:1 1 100%"><label for="er-media">Files to remove ' +
@@ -317,6 +330,10 @@
           "<b>No undo exists.</b> Rows are hard-deleted and keys destroyed in one transaction. " +
           "This is not the reversible <i>take back</i> — there is no reversal." +
         "</div>" +
+        '<label class="checkline" id="er-confirm-zero-wrap" style="display:none;margin-top:10px">' +
+          '<input type="checkbox" id="er-confirm-zero"> ' +
+          'I understand <b>nothing matches this id</b> — the preview found 0 rows everywhere.' +
+        "</label>" +
         '<div class="tight" style="margin-top:12px">' +
           '<label for="er-confirm-input" id="er-confirm-label">To confirm, type the id exactly</label>' +
           '<input type="text" id="er-confirm-input" class="field" style="width:100%" autocomplete="off">' +
@@ -330,9 +347,62 @@
 
     var confirmDlg = V.dialog("er-confirm-dialog");
 
+    /* --------------------------------- entity target picker + escape hatch */
+    // ENTITY-PICKER.md §5.3: target mode — the picker only OFFERS observed
+    // tags (allowNew:false; inventing an entity to erase is never correct),
+    // liveOnly:false because erasure targets physical rows: a tag carried
+    // only by invalidated rows is a legitimate target a live-only directory
+    // would hide. Counts render as "N live / M total" in this mode.
+    if (entPicker) { entPicker.destroy(); entPicker = null; }
+    entPicker = V.entityPicker(el("er-entity"), {
+      mode: "target",
+      multiple: false,
+      allowNew: false,
+      liveOnly: false,
+      emptyBehavior: "hide",
+      placeholder: "account:acme-inc",
+      explainer: "pick the exact tag as your data carries it — erasure matches strings exactly. Counts include invalidated rows; erasure targets those too.",
+      tenantId: function () { return tenant; },
+    });
+    // Advanced escape hatch (required by §5.3): lint-only free entry for ids
+    // that never appear in chunk/action tags. Free-entry targets MUST be
+    // previewed, and a 0-everywhere preview gates the confirm button behind
+    // an explicit acknowledgement — never a silent no-op erasure.
+    var entFree = false;
+    el("er-entity-reveal").onclick = function (ev) {
+      ev.preventDefault();
+      entFree = !entFree;
+      el("er-entity").style.display = entFree ? "none" : "";
+      el("er-entity-free-wrap").style.display = entFree ? "" : "none";
+      el("er-entity-reveal").textContent = entFree
+        ? "← back to the known-entity list"
+        : "target an unlisted id (exact string match) →";
+      if (entFree) el("er-entity-free").focus();
+    };
+    el("er-entity-free").oninput = function () {
+      var v = el("er-entity-free").value.trim();
+      el("er-entity-free-lint").textContent = !v ? ""
+        : (TAG_LINT.test(v)
+          ? "unchecked id — run the preview first; a 0-everywhere preview needs an explicit acknowledgement to erase."
+          : "doesn't look like type:name — entity tags are lowercase like account:acme. Erasure matches this string exactly.");
+    };
+    // Subject stays free text in v1 (its vocabulary lives partly in L1 facts,
+    // which the directory honestly does not cover) — it gains the same lint.
+    el("er-subject").oninput = function () {
+      var v = el("er-subject").value.trim();
+      el("er-subject-lint").textContent = (v && !TAG_LINT.test(v))
+        ? "doesn't look like type:name — subject ids are usually lowercase like user:alice@acme. Matching is exact; preview first."
+        : "";
+    };
+
     /* ------------------------------------------------ shared input readers */
     function subj() { return el("er-subject").value.trim(); }
-    function ent() { return el("er-entity").value.trim(); }
+    function ent() {
+      if (entFree) return el("er-entity-free").value.trim();
+      var v = entPicker.value();       // chips only — never in-progress text
+      return v.length ? v[0] : "";
+    }
+    function entIsFree() { return entFree && !!el("er-entity-free").value.trim(); }
     function mediaIds() {
       var raw = el("er-media").value.trim();
       if (!raw) return [];
@@ -370,9 +440,9 @@
       out.innerHTML = '<div class="note">running the dry run… (removes nothing)</div>';
       try {
         var res = await V.api("/v1/admin/erasure/preview", { admin: true, json: t.body }) || {};
-        previewedAt = Date.now();
         var report = res.would_erase || {};
         var total = REPORT_ROWS.reduce(function (a, r) { return a + Number(report[r.key] || 0); }, 0);
+        lastPreview = { at: Date.now(), key: JSON.stringify(t.body), total: total };
         var rebac = res.rebac_tuples_would_delete === true
           ? V.badge("their access grants would also be deleted", "b-provenance")
           : V.badge("no access-grant delete", "b-inferred") +
@@ -389,7 +459,10 @@
                 '<div class="et-title">0 everywhere — nothing matches</div>' +
                 '<div class="et-body">Nothing on record matches these identifiers, so an erasure would ' +
                   "remove 0 rows. Check spelling and casing in step 1 — matching is exact, and 0 here " +
-                  "usually means a mistyped id, not clean data.</div>" +
+                  "usually means a mistyped id, not clean data." +
+                  (entIsFree()
+                    ? " Erasing this unlisted id anyway will require ticking an explicit “nothing matches” acknowledgement in the confirm step."
+                    : "") + "</div>" +
               "</div>"
             : "") +
           gapsBlock(res.coverage_gaps);
@@ -421,25 +494,48 @@
           "nothing to erase — fill in a person, a record, or at least one file in step 1 (the server refuses an empty target with 422)"));
         return;
       }
+      var previewMatches = lastPreview.at > 0 && lastPreview.key === JSON.stringify(t.body);
+      var freeTarget = entIsFree();
+      // Free-entry targets MUST preview first (ENTITY-PICKER.md §5.3): the
+      // picked path only offers observed tags, but an unlisted id has no
+      // count behind it — the dry run is the only evidence it matches at all.
+      if (freeTarget && !previewMatches) {
+        V.err("er-run-err", new Error(
+          "this target uses an unlisted id — run the preview for exactly this target first. " +
+          "Free-entry ids are unchecked strings; the dry run (removes nothing) is the only proof of what they match."));
+        return;
+      }
+      var needsZeroAck = freeTarget && lastPreview.total === 0;
       el("er-confirm-summary").innerHTML =
         "You are about to permanently erase everything for " + targetSentence(t) +
         " on tenant " + V.refSpan(tenant) + ".";
-      el("er-confirm-preview").innerHTML = previewedAt
+      el("er-confirm-preview").innerHTML = previewMatches
         ? V.stateChip("ok", "previewed") + ' <span class="note">last dry run ' +
-          V.esc(V.timeAgo(previewedAt)) + " — the counts above are what goes.</span>"
-        : V.stateChip("attn", "not previewed") + ' <span class="note">you have not run the preview — ' +
-          "Cancel and preview first to see what would go (previewing removes nothing).</span>";
+          V.esc(V.timeAgo(lastPreview.at)) + " — the counts above are what goes.</span>"
+        : (lastPreview.at
+          ? V.stateChip("attn", "previewed a different target") + ' <span class="note">the last dry run was for ' +
+            "a different target — Cancel and preview exactly this one (previewing removes nothing).</span>"
+          : V.stateChip("attn", "not previewed") + ' <span class="note">you have not run the preview — ' +
+            "Cancel and preview first to see what would go (previewing removes nothing).</span>");
       el("er-confirm-label").innerHTML = c.what === "phrase"
         ? "No person or record named — files only. To confirm, type <b>ERASE MEDIA</b> exactly."
         : "To confirm, type the " + V.esc(c.what) + " exactly: <code>" + V.esc(c.token) + "</code>";
       var input = el("er-confirm-input");
       var go = el("er-confirm-go");
+      var zeroCb = el("er-confirm-zero");
+      el("er-confirm-zero-wrap").style.display = needsZeroAck ? "" : "none";
+      zeroCb.checked = false;
       input.value = "";
       go.disabled = true;
       V.clearErr("er-confirm-err");
-      input.oninput = function () { go.disabled = input.value !== c.token; };
+      var reflect = function () {
+        go.disabled = input.value !== c.token || (needsZeroAck && !zeroCb.checked);
+      };
+      input.oninput = reflect;
+      zeroCb.onchange = reflect;
       go.onclick = async function () {
         if (input.value !== c.token) return; // belt and suspenders
+        if (needsZeroAck && !zeroCb.checked) return;
         V.clearErr("er-confirm-err");
         go.disabled = true;
         try {
@@ -447,6 +543,7 @@
           confirmDlg.close();
           renderReceipt(res || {}, t);
           refreshFiles(tenant); // named files may be gone now
+          entPicker.refresh();  // counts changed — the directory must not lie
         } catch (err) {
           V.err("er-confirm-err", err);
           go.disabled = false;
