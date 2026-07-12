@@ -199,6 +199,60 @@ pub(crate) async fn list_manifests(
         .map(Json)
 }
 
+// ---------- dry-run: the live preview backend ----------
+
+#[derive(Deserialize)]
+pub(crate) struct DryRunManifestRequest {
+    #[allow(dead_code)]
+    tenant_id: TenantId,
+    /// The (in-progress) manifest, serialized to YAML by the wizard on every
+    /// preview so dry-run and activation parse identical bytes.
+    manifest_yaml: String,
+    /// One real sample message to run through the manifest.
+    sample_payload: serde_json::Value,
+}
+
+/// POST /v1/manifests/dry-run (admin): the wizard's live-preview backend.
+///
+/// Pure `from_yaml` + `runtime::apply` + serialize — it NEVER persists (zero
+/// DB queries, no episode append, no fact/chunk upsert, no principal-token
+/// allocation), so it is safe to call on every keystroke. It runs the SAME
+/// engine `deliver()` runs, so the preview is byte-honest.
+///
+/// Determinism: `apply` runs under `RuntimeOptions::fixture_clock()` (pins
+/// `$now()` to 2026-01-01T00:00:00Z) so the preview is reproducible AND
+/// identical to what a generated fixture asserts.
+///
+/// Fail-closed: a manifest whose `acl_policy` is absent (or mode quarantine,
+/// or whose principal extraction matched nothing) does NOT return a permissive
+/// default — it returns a visible `{"outcome":"quarantine","reason":…}` so the
+/// wizard shows "this would be held — no one could see it until you set who
+/// can", surfacing the runtime's real reason verbatim.
+pub(crate) async fn dry_run_manifest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DryRunManifestRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    // 422 with the verbatim ManifestError powers the wizard's live field
+    // validation (a probe manifest with one bad route.when returns the
+    // predicate.rs error, mapped client-side to the offending step).
+    let manifest = Manifest::from_yaml(&req.manifest_yaml)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let applied = runtime::apply(
+        &manifest,
+        &req.sample_payload,
+        &runtime::RuntimeOptions::fixture_clock(),
+    );
+    // The identity namespace only labels the who-can-see-it rendering for
+    // map mode; static/quarantine ignore it.
+    let namespace = manifest
+        .acl_policy
+        .as_ref()
+        .and_then(|p| p.identity_namespace);
+    Ok(Json(applied.to_json(namespace)))
+}
+
 // ---------- the webhook-path hook ----------
 
 /// Inbound delivery for a manifest-bound webhook. Fail-closed at every step:

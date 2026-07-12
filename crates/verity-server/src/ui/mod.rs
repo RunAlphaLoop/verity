@@ -90,6 +90,8 @@ const PANEL_SECTIONS: &str = concat!(
     "\n",
     include_str!("panel_memories.html"),
     "\n",
+    include_str!("panel_manifest.html"),
+    "\n",
 );
 
 const UI_STYLE: &str = concat!(
@@ -142,6 +144,8 @@ const UI_SCRIPTS: &str = concat!(
     include_str!("panel_entities.js"),
     "\n",
     include_str!("panel_memories.js"),
+    "\n",
+    include_str!("panel_manifest.js"),
     "\n",
     // Boot AFTER every panel has called Verity.register(...) at load.
     "Verity.boot();\n",
@@ -223,6 +227,7 @@ mod tests {
             "panel-principals",
             "panel-entities",
             "panel-memories",
+            "panel-manifest",
         ] {
             let pos = body
                 .find(&format!("id=\"{id}\""))

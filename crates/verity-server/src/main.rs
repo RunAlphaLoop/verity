@@ -431,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/manifests",
             post(manifests::upload_manifest).get(manifests::list_manifests),
         )
+        .route("/v1/manifests/dry-run", post(manifests::dry_run_manifest))
         .route(
             "/v1/manifests/{id}/activate",
             post(manifests::activate_manifest),

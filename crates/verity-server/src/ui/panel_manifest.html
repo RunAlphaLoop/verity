@@ -1,0 +1,38 @@
+<!-- ==========================================================================
+     panel_manifest.html — Add a source (the manifest wizard)
+     --------------------------------------------------------------------------
+     The founder-requested wizard that turns ONE real webhook/CDC message from
+     a source into scoped Verity memory, without the author needing to know the
+     manifest YAML schema, the field-extraction expression language, or the
+     permission (ACL) model by hand.
+
+     Five steps, payload-first:
+       (1) Payload   — paste one real message; we read its shape.
+       (2) Route     — click values to say which messages this handles.
+       (3) Fields    — click leaves to say what Verity should remember.
+       (4) Who can see it — THE HUMAN GATE. No default is ever pre-filled;
+           the wizard is structurally forbidden from guessing this. The
+           author answers in plain language; the wizard infers the source
+           "tier" so the emitted manifest passes activation_check().
+       (5) Review & test — a live dry-run (real apply() output or the real
+           quarantine reason), a downloadable tested fixture bundle, and
+           "Save as draft". Activation stays a SEPARATE, admin-approved,
+           audit-logged act — the wizard never auto-activates.
+
+     The preview pane (right, from step 2 on) re-renders after every change by
+     round-tripping the assembled manifest + the pasted payload through
+     POST /v1/manifests/dry-run (admin-gated, NEVER persists) — so the preview
+     is byte-identical to what deliver() would write, or the real quarantine
+     reason, never a fabricated audience.
+
+     OWNS: this file + panel_manifest.js. Panel id "manifest", mount
+     #mf-mount, rail entry data-nav="manifest" ("Operate" group). Reuses
+     frozen theme/core classes and Verity.* helpers only. Endpoint mentions
+     live in .api-crumb spans (hidden behind the off-by-default "show API
+     details" toggle); every sentence reads complete without them.
+     ========================================================================== -->
+<section class="panel" id="panel-manifest">
+  <h1>Add a source</h1>
+  <div class="lede">Paste one real message from your source. We&rsquo;ll turn it into scoped memory &mdash; <b>you decide who can see it</b>. Nothing is sent anywhere and nothing is stored while you build.</div>
+  <div id="mf-mount"></div>
+</section>

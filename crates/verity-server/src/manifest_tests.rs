@@ -394,3 +394,115 @@ async fn acl_less_manifest_parses_but_never_indexes() {
         "{reasons:?}"
     );
 }
+
+async fn dry_run(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    yaml: &str,
+    payload: serde_json::Value,
+) -> crate::HandlerResult<serde_json::Value> {
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "manifest_yaml": yaml,
+        "sample_payload": payload,
+    }))
+    .unwrap();
+    crate::manifests::dry_run_manifest(State(Arc::clone(state)), HeaderMap::new(), Json(req))
+        .await
+        .map(|Json(v)| v)
+}
+
+/// The wizard's live-preview backend, end to end through the real handler:
+/// a valid map manifest projects mapped writes + a who-can-see-it envelope of
+/// namespaced principals, under the pinned fixture clock, persisting NOTHING.
+#[tokio::test]
+async fn dry_run_valid_map_returns_envelope() {
+    let Some((state, tenant)) = test_state().await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let issue: serde_json::Value = serde_json::from_str(&fixture("issue_update.json")).unwrap();
+    let v = dry_run(&state, tenant, &linear_yaml(), issue)
+        .await
+        .expect("dry-run ok");
+    assert_eq!(v["outcome"], "writes");
+    assert_eq!(v["source"], "linear");
+    // The single issue write, canonical EntityWrites::to_json — no content key.
+    let w = &v["writes"][0];
+    assert_eq!(w["entity_id"], "d5e1f3a0-6c2b-4f9e-8a51-0b3f4c9d7e21");
+    assert_eq!(w["valid_from"], "2026-07-01T12:34:56.789Z");
+    assert_eq!(w["fields"]["title"], "Fix webhook handler timeout");
+    assert!(
+        w.get("content").is_none(),
+        "writes[] carries no content key"
+    );
+    // Who can see it: mapped, approximated (Tier B), namespaced principals.
+    assert_eq!(v["acl"]["mode"], "map");
+    assert_eq!(v["acl"]["acl_provenance"], "approximated");
+    assert_eq!(v["acl"]["identity_namespace"], "source_native_id");
+    assert_eq!(
+        v["acl"]["principals"],
+        json!(["linear:0a2f6c4e-9d31-4b8a-b7e2-5c1d8f6a3e90"])
+    );
+    // Persisted nothing: no manifest row, no fact, no principal token.
+    let manifests: i64 = sqlx::query_scalar("SELECT count(*) FROM manifests WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(state.pool())
+        .await
+        .unwrap();
+    assert_eq!(manifests, 0, "dry-run must not persist a manifest row");
+    let principals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM principals WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+    assert_eq!(principals, 0, "dry-run must not allocate principal tokens");
+}
+
+/// Fail-closed: a manifest whose acl_policy is absent dry-runs to a VISIBLE
+/// quarantine — the wizard shows "held, no one could see it" — never a silent
+/// permissive default.
+#[tokio::test]
+async fn dry_run_absent_acl_quarantines_visibly() {
+    let Some((state, tenant)) = test_state().await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    let yaml = linear_yaml();
+    let start = yaml.find("acl_policy:").expect("acl block");
+    let end = yaml.find("fixtures:").expect("fixtures block");
+    let acl_less = format!("{}{}", &yaml[..start], &yaml[end..]);
+    let issue: serde_json::Value = serde_json::from_str(&fixture("issue_update.json")).unwrap();
+    let v = dry_run(&state, tenant, &acl_less, issue)
+        .await
+        .expect("dry-run ok even without acl");
+    assert_eq!(v["outcome"], "quarantine");
+    assert!(
+        v["reason"].as_str().unwrap().contains("acl_policy absent"),
+        "{v}"
+    );
+    assert!(v.get("acl").is_none(), "quarantine names no audience");
+    assert!(v.get("writes").is_none(), "quarantine emits no writes");
+}
+
+/// A bad route.when returns 422 with the verbatim parser error — this powers
+/// the wizard's live field validation, mapped client-side to the bad step.
+#[tokio::test]
+async fn dry_run_bad_expression_returns_typed_422() {
+    let Some((state, tenant)) = test_state().await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    // Corrupt the route predicate into something the grammar rejects.
+    let yaml = linear_yaml().replace(
+        "when: \"type = 'Issue' and action in ['create','update']\"",
+        "when: \"type ~~~ nonsense\"",
+    );
+    let issue: serde_json::Value = serde_json::from_str(&fixture("issue_update.json")).unwrap();
+    let err = dry_run(&state, tenant, &yaml, issue)
+        .await
+        .expect_err("bad expression refused");
+    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!err.1.is_empty(), "verbatim parser error surfaced");
+}

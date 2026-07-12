@@ -137,6 +137,35 @@ impl Applied {
             Applied::Writes { .. } => None,
         }
     }
+
+    /// Canonical JSON projection of a dry-run result — the exact bytes the
+    /// preview endpoint returns and the generated fixture asserts against.
+    ///
+    /// `namespace` is the manifest's `acl_policy.identity_namespace` (only
+    /// meaningful for `map` mode); pass `None` for static/quarantine. The
+    /// `writes[]` array is `EntityWrites::to_json` verbatim — `{entity_type,
+    /// entity_id, valid_from, fields}` ONLY, no `content` key — so the golden
+    /// fixture matches the real engine. A quarantine projects its reason
+    /// verbatim so the preview surfaces fail-closed honestly, never a
+    /// fabricated permissive default.
+    pub fn to_json(&self, namespace: Option<IdentityNamespace>) -> Value {
+        match self {
+            Applied::Writes {
+                source,
+                writes,
+                acl,
+            } => json!({
+                "outcome": "writes",
+                "source": source,
+                "writes": writes.iter().map(EntityWrites::to_json).collect::<Vec<_>>(),
+                "acl": acl.to_json(namespace),
+            }),
+            Applied::Quarantine { reason } => json!({
+                "outcome": "quarantine",
+                "reason": reason,
+            }),
+        }
+    }
 }
 
 fn quarantine(reason: impl Into<String>) -> Applied {
@@ -448,6 +477,47 @@ acl_policy:
                 principals: vec!["linear:team_9".into()],
                 approximated: true,
             }
+        );
+    }
+
+    #[test]
+    fn to_json_projects_writes_and_acl() {
+        use crate::schema::IdentityNamespace;
+        let m = Manifest::from_yaml(MANIFEST).unwrap();
+        let out = apply(&m, &payload(), &RuntimeOptions::fixture_clock());
+        let ns = m.acl_policy.as_ref().and_then(|p| p.identity_namespace);
+        let v = out.to_json(ns);
+        assert_eq!(v["outcome"], "writes");
+        assert_eq!(v["source"], "linear");
+        // Exactly one write, and it carries NO `content` key (to_json omits it).
+        let w = &v["writes"][0];
+        assert_eq!(w["entity_id"], "iss_1");
+        assert_eq!(w["valid_from"], "2026-07-01T12:00:00.000Z");
+        assert_eq!(w["fields"]["title"], "Fix the webhook");
+        assert!(
+            w.get("content").is_none(),
+            "writes[] must not carry a content key: {w}"
+        );
+        // ACL renders who-can-see-it as namespaced principals.
+        assert_eq!(v["acl"]["mode"], "map");
+        assert_eq!(v["acl"]["acl_provenance"], "approximated");
+        assert_eq!(v["acl"]["identity_namespace"], "source_native_id");
+        assert_eq!(v["acl"]["principals"], json!(["linear:team_9"]));
+        let _ = ns.unwrap_or(IdentityNamespace::SourceNativeId);
+    }
+
+    #[test]
+    fn to_json_projects_quarantine_verbatim() {
+        // Absent acl_policy: parses, but the projection is a visible
+        // quarantine — never a silent permissive default.
+        let no_acl = MANIFEST.split("acl_policy:").next().unwrap();
+        let m = Manifest::from_yaml(no_acl).unwrap();
+        let out = apply(&m, &payload(), &RuntimeOptions::fixture_clock());
+        let v = out.to_json(None);
+        assert_eq!(v["outcome"], "quarantine");
+        assert_eq!(
+            v["reason"],
+            "acl_policy absent — manifest can only quarantine until an admin adds one"
         );
     }
 
