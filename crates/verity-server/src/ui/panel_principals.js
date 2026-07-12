@@ -12,6 +12,13 @@
      • POST   /v1/admin/groups — { tenant_id, group, member } →
        { written:true, tokens:{…} }. Requires ReBAC server-side; 503 surfaces
        verbatim, never faked as success.
+     • GET    /v1/admin/groups/members?tenant_id&group — the ROSTER read:
+       { group, direct:[{member,kind}…], people_total, read_at }. `direct`
+       is the editable list (the exact membership tuples removal needs);
+       `people_total` counts people TRANSITIVELY, through nested groups.
+       Fetched on first expand and refetched after every membership write —
+       the roster is always the server's answer, never an optimistic guess.
+       An empty roster is a 200 with direct:[] — valid truth, not an error.
      • DELETE /v1/admin/groups — same body → { deleted, tombstones,
        revoked_principals, affected_members }. Tombstones are written FIRST
        (fail-closed: a tombstone failure aborts the delete — over-hides,
@@ -26,9 +33,9 @@
        "Take someone out of a group" (tombstone jargon lives in .ref/.dc-meta
        lines only);
      • typed confirm (REMOVE) on the destructive verb;
-     • every empty state teaches; honest disclosures kept: membership is not
-       listable yet (no GET /v1/admin/groups), pagination truncation is said
-       out loud, 503/401 surface verbatim with a pointer.
+     • every empty state teaches; honest disclosures kept: pagination
+       truncation is said out loud, 503/401 surface verbatim with a pointer,
+       and each roster says when the server answered.
    ========================================================================== */
 (function () {
   var V = window.Verity;
@@ -40,6 +47,13 @@
 
   var data = { rows: [], nextAfter: null, tenant: "", loadedAt: 0 };
   var filter = "";
+
+  /* Roster state, per shared key (bare group name → {open, loading, data,
+     error}). data is ALWAYS the server's last answer to
+     GET /v1/admin/groups/members — never edited client-side. refresh()
+     refetches every open roster and drops the cache of closed ones, so any
+     membership write (which always refreshes) re-reads the roster too. */
+  var rosters = {};
 
   function el(id) { return V.$(id); }
 
@@ -162,8 +176,8 @@
             '<input type="text" id="prn-rm-member" list="prn-all-list" placeholder="alice@corp.example" ' +
               'autocomplete="off" spellcheck="false"></div>' +
         "</div>" +
-        '<div class="note">Verity cannot list a group&rsquo;s members yet (the read endpoint is planned) — ' +
-          "type the member exactly as it appears in the directory.</div>" +
+        '<div class="note">Not sure of the exact name? Open <b>who&rsquo;s inside</b> on the shared key ' +
+          "first — its remove buttons fill this in for you, exactly as the permission system holds it.</div>" +
         '<div class="note" style="border-left:3px solid var(--state-attn);padding-left:10px">' +
           "<b>Removing hides everything this group grants — on the very next read.</b> " +
           "Verity writes the hide first, then removes the membership; if the hide cannot be written, " +
@@ -218,6 +232,7 @@
 
   /* =========================================================== loading */
   async function refresh(tenant) {
+    if (data.tenant !== tenant) rosters = {}; // rosters are per-space truth
     data.tenant = tenant;
     V.clearErr("prn-err");
     el("prn-hint").innerHTML = "";
@@ -240,6 +255,14 @@
       data.rows = rows;
       data.loadedAt = Date.now();
       render();
+      // Roster honesty: re-read every open roster from the server; drop the
+      // cache of closed ones so their next expand re-reads too. Every
+      // membership write funnels through refresh(), so no write can leave a
+      // stale roster on screen.
+      Object.keys(rosters).forEach(function (name) {
+        if (rosters[name].open) fetchRoster(name);
+        else delete rosters[name];
+      });
     } catch (e) {
       var is401 = /HTTP 401/.test(String(e && e.message));
       el("prn-state").innerHTML = V.stateChip("fail", is401 ? "admin token required" : "failed");
@@ -273,6 +296,94 @@
       V.err("prn-err", e);
       btn.disabled = false;
     }
+  }
+
+  /* ======================================================= roster read */
+  /* Who's inside one shared key — fetched on first expand, refetched via
+     refresh() after every membership write. GET /v1/admin/groups/members. */
+  function fetchRoster(name) {
+    var r = rosters[name] = rosters[name] || { open: true };
+    var tenant = data.tenant;
+    r.loading = true;
+    r.error = null;
+    renderDirectory();
+    return V.api(
+      "/v1/admin/groups/members?tenant_id=" + encodeURIComponent(tenant) +
+        "&group=" + encodeURIComponent("group:" + name),
+      { admin: true }
+    ).then(function (res) {
+      if (data.tenant !== tenant) return; // space changed mid-flight — stale
+      r.data = res || {};
+      r.loading = false;
+      renderDirectory();
+    }).catch(function (e) {
+      if (data.tenant !== tenant) return;
+      r.data = null;
+      r.error = e;
+      r.loading = false;
+      renderDirectory();
+    });
+  }
+
+  function toggleRoster(name) {
+    var r = rosters[name] = rosters[name] || {};
+    r.open = !r.open;
+    if (r.open && !r.data && !r.loading) fetchRoster(name);
+    else renderDirectory();
+  }
+
+  function rosterHtml(g) {
+    var r = rosters[g.name] || {};
+    if (r.loading || (!r.data && !r.error)) {
+      return '<div class="note" style="margin:6px 0">' +
+        V.stateChip("wait", "reading") +
+        " asking the permission system who holds <b>" + V.esc(g.name) + "</b>&hellip;</div>";
+    }
+    if (r.error) {
+      var msg = String((r.error && r.error.message) || r.error);
+      var out = '<div class="err on" style="margin:6px 0">' + V.esc(msg) + "</div>";
+      if (/HTTP 503/.test(msg)) {
+        out += '<div class="note">Listing who holds a shared key needs the relationship-based ' +
+          "permissions engine (ReBAC) running — without it the server refuses rather than " +
+          "guessing, and its refusal is shown above as-is. Point the server at a ReBAC engine " +
+          "and expand again.</div>";
+      }
+      return out;
+    }
+    var res = r.data || {};
+    var direct = res.direct || [];
+    var html = "";
+    if (!direct.length) {
+      html += '<div class="note" style="margin:6px 0">Nobody holds this shared key yet — ' +
+        "a valid answer, not an error. Add someone with <b>Add someone</b> above; " +
+        "they appear here on the next read.</div>";
+    } else {
+      html += '<div class="note" style="margin:6px 0 4px"><b>' + direct.length +
+        "</b> direct member" + (direct.length === 1 ? "" : "s") +
+        " — the people and shared keys put into this key by name (removal takes out exactly one of these)</div>" +
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">' +
+        direct.map(function (m) {
+          var c = classify(m.member);
+          var kind = m.kind || (c.kind === "group" ? "group" : "user");
+          var chip = kind === "group"
+            ? V.entityChip(c.name, "shared key inside this one")
+            : V.entityChip(c.name, "person");
+          return '<span style="display:inline-flex;align-items:center;gap:4px">' + chip +
+            '<button class="prn-roster-rm" data-group="' + V.esc(g.name) + '" ' +
+              'data-member="' + V.esc(m.member) + '" ' +
+              'title="opens the remove confirm — DELETE /v1/admin/groups; hides what this shared key granted on the very next read">' +
+              "Remove&hellip;</button></span>";
+        }).join("") +
+        "</div>";
+      var n = Number(res.people_total || 0);
+      html += '<div class="note" style="margin-top:6px"><b>' + n + "</b> " +
+        (n === 1 ? "person holds" : "people hold") +
+        " this key in total (including nested shared keys) — counted live from the " +
+        'permission system<span class="api-crumb"> · GET /v1/admin/groups/members</span>.' +
+        (res.read_at ? ' <span class="ref">server answered ' + V.esc(V.fmtTime(res.read_at)) + "</span>" : "") +
+        "</div>";
+    }
+    return html;
   }
 
   /* =========================================================== render */
@@ -360,13 +471,19 @@
       html += '<div class="note">No shared keys' + (filter ? " match the filter" : " yet") +
         ". A shared key (group) lets one rule cover many people — add one with <b>Add a person or group</b>.</div>";
     } else {
-      html += '<div class="note" style="margin-top:0">Who is <em>inside</em> each shared key is not listable yet ' +
-        "(the membership read endpoint is planned) — this screen writes membership and shows the " +
-        "server&rsquo;s receipts.</div>" +
+      html += '<div class="note" style="margin-top:0">Open <b>who&rsquo;s inside</b> on any shared key to see ' +
+        "who holds it — read live from the permission system every time, with a remove button next to " +
+        "each name. The count under each list also includes people reached through nested shared keys.</div>" +
         '<div class="tablewrap"><table><thead><tr><th>group</th><th>number · raw string</th><th class="num">actions</th></tr></thead><tbody>' +
         gShown.map(function (g) {
-          return "<tr><td>" + nameCell(g.name) + "</td><td>" + tokenCell(g) + "</td>" +
+          var r = rosters[g.name];
+          var open = !!(r && r.open);
+          var row = "<tr><td>" + nameCell(g.name) + "</td><td>" + tokenCell(g) + "</td>" +
             '<td class="num">' +
+              '<button class="prn-roster-toggle" data-group="' + V.esc(g.name) + '" ' +
+                'aria-expanded="' + (open ? "true" : "false") + '" ' +
+                'title="lists who holds this shared key, straight from the permission system · GET /v1/admin/groups/members">' +
+                (open ? "&#9662;" : "&#9656;") + " Who&rsquo;s inside</button> " +
               '<button class="prn-mem-open" data-group="' + V.esc(g.name) + '" ' +
                 'title="POST /v1/admin/groups — the member sees what the group sees, on their next read">Add someone</button> ' +
               '<button class="prn-rm-open" data-group="' + V.esc(g.name) + '" ' +
@@ -374,6 +491,11 @@
               '<button class="prn-see-tokens" data-token="' + V.esc(String(g.token)) + '" ' +
                 'title="opens the mint dialog pre-filled with this group’s token — POST /v1/scopes">See as this group</button>' +
             "</td></tr>";
+          if (open) {
+            row += '<tr class="prn-roster-tr"><td colspan="3" style="padding:6px 10px 10px">' +
+              rosterHtml(g) + "</td></tr>";
+          }
+          return row;
         }).join("") +
         "</tbody></table></div>";
     }
@@ -426,6 +548,14 @@
 
     out.innerHTML = html;
 
+    wire(out, ".prn-roster-toggle", function (btn) {
+      toggleRoster(btn.getAttribute("data-group") || "");
+    });
+    wire(out, ".prn-roster-rm", function (btn) {
+      // Reuses the ONE remove path: typed confirm → DELETE /v1/admin/groups
+      // → receipt → refresh (which re-reads this roster from the server).
+      openMemberRemove(btn.getAttribute("data-group") || "", btn.getAttribute("data-member") || "");
+    });
     wire(out, ".prn-mem-open", function (btn) {
       openMemberAdd(btn.getAttribute("data-group") || "", btn.getAttribute("data-member") || "");
     });

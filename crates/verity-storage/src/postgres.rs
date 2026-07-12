@@ -2631,13 +2631,11 @@ impl StorageAdapter for PostgresAdapter {
     }
 
     async fn get_tenant(&self, tenant: TenantId) -> Result<Option<TenantRow>> {
-        let row = sqlx::query(
-            "SELECT id, name, created_at FROM tenants WHERE id = $1",
-        )
-        .bind(tenant)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row = sqlx::query("SELECT id, name, created_at FROM tenants WHERE id = $1")
+            .bind(tenant)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
         row.map(|r| {
             Ok(TenantRow {
                 tenant_id: r.try_get("id").map_err(db_err)?,

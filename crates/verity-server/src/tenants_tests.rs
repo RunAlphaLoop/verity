@@ -79,10 +79,13 @@ async fn tenant_by_id_confirms_real_and_404s_ghost() {
     let name = format!("by-id-{}", Uuid::now_v7());
     let id = state.storage.create_tenant(&name).await.expect("create");
 
-    let Json(v) =
-        crate::get_tenant(State(Arc::clone(&state)), HeaderMap::new(), axum::extract::Path(id))
-            .await
-            .expect("real tenant resolves");
+    let Json(v) = crate::get_tenant(
+        State(Arc::clone(&state)),
+        HeaderMap::new(),
+        axum::extract::Path(id),
+    )
+    .await
+    .expect("real tenant resolves");
     assert_eq!(v["tenant_id"], json!(id));
     assert_eq!(v["name"], json!(name));
     assert!(v["created_at"].as_str().is_some());

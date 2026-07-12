@@ -419,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/groups",
             post(admin_group_add).delete(admin_group_remove),
         )
+        .route("/v1/admin/groups/members", get(admin_group_members))
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
         .route("/v1/admin/knowledge/{id}", get(admin_knowledge_detail))
@@ -2458,6 +2459,81 @@ async fn admin_group_remove(
         "tombstones": tombstones,
         "revoked_principals": lost_tokens.iter().map(|(p, _)| p).collect::<Vec<_>>(),
         "affected_members": affected,
+    })))
+}
+
+#[derive(Deserialize)]
+struct GroupMembersQuery {
+    tenant_id: TenantId,
+    /// `"group:sales"` — same shape rule as the write endpoints (422 otherwise).
+    group: String,
+}
+
+/// GET /v1/admin/groups/members (admin): the membership roster read.
+///
+/// `direct` is the EDITABLE roster — one row per exact SpiceDB tuple, so each
+/// row is precisely what DELETE /v1/admin/groups removes; nested groups appear
+/// as one `kind: "group"` row, unresolved. `people_total` is the TRANSITIVE
+/// user count (nested groups resolved, same closure as revocation uses) — the
+/// UI must label it as such. An empty roster is a 200 with `direct: []` —
+/// valid truth, never an error.
+///
+/// Tenant handling deliberately differs from the writes: a READ must never
+/// create a tenant, so an unknown id 404s (like GET /v1/admin/tenants/{id})
+/// instead of `ensure_tenant`.
+async fn admin_group_members(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<GroupMembersQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    if state
+        .storage
+        .get_tenant(q.tenant_id)
+        .await
+        .map_err(storage_status)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no tenant with that id on this server".into(),
+        ));
+    }
+    let rebac = require_rebac(&state)?;
+    let Some((rebac::PrincipalKind::Group, group_name)) = rebac::parse_principal(&q.group) else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "group must be \"group:<name>\"".into(),
+        ));
+    };
+    let gateway = |e: rebac::RebacError| (StatusCode::BAD_GATEWAY, format!("spicedb: {e}"));
+
+    // Sorted and deduped inside group_direct_members (fail-closed parsing too).
+    let direct: Vec<serde_json::Value> = rebac
+        .group_direct_members(q.tenant_id, group_name)
+        .await
+        .map_err(gateway)?
+        .into_iter()
+        .map(|(kind, name)| {
+            serde_json::json!({
+                "member": format!("{}:{name}", kind.object_type()),
+                "kind": kind.object_type(),
+            })
+        })
+        .collect();
+    // Transitive user closure — the honest "how many people can this key
+    // reach" number, distinct from the editable tuple list above.
+    let people_total = rebac
+        .group_users(q.tenant_id, group_name)
+        .await
+        .map_err(gateway)?
+        .len();
+
+    Ok(Json(serde_json::json!({
+        "group": format!("group:{group_name}"),
+        "direct": direct,
+        "people_total": people_total,
+        "read_at": Utc::now().to_rfc3339(),
     })))
 }
 

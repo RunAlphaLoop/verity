@@ -158,8 +158,8 @@
       await api("/v1/admin/groups", { tenant_id: tenant, group: "group:sales", member: "user:jordan" });
       await api("/v1/admin/groups", { tenant_id: tenant, group: "group:support", member: "user:taylor" });
     } catch (e) {
-      membershipNote = "this server can't record group membership yet (needs the permissions engine: " +
-        "ReBAC, set via VERITY_SPICEDB_URL) — the shared group keys still work";
+      membershipNote = "this server can't record shared-key membership yet (needs the relationship-based " +
+        "permissions engine (ReBAC), set via VERITY_SPICEDB_URL) — the shared keys still work";
     }
 
     // 3. The connector: CDC upserts under source `verity-sample-crm:*`,
@@ -173,22 +173,37 @@
     //    lag; sample events must not invent any.
     var t1 = Date.now() - 2;
     var t2 = Date.now() - 1;
+    // Every CDC envelope carries an inline verity_acl: since the L1
+    // visibility fix (migration 0026) the choke point REFUSES an ACL-less
+    // fact rather than defaulting it tenant-wide — an un-ACL'd seed produced
+    // nameless decision cards ("name not loaded") because the name facts
+    // never landed (founder-caught 2026-07-12). Sales-side visibility only,
+    // matching the cast's story: user:sample-blind stays blind (the denial
+    // demo depends on it).
+    var crmAcl = {
+      visibility: [map["user:jordan"], map["group:sales"]].filter(function (x) { return x != null; }),
+      confidentiality: "internal",
+    };
+    if (!crmAcl.visibility.length) throw new Error("seed: no tokens for the CRM cast — cannot assign fact visibility");
     await api(
       "/v1/ingest/debezium?tenant_id=" + encodeURIComponent(tenant) + "&pk=id",
       [
         {
           op: "c",
           after: { id: "acme-freight", name: "Acme Freight Co (sample)", plan: "enterprise", region: "NA-East", csm: "jordan" },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-crm", table: "accounts", ts_ms: t1 },
         },
         {
           op: "c",
           after: { id: "acme-renewal", account: "acme-freight", stage: "negotiation", amount: 48000 },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-crm", table: "opportunities", ts_ms: t1 },
         },
         {
           op: "u",
           after: { id: "acme-renewal", account: "acme-freight", stage: "negotiation", amount: 61000 },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-crm", table: "opportunities", ts_ms: t2 },
         },
         // 3b. A SECOND system (billing) so entity resolution has a story:
@@ -198,16 +213,19 @@
         {
           op: "u",
           after: { id: "acme-freight", name: "Acme Freight Co (sample)", plan: "enterprise", region: "NA-East", csm: "jordan", duns: "98-765-4321" },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-crm", table: "accounts", ts_ms: t2 },
         },
         {
           op: "c",
           after: { id: "cust-311", name: "Acme Freight Company", duns: "98-765-4321", plan_code: "ENT-12" },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-billing", table: "customers", ts_ms: t2 },
         },
         {
           op: "c",
           after: { id: "cust-412", name: "Acme Freight Logistics (sample)" },
+          verity_acl: crmAcl,
           source: { connector: "verity-sample-billing", table: "customers", ts_ms: t2 },
         },
       ]

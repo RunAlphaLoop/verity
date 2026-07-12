@@ -46,7 +46,7 @@ pub(crate) enum PrincipalKind {
 }
 
 impl PrincipalKind {
-    fn object_type(self) -> &'static str {
+    pub(crate) fn object_type(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Group => "group",
@@ -124,6 +124,53 @@ pub(crate) fn parse_any_object_id(oid: &str) -> Option<(TenantId, String)> {
     let tenant: TenantId = oid.get(..36)?.parse().ok()?;
     let rest = oid.get(36..)?.strip_prefix('_')?;
     Some((tenant, unescape_id(rest)?))
+}
+
+/// Parse one ReadRelationships stream result (post-`post_stream`, so the
+/// per-line `result` wrapper is already stripped) into a direct member of a
+/// group. Pure — unit-testable without a live SpiceDB.
+///
+/// Returns `Ok(Some((kind, name)))` for a subject in this tenant,
+/// `Ok(None)` for subjects that must be SKIPPED fail-closed (an object id
+/// carrying another tenant's prefix, or an object type outside the Verity
+/// schema — never surface another tenant's names), and `Err(Malformed)` when
+/// the protocol shape itself is broken.
+fn parse_direct_member(
+    tenant: TenantId,
+    result: &Value,
+) -> RebacResult<Option<(PrincipalKind, String)>> {
+    let object = &result["relationship"]["subject"]["object"];
+    let object_type = object["objectType"]
+        .as_str()
+        .ok_or_else(|| RebacError::Malformed("missing subject objectType".into()))?;
+    let object_id = object["objectId"]
+        .as_str()
+        .ok_or_else(|| RebacError::Malformed("missing subject objectId".into()))?;
+    let kind = match object_type {
+        "user" => PrincipalKind::User,
+        // Nested groups join as `group#member` subjects; the subject-level
+        // `optionalRelation` is implied by the schema, so the type suffices.
+        "group" => PrincipalKind::Group,
+        other => {
+            tracing::warn!(
+                object_type = other,
+                "skipping group member with unknown subject type (fail closed)"
+            );
+            return Ok(None);
+        }
+    };
+    match parse_object_id(tenant, object_id) {
+        Some(name) => Ok(Some((kind, name))),
+        None => {
+            // Impossible by construction (object ids are tenant-prefixed at
+            // write time) — treat as a cross-tenant anomaly and hide it.
+            tracing::warn!(
+                %tenant,
+                "skipping group member whose object id is outside this tenant (fail closed)"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -517,6 +564,43 @@ impl Rebac {
         users.dedup();
         Ok(users)
     }
+
+    /// DIRECT members of a group — the editable roster. Each row corresponds
+    /// to one exact membership tuple, so a removal (DELETE /v1/admin/groups)
+    /// can target it precisely. Unlike [`Self::group_users`] this does NOT
+    /// resolve nesting: a nested group arrives as a single
+    /// `(PrincipalKind::Group, name)` row. Fully-consistent
+    /// ReadRelationships; sorted by (kind, name) and deduped. Subjects from
+    /// another tenant or outside the schema are skipped fail-closed (see
+    /// [`parse_direct_member`]).
+    pub(crate) async fn group_direct_members(
+        &self,
+        tenant: TenantId,
+        group_name: &str,
+    ) -> RebacResult<Vec<(PrincipalKind, String)>> {
+        let results = self
+            .post_stream(
+                "/v1/relationships/read",
+                json!({
+                    "consistency": { "fullyConsistent": true },
+                    "relationshipFilter": {
+                        "resourceType": "group",
+                        "optionalResourceId": object_id(tenant, group_name),
+                        "optionalRelation": "member",
+                    }
+                }),
+            )
+            .await?;
+        let mut members = Vec::with_capacity(results.len());
+        for r in &results {
+            if let Some(member) = parse_direct_member(tenant, r)? {
+                members.push(member);
+            }
+        }
+        members.sort_by(|a, b| (a.0.object_type(), &a.1).cmp(&(b.0.object_type(), &b.1)));
+        members.dedup();
+        Ok(members)
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +683,80 @@ mod tests {
         assert_eq!(parse_any_object_id(&format!("{t}_=G1")), None); // bad escape
     }
 
+    /// Build one ReadRelationships stream result (as it leaves `post_stream`,
+    /// i.e. the `result` wrapper already stripped) for the parser tests.
+    fn read_result(object_type: &str, object_id: &str, nested: bool) -> Value {
+        let mut subject = json!({
+            "object": { "objectType": object_type, "objectId": object_id }
+        });
+        if nested {
+            subject["optionalRelation"] = json!("member");
+        }
+        json!({
+            "readAt": { "token": "t0ken" },
+            "relationship": {
+                "resource": { "objectType": "group", "objectId": "irrelevant" },
+                "relation": "member",
+                "subject": subject,
+            }
+        })
+    }
+
+    #[test]
+    fn direct_member_parsing_maps_kinds() {
+        let t = uuid::Uuid::now_v7();
+        // A user subject, name unescaped back to the principal form.
+        let user = read_result("user", &object_id(t, "alice@corp.example"), false);
+        assert_eq!(
+            parse_direct_member(t, &user).expect("user parses"),
+            Some((PrincipalKind::User, "alice@corp.example".to_string()))
+        );
+        // A nested group joins as a `group#member` subject.
+        let group = read_result("group", &object_id(t, "sales-west"), true);
+        assert_eq!(
+            parse_direct_member(t, &group).expect("group parses"),
+            Some((PrincipalKind::Group, "sales-west".to_string()))
+        );
+    }
+
+    #[test]
+    fn direct_member_parsing_fails_closed() {
+        let t = uuid::Uuid::now_v7();
+        let other = uuid::Uuid::now_v7();
+        // Another tenant's object id: skipped, never surfaced.
+        let foreign = read_result("user", &object_id(other, "eve@rival.example"), false);
+        assert_eq!(
+            parse_direct_member(t, &foreign).expect("skip, not error"),
+            None
+        );
+        // An object type outside the schema: skipped.
+        let robot = read_result("robot", &object_id(t, "r2d2"), false);
+        assert_eq!(
+            parse_direct_member(t, &robot).expect("skip, not error"),
+            None
+        );
+        // A malformed escape in the id fails closed too.
+        let bad_escape = read_result("user", &format!("{t}_=G1"), false);
+        assert_eq!(
+            parse_direct_member(t, &bad_escape).expect("skip, not error"),
+            None
+        );
+        // Broken protocol shape is a hard error, not a silent empty.
+        for broken in [
+            json!({}),
+            json!({ "relationship": { "subject": {} } }),
+            json!({ "relationship": { "subject": { "object": { "objectType": "user" } } } }),
+        ] {
+            assert!(
+                matches!(
+                    parse_direct_member(t, &broken),
+                    Err(RebacError::Malformed(_))
+                ),
+                "malformed input must error: {broken}"
+            );
+        }
+    }
+
     /// Gated on VERITY_SPICEDB_URL (skips when absent, like VERITY_TEST_DSN):
     /// schema write is idempotent; nested membership resolves transitively;
     /// delete shrinks the closure.
@@ -650,6 +808,31 @@ mod tests {
         // Member subtree of the outer group reaches the nested user.
         let users = rebac.group_users(tenant, "sales").await.expect("subjects");
         assert_eq!(users, vec!["user:alice@corp.example".to_string()]);
+
+        // The DIRECT roster does not resolve nesting: sales sees only the
+        // inner group; the inner group sees only the user.
+        let direct = rebac
+            .group_direct_members(tenant, "sales")
+            .await
+            .expect("direct roster");
+        assert_eq!(
+            direct,
+            vec![(PrincipalKind::Group, "sales-west".to_string())]
+        );
+        let direct_inner = rebac
+            .group_direct_members(tenant, "sales-west")
+            .await
+            .expect("inner roster");
+        assert_eq!(
+            direct_inner,
+            vec![(PrincipalKind::User, "alice@corp.example".to_string())]
+        );
+        // A foreign tenant's roster of the same group name is empty.
+        assert!(rebac
+            .group_direct_members(uuid::Uuid::now_v7(), "sales")
+            .await
+            .expect("foreign roster")
+            .is_empty());
 
         // Another tenant sees nothing (tenant-prefixed object ids).
         let foreign = rebac

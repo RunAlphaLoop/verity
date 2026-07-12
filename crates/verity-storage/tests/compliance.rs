@@ -657,7 +657,8 @@ async fn dsar_bundle_contains_expected_rows_with_decrypted_payloads() {
         return;
     };
     let subject = "user:dsar-subject";
-    let subject_episode = interaction(&adapter, tenant, "account:acme", Some(subject), "agent:a").await;
+    let subject_episode =
+        interaction(&adapter, tenant, "account:acme", Some(subject), "agent:a").await;
     // An L1 fact derived from the subject's episode (linked by provenance) with
     // a RESTRICTED visibility no ordinary scope holds — DSAR runs under admin
     // authority and must export it regardless (SPEC §8e).

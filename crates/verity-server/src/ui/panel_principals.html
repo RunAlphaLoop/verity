@@ -13,9 +13,14 @@
          keeps its fail-closed ceremony: typed confirm, and the human-words
          explanation that removing hides everything the group grants on the
          very next read (tombstones-first stays as secondary mono jargon).
+       • Each shared key has a "who's inside" expander over
+         GET /v1/admin/groups/members: the DIRECT roster (the exact editable
+         tuples, each with a remove button that reuses the one remove path)
+         plus the labeled TRANSITIVE people count — fetched on first expand
+         and refetched after every membership write, never optimistic.
        • Fail-closed honesty kept verbatim: ReBAC-unconfigured 503s surface
-         as-is; nothing is defaulted; membership is disclosed as not-yet-
-         listable (GET /v1/admin/groups does not exist yet — UI-ACTIONS X8).
+         as-is; nothing is defaulted; an empty roster is a 200 with direct:[]
+         — rendered as valid truth, never as an error.
 
      Owns ONLY this file + panel_principals.js. Same panel id + mount id +
      register id as v1 so shell/mod.rs wiring holds. Frozen theme/core classes
@@ -23,6 +28,6 @@
      ========================================================================== -->
 <section class="panel" id="panel-principals">
   <h1>People &amp; groups</h1>
-  <div class="lede">Everyone Verity can name for this space <span class="api-crumb">(tenant)</span> — the keys (principals) and shared keys (groups) that <b>&ldquo;who can see this&rdquo;</b> rules point at. Add people, put them in shared keys, or take them out; removing someone hides everything the shared key granted on their very next read.</div>
+  <div class="lede">Everyone Verity can name for this space <span class="api-crumb">(tenant)</span> — the keys (principals) and shared keys (groups) that <b>&ldquo;who can see this&rdquo;</b> rules point at. Add people, put them in shared keys, see who holds each one, or take them out; removing someone hides everything the shared key granted on their very next read.</div>
   <div id="principals-mount"></div>
 </section>
