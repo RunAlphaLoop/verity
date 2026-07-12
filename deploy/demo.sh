@@ -115,15 +115,16 @@ show "human review queue -> $REVIEW candidate(s): Tier-2 never auto-merges; conf
 
 say "7) Knowledge: the same lesson observed by three scoped agents -> candidates, never auto-published"
 INITECH=$(mint '[11]' '["account:initech"]' 'agent:ops-bot')
+GLOBEXCS=$(mint '[11]' '["account:globex"]' 'agent:cs-bot')
 LESSON="Renewal conversations stall unless pricing is confirmed before the quarterly board review."
 observe() { curl -s -X POST "$VERITY/v1/episodes" -H 'content-type: application/json' \
   -d "{\"scope_handle\":\"$1\",\"observation\":\"$2\"}" | jq -r .episode_id; }
 E1=$(observe "$SALES"   "Renewal stalled again until pricing was confirmed ahead of the board review.")
-E2=$(observe "$SUPPORT" "Ticket resolved only after pricing confirmation unblocked the renewal discussion.")
+E2=$(observe "$GLOBEXCS" "Ticket resolved only after pricing confirmation unblocked the renewal discussion.")
 E3=$(observe "$INITECH" "Procurement said the renewal waits for the quarterly board review either way.")
 propose() { curl -s -X POST "$VERITY/v1/knowledge" -H 'content-type: application/json' -d "{
   \"scope_handle\":\"$1\",\"statement\":\"$LESSON\",\"categories\":[\"sales-process\"],\"evidence\":[\"$2\"]}" >/dev/null; }
-propose "$SALES" "$E1"; propose "$SUPPORT" "$E2"; propose "$INITECH" "$E3"
+propose "$SALES" "$E1"; propose "$GLOBEXCS" "$E2"; propose "$INITECH" "$E3"
 KN=$(curl -s "$VERITY/v1/knowledge?tenant_id=$TENANT" | jq '[.items[] | select(.status=="candidate")] | length')
 show "knowledge queue -> $KN candidate(s) of the same statement from three writers; publish stays a human gate"
 

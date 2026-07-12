@@ -79,7 +79,7 @@ const BLOCKER_CANDIDATE_CAP: i64 = 8;
 /// item never becomes eligible/published: at k=2 either supporting party could
 /// infer the other's interaction (membership inference). The publish gate
 /// clamps its own k_min to this too.
-const K_SUPPORT_MIN: i32 = 3;
+pub(crate) const K_SUPPORT_MIN: i32 = 3;
 
 /// SPEC §2 L2: supersession is keyed on NORMALIZED (subject, relation).
 /// Normalization is deterministic: lowercase, trim, collapse whitespace.

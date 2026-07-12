@@ -503,10 +503,14 @@ async fn invalid_merge_into_fails_closed_to_fresh_candidate() {
 }
 
 #[tokio::test]
-async fn no_merge_into_and_no_canonical_mints_fresh() {
-    // LLM-unavailable / judge-NO path: the worker omits merge_into. With no
-    // canonical fast-path hit either, the candidate is fresh — NEVER a bare
-    // auto-merge (the removed cosine leg would have to be gone for this to hold).
+async fn identical_statement_accrues_support_without_canonical() {
+    // LLM-unavailable / judge-NO path: the worker omits merge_into and no
+    // canonical is supplied. PARAPHRASES must never bare-auto-merge — but two
+    // BYTE-IDENTICAL statements are the same lesson by definition (exact string
+    // equality is stricter than the canonical fast path), so the second
+    // proposal ACCRUES SUPPORT on the first instead of minting a clone
+    // (amended 2026-07-11: three customers proposing the identical lesson used
+    // to render as three items each claiming lone support).
     let Some((state, tenant)) = test_state(false).await else {
         eprintln!("VERITY_TEST_DSN not set; skipping");
         return;
@@ -539,18 +543,16 @@ async fn no_merge_into_and_no_canonical_mints_fresh() {
     assert_eq!(
         body2["knowledge"][0]["merged"],
         json!(false),
-        "without canonical or merge_into the server must NOT auto-merge"
+        "the worker's merge machinery did not fire — accrual is the storage fast path"
     );
     let items = state
         .storage
         .list_knowledge(tenant, None)
         .await
         .expect("list");
-    assert_eq!(
-        items.len(),
-        2,
-        "no bare auto-merge: two separate candidates"
-    );
+    assert_eq!(items.len(), 1, "identical statement accrues, never clones");
+    assert_eq!(items[0].distinct_entities, 2, "support spans both entities");
+    assert_eq!(items[0].episode_count, 2, "both evidence episodes attached");
 }
 
 // ---------- exact-canonical-match fast path (Phase 1) ----------

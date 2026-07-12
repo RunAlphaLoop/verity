@@ -2427,24 +2427,81 @@ async fn propose_learning(
     Json(req): Json<ProposeLearningRequest>,
 ) -> HandlerResult<Json<KnowledgeItem>> {
     let payload = state.verify_scope(&req.scope_handle)?;
-    state
+
+    // A bare proposal (no evidence episodes) IS an L0 event: "this agent,
+    // scoped to this entity, hypothesized this lesson" — the design's n=1.
+    // Materialize it as an Observation episode so the EXISTING evidence
+    // attribution machinery counts it. Previously an evidence-less proposal
+    // supported nothing (distinct_entities 0), so three customers proposing
+    // the identical lesson showed as three clones each claiming no support.
+    let mut evidence = req.evidence;
+    if evidence.is_empty() {
+        let scope_entity = payload.entity_scope.first().cloned();
+        let episode = state
+            .storage
+            .append_episode(NewEpisode {
+                tenant_id: payload.tenant_id,
+                source: "agent:propose_learning".into(),
+                source_entity: scope_entity,
+                kind: EpisodeKind::Observation,
+                payload: serde_json::json!({
+                    "kind": "knowledge_proposal",
+                    "statement": req.statement,
+                }),
+                // Unique per proposal: the same lesson proposed twice by the
+                // same scope is two distinct n=1 observations on the record.
+                content_hash: format!("propose:{}", uuid::Uuid::now_v7()),
+                trust_tier: TrustTier::Observation,
+                writer_sub: payload.actor_sub.clone(),
+                writer_azp: payload.actor_azp.clone(),
+            })
+            .await
+            .map_err(internal)?;
+        evidence.push(episode);
+    }
+
+    let item = state
         .storage
         .propose_knowledge(KnowledgeProposal {
             tenant_id: payload.tenant_id,
             statement: req.statement,
             categories: req.categories,
-            evidence: req.evidence,
+            evidence,
             proposed_by_sub: payload.actor_sub.clone(),
             proposed_by_azp: payload.actor_azp.clone(),
             // The human/agent propose path carries no canonical form; the
-            // rejection memory then matches on the exact statement. (The
-            // consolidation worker supplies the canonical form for its stronger
-            // match.)
+            // rejection memory + the exact-statement accrual fast path then
+            // match on the exact statement. (The consolidation worker supplies
+            // the canonical form for its stronger match.)
             canonical_statement: None,
         })
         .await
-        .map(Json)
-        .map_err(internal)
+        .map_err(internal)?;
+
+    // Same acceptability policy as the consolidation path (§5): a candidate
+    // that crossed k-support with corroboration becomes ELIGIBLE — still
+    // human-gated, never auto-published from here.
+    if item.status == KnowledgeStatus::Candidate
+        && item.distinct_entities >= consolidation::K_SUPPORT_MIN
+        && (item.writer_count >= 2 || item.has_tier1_evidence)
+    {
+        let moved = state
+            .storage
+            .inner()
+            .mark_knowledge_eligible(payload.tenant_id, item.id)
+            .await
+            .map_err(internal)?;
+        if moved {
+            return state
+                .storage
+                .inner()
+                .get_knowledge(payload.tenant_id, item.id)
+                .await
+                .map(Json)
+                .map_err(internal);
+        }
+    }
+    Ok(Json(item))
 }
 
 #[derive(Deserialize)]

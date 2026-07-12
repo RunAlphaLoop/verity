@@ -232,7 +232,7 @@ impl PostgresAdapter {
         }
     }
 
-    async fn get_knowledge(&self, tenant: TenantId, id: Uuid) -> Result<KnowledgeItem> {
+    pub async fn get_knowledge(&self, tenant: TenantId, id: Uuid) -> Result<KnowledgeItem> {
         let row = sqlx::query("SELECT * FROM knowledge WHERE tenant_id = $1 AND id = $2")
             .bind(tenant)
             .bind(id)
@@ -1495,30 +1495,51 @@ impl PostgresAdapter {
     /// The light `name`/`domain` summary for a single ledger REF
     /// (`source:entity_id`) — the review-queue side-by-side needs each candidate
     /// ref's member fields (§4.3 review enrichment). Non-member refs (`key:*`,
-    /// `chunk:*`, malformed) yield an empty summary. Splits on the FIRST `:`
-    /// (entity_ids may contain `:`), matching the fold's `split_member_ref`.
+    /// `chunk:*`, malformed) yield an empty summary.
+    ///
+    /// The ref grammar is ambiguous from the string alone: SOURCES may contain
+    /// `:` (Debezium sources are `connector:db.table`, so a ref reads
+    /// `hubspot:crm.companies:hs-88`) AND entity_ids may contain `:`. So we
+    /// don't guess the split — we match the concatenation directly in SQL
+    /// (`source || ':' || entity_id = ref`), which is exact for however the
+    /// ref was composed. This fixed the review queue showing "no name on
+    /// record" for refs whose facts existed all along (2026-07-11).
     pub async fn ref_field_summary(
         &self,
         tenant: TenantId,
         reff: &str,
     ) -> Result<EntityFieldSummary> {
-        if reff.starts_with("key:") || reff.starts_with("chunk:") {
+        if reff.starts_with("key:") || reff.starts_with("chunk:") || !reff.contains(':') {
             return Ok(EntityFieldSummary::default());
         }
-        let Some((source, entity_id)) = reff.split_once(':') else {
-            return Ok(EntityFieldSummary::default());
-        };
-        if source.is_empty() || entity_id.is_empty() {
-            return Ok(EntityFieldSummary::default());
-        }
-        self.member_field_summary(
-            tenant,
-            &[AliasMember {
-                source: source.to_string(),
-                entity_id: entity_id.to_string(),
-            }],
+        let rows = sqlx::query(
+            "SELECT field, value FROM facts
+              WHERE tenant_id = $1
+                AND source || ':' || entity_id = $2
+                AND valid_to IS NULL
+                AND lower(field) IN ('name', 'domain', 'website')",
         )
+        .bind(tenant)
+        .bind(reff)
+        .fetch_all(&self.pool)
         .await
+        .map_err(db_err)?;
+        let mut out = EntityFieldSummary::default();
+        for row in rows {
+            let field: String = row.try_get("field").map_err(db_err)?;
+            let value: serde_json::Value = row.try_get("value").map_err(db_err)?;
+            let text = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            match field.to_lowercase().as_str() {
+                "name" => out.name = Some(text),
+                // Website URLs read fine as a domain summary line.
+                "domain" | "website" => out.domain = Some(text),
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// The cross-source merged entity view (SPEC §7f). Gathers every current
@@ -2309,6 +2330,77 @@ impl StorageAdapter for PostgresAdapter {
             ),
             None => (KnowledgeStatus::Candidate, None),
         };
+
+        // EXACT-STATEMENT ACCRUAL (the Phase-1 fast path of
+        // knowledge-merge-tuning.md, applied at propose time): an identical
+        // live lesson gains SUPPORT — it never clones. Match on the canonical
+        // form when supplied, else the exact statement; only a clean
+        // (non-quarantined) proposal accrues, and only onto a live
+        // candidate/eligible twin. Counters are recomputed from the evidence
+        // rows, so the accrual is idempotent (re-proposing the same episode is
+        // a no-op via ON CONFLICT). Deterministic string equality only — the
+        // fuzzy/LLM merge stays in the worker cascade.
+        if matches!(status, KnowledgeStatus::Candidate) {
+            let twin: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM knowledge
+                  WHERE tenant_id = $1 AND status IN ('candidate', 'eligible')
+                    AND (($2::text IS NOT NULL AND canonical_statement = $2)
+                         OR statement = $3)
+                  ORDER BY id
+                  LIMIT 1
+                  FOR UPDATE",
+            )
+            .bind(proposal.tenant_id)
+            .bind(canon)
+            .bind(&proposal.statement)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if let Some(twin_id) = twin {
+                for row in &evidence {
+                    let eid: Uuid = row.try_get("id").map_err(db_err)?;
+                    let entity: Option<String> = row.try_get("source_entity").map_err(db_err)?;
+                    let writer: Option<String> = row.try_get("writer_azp").map_err(db_err)?;
+                    let tier: i16 = row.try_get("trust_tier").map_err(db_err)?;
+                    sqlx::query(
+                        "INSERT INTO knowledge_evidence
+                             (knowledge_id, episode_id, entity, writer_azp, trust_tier)
+                         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(twin_id)
+                    .bind(eid)
+                    .bind(&entity)
+                    .bind(&writer)
+                    .bind(tier)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                }
+                sqlx::query(
+                    "UPDATE knowledge SET
+                         categories = ARRAY(SELECT DISTINCT c
+                                              FROM unnest(categories || $2::text[]) AS c),
+                         distinct_entities = (SELECT count(DISTINCT entity) FROM knowledge_evidence
+                                               WHERE knowledge_id = $1 AND entity IS NOT NULL),
+                         episode_count = (SELECT count(*) FROM knowledge_evidence
+                                           WHERE knowledge_id = $1),
+                         writer_count = (SELECT count(DISTINCT writer_azp) FROM knowledge_evidence
+                                          WHERE knowledge_id = $1 AND writer_azp IS NOT NULL),
+                         has_tier1_evidence = EXISTS(SELECT 1 FROM knowledge_evidence
+                                                      WHERE knowledge_id = $1 AND trust_tier = 1),
+                         merge_reason = COALESCE(merge_reason,
+                             'exact-statement accrual (propose fast path)')
+                     WHERE id = $1",
+                )
+                .bind(twin_id)
+                .bind(&proposal.categories)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                return self.get_knowledge(proposal.tenant_id, twin_id).await;
+            }
+        }
 
         let id = Uuid::now_v7();
         sqlx::query(
