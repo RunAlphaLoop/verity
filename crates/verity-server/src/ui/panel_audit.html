@@ -1,19 +1,23 @@
 <!-- ==========================================================================
-     panel_audit.html — Screen 2 · Access Audit  [MVP]  (TA.2, builder B)
+     panel_audit.html — Access audit  [v2 rebuild — frozen design contract]
      --------------------------------------------------------------------------
-     Who saw what, on the record. Newest-first table of every scoped read
-     (recall | get | activity | brief | forget | dsar_export), backed by
-     GET /v1/admin/audit (admin token). Client-side filter/search over the
-     fetched window, blocked-injection defense badges + zero-leak summary,
-     policy-version column (honest "not recorded" when the row carries none),
-     compliance-event row styling, CSV/JSON (SIEM-shaped) export, ~5s
-     auto-refresh, and the audit-of-audit disclosure.
+     Who saw what, on the record. Newest-first tail of every scoped read
+     (recall / get / brief / activity / …) plus compliance verbs (forget /
+     erasure / dsar_export), backed by GET /v1/admin/audit (admin token) and
+     humanized with the principal directory (GET /v1/admin/principals, N5).
 
-     OWNS: this file + panel_audit.js. Reuses frozen theme/core classes and the
-     Verity.* helpers only. Mounts into #audit-mount.
+     v2: autoloads once a tenant is known (no cold Load button), rows render
+     as plain sentences ("support-bot searched memory · 3 results · about
+     account:acme · internal ceiling"), filters are progressive (simple bar,
+     advanced collapsed), the blocked-injection summary is prominent AND
+     honest (never a fabricated zero), CSV / SIEM-JSON exports kept.
+
+     OWNS: this file + panel_audit.js. Same panel id ("audit") + mount id
+     (#audit-mount) + Verity.register shape as v1 — wiring holds. Reuses
+     frozen theme/core classes and Verity.* helpers only.
      ========================================================================== -->
 <section class="panel" id="panel-audit">
-  <h1>Access Audit</h1>
-  <div class="subtitle"><b>Who saw what, on the record.</b> Every scoped read, newest first, with the policy version that governed it &mdash; reading this panel is itself audited.</div>
+  <h1>Access audit</h1>
+  <div class="lede"><b>Who saw what, on the record.</b> Every read an agent or person makes through a scope handle lands here the moment it happens, newest first &mdash; and reading this page is itself audited.</div>
   <div id="audit-mount"></div>
 </section>

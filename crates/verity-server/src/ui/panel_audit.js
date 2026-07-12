@@ -1,104 +1,134 @@
 "use strict";
 /* ==========================================================================
-   panel_audit.js — Screen 2 · Access Audit  (TA.2, builder B)
+   panel_audit.js — Access audit  [v2 rebuild — frozen design contract]
    --------------------------------------------------------------------------
-   Backing: GET /v1/admin/audit?tenant_id=&limit= (admin token). The endpoint
-   returns, per row: id, tenant_id, actor_sub, actor_azp, verb, principals,
-   entity_scope, confidentiality, query_summary, result_ids, at.
+   Reads:
+     • GET /v1/admin/audit?tenant_id=&limit= (admin) — per row: id, tenant_id,
+       actor_sub, actor_azp, verb, principals (i32 tokens), entity_scope,
+       confidentiality (0-3), query_summary, result_ids, at. Newest first.
+     • GET /v1/admin/principals?tenant_id=&after_token=&limit= (admin, N5) —
+       the token ↔ string directory, used ONLY to NAME the tokens an audit
+       row carries. Fetch failure degrades honestly to raw #tokens.
 
-   HONESTY NOTES (read-path purity + honest-numbers non-negotiables):
-   • The endpoint does NOT (yet) emit a purpose-policy version per row, nor a
-     defense/blocked-injection flag, nor a leaked-item count. This panel NEVER
-     fabricates those. It renders policy version only if a row actually carries
-     one (policy_version / purpose_policy_version), else a dim "not recorded".
-   • Adversarial probes are counted ONLY from a real per-row signal (a truthy
-     `blocked`/`defense`/`injection_blocked` field, or a verb naming a blocked
-     read). Absent that signal the summary strip says so honestly rather than
-     inventing probes. `leaked` is likewise read from the row, never assumed.
-   • Filters/search run client-side over the fetched window (the endpoint takes
-     only tenant_id + limit); the window size is stated so the reviewer knows
-     exactly what set the filters and the CSV/JSON export cover.
-   • Auto-refresh is a pure re-GET on a ~5s timer; no LLM, no live-ReBAC.
-
-   v0.2 — DRILL INTO A ROW (SPEC §5 Screen 2 Actions v0.2):
-   • Clicking a row expands it in place to show the exact `result_ids` the row
-     carries (opaque record/chunk ids — rendered read-only, NEVER as a recall
-     affordance; the audit is a record, not a query surface) plus the actor's
-     scope claims RECONSTRUCTED from the row (tenant, actor sub·azp, principals,
-     entity_scope, confidentiality ceiling, policy version, verb).
-   • "Jump to Scope Inspector" switches panels via the Verity router and seeds
-     the ONE shared cross-panel channel we legitimately own — Verity.setTenant.
-     HONEST SEAM: an audit row does NOT carry a signed `vs_…` handle, and the
-     Scope Inspector runs its live probes only from a decoded handle. So this
-     is a read-only reconstruction, not a live decode: we pre-fill the tenant,
-     surface the reconstructed claims for the operator to compare, and say so
-     plainly. We never fabricate a handle, never imply the probes will run
-     unassisted, and only render claims the row actually carries.
+   THE LAW, applied:
+     • every row is a plain sentence a first-timer parses in ten seconds
+       ("support-bot searched memory · 3 results · about account:acme ·
+       internal ceiling"); raw verbs/uuids live in mono secondary text only;
+     • autoloads when the tenant is known — no cold Load button;
+     • filters are progressive: a simple bar (search + action), advanced
+       (actor / entity / ceiling / time / window) collapsed behind a toggle;
+     • the blocked-injection summary is prominent AND honest: probes are
+       counted ONLY from a real per-row signal; absent that signal the strip
+       says so — an honest gap, never a fabricated zero;
+     • fail-closed emptiness is stated as a correct answer, with a forensic
+       CTA (Scope Inspector / Quarantine), never a fill-it button;
+     • drill-down renders only what the row carries ("not recorded on this
+       row", never guessed); the jump to Scope Inspector stays an honest
+       seam — no handle is fabricated.
+   READ-PATH PURITY: pure re-GETs; filters/exports are local transforms.
    ========================================================================== */
 (function () {
+  var V = window.Verity;
+
   var COMPLIANCE_VERBS = { forget: 1, erasure: 1, dsar_export: 1 };
 
-  // ---- pure helpers over a raw audit row --------------------------------
+  /* ------------------------------------------------------------ plain words */
 
-  function actorStr(r) {
-    return (r.actor_sub || "—") + " · " + (r.actor_azp || "—");
+  // verb → what a first-time operator reads. The raw verb stays available in
+  // mono meta text; it is never the primary label.
+  var VERB_PLAIN = {
+    recall: "searched memory",
+    get: "looked up one record",
+    merged_entity: "viewed a merged entity",
+    activity: "viewed an activity timeline",
+    brief: "read an entity brief",
+    forget: "asked Verity to forget something (reversible)",
+    erasure: "ran a permanent erasure",
+    dsar_export: "exported a person's data (DSAR)",
+    media_sign: "signed a media download link",
+    debug_recall: "ran a why-trace (debug recall)",
+    fold_link: "linked two records after matching",
+    quarantine_reingest: "re-ingested a quarantined payload with corrected permissions",
+    quarantine_dismiss: "dismissed a quarantined payload (nothing indexed)",
+  };
+  function verbPlain(v) { return VERB_PLAIN[v] || String(v || "unknown action"); }
+
+  // Who acted, name first. fold_link rows are worker-plane (no actor);
+  // quarantine dispositions carry azp='admin'.
+  function actorPlain(r) {
+    if (r.actor_sub) return r.actor_sub;
+    if (r.verb === "fold_link") return "Verity's matching worker";
+    if (r.actor_azp === "admin") return "an admin";
+    if (r.actor_azp) return r.actor_azp;
+    return "actor not recorded";
   }
-  function resultCount(r) {
-    return (r.result_ids || []).length;
+  function actorSecondary(r) {
+    var bits = [];
+    if (r.actor_sub && r.actor_azp) bits.push("via " + r.actor_azp);
+    return bits.join(" ");
   }
-  function policyVersion(r) {
-    // Only real, if present. Never invented.
-    var v = r.policy_version;
-    if (v == null) v = r.purpose_policy_version;
-    if (v == null) v = r.policy_ver;
-    return v == null || v === "" ? null : String(v);
+  function confName(v) {
+    var n = V.CONF_NAMES;
+    return typeof v === "number" && n[v] ? n[v] : String(v);
   }
+  function resultCount(r) { return (r.result_ids || []).length; }
+  function resultPhrase(r) {
+    var n = resultCount(r);
+    if (COMPLIANCE_VERBS[r.verb] || r.verb === "fold_link") {
+      return n + " item" + (n === 1 ? "" : "s") + " on the record";
+    }
+    return n + " result" + (n === 1 ? "" : "s");
+  }
+  function aboutPhrase(r) {
+    var es = r.entity_scope || [];
+    if (!es.length) return "";
+    var shown = es.slice(0, 2).join(", ");
+    var more = es.length > 2 ? " +" + (es.length - 2) + " more" : "";
+    return "about " + shown + more;
+  }
+
+  // Honest defense signals: counted ONLY off a real per-row field or a verb
+  // that names a blocked read. Never inferred, never fabricated.
   function isBlocked(r) {
     return r.blocked === true || r.injection_blocked === true ||
            r.defense === true || String(r.verb || "").indexOf("blocked") >= 0;
   }
+  function hasDefenseSignal(r) {
+    return r.blocked !== undefined || r.injection_blocked !== undefined ||
+           r.defense !== undefined || r.leaked !== undefined;
+  }
   function leakedCount(r) {
-    // Honest: only if the row carries it. A blocked probe with no field is 0.
     if (typeof r.leaked === "number") return r.leaked;
     if (typeof r.leaked_items === "number") return r.leaked_items;
     return 0;
   }
-  function confName(v) {
-    var n = Verity.CONF_NAMES;
-    return typeof v === "number" && n[v] ? n[v] : String(v);
-  }
-  function resultIds(r) {
-    return Array.isArray(r.result_ids) ? r.result_ids : [];
+
+  /* ------------------------------------------------------------ state */
+
+  var LAST = [];        // fetched window, newest first (server order kept)
+  var PRINC = null;     // token → principal string (null = directory unavailable)
+  var SHOWN = [];       // rows currently painted (for drill lookup)
+  var OPEN = -1;        // index of the expanded row
+  var tenantNow = "";
+  var timer = null;     // auto-refresh handle
+  var TABLE_COLS = 5;
+
+  function el(id) { return V.$(id); }
+
+  // Name a principal token from the directory; degrade honestly.
+  function principalHtml(t) {
+    var name = PRINC && PRINC[t];
+    if (name) return '<b>' + V.esc(name) + '</b> ' + V.refSpan("#" + t);
+    return V.refSpan("#" + t) +
+      (PRINC ? ' <span class="refreshed">not in this tenant’s directory</span>'
+             : ' <span class="refreshed">directory unavailable</span>');
   }
 
-  // ---- reconstructed scope claims (drill-down) --------------------------
-  // Built ONLY from fields the audit row actually carries. Anything the row
-  // omits is shown as an honest "not recorded on this row", never invented.
-
-  // A principal that is an email string is an email-mapped identity — a TRUST
-  // DOWNGRADE (SPEC §6b). Flagged distinctly, consistent with Scope Inspector.
-  function principalChips(r) {
-    var ps = r.principals || [];
-    if (!ps.length) {
-      return '<span class="refreshed" title="empty principal set — such a scope sees nothing (fail closed)">&#8709; — empty (this scope sees nothing, fail closed)</span>';
-    }
-    return ps.map(function (t) {
-      var chip = Verity.badge("#" + t, "b-kind");
-      if (typeof t === "string" && /@/.test(t)) {
-        chip += ' ' + Verity.badge("trust downgrade", "b-downgrade");
-      }
-      return chip;
-    }).join(" ");
-  }
-  function claimVal(present, html) {
-    return present ? html : '<span class="refreshed">not recorded on this row</span>';
-  }
-
-  // ---- CSV / JSON (SIEM-shaped) export ----------------------------------
+  /* ------------------------------------------------------------ export */
 
   var CSV_COLS = [
-    "at", "verb", "actor_sub", "actor_azp", "principals", "entity_scope",
-    "confidentiality", "policy_version", "blocked", "leaked",
+    "at", "verb", "action_plain", "actor_sub", "actor_azp", "principals",
+    "principals_named", "entity_scope", "confidentiality", "blocked", "leaked",
     "query_summary", "result_count",
   ];
   function csvCell(s) {
@@ -109,12 +139,15 @@
     return {
       at: r.at,
       verb: r.verb,
+      action_plain: verbPlain(r.verb),
       actor_sub: r.actor_sub || "",
       actor_azp: r.actor_azp || "",
       principals: (r.principals || []).join("|"),
+      // Named ONLY from the real directory read; unknown tokens stay numeric.
+      principals_named: (r.principals || [])
+        .map(function (t) { return (PRINC && PRINC[t]) || ("#" + t); }).join("|"),
       entity_scope: (r.entity_scope || []).join("|"),
       confidentiality: confName(r.confidentiality),
-      policy_version: policyVersion(r) || "",
       blocked: isBlocked(r),
       leaked: leakedCount(r),
       query_summary: r.query_summary || "",
@@ -129,17 +162,16 @@
     });
     return lines.join("\r\n");
   }
-  function toSiemJson(rows, meta) {
-    // SIEM-shaped: a flat event array under a small envelope naming the source,
-    // tenant, window, and export time so a downstream pipeline can attribute it.
+  function toSiemJson(rows) {
     return JSON.stringify({
       source: "verity.access_audit",
       schema: "verity.audit.v1",
-      tenant_id: meta.tenant,
+      tenant_id: tenantNow,
       exported_at: new Date().toISOString(),
-      build_hash: Verity.buildHash(),
+      build_hash: V.buildHash(),
       window_rows: rows.length,
-      note: "Filtered window from GET /v1/admin/audit. Reading the audit is itself audited.",
+      note: "Filtered window from GET /v1/admin/audit. Reading the audit is itself audited. " +
+            "principals_named comes from GET /v1/admin/principals at export time.",
       events: rows.map(rowToFlat),
     }, null, 2);
   }
@@ -152,408 +184,471 @@
     setTimeout(function () { URL.revokeObjectURL(url); }, 0);
   }
 
-  // ---- filtering (client-side over the fetched window) ------------------
+  /* ------------------------------------------------------------ filtering */
 
-  function passesFilters(r, f) {
-    if (f.actor) {
-      var a = (actorStr(r)).toLowerCase();
-      if (a.indexOf(f.actor) < 0) return false;
-    }
-    if (f.verb && String(r.verb || "").toLowerCase() !== f.verb) return false;
-    if (f.entity) {
-      var es = (r.entity_scope || []).join(" ").toLowerCase();
-      if (es.indexOf(f.entity) < 0) return false;
-    }
-    if (f.conf !== "" && String(r.confidentiality) !== f.conf) return false;
-    if (f.policy) {
-      var pv = (policyVersion(r) || "").toLowerCase();
-      if (pv.indexOf(f.policy) < 0) return false;
-    }
-    if (f.from && new Date(r.at).getTime() < f.from) return false;
-    if (f.to && new Date(r.at).getTime() > f.to) return false;
-    if (f.q) {
-      var hay = ((r.query_summary || "") + " " + (r.verb || "") + " " + actorStr(r)).toLowerCase();
-      if (hay.indexOf(f.q) < 0) return false;
-    }
-    return true;
-  }
   function tsOrNull(v) {
     if (!v) return null;
     var t = new Date(v).getTime();
     return isNaN(t) ? null : t;
   }
+  function currentFilters() {
+    return {
+      q: el("au-f-q").value.trim().toLowerCase(),
+      verb: el("au-f-verb").value,
+      compliance: el("au-f-comp").checked,
+      actor: el("au-f-actor").value.trim().toLowerCase(),
+      entity: el("au-f-entity").value.trim().toLowerCase(),
+      conf: el("au-f-conf").value,
+      from: tsOrNull(el("au-f-from").value.trim()),
+      to: tsOrNull(el("au-f-to").value.trim()),
+    };
+  }
+  function passesFilters(r, f) {
+    if (f.verb && String(r.verb || "") !== f.verb) return false;
+    if (f.compliance && !COMPLIANCE_VERBS[r.verb]) return false;
+    if (f.actor) {
+      var a = ((r.actor_sub || "") + " " + (r.actor_azp || "")).toLowerCase();
+      if (a.indexOf(f.actor) < 0) return false;
+    }
+    if (f.entity) {
+      var es = (r.entity_scope || []).join(" ").toLowerCase();
+      if (es.indexOf(f.entity) < 0) return false;
+    }
+    if (f.conf !== "" && String(r.confidentiality) !== f.conf) return false;
+    if (f.from && new Date(r.at).getTime() < f.from) return false;
+    if (f.to && new Date(r.at).getTime() > f.to) return false;
+    if (f.q) {
+      var hay = ((r.query_summary || "") + " " + (r.verb || "") + " " + verbPlain(r.verb) +
+        " " + (r.actor_sub || "") + " " + (r.actor_azp || "") + " " +
+        (r.entity_scope || []).join(" ")).toLowerCase();
+      if (hay.indexOf(f.q) < 0) return false;
+    }
+    return true;
+  }
+  function filtered() {
+    var f = currentFilters();
+    return LAST.filter(function (r) { return passesFilters(r, f); });
+  }
+  function anyFilterOn() {
+    var f = currentFilters();
+    return !!(f.q || f.verb || f.compliance || f.actor || f.entity ||
+              f.conf !== "" || f.from || f.to);
+  }
 
-  Verity.register({
+  /* =========================================================== register */
+
+  V.register({
     id: "audit",
-    mount: function (section) {
-      var el = Verity.$("audit-mount");
-      if (!el) return;
 
-      var LAST = [];          // last fetched raw window (newest first)
-      var timer = null;       // auto-refresh handle
-
-      // per-panel read-only ribbon (v0.1 disclosure)
-      var tpl = Verity.$("ribbon-tpl");
-      if (tpl && tpl.content) {
-        var r = tpl.content.cloneNode(true);
-        var act = r.querySelector(".ribbon-action");
-        if (act) act.textContent = "drill-into-row / jump-to-inspector";
-        el.appendChild(r);
-      }
-
-      var card = document.createElement("div");
-      card.className = "card";
-      card.innerHTML =
-        '<h2>Access Audit <span class="sub">GET /v1/admin/audit &middot; newest first &middot; admin token</span></h2>' +
-
-        '<div class="note"><em>Audit of audit.</em> Reading this panel is itself an audited read and ' +
-        'requires the audit-reader role (SPEC §7e). Every row below is a <b>scoped read on the ' +
-        'record</b> — recall, get-by-id, adjacency, brief, subscription delivery, signed-media ' +
-        'redemption — plus compliance verbs (forget / erasure / dsar_export).</div>' +
-
-        // controls
-        '<div class="row" style="margin-top:10px">' +
-          '<div class="tight"><input type="text" id="au-tenant" placeholder="tenant_id (uuid)" size="30"></div>' +
-          '<div class="tight"><input type="number" id="au-limit" value="200" min="1" max="1000" style="width:90px" title="rows fetched (window)"></div>' +
-          '<div class="tight"><button id="au-load" class="primary">Load</button></div>' +
-          '<div class="tight"><label class="checkline"><input type="checkbox" id="au-auto"> auto-refresh (~5s)</label></div>' +
-          '<div class="tight"><span class="refreshed" id="au-stamp"></span></div>' +
+    mount: function () {
+      var host = el("audit-mount");
+      if (!host) return;
+      host.innerHTML =
+        /* ---- toolbar: state + as-of + refresh/export ---- */
+        '<div class="toolbar">' +
+          '<span id="au-state">' + V.stateChip("off", "waiting for a tenant") + '</span>' +
+          '<span class="asof" id="au-asof"></span>' +
+          '<span class="spacer"></span>' +
+          '<label class="checkline" title="plain re-read of GET /v1/admin/audit every 5 s — nothing touches the read path">' +
+            '<input type="checkbox" id="au-auto"> auto-refresh (5s)</label>' +
+          '<button id="au-csv" title="CSV of the filtered window">Export CSV</button>' +
+          '<button id="au-json" title="SIEM-shaped JSON of the filtered window">Export JSON</button>' +
+          '<button id="au-refresh">Refresh</button>' +
         '</div>' +
 
-        // filter bar (client-side over the fetched window)
-        '<div class="row" style="margin-top:8px">' +
-          '<div class="tight"><input type="text" id="f-actor" placeholder="actor (sub/azp)" size="16"></div>' +
-          '<div class="tight"><select class="field" id="f-verb">' +
-            '<option value="">verb: any</option>' +
-            '<option value="recall">recall</option>' +
-            '<option value="get">get</option>' +
-            '<option value="activity">activity</option>' +
-            '<option value="brief">brief</option>' +
-            '<option value="forget">forget</option>' +
-            '<option value="erasure">erasure</option>' +
-            '<option value="dsar_export">dsar_export</option>' +
-          '</select></div>' +
-          '<div class="tight"><input type="text" id="f-entity" placeholder="entity" size="12"></div>' +
-          '<div class="tight"><select class="field" id="f-conf">' +
-            '<option value="">conf: any</option>' +
-            '<option value="0">public</option>' +
-            '<option value="1">internal</option>' +
-            '<option value="2">confidential</option>' +
-            '<option value="3">restricted</option>' +
-          '</select></div>' +
-          '<div class="tight"><input type="text" id="f-policy" placeholder="policy ver" size="10"></div>' +
-          '<div class="tight"><input type="text" id="f-q" placeholder="search query summary" size="20"></div>' +
+        /* ---- simple filter bar (progressive; advanced collapsed) ---- */
+        '<div class="row" id="au-simple">' +
+          '<div><label for="au-f-q">search this window</label>' +
+            '<input type="text" id="au-f-q" placeholder="actor, entity, query text…" autocomplete="off"></div>' +
+          '<div class="tight" style="min-width:230px"><label for="au-f-verb">action</label>' +
+            '<select class="field" id="au-f-verb">' +
+              '<option value="">any action</option>' +
+              '<option value="recall">searched memory (recall)</option>' +
+              '<option value="get">looked up one record (get)</option>' +
+              '<option value="merged_entity">viewed a merged entity</option>' +
+              '<option value="brief">read an entity brief</option>' +
+              '<option value="activity">viewed activity</option>' +
+              '<option value="debug_recall">ran a why-trace</option>' +
+              '<option value="media_sign">signed a media link</option>' +
+              '<option value="fold_link">matching linked records</option>' +
+              '<option value="forget">forget (reversible)</option>' +
+              '<option value="erasure">permanent erasure</option>' +
+              '<option value="dsar_export">DSAR export</option>' +
+              '<option value="quarantine_reingest">quarantine re-ingest</option>' +
+              '<option value="quarantine_dismiss">quarantine dismiss</option>' +
+            '</select></div>' +
+          '<div class="tight"><label class="checkline" style="margin-bottom:7px" title="forget / erasure / dsar_export">' +
+            '<input type="checkbox" id="au-f-comp"> compliance events only</label></div>' +
+          '<div class="tight"><button id="au-adv-toggle">More filters</button></div>' +
+          '<div class="tight"><button id="au-f-clear">Clear</button></div>' +
         '</div>' +
-        '<div class="row" style="margin-top:6px">' +
-          '<div class="tight"><label class="checkline">from&nbsp;<input type="text" id="f-from" placeholder="YYYY-MM-DD HH:MM" size="17"></label></div>' +
-          '<div class="tight"><label class="checkline">to&nbsp;<input type="text" id="f-to" placeholder="YYYY-MM-DD HH:MM" size="17"></label></div>' +
-          '<div class="tight"><button id="f-clear">Clear filters</button></div>' +
-          '<div class="tight"><button id="au-csv">Export CSV</button></div>' +
-          '<div class="tight"><button id="au-json">Export JSON (SIEM)</button></div>' +
+
+        /* ---- advanced filters (collapsed by default) ---- */
+        '<div class="row" id="au-advanced" style="display:none;margin-top:8px">' +
+          '<div class="tight"><label for="au-f-actor">actor contains</label>' +
+            '<input type="text" id="au-f-actor" size="16" autocomplete="off"></div>' +
+          '<div class="tight"><label for="au-f-entity">entity contains</label>' +
+            '<input type="text" id="au-f-entity" size="14" autocomplete="off"></div>' +
+          '<div class="tight" style="min-width:150px"><label for="au-f-conf">ceiling</label>' +
+            '<select class="field" id="au-f-conf">' +
+              '<option value="">any ceiling</option>' +
+              '<option value="0">public</option><option value="1">internal</option>' +
+              '<option value="2">confidential</option><option value="3">restricted</option>' +
+            '</select></div>' +
+          '<div class="tight"><label for="au-f-from">from</label>' +
+            '<input type="text" id="au-f-from" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
+          '<div class="tight"><label for="au-f-to">to</label>' +
+            '<input type="text" id="au-f-to" placeholder="YYYY-MM-DD HH:MM" size="17"></div>' +
+          '<div class="tight"><label for="au-limit" title="rows fetched from the server (1-1000) — changing it refetches">window</label>' +
+            '<input type="number" id="au-limit" value="200" min="1" max="1000" style="width:90px"></div>' +
         '</div>' +
 
         '<div class="err" id="au-err"></div>' +
         '<div id="au-summary"></div>' +
         '<div id="au-out"></div>';
-      el.appendChild(card);
 
-      // prefill tenant from shared state / decoded handle
-      var tenantInput = Verity.$("au-tenant");
-      if (Verity.tenant()) tenantInput.value = Verity.tenant();
-      Verity.onTenant(function (t) {
-        if (t && !tenantInput.value) tenantInput.value = t;
+      /* ---- wiring ---- */
+      el("au-refresh").onclick = function () { V.reload("audit"); };
+      el("au-adv-toggle").onclick = function () {
+        var adv = el("au-advanced");
+        var on = adv.style.display === "none";
+        adv.style.display = on ? "" : "none";
+        el("au-adv-toggle").textContent = on ? "Fewer filters" : "More filters";
+      };
+      ["au-f-q", "au-f-actor", "au-f-entity", "au-f-from", "au-f-to"].forEach(function (id) {
+        el(id).addEventListener("input", rerender);
       });
-
-      // ---- rendering -----------------------------------------------------
-
-      function currentFilters() {
-        return {
-          actor: Verity.$("f-actor").value.trim().toLowerCase(),
-          verb: Verity.$("f-verb").value,
-          entity: Verity.$("f-entity").value.trim().toLowerCase(),
-          conf: Verity.$("f-conf").value,
-          policy: Verity.$("f-policy").value.trim().toLowerCase(),
-          q: Verity.$("f-q").value.trim().toLowerCase(),
-          from: tsOrNull(Verity.$("f-from").value.trim()),
-          to: tsOrNull(Verity.$("f-to").value.trim()),
-        };
-      }
-
-      function filtered() {
-        var f = currentFilters();
-        return LAST.filter(function (r) { return passesFilters(r, f); });
-      }
-
-      function renderSummary(rows) {
-        var probes = 0, leaked = 0, hasSignal = false;
-        rows.forEach(function (r) {
-          if (isBlocked(r)) { probes++; leaked += leakedCount(r); }
-          if (r.blocked !== undefined || r.injection_blocked !== undefined ||
-              r.defense !== undefined || r.leaked !== undefined) hasSignal = true;
-        });
-        var compliance = rows.filter(function (r) {
-          return COMPLIANCE_VERBS[r.verb];
-        }).length;
-
-        var strip = '<div class="note" style="margin-top:12px">' +
-          '<b>' + Verity.esc(rows.length) + '</b> row(s) in the filtered window' +
-          ' &middot; <b>' + Verity.esc(compliance) + '</b> compliance event(s) ' +
-          '(forget / erasure / dsar_export)';
-
-        if (hasSignal || probes > 0) {
-          strip += ' &middot; ' + Verity.badge(probes + " adversarial probe(s)", "b-defense") +
-            ' &middot; <b>' + Verity.esc(leaked) + ' leaked item(s)</b>';
-          if (leaked === 0) {
-            strip += ' <span class="refreshed">— fail-closed held</span>';
-          }
-        } else {
-          strip += ' &middot; <em>no defense signal in this window</em> ' +
-            '<span class="refreshed">(the audit endpoint does not yet emit a blocked-injection ' +
-            'flag; probes are not inferred — honest gap, not a fabricated zero)</span>';
+      ["au-f-verb", "au-f-conf"].forEach(function (id) {
+        el(id).addEventListener("change", rerender);
+      });
+      el("au-f-comp").addEventListener("change", rerender);
+      el("au-f-clear").onclick = function () {
+        ["au-f-q", "au-f-actor", "au-f-entity", "au-f-from", "au-f-to"].forEach(function (id) { el(id).value = ""; });
+        el("au-f-verb").value = ""; el("au-f-conf").value = "";
+        el("au-f-comp").checked = false;
+        rerender();
+      };
+      el("au-limit").addEventListener("change", function () { V.reload("audit"); });
+      el("au-csv").onclick = function () { exportRows("csv"); };
+      el("au-json").onclick = function () { exportRows("json"); };
+      el("au-auto").onchange = function (e) {
+        if (timer) { clearInterval(timer); timer = null; }
+        if (e.target.checked && tenantNow) {
+          timer = setInterval(function () { refresh(tenantNow); }, 5000);
         }
-        strip += '</div>';
-        Verity.$("au-summary").innerHTML = strip;
-      }
-
-      function verbCell(r) {
-        if (isBlocked(r)) {
-          return Verity.kindBadge(r.verb) + " " + Verity.badge("blocked probe", "b-defense");
-        }
-        return Verity.kindBadge(r.verb);
-      }
-
-      function policyCell(r) {
-        var v = policyVersion(r);
-        return v == null
-          ? '<span class="refreshed" title="the audit row carries no purpose-policy version">not recorded</span>'
-          : Verity.esc(v);
-      }
-
-      // The row set currently painted into the table, indexed by data-idx so a
-      // delegated click resolves the exact row object (survives re-filtering
-      // because we repaint SHOWN and clear it on every render).
-      var SHOWN = [];
-      var OPEN = -1;   // data-idx of the currently expanded row (-1 = none)
-
-      // Total columns incl. the leading expander — drill row spans all of them.
-      var TABLE_COLS = 10;
-
-      function renderTable(rows) {
-        SHOWN = rows;
-        OPEN = -1;
-        if (!rows.length) {
-          Verity.$("au-out").innerHTML =
-            '<div class="empty">no audit rows match — empty is a valid, on-the-record answer ' +
-            '(fail closed). Widen the window or clear filters.</div>';
-          return;
-        }
-        var head = '<div class="tablewrap"><table><thead><tr>' +
-          '<th aria-label="expand"></th>' +
-          '<th>at</th><th>verb</th><th>actor (sub · azp)</th><th>principals</th>' +
-          '<th>entity scope</th><th>conf</th><th>policy ver</th><th>query summary</th>' +
-          '<th class="num">results</th></tr></thead><tbody>';
-        var body = rows.map(function (r, i) {
-          var flag = (COMPLIANCE_VERBS[r.verb] || isBlocked(r)) ? " flag" : "";
-          var principals = (r.principals || []).length
-            ? (r.principals || []).map(function (t) { return "#" + Verity.esc(t); }).join(" ")
-            : '<span class="refreshed">∅</span>';
-          var ents = (r.entity_scope || []).length
-            ? Verity.entityBadges(r.entity_scope)
-            : '<span class="refreshed">—</span>';
-          return '<tr class="au-row' + flag + '" data-idx="' + i + '" ' +
-              'title="click to drill into this read — result_ids + reconstructed scope claims" ' +
-              'style="cursor:pointer">' +
-            '<td class="au-caret" aria-hidden="true">&#9656;</td>' +
-            '<td>' + Verity.esc(Verity.fmtTime(r.at)) + '</td>' +
-            '<td>' + verbCell(r) + '</td>' +
-            '<td>' + Verity.esc(actorStr(r)) + '</td>' +
-            '<td>' + principals + '</td>' +
-            '<td>' + ents + '</td>' +
-            '<td>' + Verity.confBadge(r.confidentiality) + '</td>' +
-            '<td>' + policyCell(r) + '</td>' +
-            '<td>' + Verity.esc(r.query_summary || "—") + '</td>' +
-            '<td class="num">' + resultCount(r) + '</td>' +
-          '</tr>' +
-          '<tr class="au-drill" data-drill="' + i + '" style="display:none">' +
-            '<td colspan="' + TABLE_COLS + '"></td>' +
-          '</tr>';
-        }).join("");
-        Verity.$("au-out").innerHTML = head + body + '</tbody></table></div>';
-      }
-
-      // ---- drill-down (v0.2) --------------------------------------------
-
-      // Toggle the expansion under row `i`, lazily rendering its body once.
-      function toggleDrill(i) {
-        var drill = document.querySelector('#au-out tr.au-drill[data-drill="' + i + '"]');
-        var mainRow = document.querySelector('#au-out tr.au-row[data-idx="' + i + '"]');
-        if (!drill || !mainRow) return;
-        var caret = mainRow.querySelector(".au-caret");
-        var isOpen = drill.style.display !== "none";
-        if (isOpen) {
-          drill.style.display = "none";
-          if (caret) caret.innerHTML = "&#9656;";
-          OPEN = -1;
-          return;
-        }
-        // Accordion: close any other open drill first.
-        if (OPEN >= 0 && OPEN !== i) {
-          var prev = document.querySelector('#au-out tr.au-drill[data-drill="' + OPEN + '"]');
-          var prevRow = document.querySelector('#au-out tr.au-row[data-idx="' + OPEN + '"]');
-          if (prev) prev.style.display = "none";
-          if (prevRow) { var pc = prevRow.querySelector(".au-caret"); if (pc) pc.innerHTML = "&#9656;"; }
-        }
-        var cell = drill.querySelector("td");
-        if (cell && !cell.getAttribute("data-rendered")) {
-          cell.innerHTML = drillBody(SHOWN[i]);
-          cell.setAttribute("data-rendered", "1");
-          var jump = cell.querySelector(".au-jump");
-          if (jump) jump.onclick = function () { jumpToInspector(SHOWN[i]); };
-        }
-        drill.style.display = "";
-        if (caret) caret.innerHTML = "&#9662;";
-        OPEN = i;
-      }
-
-      // The expansion body: exactly what THIS row carries — result_ids +
-      // reconstructed scope claims — plus the honest jump-to-Inspector seam.
-      function drillBody(r) {
-        var ids = resultIds(r);
-        // A row MAY carry a separate count without enumerating ids. Only then do
-        // we say "counted but not enumerated" — otherwise 0 ids means 0 results.
-        var sepCount = (typeof r.result_count === "number") ? r.result_count : null;
-        var idsHtml = ids.length
-          ? '<div style="display:flex;flex-wrap:wrap;gap:4px">' +
-              ids.map(function (id) { return Verity.badge(id, "b-kind"); }).join("") +
-            '</div>'
-          : (sepCount != null && sepCount > 0
-              ? '<span class="refreshed">' + sepCount + ' result(s) counted, but this row does not enumerate their ids (result_ids not recorded on this row)</span>'
-              : '<span class="refreshed">&#8709; — 0 results (nothing was returned under this scope; fail-closed empty is on the record)</span>');
-
-        var pv = policyVersion(r);
-        var hasEnts = (r.entity_scope || []).length > 0;
-        var claims =
-          '<dl class="kv">' +
-            '<dt>tenant_id</dt><dd>' + claimVal(!!r.tenant_id, Verity.esc(r.tenant_id || "")) + '</dd>' +
-            '<dt>actor (sub · azp)</dt><dd>' + Verity.esc(actorStr(r)) + '</dd>' +
-            '<dt>verb</dt><dd>' + verbCell(r) + '</dd>' +
-            '<dt>principals (tokens)</dt><dd>' + principalChips(r) + '</dd>' +
-            '<dt>entity_scope</dt><dd>' +
-              (hasEnts ? Verity.entityBadges(r.entity_scope)
-                       : '<span class="refreshed">unbound on this row (no entity restriction recorded)</span>') + '</dd>' +
-            '<dt>confidentiality ceiling</dt><dd>' + Verity.confBadge(r.confidentiality) + '</dd>' +
-            '<dt>purpose-policy version</dt><dd>' + claimVal(pv != null, Verity.esc(String(pv))) + '</dd>' +
-          '</dl>';
-
-        return '<div class="card" style="margin:6px 0">' +
-            '<h2>result_ids <span class="sub">' + ids.length + ' returned id(s) &middot; read-only — this is the audited record, not a recall surface</span></h2>' +
-            '<div class="note" style="margin-bottom:6px"><em>What this read returned.</em> These are opaque record/chunk ids exactly as the audit row stored them. ' +
-              'They are shown for the record only — the audit panel never re-issues the read (no recall affordance here; SPEC §3 read-path purity).</div>' +
-            idsHtml +
-
-            '<h2 style="margin-top:14px">reconstructed scope claims <span class="sub">derived only from this row</span></h2>' +
-            '<div class="note" style="margin-bottom:6px"><em>Reconstruction, not a decode.</em> These claims are read straight off the audit row. ' +
-              'The row does <b>not</b> carry the actor\'s signed <code>vs_&hellip;</code> handle, so this is not the same as decoding one on the Scope Inspector — ' +
-              'fields the row omits are marked <span class="refreshed">not recorded on this row</span>, never guessed.</div>' +
-            claims +
-
-            '<div class="actions" style="margin-top:12px">' +
-              '<button class="au-jump" title="Switch to the Scope Inspector and pre-fill the shared tenant. The row has no signed handle to decode, so live probes still require you to paste the actor\'s vs_… handle there.">' +
-                'Jump to Scope Inspector &rarr;</button>' +
-            '</div>' +
-            '<div class="note" style="margin-top:6px"><em>Honest seam.</em> The jump switches panels and seeds the shared <b>tenant_id</b> (the one cross-panel value we can carry). ' +
-              'It cannot run the Inspector\'s live probes for you: those decode a signed <code>vs_&hellip;</code> handle, and an audit row does not store one. ' +
-              'Compare the reconstructed claims above against a handle you paste there — we do not fabricate a handle to make the button look live.</div>' +
-          '</div>';
-      }
-
-      // Jump to Screen 1 via the router; seed ONLY the shared tenant (the sole
-      // legitimate cross-panel channel — no fabricated handle, no claim inject).
-      function jumpToInspector(r) {
-        if (r && r.tenant_id) Verity.setTenant(r.tenant_id);
-        Verity.show("scope");
-      }
-
-      // Delegated row-click → toggle drill. Ignore clicks on the jump button
-      // (its own handler runs) and on text selections.
-      Verity.$("au-out").addEventListener("click", function (ev) {
+      };
+      // delegated row click → drill
+      el("au-out").addEventListener("click", function (ev) {
         var t = ev.target;
-        if (t && t.closest && t.closest(".au-jump")) return;        // button handles itself
-        if (t && t.closest && t.closest("tr.au-drill")) return;     // inside an expansion
+        if (t && t.closest && t.closest("button")) return;   // buttons handle themselves
+        if (t && t.closest && t.closest("tr.au-drill")) return;
         var row = t && t.closest ? t.closest("tr.au-row") : null;
         if (!row) return;
         var idx = parseInt(row.getAttribute("data-idx"), 10);
         if (!isNaN(idx)) toggleDrill(idx);
       });
 
-      function rerender() {
-        var rows = filtered();
-        renderSummary(rows);
-        renderTable(rows);
-      }
+      if (!V.tenant()) renderNoTenant();
+    },
 
-      // ---- load ----------------------------------------------------------
+    // AUTOLOAD (LAW #3): the router runs this when the panel is shown and a
+    // tenant is known; re-runs on tenant change; deduped per tenant.
+    load: function (_s, tenant) {
+      tenantNow = tenant;
+      return refresh(tenant);
+    },
 
-      async function load() {
-        Verity.clearErr("au-err");
-        var tenant = tenantInput.value.trim();
-        if (!tenant) { Verity.err("au-err", new Error("enter a tenant_id to load its audit tail")); return; }
-        Verity.setTenant(tenant);
-        var limit = Math.max(1, Math.min(1000, parseInt(Verity.$("au-limit").value, 10) || 200));
-        try {
-          var rows = await Verity.api(
-            "/v1/admin/audit?tenant_id=" + encodeURIComponent(tenant) + "&limit=" + limit,
-            { admin: true });
-          LAST = Array.isArray(rows) ? rows : [];
-          Verity.$("au-stamp").textContent =
-            "refreshed " + Verity.fmtTime(Date.now()) + " · window " + LAST.length + " row(s)";
-          rerender();
-        } catch (e) {
-          Verity.err("au-err", e);
-          if (timer) { clearInterval(timer); timer = null; Verity.$("au-auto").checked = false; }
-        }
-      }
-
-      // ---- wiring --------------------------------------------------------
-
-      Verity.$("au-load").onclick = load;
-      ["f-actor", "f-entity", "f-policy", "f-q", "f-from", "f-to"].forEach(function (id) {
-        Verity.$(id).addEventListener("input", rerender);
-      });
-      ["f-verb", "f-conf"].forEach(function (id) {
-        Verity.$(id).addEventListener("change", rerender);
-      });
-      Verity.$("f-clear").onclick = function () {
-        ["f-actor", "f-entity", "f-policy", "f-q", "f-from", "f-to"].forEach(function (id) {
-          Verity.$(id).value = "";
-        });
-        Verity.$("f-verb").value = "";
-        Verity.$("f-conf").value = "";
-        rerender();
-      };
-
-      Verity.$("au-csv").onclick = function () {
-        var rows = filtered();
-        if (!rows.length) { Verity.err("au-err", new Error("nothing in the filtered window to export")); return; }
-        Verity.clearErr("au-err");
-        download("verity-audit-" + Date.now() + ".csv", "text/csv;charset=utf-8", toCsv(rows));
-      };
-      Verity.$("au-json").onclick = function () {
-        var rows = filtered();
-        if (!rows.length) { Verity.err("au-err", new Error("nothing in the filtered window to export")); return; }
-        Verity.clearErr("au-err");
-        download("verity-audit-" + Date.now() + ".json", "application/json",
-          toSiemJson(rows, { tenant: tenantInput.value.trim() }));
-      };
-
-      Verity.$("au-auto").onchange = function (e) {
-        if (e.target.checked) {
-          load();
-          timer = setInterval(load, 5000);
-        } else if (timer) {
-          clearInterval(timer); timer = null;
-        }
-      };
+    onShow: function () {
+      var p = V.navParams();
+      if (p && p.verb && el("au-f-verb")) { el("au-f-verb").value = p.verb; rerender(); }
     },
   });
+
+  /* ------------------------------------------------------------ no tenant */
+
+  function renderNoTenant() {
+    el("au-out").innerHTML =
+      '<div class="empty-teach sp-a">' +
+        '<div class="et-title">Pick a tenant to see its audit tail</div>' +
+        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle ' +
+          '&mdash; the audit loads by itself the moment a tenant is known. Every scoped read lands ' +
+          'here as it happens; nothing is sampled or summarized away.</div>' +
+        '<div class="et-actions"><button class="primary" id="au-mint">Mint a scope handle</button></div>' +
+      '</div>';
+    el("au-mint").onclick = function () { V.openMint(); };
+  }
+
+  /* ------------------------------------------------------------ load */
+
+  // Walk the principal directory (keyset pages) into a token→name map.
+  // Failure returns null — naming degrades to raw #tokens, disclosed inline.
+  async function fetchPrincipals(tenant) {
+    var map = {};
+    var after = 0;
+    for (var page = 0; page < 10; page++) {
+      var res = await V.api(
+        "/v1/admin/principals?tenant_id=" + encodeURIComponent(tenant) +
+        "&after_token=" + after + "&limit=1000", { admin: true });
+      ((res && res.principals) || []).forEach(function (p) { map[p.token] = p.principal; });
+      if (!res || res.next_after_token == null) break;
+      after = res.next_after_token;
+    }
+    return map;
+  }
+
+  async function refresh(tenant) {
+    V.clearErr("au-err");
+    el("au-state").innerHTML = V.stateChip("wait", "loading");
+    var limit = Math.max(1, Math.min(1000, parseInt(el("au-limit").value, 10) || 200));
+    try {
+      var results = await Promise.all([
+        V.api("/v1/admin/audit?tenant_id=" + encodeURIComponent(tenant) + "&limit=" + limit,
+          { admin: true }),
+        fetchPrincipals(tenant).catch(function () { return null; }),
+      ]);
+      LAST = Array.isArray(results[0]) ? results[0] : [];
+      PRINC = results[1];
+      el("au-state").innerHTML = LAST.length
+        ? V.stateChip("ok", LAST.length + " read" + (LAST.length === 1 ? "" : "s") + " on the record")
+        : V.stateChip("ok", "no reads yet");
+      el("au-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8) +
+        " · window " + LAST.length + " row" + (LAST.length === 1 ? "" : "s");
+      rerender();
+    } catch (e) {
+      el("au-state").innerHTML = V.stateChip("fail");
+      if (/HTTP 401/.test(String(e.message))) {
+        V.err("au-err", new Error(e.message +
+          "\nThis read needs the admin token — set it in the session bar (it lives in this tab only)."));
+      } else {
+        V.err("au-err", e);
+      }
+      if (timer) { clearInterval(timer); timer = null; el("au-auto").checked = false; }
+    }
+  }
+
+  /* ------------------------------------------------------------ summary */
+
+  function renderSummary(rows) {
+    if (!LAST.length) { el("au-summary").innerHTML = ""; return; }
+    var probes = 0, leaked = 0, signal = false;
+    rows.forEach(function (r) {
+      if (hasDefenseSignal(r)) signal = true;
+      if (isBlocked(r)) { probes++; leaked += leakedCount(r); }
+    });
+    var compliance = rows.filter(function (r) { return COMPLIANCE_VERBS[r.verb]; }).length;
+
+    // Blocked-injection summary — prominent AND honest (never a made-up zero).
+    var defense;
+    if (signal || probes > 0) {
+      defense = (leaked === 0
+          ? V.stateChip("ok", probes + " blocked probe" + (probes === 1 ? "" : "s") + " · 0 leaked — fail-closed held")
+          : V.stateChip("fail", leaked + " leaked item" + (leaked === 1 ? "" : "s") + " — investigate now"));
+    } else {
+      defense = V.stateChip("off", "no injection-defense signal recorded") +
+        ' <span class="refreshed">this endpoint does not yet emit a blocked-probe flag — ' +
+        'probes are not inferred; an honest gap, not a fabricated zero</span>';
+    }
+    el("au-summary").innerHTML =
+      '<div class="toolbar" style="margin:2px 0 10px">' +
+        '<span class="asof"><b style="color:var(--text)">' + rows.length + '</b> of ' + LAST.length +
+          ' loaded read' + (LAST.length === 1 ? "" : "s") + ' shown</span>' +
+        (compliance
+          ? '<span class="asof"><b style="color:var(--text)">' + compliance +
+            '</b> compliance event' + (compliance === 1 ? "" : "s") +
+            ' <span class="refreshed">(forget / erasure / DSAR)</span></span>'
+          : "") +
+        '<span class="spacer"></span>' + defense +
+      '</div>';
+  }
+
+  /* ------------------------------------------------------------ table */
+
+  function sentence(r) {
+    var about = aboutPhrase(r);
+    var html = '<b>' + V.esc(actorPlain(r)) + '</b> ' + V.esc(verbPlain(r.verb)) +
+      ' · <b>' + V.esc(resultPhrase(r)) + '</b>' +
+      (about ? ' · ' + V.esc(about) : '') +
+      ' · ' + V.esc(confName(r.confidentiality)) + ' ceiling';
+    var sec = actorSecondary(r);
+    var meta = [];
+    if (r.query_summary) meta.push('asked: “' + V.esc(r.query_summary) + '”');
+    if (sec) meta.push(V.esc(sec));
+    if (meta.length) html += '<div class="note" style="margin-top:2px">' + meta.join(' · ') + '</div>';
+    return html;
+  }
+
+  function rowChips(r) {
+    var chips = "";
+    if (COMPLIANCE_VERBS[r.verb]) chips += V.badge("compliance", "b-quarantined");
+    if (isBlocked(r)) chips += V.badge("blocked probe", "b-defense");
+    return chips;
+  }
+
+  function renderTable(rows) {
+    SHOWN = rows; OPEN = -1;
+    if (!LAST.length) {
+      el("au-out").innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">No reads on the record yet</div>' +
+          '<div class="et-body">The moment any agent or person reads through a scope handle ' +
+            '&mdash; a memory search, a record lookup, a brief &mdash; a row appears here. ' +
+            'Try it: mint a handle and run a probe in the Scope Inspector; your own read will ' +
+            'show up on refresh.</div>' +
+          '<div class="et-actions">' +
+            '<button class="primary" id="au-empty-mint">Mint a scope handle</button>' +
+            '<button id="au-empty-scope">Open the Scope Inspector</button>' +
+          '</div>' +
+        '</div>';
+      el("au-empty-mint").onclick = function () { V.openMint({ tenant: tenantNow }); };
+      el("au-empty-scope").onclick = function () { V.show("scope"); };
+      return;
+    }
+    if (!rows.length) {
+      el("au-out").innerHTML =
+        '<div class="note" style="margin-top:10px">0 of the ' + LAST.length +
+        ' loaded reads match these filters — the rows still exist one filter away. ' +
+        '<button id="au-empty-clear" style="margin-left:8px">Clear all filters</button></div>';
+      el("au-empty-clear").onclick = function () { el("au-f-clear").click(); };
+      return;
+    }
+    var head = '<div class="tablewrap"><table><thead><tr>' +
+      '<th aria-label="expand"></th>' +
+      '<th>when</th><th>what happened</th><th></th><th class="num">results</th>' +
+      '</tr></thead><tbody>';
+    var body = rows.map(function (r, i) {
+      var flag = (COMPLIANCE_VERBS[r.verb] || isBlocked(r)) ? " flag" : "";
+      return '<tr class="au-row' + flag + '" data-idx="' + i + '" style="cursor:pointer" ' +
+          'title="click to see exactly what this read returned and what the reader was allowed to see">' +
+        '<td class="au-caret" aria-hidden="true">&#9656;</td>' +
+        '<td style="white-space:nowrap" title="' + V.esc(V.fmtTime(r.at)) + '">' + V.esc(V.timeAgo(r.at)) + '</td>' +
+        '<td>' + sentence(r) + '</td>' +
+        '<td>' + rowChips(r) + '</td>' +
+        '<td class="num">' + resultCount(r) + '</td>' +
+      '</tr>' +
+      '<tr class="au-drill" data-drill="' + i + '" style="display:none">' +
+        '<td colspan="' + TABLE_COLS + '"></td>' +
+      '</tr>';
+    }).join("");
+    el("au-out").innerHTML = head + body + '</tbody></table></div>';
+  }
+
+  function rerender() {
+    var rows = filtered();
+    renderSummary(rows);
+    renderTable(rows);
+  }
+
+  /* ------------------------------------------------------------ drill-down */
+
+  function toggleDrill(i) {
+    var drill = document.querySelector('#au-out tr.au-drill[data-drill="' + i + '"]');
+    var mainRow = document.querySelector('#au-out tr.au-row[data-idx="' + i + '"]');
+    if (!drill || !mainRow) return;
+    var caret = mainRow.querySelector(".au-caret");
+    if (drill.style.display !== "none") {
+      drill.style.display = "none";
+      if (caret) caret.innerHTML = "&#9656;";
+      OPEN = -1;
+      return;
+    }
+    if (OPEN >= 0 && OPEN !== i) {
+      var prev = document.querySelector('#au-out tr.au-drill[data-drill="' + OPEN + '"]');
+      var prevRow = document.querySelector('#au-out tr.au-row[data-idx="' + OPEN + '"]');
+      if (prev) prev.style.display = "none";
+      if (prevRow) { var pc = prevRow.querySelector(".au-caret"); if (pc) pc.innerHTML = "&#9656;"; }
+    }
+    var cell = drill.querySelector("td");
+    if (cell && !cell.getAttribute("data-rendered")) {
+      cell.innerHTML = drillBody(SHOWN[i]);
+      cell.setAttribute("data-rendered", "1");
+      var jump = cell.querySelector(".au-jump");
+      if (jump) jump.onclick = function () {
+        if (SHOWN[i] && SHOWN[i].tenant_id) V.setTenant(SHOWN[i].tenant_id);
+        V.show("scope");
+      };
+      var quar = cell.querySelector(".au-quar");
+      if (quar) quar.onclick = function () { V.show("quarantine"); };
+    }
+    drill.style.display = "";
+    if (caret) caret.innerHTML = "&#9662;";
+    OPEN = i;
+  }
+
+  function drillBody(r) {
+    var ids = Array.isArray(r.result_ids) ? r.result_ids : [];
+
+    var returned;
+    if (ids.length) {
+      returned = '<div style="display:flex;flex-wrap:wrap;gap:4px 10px">' +
+        ids.map(function (id) { return V.refSpan(id); }).join("") + '</div>' +
+        '<div class="note" style="margin-top:4px">Record/chunk ids exactly as the audit stored them, ' +
+        'shown for the record only — this page never re-runs the read.</div>';
+    } else {
+      returned =
+        '<div class="empty-teach sp-b" style="margin:4px 0">' +
+          '<div class="et-title">0 results — and that can be correct</div>' +
+          '<div class="et-body">Fail-closed emptiness is a correct answer, not a bug: this reader ' +
+            'saw nothing because nothing matched what they were <b>allowed</b> to see. To see exactly ' +
+            'which filter dropped what, run this query through the why-trace in the Scope Inspector. ' +
+            'If the data may never have been indexed at all, check Quarantine.</div>' +
+          '<div class="et-actions">' +
+            '<button class="au-jump">Investigate in the Scope Inspector</button>' +
+            '<button class="au-quar">Check Quarantine</button>' +
+          '</div>' +
+        '</div>';
+    }
+
+    var ps = r.principals || [];
+    var who = ps.length
+      ? ps.map(principalHtml).join('<br>')
+      : '<span class="refreshed">nobody — an empty principal set sees nothing (fail closed)</span>';
+
+    var ents = (r.entity_scope || []).length
+      ? V.esc((r.entity_scope || []).join(", "))
+      : '<span class="refreshed">no entity restriction recorded on this row</span>';
+
+    return '<div class="card" style="margin:6px 0">' +
+        '<h2>What this read returned <span class="sub">' + ids.length + ' id(s) · read-only record</span></h2>' +
+        returned +
+
+        '<h2 style="margin-top:14px">What the reader was allowed to see</h2>' +
+        '<div class="note" style="margin:0 0 6px">Read straight off this audit row — fields the row ' +
+          'does not carry are said so, never guessed. Names come from the tenant’s principal directory.</div>' +
+        '<dl class="kv">' +
+          '<dt>who (as)</dt><dd>' + V.esc(actorPlain(r)) +
+            (r.actor_azp ? ' <span class="ref">azp: ' + V.esc(r.actor_azp) + '</span>' : '') + '</dd>' +
+          '<dt>could see</dt><dd>' + who + '</dd>' +
+          '<dt>limited to entities</dt><dd>' + ents + '</dd>' +
+          '<dt>confidentiality ceiling</dt><dd>' + V.confBadge(r.confidentiality) + '</dd>' +
+          '<dt>purpose policy</dt><dd><span class="refreshed">not recorded on this row</span></dd>' +
+          '<dt>action</dt><dd>' + V.esc(verbPlain(r.verb)) + ' <span class="ref">' + V.esc(r.verb) + '</span></dd>' +
+          '<dt>audit row</dt><dd>' + V.refSpan(r.id || "") + '</dd>' +
+        '</dl>' +
+
+        (ids.length
+          ? '<div class="actions" style="margin-top:12px;justify-content:flex-start">' +
+              '<button class="au-jump" title="Switches panels and carries the tenant. An audit row stores no signed vs_… handle, so live probes there still need you to paste or mint one — nothing is fabricated to make this button look live.">' +
+              'Compare in the Scope Inspector &rarr;</button></div>'
+          : '') +
+        '<div class="note" style="margin-top:6px"><em>Honest seam.</em> The jump carries only the tenant. ' +
+          'The row has no signed handle to decode — paste or mint one there to run live probes.</div>' +
+      '</div>';
+  }
+
+  /* ------------------------------------------------------------ export */
+
+  function exportRows(kind) {
+    var rows = filtered();
+    if (!rows.length) {
+      V.err("au-err", new Error("nothing in the filtered window to export" +
+        (anyFilterOn() ? " — clear filters to export the whole window" : "")));
+      return;
+    }
+    V.clearErr("au-err");
+    if (kind === "csv") {
+      download("verity-audit-" + Date.now() + ".csv", "text/csv;charset=utf-8", toCsv(rows));
+    } else {
+      download("verity-audit-" + Date.now() + ".json", "application/json", toSiemJson(rows));
+    }
+  }
 })();

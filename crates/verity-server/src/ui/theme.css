@@ -1,17 +1,20 @@
 /* ============================================================================
-   theme.css — DESIGN TOKENS ONLY  ·  FROZEN CONTRACT (T0.2)
+   theme.css — DESIGN TOKENS ONLY  ·  FROZEN CONTRACT (v2)
    ----------------------------------------------------------------------------
    The single shared design file. Panels CONSUME these classes and CSS custom
    properties; no panel (and no other core file) edits this file. Everything
-   here is a token or a badge-color rule — no layout, no component structure
-   (those live in core.css). If you are a panel builder, you only ever read
-   this. See the FROZEN CONTRACT returned by T0 for the class vocabulary.
+   here is a token or a color-vocabulary rule — no layout, no component
+   structure (those live in core.css).
 
-   Palette provenance: the dark GitHub-ish ground is inherited verbatim from
-   the original single-file ui.html so the console reads as the same product.
-   Accent (--accent, blue) is deliberately held DISTINCT from the semantic
-   green/amber/blue/red so an interactive accent never reads as a provenance
-   or confidentiality signal.
+   v2 evolution (the workbench rebuild): same dark GitHub-ish ground as v1 so
+   the console reads as the same product, but with REAL HIERARCHY —
+     • a genuine type scale (H1 → section → body → meta), with a humane sans
+       for prose/labels and mono RESERVED for refs/handles/ids/values;
+     • semantic STATE colors (ok / waiting / needs-you / failed) distinct from
+       the interactive accent, consumed by core.css `.state` chips;
+     • a spacing rhythm on the 4px base.
+   Every v1 token and badge class survives verbatim — panels built against v1
+   keep rendering while they are rebuilt against the v2 kit.
    ============================================================================ */
 
 :root {
@@ -19,16 +22,19 @@
   --bg:      #0d1117;   /* page ground */
   --panel:   #131920;   /* card / section surface */
   --panel2:  #1a2129;   /* raised surface: hit cards, inputs-on-panel, chips */
+  --panel3:  #212a34;   /* hover / active raised surface (v2) */
   --border:  #2b3540;   /* hairline dividers, card borders */
 
   /* ---- text ---- */
-  --text:    #cdd6df;   /* primary body text */
-  --dim:     #7d8894;   /* secondary / labels / muted meta */
+  --text:    #d6dee6;   /* primary body text (v2: one step brighter for sans) */
+  --dim:     #8b96a3;   /* secondary / labels / muted meta (v2: brighter) */
   --faint:   #4d5763;   /* tertiary: disabled, placeholder-ish */
+  --bright:  #f0f4f8;   /* headline / count numerals (v2) */
 
   /* ---- interactive accent (NOT a semantic color) ---- */
   --accent:      #58a6ff;
   --accent-soft: rgba(88, 166, 255, .10);
+  --accent-line: rgba(88, 166, 255, .50);
 
   /* ---- semantic hues (each with a soft fill + a border tint) ---- */
   --green:      #3fb950;  --green-soft:  rgba(63, 185, 80, .10);  --green-line:  rgba(63, 185, 80, .50);
@@ -37,26 +43,41 @@
   --red:        #f85149;  --red-soft:    rgba(248, 81, 73, .10);  --red-line:    rgba(248, 81, 73, .50);
   --violet:     #a371f7;  --violet-soft: rgba(163, 113, 247, .10);--violet-line: rgba(163, 113, 247, .50);
 
-  /* ---- type ---- */
+  /* ---- semantic STATE aliases (v2) — consumed by core.css .state chips ----
+     ok = healthy/settled · wait = in-flight/pending · attn = a human is
+     needed · fail = broken/refused. Distinct from --accent on purpose: an
+     interactive affordance must never read as a health signal. */
+  --state-ok:   var(--green);  --state-ok-soft:   var(--green-soft);  --state-ok-line:   var(--green-line);
+  --state-wait: var(--blue);   --state-wait-soft: var(--blue-soft);   --state-wait-line: var(--blue-line);
+  --state-attn: var(--amber);  --state-attn-soft: var(--amber-soft);  --state-attn-line: var(--amber-line);
+  --state-fail: var(--red);    --state-fail-soft: var(--red-soft);    --state-fail-line: var(--red-line);
+
+  /* ---- type (v2 scale) ----
+     Sans carries prose, labels, decisions; mono is RESERVED for refs,
+     handles, ids, and literal values — the humane/verbatim split. */
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --fs-xs:   10.5px;  /* table headers, chip micro-labels */
-  --fs-sm:   11px;    /* field labels, meta */
-  --fs-base: 13px;    /* body */
-  --fs-md:   14px;    /* panel titles */
-  --fs-lg:   18px;    /* app title */
+  --fs-sm:   11.5px;  /* field labels, meta, refs */
+  --fs-base: 13.5px;  /* body */
+  --fs-md:   15px;    /* section titles, dialog titles */
+  --fs-lg:   17px;    /* app title */
+  --fs-h1:   21px;    /* panel H1 (v2) */
+  --fs-num:  34px;    /* attention-card count numerals (v2) */
   --lh: 1.5;
 
   /* ---- spacing scale (4px base) ---- */
   --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;  --sp-4: 16px;
-  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;  --sp-10: 40px;
 
   /* ---- radii ---- */
   --r-sm: 6px;   /* inputs, buttons, hit cards */
   --r-md: 8px;   /* sections, dialogs */
-  --r-pill: 10px;/* badges */
+  --r-lg: 10px;  /* attention / decision cards (v2) */
+  --r-pill: 999px;/* badges, count pills */
 
   /* ---- chrome geometry (consumed by core.css layout) ---- */
-  --rail-w: 232px;
+  --rail-w: 236px;
   --header-h: 52px;
 }
 
@@ -113,3 +134,15 @@
 
 /* ---- trust-downgrade chip (email-mapped principals — SPEC §6b) ---- */
 .b-downgrade { color: var(--red);    border-color: var(--red-line); background: var(--red-soft); }
+
+/* ============================================================================
+   STATE-CHIP COLOR VOCABULARY (v2) — geometry lives in core.css `.state`.
+   The four visible states of THE LAW: healthy · waiting · needs-you · failed
+   (+ a neutral off/none). One chip per surface answers "what state is this
+   thing in?" at a glance.
+   ============================================================================ */
+.st-ok   { color: var(--state-ok);   border-color: var(--state-ok-line);   background: var(--state-ok-soft); }
+.st-wait { color: var(--state-wait); border-color: var(--state-wait-line); background: var(--state-wait-soft); }
+.st-attn { color: var(--state-attn); border-color: var(--state-attn-line); background: var(--state-attn-soft); }
+.st-fail { color: var(--state-fail); border-color: var(--state-fail-line); background: var(--state-fail-soft); }
+.st-off  { color: var(--dim);        border-color: var(--border);          background: var(--panel2); }

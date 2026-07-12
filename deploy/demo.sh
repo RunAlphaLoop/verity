@@ -90,3 +90,59 @@ curl -s -X POST "$VERITY/v1/forget" -H 'content-type: application/json' \
 HITS=$(curl -s -X POST "$VERITY/v1/recall" -H 'content-type: application/json' \
   -d "{\"scope_handle\":\"$SALES\",\"text\":\"wrong pricing disregard\",\"k\":5}" | jq '[.[] | select(.content | contains("disregard"))] | length')
 show "forget(episode) -> retracted note now returns $HITS results"
+
+say "6) Entity resolution: two CRMs, one company — and a fuzzy pair held for human review"
+cdc_src() { # connector table after_json — one CDC upsert from a named source
+  curl -s -X POST "$VERITY/v1/ingest/debezium?tenant_id=$TENANT" -H 'content-type: application/json' \
+    -d "{\"payload\":{\"after\":$3,\"source\":{\"connector\":\"$1\",\"db\":\"crm\",\"table\":\"$2\",\"ts_ms\":$NOW_MS},\"op\":\"c\"}}" >/dev/null
+}
+cdc_src salesforce accounts  '{"id":"sf-1001","name":"Vandelay Industries","Website":"https://vandelay.example","duns":"081466849"}'
+cdc_src hubspot    companies '{"id":"hs-77","name":"Vandelay Industries Inc","domain":"vandelay.example","duns":"081466849"}'
+show "salesforce + hubspot each hold the same company; both carry DUNS 081466849 (a strong crosswalk key)"
+cdc_src salesforce accounts  '{"id":"sf-2002","name":"Initech LLC","Website":"https://initech.example"}'
+cdc_src hubspot    companies '{"id":"hs-88","name":"Initech","domain":"initech.example"}'
+show "a second pair shares only a similar name/domain — no strong key, so Tier-1 must NOT weld it"
+curl -s -X POST "$VERITY/v1/admin/entity-evidence" -H 'content-type: application/json' -d "{
+  \"tenant_id\":\"$TENANT\",\"left_ref\":\"hubspot:crm.companies:hs-88\",
+  \"right_ref\":\"salesforce:crm.accounts:sf-2002\",\"tier\":2,\"method\":\"name_domain_fuzzy\",
+  \"score\":0.9,
+  \"evidence_l0_ref\":\"demo: fuzzy name+domain similarity — needs a human decision\"}" >/dev/null
+RUN=$(curl -s -X POST "$VERITY/v1/admin/entity-resolution/run" -H 'content-type: application/json' \
+  -d "{\"tenant_id\":\"$TENANT\"}")
+show "$(echo "$RUN" | jq -r '"resolution run -> \(.evidence_produced) new Tier-1 evidence, \(.canonicals) canonical(s) welded — the weak pair did NOT weld"')"
+REVIEW=$(curl -s "$VERITY/v1/admin/entity-resolution/review-queue?tenant_id=$TENANT" | jq length)
+show "human review queue -> $REVIEW candidate(s): Tier-2 never auto-merges; confirm/reject stays a human verb"
+
+say "7) Knowledge: the same lesson observed by three scoped agents -> candidates, never auto-published"
+INITECH=$(mint '[11]' '["account:initech"]' 'agent:ops-bot')
+LESSON="Renewal conversations stall unless pricing is confirmed before the quarterly board review."
+observe() { curl -s -X POST "$VERITY/v1/episodes" -H 'content-type: application/json' \
+  -d "{\"scope_handle\":\"$1\",\"observation\":\"$2\"}" | jq -r .episode_id; }
+E1=$(observe "$SALES"   "Renewal stalled again until pricing was confirmed ahead of the board review.")
+E2=$(observe "$SUPPORT" "Ticket resolved only after pricing confirmation unblocked the renewal discussion.")
+E3=$(observe "$INITECH" "Procurement said the renewal waits for the quarterly board review either way.")
+propose() { curl -s -X POST "$VERITY/v1/knowledge" -H 'content-type: application/json' -d "{
+  \"scope_handle\":\"$1\",\"statement\":\"$LESSON\",\"categories\":[\"sales-process\"],\"evidence\":[\"$2\"]}" >/dev/null; }
+propose "$SALES" "$E1"; propose "$SUPPORT" "$E2"; propose "$INITECH" "$E3"
+KN=$(curl -s "$VERITY/v1/knowledge?tenant_id=$TENANT" | jq '[.items[] | select(.status=="candidate")] | length')
+show "knowledge queue -> $KN candidate(s) of the same statement from three writers; publish stays a human gate"
+
+say "8) Operability: a connector heartbeat, and a payload nobody can map"
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+curl -s -X POST "$VERITY/v1/admin/connector-status" -H 'content-type: application/json' -d "{
+  \"tenant_id\":\"$TENANT\",\"source\":\"salesforce:crm.accounts\",\"cursor\":\"$TS\",
+  \"items_synced\":2,\"last_event_at\":\"$TS\"}" >/dev/null
+HB=$(curl -s "$VERITY/v1/admin/connector-status?tenant_id=$TENANT" | jq length)
+show "connector heartbeat posted -> $HB source(s) reporting"
+QFLAG=$(curl -s -X POST "$VERITY$WH" -H 'content-type: application/json' \
+  -d '{"schema":"vendor-x/lead.v2","rows":[["hot",42]]}' | jq -r .quarantined)
+QN=$(curl -s "$VERITY/v1/admin/quarantine?tenant_id=$TENANT" | jq length)
+show "unmappable webhook payload -> quarantined=$QFLAG ($QN item(s) await triage; never indexed permissively)"
+
+say "Open the console — everything above is inspectable"
+CONSOLE_HANDLE=$(mint '[11]' '[]' 'agent:console-operator')
+show "console   $VERITY/ui"
+show "tenant    $TENANT"
+show "handle    $CONSOLE_HANDLE"
+show "paste the handle into the console's Scope panel at $VERITY/ui to decode it and run scoped"
+show "recalls as this principal; the tenant id above unlocks the admin panels."

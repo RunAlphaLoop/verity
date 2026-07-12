@@ -1,45 +1,28 @@
 <!-- ==========================================================================
-     panel_principals.html — Screen 8 · Principals & Groups  (Later → live)
+     panel_principals.html — People & groups (v2 rebuild · UI-ACTIONS N5)
      --------------------------------------------------------------------------
-     The identity/membership half of the admin-curation pair (UI-SPEC §5
-     Screens 8-9). Entity aliases/precedence live with the ENTITIES panel and
-     are owned elsewhere — this screen is purely principals + ReBAC membership.
+     The identity DIRECTORY: who Verity can name for this tenant, with the
+     numbers ("tokens") its visibility rules reference. Rebuilt from the old
+     write-only trio of forms into a read-first surface:
 
-     THREE cards, all ADMIN-GATED (admin bearer; calls pass {admin:true}):
+       • AUTOLOADS the directory via GET /v1/admin/principals (keyset-paginated
+         admin read — names first, tokens secondary mono).
+       • "Add a person or group" — the founder-named task — is one primary
+         button opening a plain-language dialog over POST /v1/admin/principals.
+       • Group membership add/remove ride POST/DELETE /v1/admin/groups. Removal
+         keeps its fail-closed ceremony: typed confirm, and the human-words
+         explanation that removing hides everything the group grants on the
+         very next read (tombstones-first stays as secondary mono jargon).
+       • Fail-closed honesty kept verbatim: ReBAC-unconfigured 503s surface
+         as-is; nothing is defaulted; membership is disclosed as not-yet-
+         listable (GET /v1/admin/groups does not exist yet — UI-ACTIONS X8).
 
-       (A) PRINCIPALS — upsert principal strings → materialized int tokens
-           (POST /v1/admin/principals). Enter one-or-many principal strings;
-           the resulting {principal → token} mappings are shown. Idempotent:
-           an existing principal keeps its token, a new one is allocated
-           max(token)+1 per tenant.
-
-       (B) ADD GROUP MEMBER — write a membership tuple
-           (POST /v1/admin/groups). group = "group:<name>", member =
-           "user:<id>" or "group:<inner>" (nested). The group's + member's
-           principal tokens are allocated eagerly so visibility sets and
-           revocation tombstones can reference them; they are shown on success.
-
-       (C) REMOVE GROUP MEMBER — DELETE /v1/admin/groups, behind a STRONG
-           confirm dialog. Removal writes revocation TOMBSTONES FIRST
-           (fail-closed ordering — a tombstone-write failure aborts the delete
-           and over-hides, never under-hides), and the removed subtree is
-           HIDDEN ON THE VERY NEXT READ within the revocation window. The
-           confirm dialog states this verbatim (drift-window note) before it
-           will fire the destructive call.
-
-     HONESTY (SPEC §3): no default, no permissive affordance. Removal is never
-     a bare button — it is gated behind the tombstone-warning confirm. Group
-     management requires ReBAC server-side; if it is unconfigured the server
-     answers 503 and we surface that error faithfully rather than faking a
-     success. Zero LLM calls, zero live-ReBAC calls originate from this file —
-     every mutation is a plain admin-token fetch to a real endpoint.
-
-     Owns ONLY this file + panel_principals.js. Reuses frozen theme/core
-     classes + Verity.* helpers; never edits them. Mounts into
-     #principals-mount.
+     Owns ONLY this file + panel_principals.js. Same panel id + mount id +
+     register id as v1 so shell/mod.rs wiring holds. Frozen theme/core classes
+     and Verity.* helpers only; zero external requests.
      ========================================================================== -->
 <section class="panel" id="panel-principals">
-  <h1>Principals &amp; Groups</h1>
-  <div class="subtitle"><b>The identity &amp; membership plane.</b> Materialize principal strings into the int tokens that visibility sets and handles reference, and curate ReBAC group membership. Removing a member writes revocation tombstones <b>first</b> and hides the member on the very next read — admin-gated, fail-closed, never a permissive default.</div>
+  <h1>People &amp; groups</h1>
+  <div class="lede">Everyone Verity can name for this tenant — the people and groups that <b>&ldquo;who can see this&rdquo;</b> rules point at. Add people, put them in groups, or take them out; removing someone hides everything the group granted on their very next read.</div>
   <div id="principals-mount"></div>
 </section>

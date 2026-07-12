@@ -1,39 +1,43 @@
 <!-- ==========================================================================
-     panel_sources.html — Screen 5 · Sources & Freshness (v0.2, READ-ONLY)
+     panel_sources.html — Sources & Freshness (v2 rebuild · UN-SEAMED, N4)
      --------------------------------------------------------------------------
-     Operator seat. Three admin reads, no writes in v0.2 (manifest install /
-     activate and webhook mint / revoke are Later and are rendered as DISABLED
-     SEAMS we design but never fake — SPEC §5 Screen 5 'Actions'):
+     The operator's ingest seat, rebuilt to THE LAW (UI-ACTIONS §0): plain
+     language first, autoloaded data, visible state, teaching empty states —
+     and the four write verbs that were disabled seams in v0.2 are now LIVE:
+
+       • Connect a source  — POST /v1/webhooks (mint a scoped ingest URL;
+         the secret URL is SHOWN ONCE with copy-once UI, never re-fetched)
+       • Shut off a source — DELETE /v1/webhooks/{id} (typed confirm)
+       • Install manifest  — POST /v1/manifests (always lands as a DRAFT)
+       • Approve & activate — POST /v1/manifests/{id}/activate — the spec's
+         mandated HUMAN GATE: separate step, typed confirm, approver name
+         required and recorded in the audit log. Never a flag flip.
+
+     Reads (all admin-token, all pure — zero LLM, zero live-ReBAC):
        • GET /v1/admin/connector-status — latest heartbeat per source
-       • GET /v1/slo/freshness          — per-source freshness percentiles
-       • GET /v1/admin/backfill         — latest backfill run per source
+       • GET /v1/slo/freshness          — real p50/p95/p99 per source
+       • GET /v1/admin/backfill         — latest catch-up run per source
+       • GET /v1/manifests              — draft/active blueprints
+       • GET /v1/admin/principals       — names for the who-can-see picker
 
-     HONESTY (SPEC §3 non-negotiables · CLAUDE.md 'every measured number honest'):
-     • The connector-status row carries source / cursor / items_synced /
-       last_event_at / updated_at — and NOTHING ELSE. It has no ACL-provenance
-       tier, no truth-vs-convenience lane, and no inline error column. This
-       panel therefore renders tier + lane ONLY from a real per-row signal if
-       one is ever present, and otherwise says 'not reported by
-       connector-status' — it NEVER guesses a lane, because a mislabeled lane
-       would violate 'two lanes, labeled, never blurred' (SPEC §5e.6).
-     • The freshness endpoint computes p50 + p95 only. It emits NO p99 and NO
-       SLO target. The p99 column is therefore an honest seam (labeled 'not
-       computed by /v1/slo/freshness') rather than a fabricated percentile, and
-       the SLO target is OPERATOR-SET here (a client-side input), disclosed as
-       such — breach highlighting compares real p50/p95 against a stated target.
-     • Each source shows its TRUE cadence, read from the real gap between events
-       (last_event_at) and heartbeats — a daily-sync source is shown as daily
-       and never inherits a flagship 'seconds' claim (SPEC §5d).
-     • Backfill progress is determinate ONLY when total is known; otherwise a
-       striped indeterminate track. ETA is shown ONLY when a run is genuinely
-       running with a known total and forward progress (SPEC §7 Migrations
-       honesty, reused here).
+     HONESTY KEPT FROM v0.2 (CLAUDE.md 'every measured number honest'):
+     • Percentiles come from real samples over the stated window; null = "—",
+       never a fabricated number. They are session-local deployment numbers,
+       labeled NOT the published benchmark.
+     • The alert threshold is operator-set in the console and labeled so —
+       the server enforces no SLO here.
+     • Heartbeat rows carry no lane/tier — we say "not reported", never guess
+       (a mislabeled lane would blur the two lanes, SPEC §5e.6). Lanes ARE
+       real on manifests (acl_mode) and are explained in plain words there.
+     • Backfill bars are determinate only when a total is known; ETA only for
+       a running job with forward progress. A source seen by freshness with
+       no heartbeat gets a reconciling note, not a contradiction.
 
-     Owns ONLY this file + panel_sources.js. Reuses frozen theme/core classes +
-     Verity.* helpers; never edits them. Mounts into #sources-mount.
+     Owns ONLY this file + panel_sources.js. Same panel id + mount id +
+     register shape as v0.2 so wiring holds. Frozen theme/core classes only.
      ========================================================================== -->
 <section class="panel" id="panel-sources">
-  <h1>Sources &amp; Freshness</h1>
-  <div class="subtitle"><b>The operator's inventory.</b> Per-source ACL-provenance tier and lane, sync liveness and staleness, freshness-vs-SLO, and backfill progress — every number measured or honestly absent, never fabricated.</div>
+  <h1>Sources &amp; freshness</h1>
+  <div class="lede">Every pipe feeding data into Verity — whether each source is alive, how fast new data becomes searchable, and the controls to connect a new source, shut one off, or approve how a source&rsquo;s permissions map in.</div>
   <div id="sources-mount"></div>
 </section>

@@ -1,12 +1,29 @@
 /* ============================================================================
-   core.css — LAYOUT PRIMITIVES  ·  FROZEN (T0.3)
+   core.css — LAYOUT + THE v2 COMPONENT KIT  ·  FROZEN (workbench rebuild)
    ----------------------------------------------------------------------------
    Structural / component CSS built on theme.css tokens. Panels compose these
    classes; they do not redefine them. Colors come from theme.css only — this
    file reaches for var(--*) and never hard-codes a hue.
 
-   Vocabulary panels reuse: .badge (+ .b-inferred modifier), .card, .tablewrap,
-   table, .bar, .dialog, button, .note/.ribbon, .kv, .hit, .row, inputs.
+   v1 vocabulary (kept verbatim for panels not yet rebuilt): .badge
+   (+ .b-inferred), .card, .tablewrap, table, .bar, .dialog, button,
+   .note/.ribbon, .kv, .hit, .row, inputs, .err, .empty, .refreshed.
+
+   v2 kit (THE workbench components — every rebuilt panel uses these):
+     .lede             — the one-sentence "what is this screen" opener
+     .state            — visible-state chip (+ .st-ok/.st-wait/.st-attn/
+                         .st-fail/.st-off colors from theme.css)
+     .attn-grid/.attn-card — home attention cards (count + meaning + 1 click)
+     .decision-card    — a human decision: question, two sides, evidence,
+                         verdict buttons (.dc-question/.dc-sides/.dc-side/
+                         .dc-vs/.dc-evidence/.dc-meta/.dc-actions)
+     .entity-chip      — humane named-thing chip (name first, source small)
+     .ref              — raw ref/uuid/handle: mono, small, dim — NEVER primary
+     .empty-teach      — empty state that TEACHES (+ .sp-a/.sp-b/.sp-c species)
+     .toolbar          — panel control strip
+     .count-pill       — rail count badge (Verity.setCount)
+     .asof             — as-of/last-checked stamp
+     button.good/.danger — semantic action buttons beside .primary
    ============================================================================ */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -14,14 +31,15 @@
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--mono);
+  font-family: var(--sans);
   font-size: var(--fs-base);
   line-height: var(--lh);
 }
 
+/* mono is RESERVED for verbatim machine text */
+code, pre, .ref, .mono { font-family: var(--mono); }
+
 /* ---------------------------------------------------------------- app shell */
-/* Fixed left rail + header, scrollable content pane. The shell markup lives in
-   shell.html; these rules give it geometry. */
 #app { min-height: 100vh; }
 
 #topbar {
@@ -32,38 +50,65 @@ body {
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
-#topbar .brand { font-size: var(--fs-lg); font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+#topbar .brand { font-size: var(--fs-lg); font-weight: 650; letter-spacing: .01em; white-space: nowrap; color: var(--bright); }
 #topbar .brand .v { color: var(--accent); }
 #topbar .spacer { flex: 1; }
-#topbar .buildhash { color: var(--faint); font-size: var(--fs-sm); white-space: nowrap; }
+#topbar .buildhash { color: var(--faint); font-size: var(--fs-sm); white-space: nowrap; font-family: var(--mono); }
+
+/* slim session strip under the topbar: tenant + admin token, always visible */
+#sessionbar {
+  position: sticky; top: var(--header-h); z-index: 29;
+  display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+  padding: 6px var(--sp-4);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm); color: var(--dim);
+}
+#sessionbar label { display: inline; margin: 0; text-transform: none; letter-spacing: 0; font-size: var(--fs-sm); }
+#sessionbar input {
+  width: 300px; max-width: 40vw; padding: 3px 8px; font-size: var(--fs-sm);
+  background: var(--panel); font-family: var(--mono);
+}
+#sessionbar input#adminToken { width: 210px; }
+#sessionbar .sess-field { display: inline-flex; align-items: center; gap: 6px; }
 
 #shell { display: flex; align-items: stretch; }
 
 #rail {
   flex: 0 0 var(--rail-w);
   border-right: 1px solid var(--border);
-  padding: var(--sp-4) 0;
+  padding: var(--sp-3) 0 var(--sp-6);
   min-height: calc(100vh - var(--header-h));
 }
 #rail .group-label {
-  color: var(--dim); font-size: var(--fs-xs); text-transform: uppercase;
-  letter-spacing: .1em; padding: var(--sp-2) var(--sp-4) var(--sp-1);
+  color: var(--faint); font-size: var(--fs-xs); text-transform: uppercase;
+  letter-spacing: .12em; padding: var(--sp-2) var(--sp-4) var(--sp-1); font-weight: 600;
 }
-#rail .group-label:not(:first-child) { margin-top: var(--sp-3); }
+#rail .group-label:not(:first-child) { margin-top: var(--sp-4); }
 #rail .navitem {
-  display: flex; align-items: baseline; gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-4);
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 7px var(--sp-4);
   color: var(--text); cursor: pointer; border-left: 2px solid transparent;
-  font-size: 12.5px;
+  font-size: 13px;
 }
 #rail .navitem:hover { background: var(--panel); }
 #rail .navitem.active { background: var(--panel); border-left-color: var(--accent); color: var(--accent); }
 #rail .navitem.soon { color: var(--faint); cursor: not-allowed; }
 #rail .navitem.soon:hover { background: transparent; }
-#rail .navitem .num { color: var(--faint); font-size: var(--fs-sm); min-width: 1.2em; }
+#rail .navitem .num { color: var(--faint); font-size: var(--fs-sm); min-width: 1.1em; }
 #rail .navitem .tag {
   margin-left: auto; font-size: var(--fs-xs); color: var(--faint);
   border: 1px solid var(--border); border-radius: var(--r-pill); padding: 0 5px;
+}
+/* live count pill (Verity.setCount) — amber: a count here means work waits */
+#rail .navitem .count-pill { margin-left: auto; }
+.count-pill {
+  display: inline-block; min-width: 20px; text-align: center;
+  font-size: var(--fs-xs); font-weight: 700; line-height: 16px;
+  padding: 0 6px; border-radius: var(--r-pill);
+  color: var(--state-attn); background: var(--state-attn-soft);
+  border: 1px solid var(--state-attn-line);
+  font-variant-numeric: tabular-nums;
 }
 
 #content { flex: 1; min-width: 0; padding: var(--sp-5) var(--sp-5) 80px; }
@@ -83,13 +128,18 @@ body {
 .session-badge { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 
 /* ------------------------------------------------------------------ panels */
-/* Each panel is a <section class="panel"> hidden until routed to. */
 .panel { display: none; }
 .panel.active { display: block; }
 .panel > h1 {
-  font-size: var(--fs-md); font-weight: 600; letter-spacing: .02em;
-  margin-bottom: var(--sp-1);
+  font-size: var(--fs-h1); font-weight: 650; letter-spacing: -.01em;
+  color: var(--bright); margin-bottom: var(--sp-1);
 }
+/* THE LAW #3: every screen opens with one sentence saying what it is. */
+.panel > .lede, .lede {
+  color: var(--dim); font-size: var(--fs-base); margin-bottom: var(--sp-5); max-width: 72ch;
+}
+.lede b { color: var(--text); font-weight: 600; }
+/* v1 subtitle kept for not-yet-rebuilt panels */
 .panel > .subtitle { color: var(--dim); margin-bottom: var(--sp-4); font-size: 12.5px; }
 .panel > .subtitle b { color: var(--text); font-weight: 600; }
 
@@ -102,13 +152,125 @@ body {
   margin-bottom: var(--sp-4);
 }
 .card > h2 {
-  font-size: var(--fs-base); font-weight: 600; text-transform: uppercase;
-  letter-spacing: .08em; color: var(--accent); margin-bottom: var(--sp-3);
+  font-size: var(--fs-md); font-weight: 650; letter-spacing: 0;
+  color: var(--bright); margin-bottom: var(--sp-3);
 }
 .card > h2 .sub {
-  color: var(--dim); text-transform: none; letter-spacing: 0; font-weight: 400;
-  margin-left: var(--sp-2); font-size: 12px;
+  color: var(--faint); font-weight: 400;
+  margin-left: var(--sp-2); font-size: var(--fs-sm); font-family: var(--mono);
 }
+
+/* ------------------------------------------------------- v2 · state chips */
+/* One chip answers "what state is this in?" — colors from theme (.st-*). */
+.state {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border); border-radius: var(--r-pill);
+  padding: 1px 10px 1px 8px; font-size: var(--fs-sm); font-weight: 600;
+  white-space: nowrap; vertical-align: middle;
+}
+.state::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+
+/* --------------------------------------------- v2 · home attention cards */
+.attn-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: var(--sp-4); margin-bottom: var(--sp-4);
+}
+.attn-card {
+  display: block; text-align: left; width: 100%;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r-lg); padding: var(--sp-4);
+  cursor: pointer; font: inherit; color: inherit;
+  white-space: normal; font-weight: 400; /* undo <button> defaults */
+  transition: border-color .12s ease, background .12s ease;
+}
+.attn-card:hover { border-color: var(--accent-line); background: var(--panel2); }
+.attn-card .attn-top { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-2); flex-wrap: wrap; }
+.attn-card .attn-title { font-size: var(--fs-base); font-weight: 650; color: var(--bright); }
+.attn-card .attn-count {
+  font-size: var(--fs-num); font-weight: 700; line-height: 1.1;
+  color: var(--bright); font-variant-numeric: tabular-nums; margin: 2px 0 4px;
+}
+.attn-card.attn-needs .attn-count { color: var(--state-attn); }
+.attn-card.attn-fail  .attn-count { color: var(--state-fail); }
+.attn-card .attn-desc { color: var(--dim); font-size: var(--fs-sm); min-height: 2.6em; }
+.attn-card .attn-foot { margin-top: var(--sp-2); display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+
+/* -------------------------------------------------- v2 · decision cards */
+/* A human decision: the question in plain words, both sides, the evidence,
+   and the verdict buttons. Nothing else on the card. */
+.decision-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r-lg); padding: var(--sp-4); margin-bottom: var(--sp-4);
+}
+.decision-card.dc-flag { border-left: 3px solid var(--state-attn); }
+.dc-topline { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-2); }
+.dc-question { font-size: var(--fs-md); font-weight: 650; color: var(--bright); margin-bottom: var(--sp-3); }
+.dc-sides { display: flex; align-items: stretch; gap: var(--sp-3); flex-wrap: wrap; }
+.dc-side {
+  flex: 1; min-width: 210px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--sp-3);
+}
+.dc-side .dc-name { font-size: var(--fs-md); font-weight: 650; color: var(--bright); }
+.dc-side .dc-src { color: var(--dim); font-size: var(--fs-sm); margin-top: 2px; }
+.dc-side .ref { display: block; margin-top: var(--sp-2); }
+.dc-vs { flex: 0 0 auto; align-self: center; color: var(--faint); font-size: 15px; padding: 0 2px; white-space: nowrap; }
+.dc-evidence {
+  margin-top: var(--sp-3); padding: var(--sp-2) var(--sp-3);
+  background: var(--accent-soft); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-size: var(--fs-sm); color: var(--text);
+}
+.dc-evidence b { color: var(--bright); }
+.dc-meta { margin-top: var(--sp-2); color: var(--faint); font-size: var(--fs-xs); font-family: var(--mono); }
+.dc-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); flex-wrap: wrap; }
+
+/* ------------------------------------------------- v2 · humane entity chip */
+/* Name FIRST; source/ref small and secondary. THE LAW #1/#2. */
+.entity-chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--panel2); padding: 2px 8px; font-size: var(--fs-sm);
+  vertical-align: middle; margin: 1px 4px 1px 0;
+}
+.entity-chip b { color: var(--text); font-weight: 600; }
+.entity-chip .src { color: var(--dim); }
+/* raw machine text: NEVER primary — small, mono, dim */
+.ref { font-size: var(--fs-xs); color: var(--faint); word-break: break-all; }
+
+/* ---------------------------------------- v2 · empty state that teaches */
+/* Species (UI-ACTIONS N7): .sp-a nothing-yet → teach + button;
+   .sp-b filtered-by-scope → forensic CTA, never a fill-it button;
+   .sp-c queue-drained → celebrate with evidence. */
+.empty-teach {
+  border: 1px dashed var(--border); border-radius: var(--r-lg);
+  padding: var(--sp-5); margin: var(--sp-3) 0;
+  background: var(--panel);
+}
+.empty-teach.sp-a { border-left: 3px solid var(--blue); }
+.empty-teach.sp-b { border-left: 3px solid var(--violet); }
+.empty-teach.sp-c { border-left: 3px solid var(--green); border-style: solid; }
+.empty-teach .et-title { font-size: var(--fs-md); font-weight: 650; color: var(--bright); margin-bottom: var(--sp-1); }
+.empty-teach .et-body { color: var(--dim); font-size: var(--fs-base); max-width: 70ch; }
+.empty-teach .et-body b { color: var(--text); }
+.empty-teach .et-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); flex-wrap: wrap; align-items: center; }
+
+/* ------------------------------------------------------- v2 · toolbar */
+.toolbar {
+  display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+.toolbar .spacer { flex: 1; }
+/* view-switch buttons inside a toolbar */
+.toolbar .seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+.toolbar .seg button { border: none; border-radius: 0; }
+.toolbar .seg button + button { border-left: 1px solid var(--border); }
+.toolbar .seg button.on { background: var(--accent-soft); color: var(--accent); }
+
+/* as-of / last-checked stamp — every count carries one (N3 honesty) */
+.asof { color: var(--faint); font-size: var(--fs-xs); }
 
 /* -------------------------------------------------- read-only ribbon (§4) */
 .ribbon {
@@ -123,8 +285,8 @@ body {
 
 /* --------------------------------------------------------- form controls */
 label {
-  color: var(--dim); font-size: var(--fs-sm); text-transform: uppercase;
-  letter-spacing: .06em; display: block; margin-bottom: 3px;
+  color: var(--dim); font-size: var(--fs-sm); font-weight: 600;
+  display: block; margin-bottom: 3px;
 }
 input[type=text], input[type=password], input[type=number], textarea, select.field {
   width: 100%; background: var(--bg); color: var(--text);
@@ -137,12 +299,18 @@ textarea { resize: vertical; min-height: 58px; word-break: break-all; }
 button {
   background: var(--panel2); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--r-sm);
-  font-family: var(--mono); font-size: 12.5px; padding: 7px 14px;
+  font-family: var(--sans); font-size: 13px; font-weight: 600; padding: 7px 14px;
   cursor: pointer; white-space: nowrap;
 }
 button:hover { border-color: var(--accent); color: var(--accent); }
-button.primary { border-color: var(--accent); color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #08131f; }
+button.primary:hover { background: #79b8ff; color: #08131f; }
+button.good { border-color: var(--green-line); color: var(--green); }
+button.good:hover { background: var(--green-soft); border-color: var(--green); color: var(--green); }
+button.danger { border-color: var(--red-line); color: var(--red); }
+button.danger:hover { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 button:disabled { opacity: .5; cursor: not-allowed; border-color: var(--border); color: var(--dim); }
+button.primary:disabled { background: var(--panel2); }
 
 .row { display: flex; gap: var(--sp-3); align-items: flex-end; flex-wrap: wrap; }
 .row > div { flex: 1; min-width: 140px; }
@@ -156,6 +324,7 @@ button:disabled { opacity: .5; cursor: not-allowed; border-color: var(--border);
   display: none; margin-top: var(--sp-2); padding: 8px 10px;
   background: var(--red-soft); border: 1px solid var(--red-line);
   border-radius: var(--r-sm); color: var(--red); word-break: break-word; white-space: pre-wrap;
+  font-size: var(--fs-sm);
 }
 .err.on { display: block; }
 
@@ -172,14 +341,13 @@ button:disabled { opacity: .5; cursor: not-allowed; border-color: var(--border);
   font-size: 11px; border: 1px solid var(--border); margin: 1px 3px 1px 0;
   vertical-align: middle; white-space: nowrap;
 }
-/* THE ENCODING: dashed, unfilled outline = inferred (probabilistic).
-   Usable standalone (.b-inferred in theme.css) OR as a modifier on any badge. */
+/* THE ENCODING: dashed, unfilled outline = inferred (probabilistic). */
 .badge.b-inferred { border-style: dashed; background: transparent; }
 
 /* -------------------------------------------------- key/value claim block */
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 14px; margin-top: var(--sp-3); }
 .kv dt { color: var(--dim); }
-.kv dd { word-break: break-all; }
+.kv dd { word-break: break-all; font-family: var(--mono); font-size: var(--fs-sm); }
 .expired { color: var(--red); }
 .live { color: var(--green); }
 
@@ -194,15 +362,15 @@ button:disabled { opacity: .5; cursor: not-allowed; border-color: var(--border);
 
 /* ---------------------------------------------------------------- tables */
 .tablewrap { overflow-x: auto; margin-top: var(--sp-2); }
-table { border-collapse: collapse; width: 100%; font-size: 12px; }
-th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th {
-  color: var(--dim); font-weight: 500; text-transform: uppercase;
+  color: var(--dim); font-weight: 600; text-transform: uppercase;
   font-size: var(--fs-xs); letter-spacing: .06em; white-space: nowrap;
 }
 td { word-break: break-word; }
 td.num, th.num { text-align: right; }
-td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.num { white-space: nowrap; font-variant-numeric: tabular-nums; font-family: var(--mono); }
 tr.flag td { background: var(--red-soft); }        /* compliance/defense rows */
 
 /* -------------------------------------------------------- progress bars */
@@ -220,9 +388,7 @@ tr.flag td { background: var(--red-soft); }        /* compliance/defense rows */
 .bar.indet > i { display: none; }
 .pct { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
 
-/* --------------------------------------------------------------- dialogs
-   <div class="dialog-backdrop"><div class="dialog">…</div></div>
-   Hidden by default; core.js Verity.dialog() toggles .open on the backdrop. */
+/* --------------------------------------------------------------- dialogs */
 .dialog-backdrop {
   display: none; position: fixed; inset: 0; z-index: 50;
   background: rgba(0, 0, 0, .55); align-items: flex-start; justify-content: center;
@@ -231,10 +397,10 @@ tr.flag td { background: var(--red-soft); }        /* compliance/defense rows */
 .dialog-backdrop.open { display: flex; }
 .dialog {
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--r-md); padding: var(--sp-4);
-  width: 100%; max-width: 560px; max-height: 80vh; overflow-y: auto;
+  border-radius: var(--r-md); padding: var(--sp-5);
+  width: 100%; max-width: 560px; max-height: 82vh; overflow-y: auto;
 }
-.dialog h3 { font-size: var(--fs-md); margin-bottom: var(--sp-3); }
+.dialog h3 { font-size: var(--fs-md); font-weight: 650; color: var(--bright); margin-bottom: var(--sp-3); }
 .dialog .actions { display: flex; gap: var(--sp-2); justify-content: flex-end; margin-top: var(--sp-4); }
 
 /* ---------------------------------------------------- responsive collapse */

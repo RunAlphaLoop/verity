@@ -1,16 +1,31 @@
 "use strict";
 /* ============================================================================
-   core.js — CORE PRIMITIVES  ·  FROZEN SIGNATURES (T0.3)
+   core.js — CORE PRIMITIVES  ·  FROZEN SIGNATURES (v2, workbench rebuild)
    ----------------------------------------------------------------------------
    Hand-rolled vanilla helpers + the panel router/mount registry. Panels code
    AGAINST these signatures and never modify this file. Everything is hung off
    the single global `Verity` namespace; the short helpers ($, esc) are also
    exposed as top-level consts for terseness inside panel scripts.
 
+   Every v1 signature survives unchanged. v2 ADDS (all additive):
+     • AUTOLOAD — a panel may register `load(section, tenant)`; the router
+       runs it when the panel is shown AND a tenant is known, re-runs it when
+       the tenant changes, and never runs it twice for the same tenant.
+       `Verity.reload(id?)` forces a re-run. THE LAW #3: no panel greets a
+       first-time operator with a cold Load button.
+     • RAIL COUNTS — `Verity.setCount(navId, n)` renders a live count pill on
+       a rail entry (n = 0/null clears it). Counts must come from the same
+       query as the target panel — a badge computed differently is a lie.
+     • GLOBAL MINT — `Verity.openMint(prefill?)` opens the top-level
+       mint-a-scope-handle dialog (POST /v1/scopes, UI-ACTIONS N1) from any
+       panel; `Verity.onMint(fn)` subscribes to successful mints.
+     • humane builders — stateChip / entityChip / refSpan / fmtAge / timeAgo.
+     • tenant persistence — the active tenant_id (not a secret) is remembered
+       in localStorage so returning operators land on live data. The admin
+       token stays sessionStorage-ONLY, as before.
+
    READ-PATH PURITY: nothing here makes an LLM or live-ReBAC call. api() is a
-   thin fetch wrapper; decodeHandle() is pure client-side base64url→JSON. The
-   only network calls a panel can make go through api(), to endpoints that
-   already exist server-side.
+   thin fetch wrapper; decodeHandle() is pure client-side base64url→JSON.
    ============================================================================ */
 
 /* -------------------------------------------------------------- $ / esc */
@@ -182,6 +197,38 @@ function tagDerivationBadge(derivation) {
 /** Neutral kind/label chip. */
 function kindBadge(k) { return badge(k, "b-kind"); }
 
+/* ----------------------------------------------- v2 · humane builders */
+
+/**
+ * stateChip(kind, label?) — THE visible-state chip (LAW #4).
+ * kind ∈ "ok"|"wait"|"attn"|"fail"|"off" (aliases: healthy|waiting|
+ * needs-you|failed|none). Default labels are the plain words.
+ */
+function stateChip(kind, label) {
+  const map = {
+    ok: ["st-ok", "healthy"], healthy: ["st-ok", "healthy"],
+    wait: ["st-wait", "waiting"], waiting: ["st-wait", "waiting"],
+    attn: ["st-attn", "needs you"], "needs-you": ["st-attn", "needs you"],
+    fail: ["st-fail", "failed"], failed: ["st-fail", "failed"],
+    off: ["st-off", "—"], none: ["st-off", "—"],
+  };
+  const m = map[String(kind).toLowerCase()] || map.off;
+  return '<span class="state ' + m[0] + '">' + esc(label != null ? label : m[1]) + "</span>";
+}
+
+/**
+ * entityChip(name, source?) — a named thing, name FIRST (LAW #1/#2).
+ * A missing name renders an honest "no name on record", never a blank.
+ */
+function entityChip(name, source) {
+  return '<span class="entity-chip"><b>' +
+    (name ? esc(name) : '<span style="color:var(--dim);font-weight:400">no name on record</span>') +
+    "</b>" + (source ? '<span class="src">' + esc(source) + "</span>" : "") + "</span>";
+}
+
+/** refSpan(ref) — a raw ref/uuid/handle: mono, small, dim. Never primary. */
+function refSpan(ref) { return '<span class="ref">' + esc(ref) + "</span>"; }
+
 /* --------------------------------------------------------- fmt utilities */
 /** fmtMs(ms) → "12 ms" / "1.20 s" / "—". */
 function fmtMs(ms) {
@@ -193,35 +240,73 @@ function fmtTime(t) {
   try { return new Date(t).toISOString().replace("T", " ").replace(/\.\d+Z/, "Z"); }
   catch { return String(t); }
 }
+/** fmtAge(secs) → "3d 4h" / "2h 12m" / "45s" — compact wait-age. */
+function fmtAge(secs) {
+  secs = Math.max(0, Math.floor(Number(secs) || 0));
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return d + "d " + h + "h";
+  if (h > 0) return h + "h " + m + "m";
+  if (m > 0) return m + "m";
+  return secs + "s";
+}
+/** timeAgo(t) → "12s ago" / "3h 4m ago" from an ISO stamp, Date, or epoch ms. */
+function timeAgo(t) {
+  const then = t instanceof Date ? t.getTime()
+    : typeof t === "number" ? t
+    : Date.parse(t);
+  if (!isFinite(then)) return "—";
+  return fmtAge((Date.now() - then) / 1000) + " ago";
+}
 
 /* ============================================================================
-   ROUTER + MOUNT REGISTRY
+   ROUTER + MOUNT REGISTRY (+ v2 AUTOLOAD)
    ----------------------------------------------------------------------------
    Panels register ONE object at load via Verity.register({...}); the router
-   owns the left rail and shows exactly one panel's <section> at a time. The
-   panel's <section id="panel-<id>"> and its rail entry ([data-nav="<id>"])
-   live in shell.html / the panel HTML fragment; the router just toggles the
-   .active class and calls the panel's mount() the first time it is shown.
+   owns the left rail and shows exactly one panel's <section> at a time.
    ============================================================================ */
-const _panels = new Map();   // id → {id, mount, onShow, mounted}
+const _panels = new Map();   // id → {id, mount, onShow, load, mounted, _loadedFor}
 let _current = null;
+let _navParams = null;       // one-shot params passed via show(id, params)
 
 /**
  * Verity.register(panel)
  *   panel.id      : string, matches <section id="panel-<id>"> + [data-nav]
  *   panel.mount?  : fn(sectionEl) — called ONCE, lazily, on first show
  *   panel.onShow? : fn(sectionEl) — called every time the panel is shown
+ *   panel.load?   : fn(sectionEl, tenant) — v2 AUTOLOAD: run by the router
+ *                   when the panel is visible and a tenant is known; re-run
+ *                   on tenant change; deduped per tenant. May return a
+ *                   Promise. The panel renders its own no-tenant teach state.
  * Register at fragment load; the router wires the rail in Verity.boot().
  */
 function register(panel) {
   if (!panel || !panel.id) throw new Error("Verity.register: panel needs an id");
-  _panels.set(panel.id, Object.assign({ mounted: false }, panel));
+  _panels.set(panel.id, Object.assign({ mounted: false, _loadedFor: null }, panel));
 }
 
-/** Verity.show(id) — switch to a panel (idempotent; lazy-mounts). */
-function show(id) {
+/** Run a panel's autoload if due (visible + tenant known + not yet loaded). */
+function _maybeLoad(panel, section) {
+  if (!panel || !panel.load || !section) return;
+  const t = _tenant;
+  if (!t || panel._loadedFor === t) return;
+  panel._loadedFor = t;
+  try {
+    Promise.resolve(panel.load(section, t))
+      .catch((e) => console.error("load " + panel.id, e));
+  } catch (e) { console.error("load " + panel.id, e); }
+}
+
+/**
+ * Verity.show(id, params?) — switch to a panel (idempotent; lazy-mounts).
+ * v2: optional one-shot `params` readable via Verity.navParams() inside the
+ * target's onShow/load (e.g. Verity.show("entities", {view:"queue"})).
+ */
+function show(id, params) {
   const panel = _panels.get(id);
   if (!panel) return;
+  _navParams = params !== undefined ? params : null;
   document.querySelectorAll(".panel").forEach((s) => s.classList.remove("active"));
   document.querySelectorAll("#rail .navitem").forEach((n) => n.classList.remove("active"));
   const section = $("panel-" + id);
@@ -232,17 +317,44 @@ function show(id) {
     panel.mounted = true;
     if (panel.mount) { try { panel.mount(section); } catch (e) { console.error("mount " + id, e); } }
   }
+  if (section) _maybeLoad(panel, section);
   if (section && panel.onShow) { try { panel.onShow(section); } catch (e) { console.error("onShow " + id, e); } }
   _current = id;
   if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
 }
 
+/** Verity.navParams() — the one-shot params of the current show(), or null. */
+function navParams() { return _navParams; }
+
+/**
+ * Verity.reload(id?) — force a panel's autoload to re-run (defaults to the
+ * current panel). Use after a mutation that should refresh the view.
+ */
+function reload(id) {
+  const pid = id || _current;
+  const panel = _panels.get(pid);
+  if (!panel) return;
+  panel._loadedFor = null;
+  if (pid === _current) _maybeLoad(panel, $("panel-" + pid));
+}
+
 /**
  * Verity.boot() — called ONCE at the end of the assembled script, after every
- * panel fragment has registered. Wires rail clicks and shows the initial
- * panel (from the URL hash if it names a live panel, else the first live one).
+ * panel fragment has registered. Restores the remembered tenant, wires rail
+ * clicks, and shows the initial panel (URL hash if live, else the FIRST
+ * registered panel — the home panel registers first by assembly order).
  */
 function boot() {
+  // Adopt the tenant BEFORE first show so autoload fires (#3):
+  // 1. `?tenant=<uuid>` deep link (what the CLI/demo print) wins;
+  // 2. else the tenant remembered in localStorage from a previous visit.
+  const deepLink = new URLSearchParams(location.search).get("tenant");
+  if (deepLink) setTenant(deepLink.trim());
+  if (!_tenant) {
+    let saved = "";
+    try { saved = localStorage.getItem(TENANT_KEY) || ""; } catch (e) { /* private mode */ }
+    if (saved) setTenant(saved);
+  }
   document.querySelectorAll('#rail .navitem[data-nav]').forEach((nav) => {
     const id = nav.getAttribute("data-nav");
     if (nav.classList.contains("soon") || !_panels.has(id)) return;
@@ -250,7 +362,29 @@ function boot() {
   });
   const hash = location.hash.replace(/^#/, "");
   const start = _panels.has(hash) ? hash : (_panels.keys().next().value || null);
-  if (start) show(start);
+  // `?view=` deep-links a sub-view of the starting panel (e.g.
+  // /ui?tenant=…&view=queue#entities) — same one-shot params as show(id, p).
+  const view = new URLSearchParams(location.search).get("view");
+  if (start) show(start, view ? { view } : undefined);
+}
+
+/* ---------------------------------------------------- v2 · rail counts */
+/**
+ * Verity.setCount(navId, n) — live count pill on a rail entry.
+ * n = 0 / null clears the pill. Counts MUST be derived from the same query
+ * as the panel they badge (UI-ACTIONS N3) — never a separate estimate.
+ */
+function setCount(navId, n) {
+  const nav = document.querySelector('#rail .navitem[data-nav="' + navId + '"]');
+  if (!nav) return;
+  let pill = nav.querySelector(".count-pill");
+  if (n == null || Number(n) === 0) { if (pill) pill.remove(); return; }
+  if (!pill) {
+    pill = document.createElement("span");
+    pill.className = "count-pill";
+    nav.appendChild(pill);
+  }
+  pill.textContent = Number(n) > 99 ? "99+" : String(n);
 }
 
 /* ------------------------------------------------------------- dialog() */
@@ -270,31 +404,204 @@ function dialog(id) {
 
 /* -------------------------------------------------------- tenant helper */
 /* One active tenant_id, shared across panels; auto-filled from a decoded
-   handle. Panels read Verity.tenant() and subscribe via Verity.onTenant(). */
+   handle or the mint dialog and REMEMBERED in localStorage (a tenant id is
+   not a secret; the admin token stays sessionStorage-only). Panels read
+   Verity.tenant() and subscribe via Verity.onTenant(). */
+const TENANT_KEY = "verity.tenant";
 let _tenant = "";
 const _tenantSubs = [];
 function tenant() { return _tenant; }
 function setTenant(t) {
   _tenant = t || "";
+  try {
+    if (_tenant) localStorage.setItem(TENANT_KEY, _tenant);
+    else localStorage.removeItem(TENANT_KEY);
+  } catch (e) { /* storage unavailable — session-only */ }
   _tenantSubs.forEach((f) => { try { f(_tenant); } catch (e) { console.error(e); } });
+  // v2 AUTOLOAD: a newly-known tenant loads the panel on screen right away.
+  if (_current) _maybeLoad(_panels.get(_current), $("panel-" + _current));
 }
 function onTenant(fn) { _tenantSubs.push(fn); }
 
 /* -------------------------------------------------------- build hash */
 function buildHash() { return document.body.getAttribute("data-build-hash") || "unknown"; }
 
+/* ============================================================================
+   v2 · GLOBAL MINT DIALOG — the console's front door (UI-ACTIONS N1)
+   ----------------------------------------------------------------------------
+   POST /v1/scopes is public; this dialog makes it reachable from anywhere
+   (topbar button + any panel via Verity.openMint()). Fail-closed facts it
+   tells the operator instead of hiding:
+     • empty principals AND no subject → a handle that can SEE NOTHING —
+       omission refuses; there is no permissive default here or anywhere;
+     • a purpose can only LOWER the confidentiality ceiling, never raise it;
+     • the server enforces a 60s TTL floor (a smaller ask is raised);
+     • a fresh mint re-resolves identity server-side (unlike derive/renew).
+   The minted handle is shown ONCE with a copy affordance and never stored by
+   the console. Verity.onMint(fn) receives { handle, claims, response }.
+   ============================================================================ */
+const _mintSubs = [];
+function onMint(fn) { _mintSubs.push(fn); }
+
+function _buildMintDialog() {
+  if ($("core-mint")) return;
+  const el = document.createElement("div");
+  el.className = "dialog-backdrop";
+  el.id = "core-mint";
+  el.innerHTML =
+    '<div class="dialog" style="max-width:600px">' +
+      "<h3>Mint a scope handle</h3>" +
+      '<div class="note" style="margin-top:0">A scope handle is a signed key that decides exactly what a reader ' +
+        "can see. Everything below narrows it; nothing widens it. Leave <b>who</b> empty and the handle can see " +
+        "<b>nothing</b> — Verity fails closed, on purpose.</div>" +
+      '<div class="row" style="margin-top:12px">' +
+        '<div><label for="mint-tenant">tenant</label>' +
+          '<input type="text" id="mint-tenant" placeholder="tenant id (uuid)" spellcheck="false"></div>' +
+      "</div>" +
+      '<div class="row" style="margin-top:10px">' +
+        '<div><label for="mint-subject">who — as a person <span style="font-weight:400">(resolved server-side when identity is live)</span></label>' +
+          '<input type="text" id="mint-subject" placeholder="user:alice@corp.example" spellcheck="false"></div>' +
+        '<div><label for="mint-principals">or — raw principal tokens <span style="font-weight:400">(dev mode; comma-separated)</span></label>' +
+          '<input type="text" id="mint-principals" placeholder="e.g. 11, 1001" spellcheck="false"></div>' +
+      "</div>" +
+      '<div class="row" style="margin-top:10px">' +
+        '<div><label for="mint-entities">limit to entities <span style="font-weight:400">(optional, comma-separated)</span></label>' +
+          '<input type="text" id="mint-entities" placeholder="account:acme" spellcheck="false"></div>' +
+        '<div class="tight" style="min-width:170px"><label for="mint-conf">confidentiality ceiling</label>' +
+          '<select class="field" id="mint-conf">' +
+            '<option value="public">public</option>' +
+            '<option value="internal" selected>internal</option>' +
+            '<option value="confidential">confidential</option>' +
+            '<option value="restricted">restricted</option>' +
+          "</select></div>" +
+      "</div>" +
+      '<div class="row" style="margin-top:10px">' +
+        '<div><label for="mint-purpose">purpose <span style="font-weight:400">(optional — can only lower the ceiling; unknown purposes are refused)</span></label>' +
+          '<input type="text" id="mint-purpose" list="mint-purpose-list" placeholder="e.g. support_conversation" autocomplete="off">' +
+          '<datalist id="mint-purpose-list">' +
+            '<option value="support_conversation"><option value="sales_negotiation">' +
+            '<option value="marketing"><option value="analytics"><option value="audit">' +
+          "</datalist></div>" +
+        '<div class="tight" style="min-width:150px"><label for="mint-ttl">expires after (seconds)</label>' +
+          '<input type="number" id="mint-ttl" value="3600" min="60" step="60">' +
+        "</div>" +
+      "</div>" +
+      '<div class="note">The server enforces a <b>60&nbsp;s minimum</b> TTL. Suggested purposes are the shipped ' +
+        "default pack; a deployment may configure others. A fresh mint <b>re-resolves identity</b> server-side — " +
+        "unlike derive/renew, which reuse the old claims.</div>" +
+      '<div class="err" id="mint-err"></div>' +
+      '<div id="mint-result"></div>' +
+      '<div class="actions">' +
+        '<button id="mint-cancel">Close</button>' +
+        '<button class="primary" id="mint-go">Mint handle</button>' +
+      "</div>" +
+    "</div>";
+  document.body.appendChild(el);
+  const dlg = dialog("core-mint");
+  $("mint-cancel").onclick = dlg.close;
+  $("mint-go").onclick = async () => {
+    clearErr("mint-err");
+    $("mint-result").innerHTML = "";
+    const t = $("mint-tenant").value.trim();
+    if (!t) { showErr("mint-err", new Error("tenant is required — paste a tenant id (uuid)")); return; }
+    const body = { tenant_id: t, actor_azp: "console:mint" };
+    const subject = $("mint-subject").value.trim();
+    const principalsRaw = $("mint-principals").value.trim();
+    if (subject) body.subject = subject;
+    if (principalsRaw) {
+      const toks = principalsRaw.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+      if (toks.some((n) => !Number.isInteger(n))) {
+        showErr("mint-err", new Error("principal tokens must be integers (comma-separated), e.g. 11, 1001"));
+        return;
+      }
+      body.principals = toks;
+    }
+    const ents = $("mint-entities").value.trim();
+    if (ents) body.entity_scope = ents.split(",").map((s) => s.trim()).filter(Boolean);
+    body.max_confidentiality = $("mint-conf").value;
+    const ttl = parseInt($("mint-ttl").value, 10);
+    if (!isNaN(ttl)) body.ttl_seconds = ttl;
+    const purpose = $("mint-purpose").value.trim();
+    if (purpose) body.purpose = purpose;
+    const btn = $("mint-go");
+    btn.disabled = true;
+    try {
+      const res = await api("/v1/scopes", { json: body });
+      const handle = res && res.scope_handle;
+      if (!handle) throw new Error("mint returned no scope_handle");
+      let claims = null;
+      try { claims = decodeHandle(handle); } catch (e) { /* still usable */ }
+      setTenant(t);
+      const seesNothing = !subject && (!body.principals || !body.principals.length);
+      $("mint-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            stateChip("ok", "minted") +
+            (seesNothing ? stateChip("attn", "sees nothing — no principals were named") : "") +
+            '<span class="asof">shown once — the console does not store handles</span>' +
+          "</div>" +
+          '<textarea id="mint-handle-out" readonly style="margin-top:8px;min-height:74px">' + esc(handle) + "</textarea>" +
+          '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
+            '<button id="mint-copy">Copy handle</button>' +
+            '<button id="mint-inspect">Inspect in Scope Inspector</button>' +
+          "</div>" +
+        "</div>";
+      $("mint-copy").onclick = () => {
+        const ta = $("mint-handle-out");
+        ta.select();
+        try { navigator.clipboard.writeText(handle); } catch (e) { document.execCommand("copy"); }
+        $("mint-copy").textContent = "Copied";
+      };
+      $("mint-inspect").onclick = () => { dlg.close(); show("scope", { handle }); };
+      _mintSubs.forEach((f) => { try { f({ handle, claims, response: res }); } catch (e) { console.error(e); } });
+    } catch (e) {
+      // Server refusals (unknown purpose, entity-scope requirement, bad
+      // subject) are the teaching moment — surfaced verbatim.
+      showErr("mint-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+/**
+ * Verity.openMint(prefill?) — open the global mint dialog.
+ * prefill: { tenant?, subject?, principals?(string), entities?(string),
+ *            purpose?, confidentiality?, ttl? } — tenant defaults to the
+ * active tenant. Returns nothing; subscribe with Verity.onMint(fn).
+ */
+function openMint(prefill) {
+  _buildMintDialog();
+  prefill = prefill || {};
+  $("mint-tenant").value = prefill.tenant || _tenant || "";
+  if (prefill.subject !== undefined) $("mint-subject").value = prefill.subject;
+  if (prefill.principals !== undefined) $("mint-principals").value = prefill.principals;
+  if (prefill.entities !== undefined) $("mint-entities").value = prefill.entities;
+  if (prefill.purpose !== undefined) $("mint-purpose").value = prefill.purpose;
+  if (prefill.confidentiality) $("mint-conf").value = prefill.confidentiality;
+  if (prefill.ttl) $("mint-ttl").value = prefill.ttl;
+  clearErr("mint-err");
+  $("mint-result").innerHTML = "";
+  dialog("core-mint").open();
+}
+
 /* ---------------------------------------------------------- the namespace */
 const Verity = {
   // helpers
-  $, esc, api, decodeHandle, fmtMs, fmtTime,
+  $, esc, api, decodeHandle, fmtMs, fmtTime, fmtAge, timeAgo,
   err: showErr, clearErr,
   // admin token
   getAdminToken, setAdminToken,
-  // badges
+  // badges + humane builders
   badge, provenanceBadge, confBadge, trustBadge, statusBadge,
   entityBadges, tagDerivationBadge, kindBadge, CONF_NAMES,
+  stateChip, entityChip, refSpan,
   // router / registry
-  register, show, boot, dialog,
+  register, show, boot, dialog, reload, navParams,
+  // rail counts
+  setCount,
+  // global mint
+  openMint, onMint,
   // shared state
   tenant, setTenant, onTenant, buildHash,
 };

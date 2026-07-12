@@ -1,57 +1,32 @@
 <!-- ==========================================================================
-     panel_entities.html — Screens 8-9 · Entities & Resolution  (Later → live)
+     panel_entities.html — Entities & merges (v2 EXEMPLAR panel)
      --------------------------------------------------------------------------
-     The convergence of the resolver and the evidence-room console. TWO sections:
+     The rebuilt reference panel for THE LAW (UI-ACTIONS §0): plain-language
+     first, names before refs, autoloaded data, visible state, teaching empty
+     states, and human gates kept at full weight.
 
-       (A) ENTITIES BROWSER — the canonical entities the resolver has folded
-           (GET /v1/admin/entities · admin-token). Each canonical is a cluster
-           card: its id, its source members as chips, the confidence badge
-           (deterministic = SOLID, approximated = DASHED — the frozen theme
-           encoding), strongest_method + evidence_count. Click a card → detail:
-           the merged field view (GET /v1/entities/{canonical} · SCOPE-gated:
-           per-field winning source + provenance + superseded alternatives) plus
-           the evidence trail, plus the PRECEDENCE EDITOR (UI-SPEC §5 Screen 9
-           remainder): the per-field source-of-truth ranking. For each field of
-           the loaded merged view the admin reorders the live sources (▲▼,
-           highest precedence first) and saves via POST
-           /v1/admin/entity-precedence { tenant_id, canonical, field,
-           source_order } — field-specific rules plus the "(canonical, *)"
-           entity default. When a field carries a cross-source CONFLICT and no
-           rule is detectable (no GET exists for precedence rows; a rule is
-           INFERRED only when the winner provably overrode the recency
-           tie-break), the conflicting values render SIDE-BY-SIDE with full
-           provenance — conflict made visible beats conflict resolved wrong.
-           Saving re-loads the merged view so the new winners are shown from
-           the server's own resolution, never assumed client-side.
+     Two views, one toolbar:
+       • NEEDS YOUR DECISION — the review queue as human decision cards:
+         "Are these two the same?" with both sides named, the evidence in
+         plain words, and Confirm-merge / Keep-separate verdicts
+         (GET /v1/admin/entity-resolution/review-queue · POST …/decide).
+         Keep-separate is a PERMANENT do-not-link and takes a typed confirm.
+       • MERGED ENTITIES — named things ("Acme — 2 sources, merged
+         automatically (matching external ID)") with a detail drawer: the
+         merged fields, "which source wins" ranking (POST
+         /v1/admin/entity-precedence), and split
+         (GET /v1/admin/entities · GET /v1/entities/{canonical}, scope-gated).
 
-       (B) REVIEW QUEUE — the Tier-2/3 candidates awaiting a human decision
-           (GET /v1/admin/entity-resolution/review-queue · admin-token) as
-           SIDE-BY-SIDE diff cards: left entity vs right, their field summaries,
-           the matching method + score + key + namespace + judge rationale.
-           PRIORITIZED (design §8 Later): the server orders by a priority score
-           built from frequency, entity value, tier, and recency, with an aging /
-           SLA term so the oldest-waiting candidate is never starved. The panel
-           renders that order as a RANKED list — each card shows its #rank,
-           priority score, and wait-age — and flags the longest-waiting card not
-           yet at the top as an ⚠ SLA-risk (amber rail) so a reviewer clears it.
-           This is a read-out of the server ordering: ordering only — no client
-           re-sort and no fold/merge behaviour changes.
-           CONFIRM merge / REJECT (anti-link) per candidate → POST
-           /v1/admin/entity-resolution/decide (re-runs the fold, then refreshes
-           the queue + browser so badges/clusters update). A SPLIT affordance on
-           a merged cluster retracts via reject (anti-link) semantics.
+     "Run matching now" (POST /v1/admin/entity-resolution/run — UI-ACTIONS N6)
+     lives in the toolbar and inside every teach-empty-state; the confirm
+     dialog states that nothing uncertain is ever merged automatically.
 
-     HONESTY (SPEC §3): confidence/provenance shown faithfully; deterministic vs
-     approximated visually distinct; every merge shows its justifying evidence;
-     the whole screen is ADMIN-GATED (audit-class — it reads across scopes). An
-     empty review queue renders an honest empty state (Tier-2 must run to
-     populate it), never a fake row.
-
-     Owns ONLY this file + panel_entities.js. Reuses frozen theme/core classes +
-     Verity.* helpers; never edits them. Mounts into #entities-mount.
+     Jargon (fold / tier / polarity / canonical / anti-link) appears ONLY as
+     secondary mono text or tooltips. Owns ONLY this file + panel_entities.js;
+     consumes frozen theme/core classes + Verity.* helpers.
      ========================================================================== -->
 <section class="panel" id="panel-entities">
-  <h1>Entities &amp; Resolution</h1>
-  <div class="subtitle"><b>Where the resolver meets the evidence room.</b> Browse the folded canonical entities and their justifying evidence, and work the human gate for the Tier-2/3 candidates the fold cannot decide on its own. Admin-gated — this screen reads across scopes.</div>
+  <h1>Entities &amp; merges</h1>
+  <div class="lede">The people and companies Verity has stitched together across your sources — and the possible matches waiting for a human to confirm. Only exact identifiers merge automatically; everything uncertain stops here first.</div>
   <div id="entities-mount"></div>
 </section>

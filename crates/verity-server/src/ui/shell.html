@@ -1,18 +1,27 @@
 <!-- ==========================================================================
-     shell.html — BODY CHROME (T0.4)
+     shell.html — BODY CHROME (v2, workbench rebuild)
      --------------------------------------------------------------------------
-     Doctype-less body fragment: the header (brand + tenant switcher + session
-     badge + build hash), the left rail (grouped nav with live + v0.2/Later
-     placeholder entries), and the content pane the panels mount into. Panel
-     <section>s are appended AFTER this fragment by the assembler and are
-     hidden until the router shows one.
+     Doctype-less body fragment: topbar (brand + global MINT button + admin
+     badge + build hash), a slim session strip (tenant + admin token — the two
+     shared inputs every panel reads through Verity), the left rail (plain-
+     language nav with live count pills), and the content pane panels mount
+     into. Panel <section>s are SPLICED at the __PANEL_SECTIONS__ marker so
+     they live INSIDE .content-inner (the paint-regression test depends on
+     both the marker and that structure — do not remove either).
 
      Consumed contracts:
-       • rail entries carry data-nav="<panel-id>"; live ones match a panel that
-         calls Verity.register({id:"<panel-id>"}). .soon entries are inert.
-       • the session badge / tenant switcher ids are read by core.js glue below.
-       • the read-only ribbon is a REUSABLE TEMPLATE (<template id="ribbon-tpl">)
-         panels clone; per SPEC §4 the ribbon is per-panel, not one global band.
+       • rail entries carry data-nav="<panel-id>" matching a
+         Verity.register({id}) call; count pills are rendered by
+         Verity.setCount(id, n) — panels own their own counts.
+       • #tenantInput / #adminToken are the shared session inputs; the glue
+         below binds them to Verity.setTenant / Verity.setAdminToken. The
+         admin token is sessionStorage-ONLY (never disk); the tenant id is
+         remembered in localStorage (not a secret) so returning operators
+         land on live data, not a Load button.
+       • #mintBtn opens the global mint dialog (Verity.openMint) — the
+         console's front door (UI-ACTIONS N1).
+       • the read-only ribbon template (<template id="ribbon-tpl">) is kept
+         for v1 panels that still clone it.
      ========================================================================== -->
 
 <div id="app">
@@ -20,16 +29,25 @@
   <!-- ----------------------------------------------------------- header -->
   <div id="topbar">
     <div class="brand"><span class="v">verity</span> console</div>
-    <div id="tenantSwitch" class="chip" title="one active tenant_id — auto-fills from a decoded handle">
-      tenant
-      <select id="tenantSelect"><option value="">— none —</option></select>
-    </div>
     <div class="spacer"></div>
+    <button class="primary" id="mintBtn" title="POST /v1/scopes — mint a signed scope handle for probing or agents. Nothing here widens access; empty inputs mint a handle that sees nothing.">+ Mint scope handle</button>
     <div id="sessionBadge" class="session-badge">
-      <!-- populated by the glue script below from the decoded handle / admin token -->
-      <span class="chip" id="adminChip" title="admin bearer token — sessionStorage only">admin: <b id="adminState">dev-mode (unset)</b></span>
+      <span class="chip" id="adminChip" title="admin bearer token — held in sessionStorage for this tab only, never written to disk">admin: <b id="adminState">dev-mode (unset)</b></span>
     </div>
     <div class="buildhash" id="buildHashLabel" title="the served page is embedded in the binary — the hash IS the version">build …</div>
+  </div>
+
+  <!-- ------------------------------------------------- session strip -->
+  <div id="sessionbar">
+    <span class="sess-field">
+      <label for="tenantInput">tenant</label>
+      <input type="text" id="tenantInput" placeholder="paste a tenant id — every screen loads itself once this is set" spellcheck="false" title="the active tenant_id — auto-filled from a decoded handle or a mint; remembered in this browser (it is an id, not a secret)">
+    </span>
+    <span class="sess-field">
+      <label for="adminToken">admin token</label>
+      <input type="password" id="adminToken" placeholder="empty = dev mode" autocomplete="off" title="admin bearer for admin-plane reads/writes — sessionStorage only, cleared when the tab closes">
+    </span>
+    <span class="asof" id="sessionHint">no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id</span>
   </div>
 
   <!-- ------------------------------------------------------------ shell -->
@@ -37,41 +55,28 @@
 
     <!-- ----------------------------------------------------- left rail -->
     <nav id="rail">
-      <div class="group-label">Prove · Evidence</div>
-      <div class="navitem" data-nav="scope">     <span class="num">1</span> Scope Inspector</div>
-      <div class="navitem" data-nav="audit">     <span class="num">2</span> Access Audit</div>
-      <div class="navitem" data-nav="knowledge"> <span class="num">3</span> Knowledge Review</div>
-      <div class="navitem" data-nav="erasure">  <span class="num">4</span> Erasure &amp; DSAR</div>
+      <div class="navitem" data-nav="home">Needs decision</div>
+      <div class="navitem" data-nav="ingest">Add memory</div>
 
-      <div class="group-label">Run · Operations</div>
-      <div class="navitem" data-nav="sources">    <span class="num">5</span> Sources &amp; Freshness</div>
-      <div class="navitem" data-nav="quarantine"> <span class="num">6</span> Quarantine</div>
-      <div class="navitem" data-nav="migrations"> <span class="num">7</span> Migrations</div>
+      <div class="group-label">Review &amp; decide</div>
+      <div class="navitem" data-nav="entities">Entities &amp; merges</div>
+      <div class="navitem" data-nav="knowledge">Knowledge review</div>
+      <div class="navitem" data-nav="quarantine">Quarantine</div>
 
-      <div class="group-label">Configure · Admin</div>
-      <div class="navitem" data-nav="principals"><span class="num">8</span> Principals &amp; Groups</div>
-      <div class="navitem" data-nav="entities">  <span class="num">9</span> Entities &amp; Resolution</div>
+      <div class="group-label">Prove &amp; inspect</div>
+      <div class="navitem" data-nav="scope">Scope Inspector</div>
+      <div class="navitem" data-nav="audit">Access audit</div>
+      <div class="navitem" data-nav="erasure">Erasure &amp; DSAR</div>
+
+      <div class="group-label">Operate</div>
+      <div class="navitem" data-nav="sources">Sources &amp; freshness</div>
+      <div class="navitem" data-nav="migrations">Migrations</div>
+      <div class="navitem" data-nav="principals">People &amp; groups</div>
     </nav>
 
     <!-- --------------------------------------------------- content pane -->
     <main id="content">
       <div class="content-inner">
-
-        <!-- Admin/tenant credential inputs — shared across admin panels.
-             The admin token is held in sessionStorage only (never disk). -->
-        <div class="card" id="credentials">
-          <h2>Session <span class="sub">credentials for admin-plane probes — read only, held in this tab</span></h2>
-          <div class="row">
-            <div>
-              <label for="adminToken">admin token (sessionStorage only — never persisted to disk)</label>
-              <input type="password" id="adminToken" placeholder="empty = dev mode (server allows + warns)" autocomplete="off">
-            </div>
-            <div>
-              <label for="tenantInput">tenant_id (auto-filled from a decoded handle)</label>
-              <input type="text" id="tenantInput" placeholder="uuid" spellcheck="false">
-            </div>
-          </div>
-        </div>
 
         <!-- Panel <section>s are SPLICED here by the assembler (mod.rs
              replaces the marker below with every panel fragment) so panels
@@ -85,9 +90,8 @@
 </div>
 
 <!-- ------------------------------------- reusable per-panel ribbon template -->
-<!-- Clone with Verity: const r = document.getElementById('ribbon-tpl')
-     .content.cloneNode(true); fill .ribbon-action; prepend into the panel.
-     Per SPEC §4 the ribbon is PER-PANEL and lifts screen-by-screen at v0.2. -->
+<!-- Kept for v1 panels that still clone it; rebuilt panels do not use it.
+     A live endpoint must never sit behind a stale ribbon (the Audit lesson). -->
 <template id="ribbon-tpl">
   <div class="ribbon">
     this panel is <b>read-only</b> · the <span class="ribbon-action">publish/reject/erase</span>
@@ -96,23 +100,17 @@
 </template>
 
 <!-- ------------------------------------------ generic "coming later" panel -->
-<!-- The router only wires live panels; .soon rail entries are inert. This
-     placeholder <section> is shown if a hash points at a not-yet-built panel
-     (defensive; normal nav never reaches a .soon panel). -->
 <section class="panel" id="panel-_placeholder">
   <h1>Not yet built</h1>
-  <div class="subtitle">This screen ships in a later milestone. The rail entry is labeled with its target version.</div>
+  <div class="lede">This screen ships in a later milestone.</div>
 </section>
 
 <script>
 /* ------------------------- shell glue (chrome wiring) -------------------------
-   Small, panel-agnostic glue that lives with the shell: it fills the build
-   hash, binds the tenant switcher + tenant input to Verity's shared tenant
-   state, and binds the admin-token input to sessionStorage with an honest
-   session-badge reflection. Panels never touch this. */
+   Small, panel-agnostic glue that lives with the shell: build hash, the mint
+   button, and the two shared session inputs. Panels never touch this. */
 (function () {
   document.addEventListener("DOMContentLoaded", init);
-  // If the DOM is already parsed (script runs after body content), init now.
   if (document.readyState !== "loading") init();
   let inited = false;
 
@@ -120,13 +118,20 @@
     if (inited) return; inited = true;
 
     // build hash header
-    var bh = Verity.buildHash();
     var lbl = document.getElementById("buildHashLabel");
-    if (lbl) lbl.textContent = "build " + bh;
+    if (lbl) lbl.textContent = "build " + Verity.buildHash();
 
-    // admin token → sessionStorage, reflected in the session badge honestly
+    // global mint (UI-ACTIONS N1 — the front door)
+    var mint = document.getElementById("mintBtn");
+    if (mint) mint.addEventListener("click", function () { Verity.openMint(); });
+
+    // admin token → sessionStorage, reflected in the badge honestly
     var adminInput = document.getElementById("adminToken");
     var adminState = document.getElementById("adminState");
+    function reflectAdmin() {
+      if (!adminState) return;
+      adminState.textContent = Verity.getAdminToken() ? "set (this tab only)" : "dev-mode (unset)";
+    }
     if (adminInput) {
       adminInput.value = Verity.getAdminToken();
       reflectAdmin();
@@ -135,29 +140,26 @@
         reflectAdmin();
       });
     }
-    function reflectAdmin() {
-      if (!adminState) return;
-      var t = Verity.getAdminToken();
-      adminState.textContent = t ? "set (this tab only)" : "dev-mode (unset)";
-    }
 
-    // tenant switcher <-> tenant input <-> shared state
-    var tenantSelect = document.getElementById("tenantSelect");
+    // tenant input <-> shared state (+ the hint line)
     var tenantInput = document.getElementById("tenantInput");
-    function pushTenant(v) { Verity.setTenant(v); }
-    if (tenantInput) tenantInput.addEventListener("input", function () { pushTenant(tenantInput.value.trim()); });
-    if (tenantSelect) tenantSelect.addEventListener("change", function () { pushTenant(tenantSelect.value); });
-    Verity.onTenant(function (t) {
+    var hint = document.getElementById("sessionHint");
+    if (tenantInput) {
+      tenantInput.addEventListener("change", function () { Verity.setTenant(tenantInput.value.trim()); });
+      tenantInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") Verity.setTenant(tenantInput.value.trim());
+      });
+    }
+    function reflectTenant(t) {
       if (tenantInput && tenantInput.value !== t) tenantInput.value = t;
-      if (tenantSelect) {
-        // add the tenant as an option if unseen, then select it
-        if (t && !Array.prototype.some.call(tenantSelect.options, function (o) { return o.value === t; })) {
-          var opt = document.createElement("option"); opt.value = t; opt.textContent = t;
-          tenantSelect.appendChild(opt);
-        }
-        tenantSelect.value = t || "";
-      }
-    });
+      if (hint) hint.textContent = t
+        ? "screens auto-load for this tenant"
+        : "no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id";
+    }
+    Verity.onTenant(reflectTenant);
+    // Verity.boot() may have adopted a tenant (deep link / localStorage)
+    // before this glue subscribed — reflect the current value now.
+    reflectTenant(Verity.tenant());
   }
 })();
 </script>

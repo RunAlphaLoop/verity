@@ -1,0 +1,16 @@
+<!-- ==========================================================================
+     panel_home.html — HOME · "Needs decision" (UI-ACTIONS N3)
+     --------------------------------------------------------------------------
+     The console's landing panel: one attention card per human queue, each
+     showing a live count + the oldest wait, each ONE CLICK from the decision
+     itself. Counts are derived from the same queries as the target panels
+     and stamped as-of — a badge computed differently than its list is a lie.
+     The zero state is affirmative and evidenced ("nothing needs you,
+     checked Xs ago"), never a blank page. Owns ONLY this file +
+     panel_home.js; consumes frozen theme/core classes + Verity.* helpers.
+     ========================================================================== -->
+<section class="panel" id="panel-home">
+  <h1>Needs decision</h1>
+  <div class="lede">Everything in this tenant that is waiting on a human — live counts, one click from each decision.</div>
+  <div id="home-mount"></div>
+</section>

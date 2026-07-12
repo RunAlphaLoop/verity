@@ -1,42 +1,37 @@
 <!-- ==========================================================================
-     panel_erasure.html — Screen 4 · Erasure & DSAR  [v0.2]
+     panel_erasure.html — Erasure & data export (v2 rebuild, frozen contract)
      --------------------------------------------------------------------------
      The irreversible admin verb, STRUCTURALLY quarantined from agent scope
-     (SPEC §5 Screen 4 / §8f). This panel's live surface only instantiates when
-     an admin token is present — a scope-handle session can NEVER reach the
-     destructive controls. When no admin token is set the mount renders an
-     honest "admin-token required" state instead of the tools (see
-     panel_erasure.js).
+     (SPEC §5 Screen 4 / §8f): the destructive controls are only instantiated
+     when an admin token is present — a scope-handle session renders an honest
+     locked state instead, never hidden buttons.
 
-     Backing endpoints (verified in crates/verity-server/src/main.rs + compliance.rs
-     + media.rs):
-       • POST /v1/admin/erasure/preview   — TRUE dry run (rolls back, purges nothing) (admin)
-       • POST /v1/admin/erasure           — crypto-shred / lineage hard-purge (admin)
-       • GET  /v1/admin/dsar/export       — audited DSAR bundle (admin)
-       • GET  /v1/admin/media             — list a tenant's named blobs (admin)
-       • POST /v1/forget                  — item-level invalidation (scope-token)
+     Backing endpoints (verified in main.rs + compliance.rs + media.rs +
+     backfill.rs):
+       • POST /v1/admin/erasure/preview  — TRUE dry run (rolls back, removes
+         nothing); returns would_erase (ErasureReport), coverage_gaps,
+         rebac_tuples_would_delete (admin)
+       • POST /v1/admin/erasure          — crypto-shred hard purge; returns
+         erased, rebac_tuples_deleted, purge_report {facts, algorithm, domain,
+         signature|null, signed} — SERVER-signed; signed=false = ephemeral dev
+         key, disclosed honestly (admin)
+       • GET  /v1/admin/dsar/export?tenant_id=&subject= — audited DSAR bundle;
+         the export self-audits (admin)
+       • GET  /v1/admin/media?tenant_id=&limit= — the tenant's named files
+         (admin; auto-loaded so the operator never types blind UUIDs)
+       • POST /v1/forget {scope_handle, ref:{kind,id}, reason} — reversible
+         invalidation, scope-token (NOT admin); tenant comes from the handle
 
-     SEAMS NOW CLOSED (were designed seams; now backed by real endpoints):
-       • Erasure PREVIEW is a REAL dry run against POST /v1/admin/erasure/preview.
-         It runs the same lineage walk as the destructive erasure inside a
-         transaction it rolls back — nothing is purged — and returns the exact
-         would-purge counts (one shared walk_lineage feeds preview and erase, so
-         they cannot drift). Covers subject-, entity- AND media-only erasures.
-       • The purge report is SERVER-SIGNED (HMAC-SHA256, domain-separated). The
-         console DISPLAYS the server's signature; it no longer assembles one.
-         When the server runs on an ephemeral/dev key (signed=false), that is
-         surfaced honestly as process-scoped, not a durable attestation.
+     Fail-closed gates kept verbatim: structural admin gate, typed-confirm on
+     the destructive verb, at-least-one-target required (server 422 mirrored
+     client-side), coverage gaps disclosed (server-driven strings), signed
+     report displayed never assembled, forget always labeled reversible.
 
-     STILL DISCLOSED (real coverage gaps, returned by the server in the preview
-     response): operator-named media (no automatic subject attribution),
-     exact-string subject/entity match, and the backup-retention window.
-     "Disclose the window, don't claim perfection" (SPEC §8b).
-
-     Owns ONLY this file + panel_erasure.js. Reuses frozen theme/core classes and
-     the Verity.* helpers; never edits them. Mounts into #erasure-mount.
+     Owns ONLY this file + panel_erasure.js. Same panel id (#panel-erasure) +
+     mount id (#erasure-mount) + Verity.register shape as v1 — wiring holds.
      ========================================================================== -->
 <section class="panel" id="panel-erasure">
-  <h1>Erasure &amp; DSAR</h1>
-  <div class="subtitle"><b>The irreversible admin verb.</b> Right-to-be-forgotten crypto-shred and subject export &mdash; physically behind the admin token, structurally unreachable from any scope handle (SPEC &sect;8f).</div>
+  <h1>Erasure &amp; data export</h1>
+  <div class="lede">Permanently remove everything about a person, company, or file — or export it all for a data-subject request. You preview first, and nothing is removed without a typed confirmation.</div>
   <div id="erasure-mount"></div>
 </section>

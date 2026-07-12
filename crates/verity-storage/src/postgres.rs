@@ -1210,6 +1210,43 @@ impl PostgresAdapter {
         Ok(out)
     }
 
+    // ---------- admin principal-directory read (UI-ACTIONS N5) ----------
+
+    /// One page of the tenant's principal directory (the `principals` table
+    /// that POST /v1/admin/principals upserts into): `(principal, token)`
+    /// pairs ordered by token, keyset-paginated with `token > after_token`.
+    /// `limit` is clamped to 1..=1000. A tenant with no principals (or an
+    /// unknown tenant) yields an empty page — a read discloses nothing and
+    /// creates nothing. **Admin plane only; never on the recall/`get` path.**
+    pub async fn list_principals(
+        &self,
+        tenant: TenantId,
+        after_token: PrincipalToken,
+        limit: i64,
+    ) -> Result<Vec<(String, PrincipalToken)>> {
+        let rows = sqlx::query(
+            "SELECT principal, token
+               FROM principals
+              WHERE tenant_id = $1 AND token > $2
+              ORDER BY token
+              LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(after_token)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("principal").map_err(db_err)?,
+                    r.try_get("token").map_err(db_err)?,
+                ))
+            })
+            .collect()
+    }
+
     // ---------- admin debug-recall "why-out" trace (UI-SPEC §6 Later) ----------
 
     /// Candidate rows for the ADMIN debug-recall trace: the top-`limit` chunks

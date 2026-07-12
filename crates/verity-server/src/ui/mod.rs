@@ -58,7 +58,13 @@ const SHELL: &str = include_str!("shell.html");
 const PANEL_MARKER: &str = "<!-- __PANEL_SECTIONS__ -->";
 
 /// ---- panel HTML fragments (rail order) — APPEND ONE LINE PER PANEL ----
+/// `panel_home` is FIRST: it registers first, so `Verity.boot()` lands on the
+/// attention-first home when the URL carries no hash (UI-ACTIONS N3).
 const PANEL_SECTIONS: &str = concat!(
+    include_str!("panel_home.html"),
+    "\n",
+    include_str!("panel_ingest.html"),
+    "\n",
     include_str!("panel_scope.html"),
     "\n",
     include_str!("panel_audit.html"),
@@ -93,6 +99,11 @@ const UI_SCRIPTS: &str = concat!(
     include_str!("core.js"),
     "\n",
     // ---- panel JS fragments — APPEND ONE LINE PER PANEL ----
+    // home FIRST: registration order decides the default panel (see above).
+    include_str!("panel_home.js"),
+    "\n",
+    include_str!("panel_ingest.js"),
+    "\n",
     include_str!("panel_scope.js"),
     "\n",
     include_str!("panel_audit.js"),
@@ -170,6 +181,8 @@ mod tests {
             .find("class=\"content-inner\"")
             .expect("shell has .content-inner");
         for id in [
+            "panel-home",
+            "panel-ingest",
             "panel-scope",
             "panel-audit",
             "panel-knowledge",

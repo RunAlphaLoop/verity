@@ -1,21 +1,20 @@
 <!-- ==========================================================================
-     panel_scope.html — Screen 1 · Scope Inspector  [MVP]  (TA.1)
+     panel_scope.html — Scope Inspector, v2 rebuild (UI-ACTIONS §5 / frozen v2)
      --------------------------------------------------------------------------
-     The crown jewel: "what can this agent see, exactly?" Paste a vs_… handle,
-     decode its signed claims client-side, then probe recall / brief / activity
-     THROUGH that exact handle — each hit rendered with the full honesty payload
-     (ACL provenance · confidentiality · trust tier · tag-derivation solid-vs-
-     dashed · bi-temporal · citation→L0). Boundary trace, Explain-zero, honest
-     session-local latency, and Export boundary as evidence. Plus ONE clearly
-     labeled non-pure-read action: "why filtered?" — the admin-gated, audited
-     POST /v1/admin/debug/recall tracer (OFF the read path by construction)
-     that renders per-candidate drop reasons for the current handle + query.
+     "What can this agent see?" in plain language. Decode is client-side;
+     probes AUTOLOAD a default recall the moment a handle is present; hits are
+     readable results (content first, chips second, refs mono-small); the
+     explain-zero speaks human and TEACHES the forensic next step (sp-b — never
+     a fill-it button); the why-filtered trace names principals BY NAME via
+     GET /v1/admin/principals + the visibility_tokens field; derive/renew are
+     prominent; export-evidence kept. The top-level mint lives in the SHELL —
+     this panel links to it (Verity.openMint), it does not duplicate it.
 
-     Owns ONLY this file + panel_scope.js. Reuses theme.css / core.js verbatim;
-     mounts everything into #scope-mount. No other panel's DOM is touched.
+     Owns ONLY this file + panel_scope.js. Same panel id (#panel-scope), same
+     mount id (#scope-mount), same Verity.register id ("scope") as v1.
      ========================================================================== -->
 <section class="panel" id="panel-scope">
-  <h1>Scope Inspector</h1>
-  <div class="subtitle"><b>What can this agent see, exactly?</b> Paste a scope handle, read its signed claims, then probe recall, briefs, and activity through it &mdash; read-only, client-side decode, against this server.</div>
+  <h1>What can this agent see?</h1>
+  <div class="lede">Paste a <b>scope handle</b> — the signed key an agent reads with — and this screen shows who it reads as, what it is limited to, and then <b>proves it</b> with live reads through that exact handle. Nothing here can widen a handle; you can only inspect, narrow, or renew.</div>
   <div id="scope-mount"></div>
 </section>

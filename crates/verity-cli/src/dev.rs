@@ -273,14 +273,29 @@ fn print_summary(ctx: &Ctx, tenant_id: &str, repo: Option<&Path>) {
     let kv =
         |label: &str, value: &str| println!("    {}  {value}", ui::dim(&format!("{label:<13}")));
     kv("server", &ctx.url);
+    kv("console", &format!("{}/ui", ctx.url));
     kv("tenant (dev)", tenant_id);
-    kv(
-        "scope handle",
-        &format!(
-            "saved to {} (org-wide, principals [1])",
-            ctx.config_path.display()
+    match &ctx.config.scope_handle {
+        Some(handle) => {
+            kv("scope handle", handle);
+            println!(
+                "    {}",
+                ui::dim(&format!(
+                    "org-wide (principals [1]), saved to {} — paste it into the console's \
+                     Scope panel at {}/ui to decode it and run scoped reads",
+                    ctx.config_path.display(),
+                    ctx.url
+                ))
+            );
+        }
+        None => kv(
+            "scope handle",
+            &format!(
+                "saved to {} (org-wide, principals [1])",
+                ctx.config_path.display()
+            ),
         ),
-    );
+    }
     println!();
     println!("  {}", ui::bold("Connect Claude Code (MCP):"));
     println!();

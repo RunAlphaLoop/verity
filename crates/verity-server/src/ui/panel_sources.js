@@ -1,507 +1,907 @@
 "use strict";
 /* ==========================================================================
-   panel_sources.js — Screen 5 · Sources & Freshness  (v0.2 · READ-ONLY)
+   panel_sources.js — Sources & Freshness (v2 rebuild · UN-SEAMED, N4)
    --------------------------------------------------------------------------
-   Backing reads (all admin-token, all pure — zero LLM, zero live-ReBAC):
-     • GET /v1/admin/connector-status?tenant_id=  → [{ source, cursor,
-         items_synced, last_event_at|null, updated_at }]
-     • GET /v1/slo/freshness?tenant_id=&window_hours= → [{ source, samples,
-         p50_ms|null, p95_ms|null, p99_ms|null }]           (NOTE: no target)
-     • GET /v1/admin/backfill?tenant_id=          → [{ run_id, source, state,
-         total|null, processed, cursor, error|null, started_at, updated_at }]
+   Verbs (all live, none faked):
+     • mint webhook   POST /v1/webhooks            — show-once secret URL
+     • revoke webhook DELETE /v1/webhooks/{id}     — typed confirm (REVOKE)
+     • install draft  POST /v1/manifests           — draft only, never runs
+     • activate       POST /v1/manifests/{id}/activate — THE human gate:
+                      separate step, typed confirm (ACTIVATE), approver name
+                      required + recorded in audit_log by the server.
+   Reads autoload when the tenant is known (LAW #3 — no cold Load button):
+     connector-status · slo/freshness · backfill · manifests, allSettled so
+     one failure never blanks the screen. GET /v1/admin/principals feeds the
+     who-can-see picker in the connect dialog (names, not bare ints).
 
-   HONESTY CONTRACT (SPEC §3 / §5 Screen 5 / CLAUDE.md 'measured or absent'):
-   1. connector-status has NO provenance-tier, NO lane, NO error column. We
-      render tier/lane ONLY from a real per-row field if one ever appears; else
-      an explicit 'not reported' seam. We NEVER default a source into a lane —
-      a wrong lane label breaks 'never blurred' (SPEC §5e.6). The inline
-      error/last-failure is sourced from the matching BACKFILL run's `error`
-      (the only real failure signal we have), disclosed as such.
-   2. Freshness emits p50 + p95 + p99, all from real samples (server-computed
-      over the same window/group), never fabricated — null when a group has no
-      samples. The SLO target is OPERATOR-SET (an input) and labeled as such;
-      breach = a REAL percentile exceeding the STATED target.
-   3. True cadence is derived from real timestamps (event age + heartbeat gap),
-      never a flagship 'seconds' claim inherited by a daily source (SPEC §5d).
-   4. Backfill: determinate bar only when total known; striped indeterminate
-      otherwise. ETA only when running + known total + forward progress.
-   5. v0.2 is READ-ONLY: manifest install/activate + webhook mint/revoke are
-      Later and rendered as DISABLED seams (designed, never faked). The
-      graduation prompt for convenience-lane sources is shown, but only for a
-      source whose lane is actually KNOWN to be convenience — never guessed.
+   Fail-closed gates kept: empty visibility on mint → the server's own 422
+   refusal, surfaced verbatim (no client-side permissive default); the raw
+   webhook URL is shown ONCE and never re-fetched (only its hash persists);
+   activation is never bundled into install; no "index it anyway" anywhere.
+
+   Honesty: percentiles are real samples over the stated window on THIS
+   deployment (labeled not-the-benchmark); the alert threshold is
+   operator-set and labeled so; heartbeat rows never get a guessed lane;
+   client-side "waiting for first delivery" rows are labeled client-side.
    ========================================================================== */
 (function () {
-  // Last-event / heartbeat staleness thresholds (SPEC §5: green <15m / amber
-  // <24h / red beyond). Milliseconds.
-  var FRESH_MS = 15 * 60 * 1000;      // < 15m → green
-  var STALE_MS = 24 * 60 * 60 * 1000; // < 24h → amber, else red
+  var V = window.Verity;
 
-  // -------------------------------------------------- pure age helpers -----
+  // Liveness thresholds (SPEC §5): <15m fresh · <24h quiet · beyond = cold.
+  var FRESH_MS = 15 * 60 * 1000;
+  var STALE_MS = 24 * 60 * 60 * 1000;
+
+  /* ------------------------------------------------------------ state */
+
+  var data = {
+    status: [],     // connector heartbeats
+    fresh: [],      // freshness percentiles
+    backfill: [],   // latest catch-up run per source
+    manifests: [],  // draft/active blueprints
+    errs: [],       // per-read load failures (rendered, never hidden)
+    loadedAt: 0,
+  };
+  // Client-side only: sources minted this session that have not yet posted a
+  // heartbeat or delivery. Labeled as client-side in the table — honest.
+  var pendingLocal = [];
+  var tenantNow = "";
+  var pendingActivate = null; // { id, name, laneWords, ready }
+
+  function el(id) { return V.$(id); }
+
+  /* ------------------------------------------------------------ helpers */
 
   function ageMs(iso) {
     if (!iso) return null;
     var t = new Date(iso).getTime();
-    if (isNaN(t)) return null;
-    return Date.now() - t;
+    return isNaN(t) ? null : Date.now() - t;
   }
 
-  // Humanize a positive duration in ms into a coarse, honest label.
+  // Coarse, honest age label ("2m ago"), never a fake-precise stamp.
   function humanAge(ms) {
     if (ms == null) return "—";
     if (ms < 0) ms = 0;
-    var s = Math.round(ms / 1000);
-    if (s < 60) return s + "s ago";
-    var m = Math.round(s / 60);
-    if (m < 60) return m + "m ago";
-    var h = Math.round(m / 60);
-    if (h < 48) return h + "h ago";
-    var d = Math.round(h / 24);
-    return d + "d ago";
+    return V.fmtAge(ms / 1000) + " ago";
   }
 
-  // Coarse cadence bucket from a representative gap (ms). Honest: this is the
-  // OBSERVED cadence of the newest event vs now — a daily source reads daily.
-  function cadenceLabel(ms) {
-    if (ms == null) return null;
-    if (ms < 5 * 60 * 1000) return "sub-5-minute";
-    if (ms < FRESH_MS) return "minutes";
-    if (ms < 60 * 60 * 1000) return "hourly-ish";
-    if (ms < STALE_MS) return "intra-day";
-    if (ms < 7 * STALE_MS) return "daily";
-    return "weekly+";
-  }
-
-  // Staleness → the theme's green/amber/red badge classes (reused, not new).
-  // We map onto the confidentiality hue classes purely for the fill color:
-  // b-conf-0 = green, b-conf-2 = amber, b-conf-3 = red. This keeps us inside
-  // the FROZEN badge vocabulary without inventing a class.
-  function ageBadge(ms, label) {
-    if (ms == null) {
-      // Honest 'no event time' fallback (SPEC §5): a dim neutral chip, never
-      // a fake-fresh green.
-      return Verity.badge("no event time", "b-kind");
+  // One plain-words liveness verdict per source (the ten-second read).
+  function liveness(evAge, hbAge, bfError) {
+    if (bfError) {
+      return { chip: V.stateChip("fail"), text: "catch-up import failed — see notes" };
     }
-    var cls = ms < FRESH_MS ? "b-conf-0" : (ms < STALE_MS ? "b-conf-2" : "b-conf-3");
-    return Verity.badge(label, cls);
-  }
-
-  // -------------------------------------------------- provenance / lane ----
-  // connector-status does NOT report these. If a future row carries them we
-  // render faithfully; otherwise we surface an explicit 'not reported' seam and
-  // NEVER guess a lane.
-
-  function provenanceTier(row) {
-    // Accept any of the plausible field names a future connector-status might
-    // carry. Absent → null (seam).
-    return row.provenance_tier || row.acl_provenance || row.tier || null;
-  }
-  function laneOf(row) {
-    // Explicit lane field only. We do NOT infer a lane from the tier here,
-    // because a wrong lane is worse than an admitted-unknown one.
-    var l = row.lane;
-    return l == null || l === "" ? null : String(l).toLowerCase();
-  }
-  function tierBadgeCell(row) {
-    var t = provenanceTier(row);
-    if (!t) {
-      return '<span class="refreshed" title="connector-status does not report an ' +
-        'ACL-provenance tier; this is a telemetry gap, not a permissive default">' +
-        'not reported</span>';
+    var a = evAge != null ? evAge : hbAge;
+    if (a == null) {
+      // Honest fallback: a source that reports no event time never shows
+      // fake-fresh green.
+      return { chip: V.stateChip("off", "age unknown"), text: "no event time reported yet" };
     }
-    // Reuse the frozen provenance badge vocabulary
-    // (mirrored / approximated / admin-assigned / quarantined).
-    return Verity.provenanceBadge(t);
-  }
-  function laneBadgeCell(row) {
-    var l = laneOf(row);
-    if (!l) {
-      return '<span class="refreshed" title="connector-status does not report a ' +
-        'truth-vs-convenience lane; never guessed — a mislabeled lane would blur ' +
-        'the two lanes (SPEC §5e.6)">not reported</span>';
+    if (a < FRESH_MS) {
+      return { chip: V.stateChip("ok", "fresh"), text: "fresh " + humanAge(a) + " · syncing normally" };
     }
-    if (l === "truth") return Verity.badge("truth lane", "b-conf-0");
-    if (l === "convenience") return Verity.badge("convenience lane", "b-conf-2");
-    return Verity.badge(l + " lane", "b-kind");
+    if (a < STALE_MS) {
+      return { chip: V.stateChip("wait", "quiet"), text: "quiet — last new data " + humanAge(a) };
+    }
+    return { chip: V.stateChip("attn", "cold"), text: "cold — no new data for " + V.fmtAge(a / 1000) };
   }
 
-  // -------------------------------------------------- backfill helpers -----
-  // Reuse the same determinate/indeterminate + honest-ETA discipline the
-  // Migrations panel is speced for. total==null → uncountable → striped bar.
+  // Manifest permission lane, in plain words. acl_mode is real server data
+  // (map | static | quarantine); a manifest that no longer parses is null.
+  function laneWords(aclMode) {
+    var m = String(aclMode || "").toLowerCase();
+    if (m === "map") return "source permissions copied exactly";
+    if (m === "static") return "an admin chose who can see it";
+    if (m === "quarantine") return "no permission mapping — everything it sends is quarantined";
+    return "manifest unreadable — cannot state a lane";
+  }
 
-  function progressBar(run) {
+  function fmtCount(n) { return n == null ? "—" : String(n); }
+
+  // Operator-set alert threshold (ms) — display highlighting only.
+  function targetMs() {
+    var f = el("src-target");
+    if (!f) return null;
+    var v = parseInt(f.value, 10);
+    return isNaN(v) || v < 0 ? null : v;
+  }
+
+  function windowHours() {
+    var f = el("src-window");
+    var v = f ? parseInt(f.value, 10) : 24;
+    return Math.max(1, Math.min(2160, isNaN(v) ? 24 : v));
+  }
+
+  function pctCell(ms, tgt) {
+    if (ms == null) return '<span class="ref">—</span>';
+    var txt = V.fmtMs(ms);
+    return (tgt != null && ms > tgt)
+      ? V.badge(txt + " · over your target", "b-conf-3")
+      : V.esc(txt);
+  }
+
+  function receipt(kind, html) {
+    el("src-receipt").innerHTML =
+      '<div class="card" style="border-left:3px solid var(--state-' +
+        (kind === "ok" ? "ok" : "attn") + ')">' +
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+          V.stateChip(kind) + "<span>" + html + "</span>" +
+          '<span class="spacer" style="flex:1"></span>' +
+          '<button id="src-receipt-x">Dismiss</button>' +
+        "</div></div>";
+    el("src-receipt-x").onclick = function () { el("src-receipt").innerHTML = ""; };
+  }
+
+  function hint401(errs) {
+    return errs.some(function (m) { return /HTTP 401/.test(m); })
+      ? '<div class="note"><em>admin token required</em> — this deployment enforces one; set it in the session bar above (kept in this tab only).</div>'
+      : "";
+  }
+
+  /* =========================================================== register */
+
+  V.register({
+    id: "sources",
+
+    mount: function () {
+      var host = el("sources-mount");
+      if (!host) return;
+      host.innerHTML =
+        /* ---- toolbar ---- */
+        '<div class="toolbar">' +
+          '<span id="src-state"></span>' +
+          '<span class="asof" id="src-asof"></span>' +
+          '<span class="spacer"></span>' +
+          '<button id="src-refresh">Refresh</button>' +
+          '<button id="src-revoke-open" title="DELETE /v1/webhooks/{id} — the URL stops resolving immediately">Shut off a source&hellip;</button>' +
+          '<button id="src-manifest-open" title="POST /v1/manifests — installs as a DRAFT; a separate human approval activates it">Install a manifest&hellip;</button>' +
+          '<button class="primary" id="src-connect-open" title="POST /v1/webhooks — mints a private URL any system can POST JSON to">Connect a source</button>' +
+        "</div>" +
+        '<div class="err" id="src-err"></div>' +
+        '<div id="src-hint"></div>' +
+        '<div id="src-receipt"></div>' +
+
+        /* ---- source health ---- */
+        '<div class="card">' +
+          '<h2>Your sources <span class="sub">GET /v1/admin/connector-status · /v1/admin/backfill</span></h2>' +
+          '<div id="src-health"></div>' +
+        "</div>" +
+
+        /* ---- manifests ---- */
+        '<div class="card">' +
+          '<h2>Manifests — how each source&rsquo;s permissions map in <span class="sub">GET /v1/manifests</span></h2>' +
+          '<div class="note" style="margin-top:0">A manifest is the reviewed blueprint for a source: what its payloads mean and <b>who gets to see what it writes</b>. ' +
+            "Two lanes, labeled, never blurred: <b>mirrored</b> = the source&rsquo;s own permission lists are copied exactly; <b>assigned</b> = an admin chose who can see it. " +
+            "Installing creates a <b>draft that never runs</b> — a named human must approve it in a separate step, and that approval is written to the audit log.</div>" +
+          '<div id="src-manifests"></div>' +
+        "</div>" +
+
+        /* ---- freshness ---- */
+        '<div class="card">' +
+          '<h2>Ingest freshness — how fast new data becomes searchable <span class="sub">GET /v1/slo/freshness</span></h2>' +
+          '<div class="row" style="margin-top:0">' +
+            '<div class="tight"><label for="src-window">measured over the last (hours)</label>' +
+              '<input type="number" id="src-window" value="24" min="1" max="2160" style="width:110px"></div>' +
+            '<div class="tight"><label for="src-target">alert me over (ms) <span style="font-weight:400">— your setting, not a server SLO</span></label>' +
+              '<input type="number" id="src-target" value="900000" min="0" step="1000" style="width:130px" ' +
+              'title="Set in this console for display highlighting only. The server enforces no SLO here; a red chip means a REAL measured percentile exceeded the number you typed."></div>' +
+          "</div>" +
+          '<div id="src-fresh"></div>' +
+        "</div>" +
+
+        /* ---- backfill ---- */
+        '<div class="card">' +
+          '<h2>Catch-up imports <span class="sub">backfill · latest run per source</span></h2>' +
+          '<div class="note" style="margin-top:0">A catch-up import replays a source&rsquo;s history into Verity. A bar is exact only when the total is known; ' +
+            "a striped track means the total is genuinely unknown — never a fabricated percentage. A time-left estimate appears only for a running job with real forward progress.</div>" +
+          '<div id="src-back"></div>' +
+        "</div>" +
+
+        /* ================= dialogs ================= */
+
+        /* ---- connect a source (mint webhook) ---- */
+        '<div class="dialog-backdrop" id="src-mint-dialog"><div class="dialog" style="max-width:640px">' +
+          "<h3>Connect a source</h3>" +
+          '<div class="note" style="margin-top:0">Verity mints a <b>private URL</b>; anything that can POST JSON to it becomes a memory source — no code on the sender side. ' +
+            "Everything it writes is stamped with the visibility you pick here. There is no default: <b>if nobody is picked, the server refuses to mint</b> — a source whose writes nobody could ever read is refused, not silently created.</div>" +
+          '<div style="margin-top:12px"><label for="src-mint-name">source name <span style="font-weight:400">— becomes the source label on every record it writes</span></label>' +
+            '<input type="text" id="src-mint-name" placeholder="e.g. hubspot" autocomplete="off" spellcheck="false"></div>' +
+          '<div style="margin-top:10px"><label>who can see what it writes</label>' +
+            '<div id="src-mint-principals" style="max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 10px"></div>' +
+          "</div>" +
+          '<div style="margin-top:8px"><label for="src-mint-raw">raw principal tokens <span style="font-weight:400">(dev mode; comma-separated ints — added to any picks above)</span></label>' +
+            '<input type="text" id="src-mint-raw" placeholder="e.g. 11, 1001" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="row" style="margin-top:10px">' +
+            '<div><label for="src-mint-entities">limit to entities <span style="font-weight:400">(optional, comma-separated)</span></label>' +
+              '<input type="text" id="src-mint-entities" placeholder="account:acme" autocomplete="off" spellcheck="false"></div>' +
+            '<div class="tight" style="min-width:170px"><label for="src-mint-conf">confidentiality ceiling</label>' +
+              // No preselection — the ceiling is an explicit choice, same
+              // no-default stance as every other dialog (audit advisory fix).
+              '<select class="field" id="src-mint-conf">' +
+                '<option value="" selected disabled>choose…</option>' +
+                '<option value="Public">public</option>' +
+                '<option value="Internal">internal</option>' +
+                '<option value="Confidential">confidential</option>' +
+                '<option value="Restricted">restricted</option>' +
+              "</select></div>" +
+          "</div>" +
+          '<div style="margin-top:10px"><label for="src-mint-manifest">route payloads through a manifest <span style="font-weight:400">(optional)</span></label>' +
+            '<select class="field" id="src-mint-manifest"><option value="">no — plain JSON shape</option></select>' +
+            '<div class="note">Binding a <b>draft</b> is allowed — every payload quarantines until a human approves the manifest. Fail closed, never mis-filed.</div>' +
+          "</div>" +
+          '<div class="err" id="src-mint-err"></div>' +
+          '<div id="src-mint-result"></div>' +
+          '<div class="actions">' +
+            '<button id="src-mint-cancel">Close</button>' +
+            '<button class="primary" id="src-mint-go">Mint the URL</button>' +
+          "</div>" +
+        "</div></div>" +
+
+        /* ---- shut off (revoke webhook) ---- */
+        '<div class="dialog-backdrop" id="src-revoke-dialog"><div class="dialog" style="max-width:560px">' +
+          "<h3>Shut off a source</h3>" +
+          '<div class="note" style="margin-top:0">Revoking kills the private URL <b>immediately</b> — deliveries stop and the URL can never be revived. ' +
+            "Nothing already ingested is deleted (history is invalidated elsewhere, never erased here). " +
+            "You need the <b>webhook id</b> from when the source was minted — the console cannot list webhooks yet (<code>GET /v1/webhooks</code> is on the roadmap).</div>" +
+          '<div style="margin-top:12px"><label for="src-revoke-id">webhook id</label>' +
+            '<input type="text" id="src-revoke-id" placeholder="the uuid shown when you minted it" autocomplete="off" spellcheck="false"></div>' +
+          '<div style="margin-top:10px"><label for="src-revoke-word">this is permanent — type <b>REVOKE</b> to continue</label>' +
+            '<input type="text" id="src-revoke-word" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="err" id="src-revoke-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-revoke-cancel">Cancel</button>' +
+            '<button class="danger" id="src-revoke-go" disabled>Shut it off</button>' +
+          "</div>" +
+        "</div></div>" +
+
+        /* ---- install manifest (draft) ---- */
+        '<div class="dialog-backdrop" id="src-manifest-dialog"><div class="dialog" style="max-width:640px">' +
+          "<h3>Install a manifest (draft)</h3>" +
+          '<div class="note" style="margin-top:0">Paste the manifest YAML. It is validated and stored as a <b>draft — it never runs</b> until a named human approves it in the separate activate step. ' +
+            "Re-installing an existing name replaces its YAML and <b>demotes it back to draft</b>: every change re-crosses the human gate.</div>" +
+          '<div style="margin-top:12px"><label for="src-manifest-yaml">manifest YAML</label>' +
+            '<textarea id="src-manifest-yaml" style="min-height:180px" placeholder="source:&#10;  name: hubspot&#10;  &hellip;" spellcheck="false"></textarea></div>' +
+          '<div class="err" id="src-manifest-err"></div>' +
+          '<div id="src-manifest-result"></div>' +
+          '<div class="actions">' +
+            '<button id="src-manifest-cancel">Close</button>' +
+            '<button class="primary" id="src-manifest-go">Install as draft</button>' +
+          "</div>" +
+        "</div></div>" +
+
+        /* ---- activate manifest (THE human gate) ---- */
+        '<div class="dialog-backdrop" id="src-activate-dialog"><div class="dialog" style="max-width:600px">' +
+          '<h3 id="src-activate-title">Approve &amp; activate</h3>' +
+          '<div id="src-activate-summary"></div>' +
+          '<div class="note">This is the product&rsquo;s mandated <b>human approval</b>: you are vouching that this manifest&rsquo;s permission mapping is correct. ' +
+            "Your name is stored on the manifest and written to the <b>audit log</b>. The server re-checks the permission policy and will refuse a manifest whose policy is absent or violates its declared tier — that refusal appears here verbatim.</div>" +
+          '<div style="margin-top:12px"><label for="src-activate-who">your name — recorded as the approver</label>' +
+            '<input type="text" id="src-activate-who" placeholder="e.g. jane@corp.example" autocomplete="off" spellcheck="false"></div>' +
+          '<div style="margin-top:10px"><label for="src-activate-word">type <b>ACTIVATE</b> to continue</label>' +
+            '<input type="text" id="src-activate-word" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="err" id="src-activate-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-activate-cancel">Cancel</button>' +
+            '<button class="good" id="src-activate-go" disabled>Approve &amp; activate</button>' +
+          "</div>" +
+        "</div></div>";
+
+      /* ---- wiring ---- */
+      el("src-refresh").onclick = function () { V.reload("sources"); };
+      el("src-connect-open").onclick = function () { openMintDialog(""); };
+      el("src-mint-cancel").onclick = function () { V.dialog("src-mint-dialog").close(); };
+      el("src-mint-go").onclick = mintWebhook;
+
+      el("src-revoke-open").onclick = openRevokeDialog;
+      el("src-revoke-cancel").onclick = function () { V.dialog("src-revoke-dialog").close(); };
+      el("src-revoke-go").onclick = revokeWebhook;
+      el("src-revoke-word").oninput = reflectRevokeTyped;
+      el("src-revoke-id").oninput = reflectRevokeTyped;
+
+      el("src-manifest-open").onclick = openManifestDialog;
+      el("src-manifest-cancel").onclick = function () { V.dialog("src-manifest-dialog").close(); };
+      el("src-manifest-go").onclick = installManifest;
+
+      el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
+      el("src-activate-go").onclick = activateManifest;
+      el("src-activate-word").oninput = reflectActivateTyped;
+      el("src-activate-who").oninput = reflectActivateTyped;
+
+      el("src-window").addEventListener("change", function () { V.reload("sources"); });
+      el("src-target").addEventListener("input", renderFreshness);
+
+      if (!V.tenant()) renderNoTenant();
+    },
+
+    /* v2 AUTOLOAD — the router runs this when the tenant is known. */
+    load: function (_section, tenant) { return refresh(tenant); },
+
+    onShow: function () {
+      var p = V.navParams();
+      if (p && p.view === "connect" && V.tenant()) openMintDialog("");
+      if (!V.tenant()) renderNoTenant();
+    },
+  });
+
+  /* =========================================================== loading */
+
+  function renderNoTenant() {
+    el("src-state").innerHTML = V.stateChip("off", "no tenant");
+    el("src-health").innerHTML =
+      '<div class="empty-teach sp-a">' +
+        '<div class="et-title">Pick a tenant to see its sources</div>' +
+        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle — the tenant fills in automatically and this screen loads itself.</div>' +
+        '<div class="et-actions"><button class="primary" id="src-teach-mint">Mint a scope handle</button></div>' +
+      "</div>";
+    el("src-manifests").innerHTML = "";
+    el("src-fresh").innerHTML = "";
+    el("src-back").innerHTML = "";
+    el("src-teach-mint").onclick = function () { V.openMint(); };
+  }
+
+  async function refresh(tenant) {
+    tenantNow = tenant;
+    V.clearErr("src-err");
+    el("src-hint").innerHTML = "";
+    el("src-state").innerHTML = V.stateChip("wait", "loading");
+    var q = "tenant_id=" + encodeURIComponent(tenant);
+    var results = await Promise.allSettled([
+      V.api("/v1/admin/connector-status?" + q, { admin: true }),
+      V.api("/v1/slo/freshness?" + q + "&window_hours=" + windowHours(), { admin: true }),
+      V.api("/v1/admin/backfill?" + q, { admin: true }),
+      V.api("/v1/manifests?" + q, { admin: true }),
+    ]);
+    var keys = ["status", "fresh", "backfill", "manifests"];
+    data.errs = [];
+    results.forEach(function (r, i) {
+      if (r.status === "fulfilled") data[keys[i]] = Array.isArray(r.value) ? r.value : [];
+      else { data[keys[i]] = []; data.errs.push(r.reason && r.reason.message ? r.reason.message : String(r.reason)); }
+    });
+    data.loadedAt = Date.now();
+    renderAll();
+  }
+
+  function needsYou() {
+    // The rail-pill count — derived from the SAME rows this panel renders:
+    // drafts awaiting the human gate + failed catch-up runs. (Threshold
+    // breaches are excluded on purpose: the threshold is a client-side knob.)
+    var drafts = data.manifests.filter(function (m) { return m.status === "draft"; }).length;
+    var failed = data.backfill.filter(function (b) { return String(b.state).toLowerCase() === "failed"; }).length;
+    return drafts + failed;
+  }
+
+  function renderAll() {
+    var needs = needsYou();
+    V.setCount("sources", needs);
+    var anything = data.status.length || data.fresh.length || data.backfill.length ||
+                   data.manifests.length || pendingLocal.length;
+    if (data.errs.length) {
+      el("src-state").innerHTML = V.stateChip("fail", "couldn't load");
+      V.err("src-err", new Error(data.errs.join("  |  ")));
+      el("src-hint").innerHTML = hint401(data.errs);
+    } else if (needs) {
+      el("src-state").innerHTML = V.stateChip("attn", needs + " need" + (needs === 1 ? "s" : "") + " you");
+    } else if (!anything) {
+      el("src-state").innerHTML = V.stateChip("off", "nothing connected");
+    } else {
+      el("src-state").innerHTML = V.stateChip("ok", "syncing normally");
+    }
+    el("src-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8);
+    renderHealth();
+    renderManifests();
+    renderFreshness();
+    renderBackfill();
+  }
+
+  /* =========================================================== health */
+
+  function renderHealth() {
+    var host = el("src-health");
+    var freshBy = {};
+    data.fresh.forEach(function (f) { freshBy[f.source] = f; });
+    var backBy = {};
+    data.backfill.forEach(function (b) { backBy[b.source] = b; });
+    var hbBy = {};
+    data.status.forEach(function (s) { hbBy[s.source] = s; });
+
+    // Union of every source any endpoint knows about + this session's mints —
+    // kills the old "no connectors" vs live-freshness self-contradiction.
+    var names = {};
+    data.status.forEach(function (s) { names[s.source] = 1; });
+    data.fresh.forEach(function (f) { names[f.source] = 1; });
+    data.backfill.forEach(function (b) { names[b.source] = 1; });
+    pendingLocal.forEach(function (p) { if (!names[p.source]) names[p.source] = 2; });
+    var sources = Object.keys(names).sort();
+
+    if (!sources.length) {
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">No sources connected yet</div>' +
+          '<div class="et-body">Verity ingests through minted <b>private URLs</b> (any system that can POST JSON) and manifest-driven connectors. ' +
+            "Connect your first source — you get a copyable URL and a curl line to send the first payload with. An empty inventory is a real state, not an error.</div>" +
+          '<div class="et-actions">' +
+            '<button class="primary" id="src-teach-connect">Connect a source</button>' +
+            '<button id="src-teach-manifest">Install a manifest</button>' +
+          "</div>" +
+        "</div>";
+      el("src-teach-connect").onclick = function () { openMintDialog(""); };
+      el("src-teach-manifest").onclick = openManifestDialog;
+      return;
+    }
+
+    var body = sources.map(function (name) {
+      var hb = hbBy[name];
+      var fr = freshBy[name];
+      var bf = backBy[name];
+      var mintedOnly = names[name] === 2;
+      var evAge = hb ? ageMs(hb.last_event_at) : null;
+      var hbAge = hb ? ageMs(hb.updated_at) : null;
+      var bfError = bf && bf.error ? bf.error : null;
+
+      var stateCell, liveText;
+      if (mintedOnly) {
+        stateCell = V.stateChip("wait", "waiting for first delivery");
+        liveText = "minted this session — nothing has arrived yet";
+      } else {
+        var lv = liveness(evAge, hbAge, bfError);
+        stateCell = lv.chip;
+        liveText = lv.text;
+      }
+
+      var searchable = fr && fr.p50_ms != null
+        ? "typically searchable in <b>" + V.esc(V.fmtMs(fr.p50_ms)) + "</b>"
+        : '<span class="ref">not measured in this window</span>';
+
+      var notes = [];
+      if (mintedOnly) {
+        notes.push('<span class="ref">client-side row — shown here until the first payload or heartbeat arrives; refresh to re-check</span>');
+      }
+      if (!hb && fr && !mintedOnly) {
+        notes.push('<span class="ref">alive per freshness; no heartbeat yet (connectors push those) — a telemetry gap, not a dead source</span>');
+      }
+      if (bfError) {
+        notes.push(V.badge("catch-up failed", "b-conf-3") + ' <span class="note" style="margin-top:0">' + V.esc(bfError) + "</span>");
+      }
+      if (hb && hb.cursor) {
+        notes.push('<span class="ref" title="opaque connector checkpoint — display only">checkpoint ' + V.esc(hb.cursor) + "</span>");
+      }
+
+      return "<tr>" +
+        "<td><b>" + V.esc(name) + "</b>" +
+          (mintedOnly && pendingLocal.some(function (p) { return p.source === name; })
+            ? '<div class="ref">id ' + V.esc((pendingLocal.filter(function (p) { return p.source === name; })[0] || {}).webhook_id || "") + "</div>"
+            : "") + "</td>" +
+        "<td>" + stateCell + "</td>" +
+        "<td>" + V.esc(liveText) + "</td>" +
+        "<td>" + searchable + "</td>" +
+        '<td class="num">' + fmtCount(hb ? hb.items_synced : null) + "</td>" +
+        "<td>" + (notes.length ? notes.join("<br>") : '<span class="ref">—</span>') + "</td>" +
+      "</tr>";
+    }).join("");
+
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>source</th><th>state</th><th>what's happening</th>" +
+        "<th>new data becomes searchable</th>" +
+        '<th class="num">items synced</th><th>notes</th>' +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+      '<div class="note">Heartbeat rows carry no permission lane or tier — the heartbeat does not report one, and this screen never guesses ' +
+        "(a mislabeled lane is worse than an admitted unknown). Lanes are real, and explained, on the manifests below.</div>";
+  }
+
+  /* =========================================================== manifests */
+
+  function renderManifests() {
+    var host = el("src-manifests");
+    var rows = data.manifests;
+    if (!rows.length) {
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">No manifests installed</div>' +
+          '<div class="et-body">A manifest lets a real connector (HubSpot, Drive, Slack&hellip;) map its payloads <b>and its permissions</b> into Verity. ' +
+            "Installing one creates a draft that never runs; a named human approves it in a separate step, on the record.</div>" +
+          '<div class="et-actions"><button class="primary" id="src-m-teach">Install a manifest</button></div>' +
+        "</div>";
+      el("src-m-teach").onclick = openManifestDialog;
+      return;
+    }
+
+    var drafts = rows.filter(function (m) { return m.status === "draft"; }).length;
+    var body = rows.map(function (m, i) {
+      var active = m.status === "active";
+      var chip = active
+        ? V.stateChip("ok", "active")
+        : V.stateChip("attn", "awaiting your approval");
+      var approver = active && m.approved_by
+        ? "approved by <b>" + V.esc(m.approved_by) + "</b>"
+        : (active ? '<span class="ref">approver not recorded</span>' : '<span class="ref">draft — never runs until approved</span>');
+      var actions = active
+        ? '<button class="src-m-use" data-i="' + i + '" title="opens the connect dialog with this manifest pre-selected">Connect a source with it</button>'
+        : '<button class="good src-m-activate" data-i="' + i + '">Approve &amp; activate&hellip;</button>';
+      return "<tr>" +
+        "<td><b>" + V.esc(m.name) + "</b><div class=\"ref\">" + V.esc(m.manifest_id) + "</div></td>" +
+        "<td>" + chip + "</td>" +
+        "<td>" + V.esc(laneWords(m.acl_mode)) +
+          '<div class="ref">acl_mode: ' + V.esc(m.acl_mode == null ? "unparsed" : m.acl_mode) +
+          " · tier " + V.esc(m.tier == null ? "unstated" : m.tier) + "</div></td>" +
+        "<td>" + approver + "</td>" +
+        '<td><span class="ref" title="last change">' + V.esc(V.fmtTime(m.updated_at)) + "</span></td>" +
+        "<td>" + actions + "</td>" +
+      "</tr>";
+    }).join("");
+
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>manifest</th><th>state</th><th>who can see its writes</th>" +
+        "<th>approval</th><th>updated</th><th></th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+      (drafts ? "" :
+        '<div class="note">Every installed manifest has crossed the human gate — nothing here runs unapproved.</div>');
+
+    Array.prototype.forEach.call(host.querySelectorAll(".src-m-activate"), function (btn) {
+      btn.onclick = function () { openActivateDialog(rows[Number(btn.getAttribute("data-i"))]); };
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-m-use"), function (btn) {
+      btn.onclick = function () { openMintDialog(rows[Number(btn.getAttribute("data-i"))].manifest_id); };
+    });
+  }
+
+  /* =========================================================== freshness */
+
+  function renderFreshness() {
+    var host = el("src-fresh");
+    if (!host) return;
+    var rows = data.fresh;
+    var tgt = targetMs();
+    if (!rows.length) {
+      host.innerHTML =
+        '<div class="empty">No freshness samples in the last ' + windowHours() +
+        " hours. Nothing measured means no number — this screen shows the empty state rather than a fabricated percentile. " +
+        "Samples appear automatically as soon as a source delivers data.</div>";
+      return;
+    }
+    var body = rows.map(function (r) {
+      var breach = tgt != null && r.p95_ms != null && r.p95_ms > tgt;
+      return "<tr" + (breach ? ' class="flag"' : "") + ">" +
+        "<td><b>" + V.esc(r.source) + "</b></td>" +
+        '<td class="num">' + fmtCount(r.samples) + "</td>" +
+        '<td class="num">' + pctCell(r.p50_ms, tgt) + "</td>" +
+        '<td class="num">' + pctCell(r.p95_ms, tgt) + "</td>" +
+        '<td class="num">' + pctCell(r.p99_ms, tgt) + "</td>" +
+      "</tr>";
+    }).join("");
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>source</th>" +
+        '<th class="num">samples</th>' +
+        '<th class="num">typical <span style="text-transform:none">(p50)</span></th>' +
+        '<th class="num">slow <span style="text-transform:none">(p95)</span></th>' +
+        '<th class="num">worst seen <span style="text-transform:none">(p99)</span></th>' +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+      '<div class="note">Every number is computed from real samples on <b>this deployment</b> over the last ' + windowHours() +
+      " hours — session-local measurements, <em>not the published benchmark</em>. A red row means a real p95 exceeded " +
+      (tgt != null ? "your " + V.esc(V.fmtMs(tgt)) + " threshold" : "your threshold (unset)") +
+      " — a console display setting, not a server-enforced SLO.</div>";
+  }
+
+  /* =========================================================== backfill */
+
+  function backfillChip(state) {
+    var s = String(state || "").toLowerCase();
+    if (s === "running") return V.stateChip("wait", "running");
+    if (s === "completed") return V.stateChip("ok", "completed");
+    if (s === "failed") return V.stateChip("fail", "failed");
+    if (s === "paused") return V.stateChip("off", "paused");
+    return V.stateChip("off", s || "—");
+  }
+
+  function progressCell(run) {
     var state = String(run.state || "").toLowerCase();
     var total = run.total;
     var processed = run.processed || 0;
     if (total != null && total > 0) {
       var pct = Math.max(0, Math.min(100, (processed / total) * 100));
-      var stateCls = (state === "completed" || state === "failed" || state === "paused") ? " " + state : "";
-      return {
-        html: '<div class="bar' + stateCls + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
-          '<span class="pct">' + pct.toFixed(1) + "% · " +
-          Verity.esc(processed) + " / " + Verity.esc(total) + "</span>",
-        pct: pct, determinate: true,
-      };
+      var cls = (state === "completed" || state === "failed" || state === "paused") ? " " + state : "";
+      return '<div class="bar' + cls + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+        '<span class="pct">' + pct.toFixed(1) + "% · " + V.esc(processed) + " / " + V.esc(total) + "</span>";
     }
-    // No total → NEVER fabricate a percentage. Striped indeterminate track.
-    return {
-      html: '<div class="bar indet"></div>' +
-        '<span class="pct">' + Verity.esc(processed) + " processed · total unknown</span>",
-      pct: null, determinate: false,
-    };
+    // No total → NEVER fabricate a percentage.
+    return '<div class="bar indet"></div>' +
+      '<span class="pct">' + V.esc(processed) + " done · total unknown</span>";
   }
 
-  // ETA is honest ONLY for a running job with a known total and forward
-  // progress; otherwise we say nothing (no fabricated ETA).
   function etaCell(run) {
     var state = String(run.state || "").toLowerCase();
     var total = run.total, processed = run.processed || 0;
     if (state !== "running" || total == null || total <= 0 || processed <= 0 || processed >= total) {
-      return '<span class="refreshed" title="ETA is shown only for a running job ' +
-        'with a known total and forward progress">—</span>';
+      return '<span class="ref" title="a time-left estimate is shown only for a running job with a known total and forward progress">—</span>';
     }
-    var started = new Date(run.started_at).getTime();
-    var updated = new Date(run.updated_at).getTime();
-    var elapsed = updated - started;
-    if (!(elapsed > 0)) {
-      return '<span class="refreshed" title="not enough elapsed time to project honestly">—</span>';
+    var elapsed = new Date(run.updated_at).getTime() - new Date(run.started_at).getTime();
+    if (!(elapsed > 0)) return '<span class="ref">—</span>';
+    var rate = processed / elapsed;
+    if (!(rate > 0)) return '<span class="ref">—</span>';
+    return '<span title="projected from processed/elapsed at the last heartbeat, as-of ' +
+      V.esc(V.fmtTime(run.updated_at)) + '">~' + V.esc(V.fmtMs((total - processed) / rate)) + " left</span>";
+  }
+
+  function renderBackfill() {
+    var host = el("src-back");
+    var rows = data.backfill;
+    if (!rows.length) {
+      host.innerHTML =
+        '<div class="empty">No catch-up imports have run for this tenant. Connectors report them as they replay history — nothing to show is a real state, not an error.</div>';
+      return;
     }
-    var rate = processed / elapsed; // items per ms
-    if (!(rate > 0)) return '<span class="refreshed">—</span>';
-    var remainingMs = (total - processed) / rate;
-    return '<span title="projected from processed/elapsed at last heartbeat; ' +
-      'as-of ' + Verity.esc(Verity.fmtTime(run.updated_at)) + '">~' +
-      Verity.esc(Verity.fmtMs(remainingMs)) + " left</span>";
+    var body = rows.map(function (r) {
+      return "<tr>" +
+        "<td><b>" + V.esc(r.source) + "</b></td>" +
+        "<td>" + backfillChip(r.state) + "</td>" +
+        '<td style="min-width:180px">' + progressCell(r) + "</td>" +
+        "<td>" + etaCell(r) + "</td>" +
+        "<td>" + (r.error
+          ? V.badge("error", "b-conf-3") + ' <span class="note" style="margin-top:0">' + V.esc(r.error) + "</span>"
+          : '<span class="ref">—</span>') + "</td>" +
+        '<td><span class="ref">' + V.esc(V.fmtTime(r.updated_at)) + "</span></td>" +
+      "</tr>";
+    }).join("");
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>source</th><th>state</th><th>progress</th><th>time left</th><th>error</th><th>updated</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>";
   }
 
-  function backfillStateBadge(state) {
-    var s = String(state || "").toLowerCase();
-    if (s === "completed") return Verity.badge("completed", "b-st-published");
-    if (s === "failed") return Verity.badge("failed", "b-st-quarantined");
-    if (s === "paused") return Verity.badge("paused", "b-st-candidate");
-    if (s === "running") return Verity.badge("running", "b-tier");
-    return Verity.badge(s || "—", "b-kind");
-  }
+  /* ================================================= connect (mint) flow */
 
-  // -------------------------------------------------- freshness helpers ----
+  async function openMintDialog(manifestId) {
+    if (!tenantNow) { V.openMint(); return; }
+    V.clearErr("src-mint-err");
+    el("src-mint-result").innerHTML = "";
+    el("src-mint-go").disabled = false;
 
-  function pctCell(ms, targetMs) {
-    if (ms == null) return '<span class="refreshed">—</span>';
-    var over = targetMs != null && ms > targetMs;
-    var txt = Verity.fmtMs(ms);
-    return over
-      ? Verity.badge(txt + " · breach", "b-conf-3")     // red — real value over stated target
-      : '<span>' + Verity.esc(txt) + "</span>";
-  }
+    // Manifest binding options from the SAME list the panel renders.
+    var sel = el("src-mint-manifest");
+    sel.innerHTML = '<option value="">no — plain JSON shape</option>' +
+      data.manifests.map(function (m) {
+        return '<option value="' + V.esc(m.manifest_id) + '">' +
+          V.esc(m.name) + (m.status === "active" ? " (active)" : " (draft — quarantines until approved)") +
+        "</option>";
+      }).join("");
+    if (manifestId) sel.value = manifestId;
 
-  Verity.register({
-    id: "sources",
-    mount: function (section) {
-      var el = Verity.$("sources-mount");
-      if (!el) return;
+    V.dialog("src-mint-dialog").open();
 
-      // Per-panel read-only ribbon (v0.1/v0.2 disclosure). This screen's write
-      // actions (manifest install/activate, webhook mint/revoke) are Later, so
-      // the ribbon stays and the writes are disabled seams below.
-      var tpl = Verity.$("ribbon-tpl");
-      if (tpl && tpl.content) {
-        var rib = tpl.content.cloneNode(true);
-        var act = rib.querySelector(".ribbon-action");
-        if (act) act.textContent = "install-manifest / mint-webhook";
-        el.appendChild(rib);
+    // Who-can-see picker: names from the principal directory, not bare ints.
+    var box = el("src-mint-principals");
+    box.innerHTML = '<span class="ref">loading the principal directory&hellip;</span>';
+    try {
+      var res = await V.api(
+        "/v1/admin/principals?tenant_id=" + encodeURIComponent(tenantNow) + "&limit=1000",
+        { admin: true });
+      var list = (res && res.principals) || [];
+      if (!list.length) {
+        box.innerHTML = '<span class="ref">the principal directory is empty for this tenant — ' +
+          "add people on the People &amp; groups screen, or use raw tokens below (dev mode)</span>";
+      } else {
+        box.innerHTML = list.map(function (p) {
+          return '<label class="checkline" style="display:flex;margin:2px 0">' +
+            '<input type="checkbox" class="src-mint-p" value="' + Number(p.token) + '"> ' +
+            "<b>" + V.esc(p.principal) + "</b>" +
+            '<span class="ref" style="margin-left:auto">#' + Number(p.token) + "</span>" +
+          "</label>";
+        }).join("");
       }
+    } catch (e) {
+      box.innerHTML = '<span class="ref">could not read the principal directory (' +
+        V.esc((e && e.message) || e) + ") — enter raw tokens below</span>";
+    }
+  }
 
-      var LAST = { status: [], fresh: [], backfill: [] };
+  async function mintWebhook() {
+    V.clearErr("src-mint-err");
+    var name = el("src-mint-name").value.trim();
+    if (!name) {
+      V.err("src-mint-err", new Error("give the source a name — it becomes the source label on every record it writes"));
+      return;
+    }
+    var tokens = [];
+    Array.prototype.forEach.call(document.querySelectorAll(".src-mint-p:checked"), function (cb) {
+      tokens.push(Number(cb.value));
+    });
+    var raw = el("src-mint-raw").value.trim();
+    if (raw) {
+      var parsed = raw.split(",").map(function (s) { return s.trim(); }).filter(Boolean).map(Number);
+      if (parsed.some(function (n) { return !Number.isInteger(n); })) {
+        V.err("src-mint-err", new Error("raw principal tokens must be integers (comma-separated), e.g. 11, 1001"));
+        return;
+      }
+      parsed.forEach(function (n) { if (tokens.indexOf(n) < 0) tokens.push(n); });
+    }
+    // No client-side default if empty: the server's 422 refusal IS the
+    // teaching moment (fail closed — omission refuses), surfaced verbatim.
+    var conf = el("src-mint-conf").value;
+    if (!conf) {
+      V.err("src-mint-err", new Error(
+        "Choose a confidentiality ceiling — there is no default. " +
+        "It caps how sensitive the memories this webhook writes can be."));
+      return;
+    }
+    var body = {
+      tenant_id: tenantNow,
+      name: name,
+      visibility: tokens,
+      confidentiality: conf,
+    };
+    var ents = el("src-mint-entities").value.trim();
+    if (ents) body.entity_scope = ents.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    var mid = el("src-mint-manifest").value;
+    if (mid) body.manifest_id = mid;
 
-      // ---- controls card ------------------------------------------------
-      var controls = document.createElement("div");
-      controls.className = "card";
-      controls.innerHTML =
-        '<h2>Sources <span class="sub">GET /v1/admin/connector-status · /v1/slo/freshness · /v1/admin/backfill · admin token</span></h2>' +
-        '<div class="row">' +
-          '<div class="tight"><label for="src-tenant">tenant_id</label>' +
-            '<input type="text" id="src-tenant" placeholder="(uses active tenant)" size="30"></div>' +
-          '<div class="tight"><label for="src-window">freshness window (h)</label>' +
-            '<input type="number" id="src-window" value="24" min="1" max="2160" style="width:110px"></div>' +
-          '<div class="tight"><label for="src-target">SLO target (ms) <span class="note">operator-set</span></label>' +
-            '<input type="number" id="src-target" value="900000" min="0" step="1000" style="width:130px" ' +
-            'title="Operator-set target, NOT server-authoritative. Breach highlighting compares real p50/p95 to this."></div>' +
-          '<div class="tight" style="align-self:flex-end"><button id="src-load" class="primary">Load inventory</button></div>' +
-        "</div>" +
-        '<div class="note"><em>Two lanes, labeled, never blurred.</em> A source is <b>truth lane</b> ' +
-          '(mirrored, source-fidelity ACLs) or <b>convenience lane</b> (admin-assigned/approximated, no ' +
-          'per-object ACL fidelity). The <code>connector-status</code> heartbeat does not yet carry the ' +
-          'tier or lane, so where it is absent this panel says <b>not reported</b> rather than guessing — ' +
-          'a mislabeled lane is worse than an admitted-unknown one (SPEC §5e.6).</div>' +
-        '<div class="err" id="src-err"></div>' +
-        '<div id="src-stamp"></div>';
-      el.appendChild(controls);
-
-      // Mount points for the three sub-sections.
-      var invCard = document.createElement("div");
-      invCard.className = "card";
-      invCard.innerHTML =
-        '<h2>Source inventory <span class="sub">provenance tier · lane · sync · staleness</span></h2>' +
-        '<div id="src-inv"></div>';
-      el.appendChild(invCard);
-
-      var freshCard = document.createElement("div");
-      freshCard.className = "card";
-      freshCard.innerHTML =
-        '<h2>Freshness SLO <span class="sub">source-change → queryable · GET /v1/slo/freshness</span></h2>' +
-        '<div class="note"><em>Honest percentiles.</em> The endpoint computes <b>p50</b>, <b>p95</b> ' +
-          'and <b>p99</b> from real samples over the same window (null when a source has no samples), ' +
-          'never a fabricated number. The <b>SLO target</b> is <b>operator-set</b> above (not ' +
-          'server-authoritative); a value over target is highlighted as a breach (SPEC §5 Screen 5 / ' +
-          'CLAUDE.md honest-numbers).</div>' +
-        '<div id="src-fresh"></div>';
-      el.appendChild(freshCard);
-
-      var backCard = document.createElement("div");
-      backCard.className = "card";
-      backCard.innerHTML =
-        '<h2>Backfill <span class="sub">latest run per source · GET /v1/admin/backfill</span></h2>' +
-        '<div class="note"><em>Determinate only when countable.</em> A run with a known total shows a ' +
-          'real progress bar; an uncountable run shows a striped indeterminate track, never a fabricated ' +
-          'percentage. ETA appears only for a running job with a known total and forward progress.</div>' +
-        '<div id="src-back"></div>';
-      el.appendChild(backCard);
-
-      // ---- Later-only write seams (designed, never faked) ---------------
-      var seamCard = document.createElement("div");
-      seamCard.className = "card";
-      seamCard.innerHTML =
-        '<h2>Source writes <span class="sub">Later — disabled seams, not faked buttons</span></h2>' +
-        '<div class="note">v0.2 is <b>read-only</b> for this screen. Installing a manifest, activating it as ' +
-          'an explicit human-approved step, and minting/revoking webhooks are <b>Later</b> ' +
-          '(SPEC §5 Screen 5 · §6 checklist). We render the seams so the destination is visible, but we do ' +
-          '<b>not</b> fake a working button — and there will never be an "index it anyway" permissive ' +
-          'shortcut (SPEC §3 fail-closed).</div>' +
-        '<div class="actions" style="justify-content:flex-start;flex-wrap:wrap;gap:8px;margin-top:8px">' +
-          '<button disabled title="POST /v1/manifests — Later. Install as a DRAFT; activation is a separate audited human-approval step.">Install manifest (draft) — seam</button>' +
-          '<button disabled title="POST /v1/manifests/{id}/activate — Later. Explicit, human-approver-recorded, audited — never a flag flip.">Activate manifest — seam</button>' +
-          '<button disabled title="POST /v1/webhooks — Later. Show-once secret with copy-once UI.">Mint webhook — seam</button>' +
-          '<button disabled title="DELETE /v1/webhooks/{id} — Later.">Revoke webhook — seam</button>' +
+    var btn = el("src-mint-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api("/v1/webhooks", { json: body, admin: true });
+      var url = location.origin + res.url;
+      var curl = "curl -X POST " + url + " \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"content\":\"Hello from " + name.replace(/'/g, "") + "\"}'";
+      el("src-mint-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", "source connected") +
+            '<span class="asof">secret URL — shown ONCE; Verity keeps only a fingerprint and can never show it again</span>' +
+          "</div>" +
+          '<textarea id="src-mint-url" readonly style="margin-top:8px;min-height:52px">' + V.esc(url) + "</textarea>" +
+          '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
+            '<button class="primary" id="src-mint-copy">Copy the URL</button>' +
+            '<button id="src-mint-copy-curl">Copy a test curl</button>' +
+          "</div>" +
+          '<pre style="margin-top:8px;padding:8px 10px;border:1px solid var(--border);border-radius:var(--r-sm);overflow-x:auto;font-size:11.5px">' + V.esc(curl) + "</pre>" +
+          '<div class="note">Save the webhook id ' + V.refSpan(res.webhook_id) +
+            " — shutting this source off later needs it (the console cannot list webhooks yet). " +
+            "The source appears in the table as <b>waiting for first delivery</b> until the first payload lands.</div>" +
         "</div>";
-      el.appendChild(seamCard);
+      el("src-mint-copy").onclick = function () {
+        el("src-mint-url").select();
+        try { navigator.clipboard.writeText(url); } catch (e) { document.execCommand("copy"); }
+        el("src-mint-copy").textContent = "Copied";
+      };
+      el("src-mint-copy-curl").onclick = function () {
+        try { navigator.clipboard.writeText(curl); } catch (e) { /* selection fallback below */ }
+        el("src-mint-copy-curl").textContent = "Copied";
+      };
+      pendingLocal.push({ source: "webhook:" + name, webhook_id: res.webhook_id, mintedAt: Date.now() });
+      renderHealth();
+    } catch (e) {
+      // Server refusals (empty visibility, unknown manifest) verbatim — the
+      // refusal is the product speaking, not an error to soften.
+      V.err("src-mint-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
 
-      // ---- tenant/window helpers ----------------------------------------
-      function activeTenant() {
-        var typed = Verity.$("src-tenant").value.trim();
-        return typed || Verity.tenant() || "";
+  /* ================================================= revoke flow */
+
+  function openRevokeDialog() {
+    V.clearErr("src-revoke-err");
+    el("src-revoke-id").value = "";
+    el("src-revoke-word").value = "";
+    el("src-revoke-go").disabled = true;
+    V.dialog("src-revoke-dialog").open();
+  }
+
+  function reflectRevokeTyped() {
+    el("src-revoke-go").disabled = !(
+      el("src-revoke-word").value.trim() === "REVOKE" && el("src-revoke-id").value.trim()
+    );
+  }
+
+  async function revokeWebhook() {
+    V.clearErr("src-revoke-err");
+    var id = el("src-revoke-id").value.trim();
+    var btn = el("src-revoke-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api("/v1/webhooks/" + encodeURIComponent(id), { method: "DELETE", admin: true });
+      V.dialog("src-revoke-dialog").close();
+      if (res && res.revoked) {
+        receipt("ok", "Source shut off — the URL stopped resolving the moment you clicked. Already-ingested history is untouched (invalidate, never erase).");
+      } else {
+        receipt("attn", "Nothing was revoked — that id is unknown or was already shut off. An honest no-op, not a failure.");
       }
-      function targetMs() {
-        var v = parseInt(Verity.$("src-target").value, 10);
-        return isNaN(v) || v < 0 ? null : v;
-      }
+      pendingLocal = pendingLocal.filter(function (p) { return p.webhook_id !== id; });
+      V.reload("sources");
+    } catch (e) {
+      V.err("src-revoke-err", e);
+      btn.disabled = false;
+    }
+  }
 
-      // ---- render: source inventory -------------------------------------
-      function renderInventory() {
-        var rows = LAST.status;
-        var backBySource = {};
-        LAST.backfill.forEach(function (b) { backBySource[b.source] = b; });
+  /* ================================================= manifest flows */
 
-        if (!rows.length) {
-          Verity.$("src-inv").innerHTML =
-            '<div class="empty">No connector heartbeats for this tenant. An empty inventory means no ' +
-            'source has reported in — that is a real state (nothing hidden), not an error.</div>';
-          return;
-        }
-        var body = rows.map(function (r) {
-          var evAge = ageMs(r.last_event_at);
-          var hbAge = ageMs(r.updated_at);
-          var cad = cadenceLabel(evAge != null ? evAge : hbAge);
-          // Inline error/last-failure: connector-status has no error column, so
-          // the only real failure signal is the matching backfill run's error.
-          var bf = backBySource[r.source];
-          var errCell;
-          if (bf && bf.error) {
-            errCell = Verity.badge("last-failure", "b-conf-3") +
-              ' <span class="note" title="from the source\'s latest backfill run — connector-status carries no error column">' +
-              Verity.esc(bf.error) + "</span>";
-          } else {
-            errCell = '<span class="refreshed" title="no error on this source\'s latest backfill run; ' +
-              'connector-status itself reports no error field">none reported</span>';
-          }
-          var lane = laneOf(r);
-          var gradRow = lane === "convenience"
-            ? '<tr class="grad-row"><td colspan="9">' +
-                '<div class="note"><em>Graduation.</em> This source is on the <b>convenience lane</b> ' +
-                '(admin-assigned/approximated ACLs). Connect the native <b>Tier-A</b> connector to graduate ' +
-                'it to <b>mirrored</b> ACLs with per-object source fidelity (SPEC §5e.4). ' +
-                '<span class="refreshed">(install-manifest write is Later — seam above)</span></div></td></tr>'
-            : "";
-          return '<tr>' +
-            "<td><b>" + Verity.esc(r.source) + "</b></td>" +
-            "<td>" + tierBadgeCell(r) + "</td>" +
-            "<td>" + laneBadgeCell(r) + "</td>" +
-            '<td class="num">' + Verity.esc(r.items_synced == null ? "—" : r.items_synced) + "</td>" +
-            '<td>' + (r.cursor
-              ? '<span class="note" title="opaque connector checkpoint — display only">' + Verity.esc(r.cursor) + "</span>"
-              : '<span class="refreshed">—</span>') + "</td>" +
-            "<td>" + ageBadge(evAge, humanAge(evAge)) + "</td>" +
-            "<td>" + (cad
-              ? Verity.badge("cadence: " + cad, "b-kind")
-              : '<span class="refreshed">—</span>') + "</td>" +
-            '<td>' + (hbAge != null
-              ? '<span title="last heartbeat updated_at ' + Verity.esc(Verity.fmtTime(r.updated_at)) + '">' +
-                  Verity.esc(humanAge(hbAge)) + "</span>"
-              : '<span class="refreshed">—</span>') + "</td>" +
-            "<td>" + errCell + "</td>" +
-          "</tr>" + gradRow;
-        }).join("");
+  function openManifestDialog() {
+    V.clearErr("src-manifest-err");
+    el("src-manifest-result").innerHTML = "";
+    V.dialog("src-manifest-dialog").open();
+  }
 
-        Verity.$("src-inv").innerHTML =
-          '<div class="tablewrap"><table><thead><tr>' +
-            "<th>source</th>" +
-            '<th>provenance tier</th>' +
-            "<th>lane</th>" +
-            '<th class="num">items synced</th>' +
-            "<th>cursor</th>" +
-            "<th>last-event age</th>" +
-            "<th>cadence <span class=\"sub\">(observed)</span></th>" +
-            "<th>heartbeat</th>" +
-            "<th>inline error</th>" +
-          "</tr></thead><tbody>" + body + "</tbody></table></div>" +
-          '<div class="note">Last-event age: ' +
-            Verity.badge("&lt;15m", "b-conf-0") + " fresh · " +
-            Verity.badge("&lt;24h", "b-conf-2") + " stale · " +
-            Verity.badge("&ge;24h", "b-conf-3") + " cold · " +
-            Verity.badge("no event time", "b-kind") + " honest fallback (a source with no source-side " +
-            "clock — e.g. webhook-only — never shows a fake-fresh green).</div>";
-      }
+  async function installManifest() {
+    V.clearErr("src-manifest-err");
+    el("src-manifest-result").innerHTML = "";
+    var yaml = el("src-manifest-yaml").value;
+    if (!yaml.trim()) {
+      V.err("src-manifest-err", new Error("paste the manifest YAML — the server validates it before anything is stored"));
+      return;
+    }
+    var btn = el("src-manifest-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api("/v1/manifests", { json: { tenant_id: tenantNow, yaml: yaml }, admin: true });
+      var ready = res.activation_ready === true;
+      el("src-manifest-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", "installed as a draft") +
+            (ready
+              ? V.stateChip("attn", "awaiting a human approval")
+              : V.stateChip("attn", "not yet activatable")) +
+          "</div>" +
+          '<div class="note"><b>' + V.esc(res.name) + "</b> " + V.refSpan(res.manifest_id) +
+            " — permission lane: " + V.esc(laneWords(res.acl_mode)) + ". " +
+            (ready
+              ? "It never runs until a named person approves it — the button is in the manifests table."
+              : "The server pre-checked the gate and would refuse activation: <b>" +
+                V.esc((res.activation_ready && res.activation_ready.refused) || "reason not stated") +
+                "</b> — fix the YAML and re-install.") +
+          "</div>" +
+        "</div>";
+      V.reload("sources");
+    } catch (e) {
+      // Validation refusals (bad YAML, schema violations) verbatim.
+      V.err("src-manifest-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
 
-      // ---- render: freshness SLO ----------------------------------------
-      function renderFreshness() {
-        var rows = LAST.fresh;
-        var tgt = targetMs();
-        if (!rows.length) {
-          Verity.$("src-fresh").innerHTML =
-            '<div class="empty">No freshness samples in this window. Nothing measured means no number — ' +
-            'we show the empty state rather than a fabricated percentile.</div>';
-          return;
-        }
-        var body = rows.map(function (r) {
-          var breach = (r.p50_ms != null && tgt != null && r.p50_ms > tgt) ||
-                       (r.p95_ms != null && tgt != null && r.p95_ms > tgt) ||
-                       (r.p99_ms != null && tgt != null && r.p99_ms > tgt);
-          return '<tr' + (breach ? ' class="flag"' : "") + ">" +
-            "<td><b>" + Verity.esc(r.source) + "</b></td>" +
-            '<td class="num">' + Verity.esc(r.samples == null ? "—" : r.samples) + "</td>" +
-            '<td class="num">' + pctCell(r.p50_ms, tgt) + "</td>" +
-            '<td class="num">' + pctCell(r.p95_ms, tgt) + "</td>" +
-            '<td class="num">' + pctCell(r.p99_ms, tgt) + "</td>" +
-            '<td class="num">' + (tgt != null
-              ? '<span title="operator-set target, not server-authoritative">' + Verity.esc(Verity.fmtMs(tgt)) + "</span>"
-              : '<span class="refreshed">unset</span>') + "</td>" +
-          "</tr>";
-        }).join("");
+  function openActivateDialog(m) {
+    pendingActivate = m;
+    V.clearErr("src-activate-err");
+    el("src-activate-title").textContent = "Approve & activate “" + m.name + "”";
+    el("src-activate-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>What you are approving:</b> payloads from <b>' +
+        V.esc(m.name) + "</b> will be indexed with the lane <b>" + V.esc(laneWords(m.acl_mode)) + "</b>." +
+        '<div class="dc-meta" style="margin-top:6px">' + V.esc(m.manifest_id) +
+        " · acl_mode: " + V.esc(m.acl_mode == null ? "unparsed" : m.acl_mode) +
+        " · tier " + V.esc(m.tier == null ? "unstated" : m.tier) + "</div></div>";
+    el("src-activate-who").value = "";
+    el("src-activate-word").value = "";
+    el("src-activate-go").disabled = true;
+    V.dialog("src-activate-dialog").open();
+  }
 
-        Verity.$("src-fresh").innerHTML =
-          '<div class="tablewrap"><table><thead><tr>' +
-            "<th>source</th>" +
-            '<th class="num">samples</th>' +
-            '<th class="num">p50</th>' +
-            '<th class="num">p95</th>' +
-            '<th class="num">p99</th>' +
-            '<th class="num">SLO target <span class="sub">(operator-set)</span></th>' +
-          "</tr></thead><tbody>" + body + "</tbody></table></div>" +
-          '<div class="note">A red <b>breach</b> chip marks a real p50/p95/p99 exceeding the stated ' +
-            (tgt != null ? "target of " + Verity.esc(Verity.fmtMs(tgt)) : "target (unset)") +
-            ". The ACL-sync / grant-staleness window is itself an SLO here — never claimed 'instant' " +
-            "(SPEC §7b/§14).</div>";
-      }
+  function reflectActivateTyped() {
+    el("src-activate-go").disabled = !(
+      el("src-activate-word").value.trim() === "ACTIVATE" && el("src-activate-who").value.trim()
+    );
+  }
 
-      // ---- render: backfill ---------------------------------------------
-      function renderBackfill() {
-        var rows = LAST.backfill;
-        if (!rows.length) {
-          Verity.$("src-back").innerHTML =
-            '<div class="empty">No backfill runs for this tenant.</div>';
-          return;
-        }
-        var body = rows.map(function (r) {
-          var bar = progressBar(r);
-          return "<tr>" +
-            "<td><b>" + Verity.esc(r.source) + "</b></td>" +
-            "<td>" + backfillStateBadge(r.state) + "</td>" +
-            '<td style="min-width:180px">' + bar.html + "</td>" +
-            "<td>" + etaCell(r) + "</td>" +
-            '<td>' + (r.error
-              ? Verity.badge("error", "b-conf-3") + ' <span class="note">' + Verity.esc(r.error) + "</span>"
-              : '<span class="refreshed">—</span>') + "</td>" +
-            '<td><span class="refreshed" title="latest heartbeat for this run">' +
-              Verity.esc(Verity.fmtTime(r.updated_at)) + "</span></td>" +
-          "</tr>";
-        }).join("");
-
-        Verity.$("src-back").innerHTML =
-          '<div class="tablewrap"><table><thead><tr>' +
-            "<th>source</th><th>state</th><th>progress</th><th>ETA</th>" +
-            "<th>error</th><th>updated</th>" +
-          "</tr></thead><tbody>" + body + "</tbody></table></div>";
-      }
-
-      function renderAll() {
-        renderInventory();
-        renderFreshness();
-        renderBackfill();
-      }
-
-      // ---- load ---------------------------------------------------------
-      async function load() {
-        Verity.clearErr("src-err");
-        var tenant = activeTenant();
-        if (!tenant) {
-          Verity.err("src-err", new Error(
-            "no tenant selected — decode a scope handle on Scope Inspector or type a tenant_id above"));
-          return;
-        }
-        Verity.setTenant(tenant);
-        var win = Math.max(1, Math.min(2160, parseInt(Verity.$("src-window").value, 10) || 24));
-        var q = "tenant_id=" + encodeURIComponent(tenant);
-        try {
-          // Three independent reads — fire together; each surfaces its own error
-          // honestly rather than one failure blanking the whole screen.
-          var results = await Promise.allSettled([
-            Verity.api("/v1/admin/connector-status?" + q, { admin: true }),
-            Verity.api("/v1/slo/freshness?" + q + "&window_hours=" + win, { admin: true }),
-            Verity.api("/v1/admin/backfill?" + q, { admin: true }),
-          ]);
-          var errs = [];
-          LAST.status   = results[0].status === "fulfilled" && Array.isArray(results[0].value) ? results[0].value : [];
-          if (results[0].status === "rejected") errs.push(results[0].reason.message || String(results[0].reason));
-          LAST.fresh    = results[1].status === "fulfilled" && Array.isArray(results[1].value) ? results[1].value : [];
-          if (results[1].status === "rejected") errs.push(results[1].reason.message || String(results[1].reason));
-          LAST.backfill = results[2].status === "fulfilled" && Array.isArray(results[2].value) ? results[2].value : [];
-          if (results[2].status === "rejected") errs.push(results[2].reason.message || String(results[2].reason));
-
-          renderAll();
-          Verity.$("src-stamp").innerHTML =
-            '<span class="refreshed">loaded ' + Verity.esc(Verity.fmtTime(Date.now())) + " · " +
-            LAST.status.length + " source(s) · " + LAST.fresh.length + " freshness row(s) · " +
-            LAST.backfill.length + " backfill run(s)</span>";
-          if (errs.length) Verity.err("src-err", new Error(errs.join("  |  ")));
-        } catch (e) {
-          Verity.err("src-err", e);
-        }
-      }
-
-      Verity.$("src-load").onclick = load;
-      Verity.$("src-target").addEventListener("input", function () {
-        // Re-highlight breaches live against the new operator-set target.
-        renderFreshness();
-      });
-
-      // Auto-fill the tenant field from shared state.
-      Verity.onTenant(function (t) {
-        var f = Verity.$("src-tenant");
-        if (f && !f.value.trim()) f.placeholder = t ? "(active: " + t + ")" : "(uses active tenant)";
-      });
-      (function () {
-        var t = Verity.tenant();
-        var f = Verity.$("src-tenant");
-        if (f && t) f.placeholder = "(active: " + t + ")";
-      })();
-    },
-  });
+  async function activateManifest() {
+    if (!pendingActivate) return;
+    V.clearErr("src-activate-err");
+    var who = el("src-activate-who").value.trim();
+    var btn = el("src-activate-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api(
+        "/v1/manifests/" + encodeURIComponent(pendingActivate.id || pendingActivate.manifest_id) + "/activate",
+        { json: { tenant_id: tenantNow, approved_by: who }, admin: true });
+      V.dialog("src-activate-dialog").close();
+      receipt("ok",
+        "<b>" + V.esc(res.name) + "</b> is live — approved by <b>" + V.esc(res.approved_by) +
+        "</b>, recorded in the audit log. Payloads it maps start indexing on the next delivery.");
+      V.reload("sources");
+    } catch (e) {
+      // The gate's refusal (absent acl_policy, tier violation) verbatim —
+      // an approval the server won't take is a fact, not a UI failure.
+      V.err("src-activate-err", e);
+      btn.disabled = false;
+    }
+  }
 })();

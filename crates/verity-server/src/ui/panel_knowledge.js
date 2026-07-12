@@ -1,569 +1,819 @@
 "use strict";
 /* ==========================================================================
-   panel_knowledge.js — Screen 3 · Knowledge Review (TA.3 · BeyondMVP)
+   panel_knowledge.js — Knowledge review (v2 rebuild, UI-ACTIONS §5)
    --------------------------------------------------------------------------
-   Reads (unchanged):
-     • GET /v1/knowledge                 — the review queue (admin-token)
-     • GET /v1/admin/knowledge/{id}      — the item detail drawer (admin-token)
-   The read-only ribbon is LIFTED here: the two flagship human-gated WRITES are
-   wired live (SPEC §5 Screen 3 'Actions (v0.2)'):
-     • POST /v1/knowledge/{id}/publish   — admin-token; body
-       { tenant_id, visibility: [<i32 principal token>…], k_min }. visibility is
-       REQUIRED and has NO DEFAULT — an unset/empty set REFUSES to submit
-       (omission is a refusal, SPEC §3 / §5e.8). k_min is clamped ≥3 client-side
-       for honesty; the server re-clamps as the authority.
-     • POST /v1/admin/knowledge/{id}/reject — admin-token; body
-       { tenant_id, reason } behind an explicit confirm.
-   Both refresh the queue on success so the status badge updates. Still zero LLM
-   calls and zero live-ReBAC calls from this panel.
+   Reads / writes:
+     • GET  /v1/knowledge?tenant_id            — every lesson (admin-token);
+       the rail count is derived from THIS query (candidate+eligible), the
+       same one the list below renders — never a separate estimate.
+     • GET  /v1/admin/knowledge/{id}?tenant_id — one lesson's full story:
+       support, de-identification gate, evidence lineage (audit-scope-only).
+     • GET  /v1/admin/principals?tenant_id&after_token&limit — the NAMED
+       people & groups directory feeding the publish picker (N5). Keyset-
+       paginated; truncation is disclosed, never hidden.
+     • POST /v1/knowledge/{id}/publish — THE human gate. visibility is
+       REQUIRED with NO default (omission refuses, verbatim server 422s
+       surface); k_min is clamped ≥3 client-side for honesty and re-clamped
+       by the server as the authority.
+     • POST /v1/admin/knowledge/{id}/reject — reason REQUIRED here (house
+       rule); the decision is remembered so the lesson never resurrects.
 
-   PROVENANCE FIREWALL (SPEC §2, §7g): this is the ADMIN surface, so exact
-   distinct_entities / writer_count are shown. We render the split faithfully
-   and disclose that the agent-facing preview would instead be a BUCKET
-   (several | many | extensive). Evidence lineage in the drawer is present but
-   LABELED audit-scope-only — never a recall/brief affordance.
-
-   RETRACTION (honest gap, SPEC §5 Screen 3): there is NO un-publish endpoint.
-   A published item renders a DISABLED Erasure/forget seam — designed, never
-   faked as a working button.
+   THE LAW, applied:
+     • lesson cards read in plain words ("Learned across 3 customers: …" /
+       "Waiting: only 1 customer supports this so far — needs 3");
+     • lifecycle as state chips: proposed → gathering support → awaiting
+       your review → published (quarantined/rejected shown as honest exits);
+     • jargon (status enums, support_tier, distinct_entities, endpoints)
+       lives ONLY in .dc-meta mono lines and card h2 .sub;
+     • autoloads when the tenant is known; every empty state teaches;
+     • provenance firewall kept: exact counts admin-only, the agent-facing
+       bucket disclosed as a dashed (probabilistic-style) coarse chip;
+     • NO un-publish exists — the retraction seam stays disabled and honest.
    ========================================================================== */
 (function () {
-  var STATUSES = ["candidate", "eligible", "published", "quarantined", "rejected", "invalidated"];
+  var V = window.Verity;
 
-  // Agent-facing bucket vocabulary (SPEC §2/§7g). The server's SupportTier
-  // enum serializes as emerging(3-4) | established(5-9) | extensive(10+); the
-  // agent-visible preview collapses those to the coarser several|many|extensive
-  // ladder. This mapping is disclosure-only — the exact count never leaves the
-  // admin surface.
-  function agentBucket(item) {
-    var d = item.distinct_entities;
-    if (d == null || d < 3) return null; // below the k-support floor → nothing to disclose
+  /* ------------------------------------------------------------ state */
+
+  var data = { items: [], byId: {}, loadedAt: 0 };
+  var view = "review"; // "review" (candidate+eligible) | "all"
+  var tenantNow = "";
+  var current = { id: "", statement: "", status: "", item: null };
+  var dir = { state: "idle", rows: [], truncated: false, error: "" };
+  var pubSel = {}; // token(number as string) -> principal name
+
+  function el(id) { return V.$(id); }
+
+  function wire(host, sel, fn) {
+    var nodes = host.querySelectorAll(sel);
+    for (var i = 0; i < nodes.length; i++) {
+      (function (n) { n.onclick = function () { fn(n); }; })(nodes[i]);
+    }
+  }
+
+  /* ------------------------------------------------------------ plain words */
+
+  function isWaiting(it) {
+    var s = String(it.status || "").toLowerCase();
+    return s === "candidate" || s === "eligible";
+  }
+
+  // k-support gate math — DISPLAY only; the server is the authority.
+  function kSupport(it) {
+    var d = it.distinct_entities, w = it.writer_count;
+    var entOk = d != null && d >= 3;
+    var writerOk = (w != null && w >= 2) || !!it.has_tier1_evidence;
+    var catOk = (it.categories || []).length >= 1;
+    return { entOk: entOk, writerOk: writerOk, catOk: catOk, pass: entOk && writerOk && catOk,
+      d: d == null ? 0 : Number(d), w: w == null ? 0 : Number(w) };
+  }
+
+  // The coarse bucket an agent would see (provenance firewall) — exact
+  // counts never leave this admin surface.
+  function agentBucket(it) {
+    var d = it.distinct_entities;
+    if (d == null || d < 3) return null;
     if (d >= 10) return "extensive";
     if (d >= 5) return "many";
     return "several";
   }
 
-  // k-support gate math (SPEC §5 / knowledge-merge-tuning): publishable needs
-  // ≥3 distinct entities AND (≥2 writers OR tier-1 evidence). Category floor is
-  // a separate signal (has at least one category). We only DISPLAY the math —
-  // the server is the authority; this is a read-side explanation, not a check.
-  function kSupport(item) {
-    var d = item.distinct_entities;
-    var w = item.writer_count;
-    var entOk = d != null && d >= 3;
-    var writerOk = (w != null && w >= 2) || !!item.has_tier1_evidence;
-    var catOk = (item.categories || []).length >= 1;
-    return {
-      entOk: entOk, writerOk: writerOk, catOk: catOk,
-      pass: entOk && writerOk && catOk,
-      d: d, w: w,
-    };
-  }
-
-  function gateChip(ok, label) {
-    // Solid green pass / dashed-amber unmet — deterministic gate, so solid on
-    // pass. Unmet uses the eligible/amber lifecycle hue to read as "not yet".
-    return ok
-      ? Verity.badge("✓ " + label, "b-st-published")
-      : Verity.badge("✗ " + label, "b-st-eligible");
-  }
-
-  function catBadges(cats) {
-    return (cats || []).map(function (c) { return Verity.kindBadge(c); }).join(" ");
-  }
-
-  // merge_reason vs quarantine gate reason — render the split faithfully.
-  function reasonCell(item) {
-    if (item.quarantine_reason) {
-      return Verity.statusBadge("quarantined") + " " +
-        '<span class="note"><em>gate:</em> ' + Verity.esc(item.quarantine_reason) + "</span>";
+  // Lifecycle in plain words. candidate below the support floor is still
+  // "gathering support"; at/above the floor it needs a human.
+  function lifeChip(it) {
+    var s = String(it.status || "").toLowerCase();
+    if (s === "candidate") {
+      return kSupport(it).pass
+        ? V.stateChip("attn", "awaiting your review")
+        : V.stateChip("wait", "gathering support");
     }
-    if (item.merge_reason) {
-      return '<span class="note">' + Verity.esc(item.merge_reason) + "</span>";
-    }
-    return '<span class="note">—</span>';
+    if (s === "eligible") return V.stateChip("attn", "awaiting your review");
+    if (s === "published") return V.stateChip("ok", "published");
+    if (s === "quarantined") return V.stateChip("fail", "held back — identifying details");
+    if (s === "rejected") return V.stateChip("off", "rejected by a person");
+    if (s === "invalidated") return V.stateChip("off", "withdrawn — sources forgotten");
+    return V.stateChip("off", s || "unknown");
   }
 
-  Verity.register({
+  // The one-sentence "why this card looks the way it does".
+  function supportSentence(it) {
+    var s = String(it.status || "").toLowerCase();
+    var k = kSupport(it);
+    var d = k.d, w = k.w;
+    var ep = it.episode_count == null ? null : Number(it.episode_count);
+    if (s === "quarantined") {
+      return "<b>Held back before review:</b> this lesson may identify a specific customer, so Verity refused to consider it." +
+        (it.quarantine_reason ? " Reason on record: <b>" + V.esc(it.quarantine_reason) + "</b>." : "");
+    }
+    if (s === "rejected") {
+      return "<b>Rejected by a reviewer.</b> The decision is remembered — the same lesson will not be proposed again.";
+    }
+    if (s === "invalidated") {
+      return "<b>Withdrawn automatically:</b> the conversations that supported this lesson were forgotten, so the lesson was invalidated with them.";
+    }
+    var learned = d > 0
+      ? "Learned across <b>" + d + " customer" + (d === 1 ? "" : "s") + "</b>" +
+        (ep ? " in " + ep + " conversation" + (ep === 1 ? "" : "s") : "") +
+        (w ? ", written down by " + w + " independent writer" + (w === 1 ? "" : "s") : "") +
+        (it.has_tier1_evidence ? " (includes an authoritative source)" : "")
+      : "No supporting customers on record yet";
+    if (s === "published") {
+      return learned + ". <b>Published</b>" +
+        (it.published_at ? " " + V.esc(V.timeAgo(it.published_at)) : "") +
+        " — visible only to the people it was published to.";
+    }
+    if (k.pass) return learned + " — <b>enough independent support to publish</b>. Your call.";
+    var needs = [];
+    if (!k.entOk) needs.push("<b>" + Math.max(0, 3 - d) + " more customer" + ((3 - d) === 1 ? "" : "s") + "</b> (3 required)");
+    if (!k.writerOk) needs.push("a <b>second independent writer</b> or an authoritative source");
+    if (!k.catOk) needs.push("a <b>category</b>");
+    var sofar = d === 0 ? "no customers support this yet"
+      : "only " + d + " customer" + (d === 1 ? " supports" : "s support") + " this so far";
+    return "<b>Waiting:</b> " + sofar + " — still needs " + needs.join(" and ") + ". It cannot be published before then.";
+  }
+
+  // Named-principal chip: "group:sales" → sales (group) · "user:alice@…" →
+  // alice@… (person). The raw token renders as mono-small secondary text.
+  function principalChip(principal) {
+    var p = String(principal || "");
+    var i = p.indexOf(":");
+    if (i < 0) return V.entityChip(p);
+    var kind = p.slice(0, i);
+    var word = kind === "user" ? "person" : kind;
+    return V.entityChip(p.slice(i + 1), word);
+  }
+
+  /* =========================================================== mount */
+
+  V.register({
     id: "knowledge",
-    mount: function (section) {
-      var el = Verity.$("knowledge-mount");
-      if (!el) return;
-
-      /* -- read-only ribbon LIFTED on this panel (SPEC §5 Screen 3): the two
-            human-gated writes below are wired live, so no ribbon is cloned. */
-
-      /* -- controls card: status filter + load ------------------------------ */
-      var controls = document.createElement("div");
-      controls.className = "card";
-      controls.innerHTML =
-        '<h2>Review queue <span class="sub">GET /v1/knowledge · admin-token</span></h2>' +
-        '<div class="row">' +
-          '<div class="tight">' +
-            '<label for="know-status">status</label> ' +
-            '<select id="know-status" class="field">' +
-              '<option value="">all</option>' +
-              STATUSES.map(function (s) {
-                return '<option value="' + s + '">' + s + "</option>";
-              }).join("") +
-            "</select>" +
-          "</div>" +
-          '<div class="tight"><label for="know-tenant">tenant_id</label> ' +
-            '<input type="text" id="know-tenant" placeholder="(uses active tenant)"></div>' +
-          '<div class="tight"><button id="know-load">Load queue</button></div>' +
+    mount: function () {
+      var host = el("knowledge-mount");
+      if (!host) return;
+      host.innerHTML =
+        /* ---- toolbar ---- */
+        '<div class="toolbar">' +
+          '<span class="seg">' +
+            '<button id="know-view-review" class="on">Needs your review</button>' +
+            '<button id="know-view-all">All lessons</button>' +
+          "</span>" +
+          '<span id="know-state"></span>' +
+          '<span class="asof" id="know-asof"></span>' +
+          '<span class="spacer"></span>' +
+          '<button id="know-refresh" title="GET /v1/knowledge — reloads the same query the rail count uses">Refresh</button>' +
         "</div>" +
-        '<div class="note"><em>Provenance firewall.</em> This is the admin surface: exact ' +
-          '<b>distinct_entities</b> / <b>writer_count</b> are shown here. An agent-facing preview ' +
-          'would instead see a BUCKET (<b>several</b> · <b>many</b> · <b>extensive</b>) and ' +
-          'never the exact counts (SPEC §2/§7g). Evidence lineage in the detail drawer is ' +
-          '<b>audit-scope-only</b> and is never rendered in a recall/brief context.</div>' +
         '<div class="err" id="know-err"></div>' +
-        '<div id="know-refreshed"></div>' +
-        '<div id="know-out"></div>';
-      el.appendChild(controls);
+        '<div id="know-receipt"></div>' +
+        '<div id="know-teach"></div>' +
+        '<div id="know-out"></div>' +
 
-      /* -- detail drawer (dialog-backdrop) ---------------------------------- */
-      var drawer = document.createElement("div");
-      drawer.className = "dialog-backdrop";
-      drawer.id = "know-drawer";
-      drawer.innerHTML =
-        '<div class="dialog" style="max-width:760px">' +
-          '<h3 id="know-drawer-title">Knowledge item</h3>' +
+        /* ---- lesson detail drawer ---- */
+        '<div class="dialog-backdrop" id="know-drawer"><div class="dialog" style="max-width:820px">' +
+          '<h3 id="know-drawer-title">Lesson</h3>' +
           '<div id="know-drawer-body"></div>' +
           '<div class="actions">' +
-            // Human-gated WRITES — ribbon lifted (SPEC §5 Screen 3). Each opens
-            // a confirm; Publish's confirm forces an explicit visibility set.
-            '<button class="primary" id="know-publish" ' +
-              'data-knowledge-action="publish" data-knowledge-id="" ' +
-              'title="POST /v1/knowledge/{id}/publish (admin) — requires an explicit visibility set + k_min≥3. No default visibility.">' +
-              'Publish…</button>' +
-            '<button id="know-reject" ' +
-              'data-knowledge-action="reject" data-knowledge-id="" ' +
-              'title="POST /v1/admin/knowledge/{id}/reject (admin) — remembered so it will not resurrect.">' +
-              'Reject…</button>' +
+            '<button class="good" id="know-drawer-publish">Publish to people&hellip;</button>' +
+            '<button class="danger" id="know-drawer-reject">Reject&hellip;</button>' +
             '<button id="know-drawer-close">Close</button>' +
           "</div>" +
-        "</div>";
-      el.appendChild(drawer);
+        "</div></div>" +
 
-      var dlg = Verity.dialog("know-drawer");
-      Verity.$("know-drawer-close").onclick = function () { dlg.close(); };
-
-      /* -- publish confirm dialog (no default visibility — omission refuses) - */
-      var pubDlgEl = document.createElement("div");
-      pubDlgEl.className = "dialog-backdrop";
-      pubDlgEl.id = "know-publish-dialog";
-      pubDlgEl.innerHTML =
-        '<div class="dialog" style="max-width:600px">' +
-          '<h3>Publish knowledge item</h3>' +
-          '<div class="note" id="know-pub-stmt"></div>' +
+        /* ---- publish dialog (THE human gate — named audience, no default) ---- */
+        '<div class="dialog-backdrop" id="know-pub-dialog"><div class="dialog" style="max-width:660px">' +
+          "<h3>Publish this lesson</h3>" +
+          '<div id="know-pub-stmt" style="font-size:var(--fs-md);font-weight:650;color:var(--bright)"></div>' +
+          '<div class="note" id="know-pub-support" style="margin-top:6px"></div>' +
+          '<div class="note" style="margin-top:8px"><b>Publishing is one-way.</b> Everyone you pick below will see this ' +
+            "lesson in their scoped recalls, and there is <b>no un-publish</b> — retraction happens only through " +
+            "Erasure / forget.</div>" +
           '<div class="card" style="margin-top:10px">' +
-            '<div class="note" style="margin-bottom:8px"><em>This grants BROAD visibility.</em> ' +
-              'Publishing exposes this generalization to <b>every</b> principal token you list below, ' +
-              'across scoped interactions. There is <b>no un-publish</b> — retraction is Erasure/forget only.</div>' +
-            '<div class="tight">' +
-              '<label for="know-pub-vis">visibility <span class="note">(required — principal tokens, comma/space separated i32)</span></label>' +
-              '<input type="text" id="know-pub-vis" class="field" placeholder="e.g. 1001, 1002, 2003" autocomplete="off">' +
-            "</div>" +
-            '<div class="note" style="margin-top:6px"><em>No default visibility.</em> Leave this blank and the ' +
-              'dialog will <b>refuse</b> to publish (SPEC §3 / §5e.8) — omission is a refusal, not a permissive default.</div>' +
-            '<div class="tight" style="margin-top:10px">' +
-              '<label for="know-pub-kmin">k_min <span class="note">(clamped ≥3 — server is the authority)</span></label>' +
-              '<input type="number" id="know-pub-kmin" class="field" min="3" step="1" value="3">' +
-            "</div>" +
+            '<h2>Who can see it <span class="sub">required · GET /v1/admin/principals</span></h2>' +
+            '<div class="note" style="margin-top:0">Pick the people and groups this lesson becomes visible to. ' +
+              "Picking <b>no one</b> refuses to publish — there is no default audience, here or anywhere.</div>" +
+            '<input type="text" id="know-pub-filter" placeholder="filter people &amp; groups&hellip;" autocomplete="off" style="margin-top:6px">' +
+            '<div id="know-pub-dir" style="max-height:220px;overflow-y:auto;margin-top:6px"></div>' +
+            '<div style="margin-top:8px"><label for="know-pub-raw">raw principal tokens ' +
+              '<span style="font-weight:400">(dev mode — comma-separated integers, for principals with no name in the directory)</span></label>' +
+              '<input type="text" id="know-pub-raw" placeholder="e.g. 11, 1001" autocomplete="off" spellcheck="false"></div>' +
+            '<div class="note" id="know-pub-count" style="margin-top:6px"></div>' +
           "</div>" +
+          '<div style="margin-top:10px"><label for="know-pub-kmin">privacy floor &mdash; fewest supporting customers allowed</label>' +
+            '<input type="number" id="know-pub-kmin" min="3" step="1" value="3" style="max-width:130px">' +
+            '<div class="note">Minimum <b>3</b> &mdash; and the server re-clamps it even if a smaller number is sent: ' +
+              "at 2, either supporting customer could infer the other&rsquo;s situation. " +
+              '<span class="ref">k_min · POST /v1/knowledge/{id}/publish</span></div></div>' +
           '<div class="err" id="know-pub-err"></div>' +
           '<div class="actions">' +
-            '<button class="primary" id="know-pub-confirm">Grant broad visibility &amp; publish</button>' +
             '<button id="know-pub-cancel">Cancel</button>' +
+            '<button class="good" id="know-pub-go" disabled>Publish</button>' +
           "</div>" +
-        "</div>";
-      el.appendChild(pubDlgEl);
-      var pubDlg = Verity.dialog("know-publish-dialog");
+        "</div></div>" +
 
-      /* -- reject confirm dialog ------------------------------------------- */
-      var rejDlgEl = document.createElement("div");
-      rejDlgEl.className = "dialog-backdrop";
-      rejDlgEl.id = "know-reject-dialog";
-      rejDlgEl.innerHTML =
-        '<div class="dialog" style="max-width:560px">' +
-          '<h3>Reject knowledge item</h3>' +
-          '<div class="note" id="know-rej-stmt"></div>' +
-          '<div class="card" style="margin-top:10px">' +
-            '<div class="note" style="margin-bottom:8px">Rejecting is <b>remembered</b>: the same canonical ' +
-              'statement will not resurrect as a fresh candidate. Only candidate/eligible items can be ' +
-              'rejected — a published item is refused (retraction is Erasure/forget’s job).</div>' +
-            '<div class="tight">' +
-              '<label for="know-rej-reason">reason <span class="note">(optional — defaults to "rejected by reviewer")</span></label>' +
-              '<input type="text" id="know-rej-reason" class="field" placeholder="why this is refused" autocomplete="off">' +
-            "</div>" +
-          "</div>" +
+        /* ---- reject dialog (reason required — the decision is remembered) ---- */
+        '<div class="dialog-backdrop" id="know-rej-dialog"><div class="dialog" style="max-width:560px">' +
+          "<h3>Reject this lesson?</h3>" +
+          '<div id="know-rej-stmt" style="font-size:var(--fs-md);font-weight:650;color:var(--bright)"></div>' +
+          '<div class="note" style="margin-top:8px">Rejecting is <b>remembered</b>: the same lesson will not be proposed ' +
+            "again. Only a lesson still waiting for review can be rejected — a published one is refused (retraction is " +
+            "Erasure / forget&rsquo;s job). " +
+            '<span class="ref">POST /v1/admin/knowledge/{id}/reject</span></div>' +
+          '<div style="margin-top:10px"><label for="know-rej-reason">why <span style="font-weight:400">(required &mdash; stored with the decision, on the record)</span></label>' +
+            '<input type="text" id="know-rej-reason" placeholder="e.g. too specific to one industry to generalize" autocomplete="off"></div>' +
           '<div class="err" id="know-rej-err"></div>' +
           '<div class="actions">' +
-            '<button class="primary" id="know-rej-confirm">Reject item</button>' +
             '<button id="know-rej-cancel">Cancel</button>' +
+            '<button class="danger" id="know-rej-go" disabled>Reject &mdash; remembered forever</button>' +
           "</div>" +
-        "</div>";
-      el.appendChild(rejDlgEl);
-      var rejDlg = Verity.dialog("know-reject-dialog");
+        "</div></div>";
 
-      // The item currently open in the drawer (id + statement + tenant) — the
-      // confirm dialogs act on this.
-      var current = { id: "", statement: "", tenant: "" };
-
-      /* -- parse a visibility input into an i32 principal-token set. Returns
-            { tokens, error }. An empty/blank input is a REFUSAL, not a default:
-            callers must treat a null tokens as "do not submit". */
-      function parseVisibility(raw) {
-        var parts = String(raw || "").split(/[\s,]+/).filter(function (s) { return s.length; });
-        if (!parts.length) {
-          return { tokens: null, error:
-            "Visibility is required — no default visibility. Enter at least one principal token, " +
-            "or Cancel. (SPEC §3 / §5e.8: omission refuses.)" };
-        }
-        var tokens = [];
-        for (var i = 0; i < parts.length; i++) {
-          if (!/^-?\d+$/.test(parts[i])) {
-            return { tokens: null, error: 'not an integer principal token: "' + parts[i] + '"' };
-          }
-          tokens.push(parseInt(parts[i], 10));
-        }
-        return { tokens: tokens, error: null };
-      }
-
-      /* -- publish flow ---------------------------------------------------- */
-      Verity.$("know-publish").onclick = function () {
-        if (!current.id) return;
-        Verity.clearErr("know-pub-err");
-        Verity.$("know-pub-vis").value = "";
-        Verity.$("know-pub-kmin").value = "3";
-        Verity.$("know-pub-stmt").innerHTML =
-          "<b>" + Verity.esc(current.statement || current.id) + "</b>";
-        pubDlg.open();
-      };
-      Verity.$("know-pub-cancel").onclick = function () { pubDlg.close(); };
-      Verity.$("know-pub-confirm").onclick = async function () {
-        Verity.clearErr("know-pub-err");
-        var vis = parseVisibility(Verity.$("know-pub-vis").value);
-        if (vis.tokens === null) {
-          // Omission (or a bad token) REFUSES — we never fall back to a default.
-          Verity.err("know-pub-err", new Error(vis.error));
-          return;
-        }
-        // Client-side honesty clamp; the server re-clamps as the authority.
-        var kmin = parseInt(Verity.$("know-pub-kmin").value, 10);
-        if (isNaN(kmin) || kmin < 3) kmin = 3;
-        var btn = Verity.$("know-pub-confirm");
-        btn.disabled = true;
-        try {
-          await Verity.api(
-            "/v1/knowledge/" + encodeURIComponent(current.id) + "/publish",
-            { admin: true, json: { tenant_id: current.tenant, visibility: vis.tokens, k_min: kmin } });
-          pubDlg.close();
-          dlg.close();
-          await loadQueue();
-        } catch (e) {
-          Verity.err("know-pub-err", e);
-        } finally {
-          btn.disabled = false;
-        }
+      /* ---- wiring ---- */
+      el("know-view-review").onclick = function () { switchView("review"); };
+      el("know-view-all").onclick = function () { switchView("all"); };
+      el("know-refresh").onclick = function () { V.reload("knowledge"); };
+      el("know-drawer-close").onclick = function () { V.dialog("know-drawer").close(); };
+      el("know-drawer-publish").onclick = function () { if (current.id) openPublish(current.id); };
+      el("know-drawer-reject").onclick = function () { if (current.id) openReject(current.id); };
+      el("know-pub-cancel").onclick = function () { V.dialog("know-pub-dialog").close(); };
+      el("know-pub-go").onclick = submitPublish;
+      el("know-pub-filter").oninput = renderDir;
+      el("know-pub-raw").oninput = updatePubCount;
+      el("know-rej-cancel").onclick = function () { V.dialog("know-rej-dialog").close(); };
+      el("know-rej-go").onclick = submitReject;
+      el("know-rej-reason").oninput = function () {
+        el("know-rej-go").disabled = !el("know-rej-reason").value.trim();
       };
 
-      /* -- reject flow ----------------------------------------------------- */
-      Verity.$("know-reject").onclick = function () {
-        if (!current.id) return;
-        Verity.clearErr("know-rej-err");
-        Verity.$("know-rej-reason").value = "";
-        Verity.$("know-rej-stmt").innerHTML =
-          "<b>" + Verity.esc(current.statement || current.id) + "</b>";
-        rejDlg.open();
-      };
-      Verity.$("know-rej-cancel").onclick = function () { rejDlg.close(); };
-      Verity.$("know-rej-confirm").onclick = async function () {
-        Verity.clearErr("know-rej-err");
-        var btn = Verity.$("know-rej-confirm");
-        btn.disabled = true;
-        try {
-          await Verity.api(
-            "/v1/admin/knowledge/" + encodeURIComponent(current.id) + "/reject",
-            { admin: true, json: {
-              tenant_id: current.tenant,
-              reason: Verity.$("know-rej-reason").value.trim(),
-            } });
-          rejDlg.close();
-          dlg.close();
-          await loadQueue();
-        } catch (e) {
-          Verity.err("know-rej-err", e);
-        } finally {
-          btn.disabled = false;
-        }
-      };
+      if (!V.tenant()) renderNoTenant();
+    },
 
-      /* -- load handler ----------------------------------------------------- */
-      function activeTenant() {
-        var typed = Verity.$("know-tenant").value.trim();
-        return typed || Verity.tenant() || "";
-      }
+    /* v2 AUTOLOAD — the router runs this once a tenant is known. */
+    load: function (_section, tenant) { return loadAll(tenant); },
 
-      async function loadQueue() {
-        Verity.clearErr("know-err");
-        Verity.$("know-out").innerHTML = "";
-        Verity.$("know-refreshed").innerHTML = "";
-        var tenant = activeTenant();
-        if (!tenant) {
-          Verity.err("know-err", new Error(
-            "no tenant selected — decode a scope handle on Scope Inspector or type a tenant_id above"));
-          return;
-        }
-        var status = Verity.$("know-status").value;
-        var url = "/v1/knowledge?tenant_id=" + encodeURIComponent(tenant);
-        if (status) url += "&status=" + encodeURIComponent(status);
-        try {
-          var res = await Verity.api(url, { admin: true });
-          var items = (res && res.items) || [];
-          renderQueue(items, tenant);
-          Verity.$("know-refreshed").innerHTML =
-            '<span class="refreshed">' + items.length + " item" + (items.length === 1 ? "" : "s") +
-            " · loaded " + Verity.esc(Verity.fmtTime(Date.now())) + "</span>";
-        } catch (e) {
-          Verity.err("know-err", e);
-        }
-      }
-
-      function renderQueue(items, tenant) {
-        if (!items.length) {
-          // Fail-closed / honest empty state WITH the reason (SPEC §3).
-          Verity.$("know-out").innerHTML =
-            '<div class="empty">No knowledge items for tenant <b>' + Verity.esc(tenant) +
-            "</b>" + (Verity.$("know-status").value ? " at status <b>" +
-              Verity.esc(Verity.$("know-status").value) + "</b>" : "") +
-            ". Nothing is auto-published; an empty queue means nothing has cleared the gate here — that is not an error.</div>";
-          return;
-        }
-        var rows = items.map(function (it) {
-          var bucket = agentBucket(it);
-          // The BUCKET an agent would see (SPEC §2/§7g). Rendered dashed
-          // (inferred=true) to read as a coarse disclosure, not an exact fact.
-          var supportCell =
-            '<span class="note">agent preview: </span>' +
-            (bucket ? Verity.badge(bucket, "b-trust", true)
-                    : Verity.badge("below k-floor", "b-st-candidate"));
-          var exact = Verity.esc(it.distinct_entities == null ? "—" : it.distinct_entities);
-          var writers = Verity.esc(it.writer_count == null ? "—" : it.writer_count) +
-            (it.has_tier1_evidence ? " " + Verity.trustBadge("authoritative") : "");
-          var evCount = (it.evidence || []).length;
-          var idAttr = Verity.esc(it.id);
-          return '<tr class="' + (it.quarantine_reason ? "flag" : "") + '">' +
-            "<td>" + Verity.statusBadge(it.status) + "</td>" +
-            "<td>" + Verity.esc(it.statement || "") +
-              ((it.categories || []).length
-                ? '<div style="margin-top:4px">' + catBadges(it.categories) + "</div>" : "") +
-            "</td>" +
-            "<td>" + supportCell + "</td>" +
-            '<td class="num">' + exact + "</td>" +
-            '<td class="num">' + writers + "</td>" +
-            "<td>" + reasonCell(it) + "</td>" +
-            '<td class="num">' + evCount + "</td>" +
-            '<td><button class="know-detail" data-id="' + idAttr + '">Detail</button></td>' +
-            "</tr>";
-        }).join("");
-
-        Verity.$("know-out").innerHTML =
-          '<div class="tablewrap"><table>' +
-          "<thead><tr>" +
-            "<th>status</th><th>statement</th>" +
-            '<th>support <span class="sub">(agent bucket)</span></th>' +
-            '<th class="num">distinct entities <span class="sub">(admin-exact)</span></th>' +
-            '<th class="num">writers <span class="sub">(admin-exact)</span></th>' +
-            "<th>merge / gate reason</th>" +
-            '<th class="num">evidence</th><th></th>' +
-          "</tr></thead><tbody>" + rows + "</tbody></table></div>";
-
-        // Wire per-row detail buttons.
-        var btns = Verity.$("know-out").querySelectorAll(".know-detail");
-        for (var i = 0; i < btns.length; i++) {
-          btns[i].onclick = function () { openDetail(this.getAttribute("data-id"), tenant); };
-        }
-      }
-
-      /* -- detail drawer load ---------------------------------------------- */
-      async function openDetail(id, tenant) {
-        var body = Verity.$("know-drawer-body");
-        Verity.$("know-drawer-title").textContent = "Knowledge item " + id;
-        body.innerHTML = '<div class="note">loading GET /v1/admin/knowledge/' + Verity.esc(id) + " …</div>";
-        // Wire the write-action target. Statement is filled once the detail loads.
-        current = { id: id, statement: "", tenant: tenant };
-        Verity.$("know-publish").setAttribute("data-knowledge-id", id);
-        Verity.$("know-reject").setAttribute("data-knowledge-id", id);
-        // Until the item loads, keep the write actions disabled so we never act
-        // on an unknown status.
-        setActionsForStatus(null);
-        dlg.open();
-        try {
-          var item = await Verity.api(
-            "/v1/admin/knowledge/" + encodeURIComponent(id) +
-              "?tenant_id=" + encodeURIComponent(tenant),
-            { admin: true });
-          current.statement = item.statement || "";
-          setActionsForStatus(item.status);
-          renderDetail(item);
-        } catch (e) {
-          setActionsForStatus(null);
-          body.innerHTML = '<div class="err on">' + Verity.esc(e.message || String(e)) + "</div>";
-        }
-      }
-
-      // Publish/Reject are only valid on a candidate/eligible item — the server
-      // refuses otherwise (422). Reflect that honestly by disabling the buttons
-      // and explaining why, rather than letting the operator fire a doomed POST.
-      function setActionsForStatus(status) {
-        var s = status == null ? null : String(status).toLowerCase();
-        var actionable = s === "candidate" || s === "eligible";
-        var pub = Verity.$("know-publish");
-        var rej = Verity.$("know-reject");
-        pub.disabled = !actionable;
-        rej.disabled = !actionable;
-        if (s === "published") {
-          pub.title = "Already published — there is no un-publish endpoint (retraction is Erasure/forget).";
-          rej.title = "A published item cannot be rejected — retraction is Erasure/forget’s job (SPEC §5 Screen 3).";
-        } else if (!actionable && s != null) {
-          pub.title = "Only candidate/eligible items are publishable (status: " + s + ").";
-          rej.title = "Only candidate/eligible items are rejectable (status: " + s + ").";
-        } else if (actionable) {
-          pub.title = "POST /v1/knowledge/{id}/publish (admin) — requires an explicit visibility set + k_min≥3. No default visibility.";
-          rej.title = "POST /v1/admin/knowledge/{id}/reject (admin) — remembered so it will not resurrect.";
-        }
-      }
-
-      function renderDetail(item) {
-        var body = Verity.$("know-drawer-body");
-        var k = kSupport(item);
-        var bucket = agentBucket(item);
-        var gate = item.deid_gate || {};
-        var deidPass = gate.passed !== false && !item.quarantine_reason;
-
-        var claims =
-          '<dl class="kv">' +
-            "<dt>status</dt><dd>" + Verity.statusBadge(item.status) + "</dd>" +
-            "<dt>statement</dt><dd>" + Verity.esc(item.statement || "—") + "</dd>" +
-            "<dt>categories</dt><dd>" +
-              ((item.categories || []).length ? catBadges(item.categories)
-                : '<span class="note">none — category floor unmet</span>') + "</dd>" +
-            "<dt>first seen</dt><dd>" + Verity.esc(item.first_seen ? Verity.fmtTime(item.first_seen) : "—") + "</dd>" +
-            "<dt>last reinforced</dt><dd>" + Verity.esc(item.last_reinforced ? Verity.fmtTime(item.last_reinforced) : "—") + "</dd>" +
-            "<dt>published at</dt><dd>" + (item.published_at
-              ? Verity.esc(Verity.fmtTime(item.published_at)) + " " + Verity.statusBadge("published")
-              : '<span class="note">not published</span>') + "</dd>" +
-          "</dl>";
-
-        // Support: admin-exact vs the bucket an agent would see.
-        var support =
-          '<div class="card"><h2>Support <span class="sub">admin-exact vs agent bucket</span></h2>' +
-          '<dl class="kv">' +
-            "<dt>distinct entities <span class=\"note\">(admin-exact)</span></dt><dd>" +
-              Verity.esc(item.distinct_entities == null ? "—" : item.distinct_entities) + "</dd>" +
-            "<dt>writer count <span class=\"note\">(admin-exact)</span></dt><dd>" +
-              Verity.esc(item.writer_count == null ? "—" : item.writer_count) + "</dd>" +
-            "<dt>episode count</dt><dd>" + Verity.esc(item.episode_count == null ? "—" : item.episode_count) + "</dd>" +
-            "<dt>tier-1 evidence</dt><dd>" +
-              (item.has_tier1_evidence ? Verity.trustBadge("authoritative")
-                : '<span class="note">none</span>') + "</dd>" +
-            "<dt>support tier</dt><dd>" +
-              (item.support_tier ? Verity.badge(item.support_tier, "b-tier") : '<span class="note">below k-floor</span>') + "</dd>" +
-            "<dt>agent-facing preview</dt><dd>" +
-              (bucket ? Verity.badge(bucket, "b-trust", true) : Verity.badge("below k-floor", "b-st-candidate")) +
-              ' <span class="note">buckets only — exact counts stay on this admin surface (SPEC §2/§7g)</span></dd>' +
-          "</dl></div>";
-
-        // k-support gate math — DISPLAY of the publish floor, server is authority.
-        var math =
-          '<div class="card"><h2>k-support gate <span class="sub">publish floor — display only, server enforces</span></h2>' +
-          '<div class="row" style="gap:8px;flex-wrap:wrap">' +
-            gateChip(k.entOk, "≥3 distinct entities (" + (k.d == null ? "—" : k.d) + ")") +
-            gateChip(k.writerOk, "≥2 writers or tier-1 (" + (k.w == null ? "—" : k.w) + (item.has_tier1_evidence ? ", tier-1" : "") + ")") +
-            gateChip(k.catOk, "category floor ≥1") +
-          "</div>" +
-          '<div class="note" style="margin-top:8px">Overall: ' +
-            (k.pass ? Verity.badge("meets publish floor", "b-st-eligible")
-                    : Verity.badge("below publish floor", "b-st-candidate")) +
-            ". Publishing is the final human gate (v0.2) and requires an explicit visibility + k_min≥3 — " +
-            "there is no default visibility, and omission refuses (SPEC §5e.8).</div>" +
-          "</div>";
-
-        // De-identification gate result (deterministic, auditable).
-        var deid =
-          '<div class="card"><h2>De-identification gate</h2>' +
-          '<div>' + (deidPass
-            ? Verity.badge("✓ passed", "b-st-published")
-            : Verity.badge("✗ quarantined", "b-st-quarantined")) + "</div>" +
-          (item.quarantine_reason
-            ? '<div class="note" style="margin-top:6px"><em>reason:</em> ' + Verity.esc(item.quarantine_reason) + "</div>"
-            : '<div class="note" style="margin-top:6px">no gate failure recorded</div>') +
-          (item.merge_reason
-            ? '<div class="note" style="margin-top:6px"><em>merge reason:</em> ' + Verity.esc(item.merge_reason) + "</div>"
-            : "") +
-          "</div>";
-
-        // Lineage-to-episodes — LABELED audit-scope-only. Never a recall/brief
-        // affordance: no "open in inspector" jump, no citation-to-brief link.
-        var ev = item.evidence || [];
-        var lineageRows = ev.map(function (e) {
-          var tier = e.trust_tier;
-          var tierBadge = (tier === 1 || tier === "1")
-            ? Verity.trustBadge("authoritative")
-            : Verity.badge("trust tier " + Verity.esc(tier == null ? "—" : tier), "b-trust");
-          return "<tr>" +
-            "<td>" + Verity.esc(e.episode_id || "—") + "</td>" +
-            "<td>" + (e.entity ? Verity.badge(e.entity, "b-entity") : '<span class="note">—</span>') + "</td>" +
-            "<td>" + (e.writer_azp ? Verity.esc(e.writer_azp) : '<span class="note">—</span>') + "</td>" +
-            "<td>" + tierBadge + "</td>" +
-            "</tr>";
-        }).join("");
-        var lineage =
-          '<div class="card"><h2>Evidence lineage ' +
-            '<span class="sub">' + ev.length + " episode" + (ev.length === 1 ? "" : "s") + "</span></h2>" +
-          '<div class="note"><em>Audit-scope-only.</em> This episode/entity lineage is shown for review here ' +
-            'and is <b>never</b> rendered in any recall or brief context (provenance firewall, SPEC §2/§7g). ' +
-            "Writer/entity attribution is read from the L0 episodes, never caller-supplied.</div>" +
-          (ev.length
-            ? '<div class="tablewrap" style="margin-top:8px"><table><thead><tr>' +
-                "<th>episode_id (L0)</th><th>entity</th><th>writer azp</th><th>trust tier</th>" +
-              "</tr></thead><tbody>" + lineageRows + "</tbody></table></div>"
-            : '<div class="empty">no evidence rows</div>') +
-          "</div>";
-
-        // Retraction seam (honest gap, SPEC §5 Screen 3): there is NO un-publish
-        // endpoint. For a published item we render the retraction path as a
-        // DISABLED seam — designed, never faked as a working button.
-        var retraction = item.status && String(item.status).toLowerCase() === "published"
-          ? '<div class="card" style="margin-top:8px">' +
-            '<h2>Retraction <span class="sub">no un-publish endpoint</span></h2>' +
-            '<div class="note"><em>Publishing is one-way here.</em> There is no un-publish endpoint. ' +
-              "Retracting a published generalization is <b>Erasure &amp; DSAR / forget</b>'s job — " +
-              "the lineage-driven cascade auto-invalidates it when its sources are forgotten (SPEC §5 Screen 3). " +
-              "The seam is designed; we do not fake a working button for it.</div>" +
-            '<div class="actions">' +
-              '<button disabled title="No un-publish endpoint. Retraction is Erasure/forget (Screen 4, v0.2) — this seam is designed, not faked.">' +
-                'Retract via Erasure / forget (seam — v0.2)</button>' +
-            "</div></div>"
-          : "";
-
-        body.innerHTML = claims + support + math + deid + lineage + retraction;
-      }
-
-      Verity.$("know-load").onclick = loadQueue;
-
-      // Auto-fill the tenant field from the shared tenant when it changes.
-      Verity.onTenant(function (t) {
-        var f = Verity.$("know-tenant");
-        if (f && !f.value.trim()) f.placeholder = t ? "(active: " + t + ")" : "(uses active tenant)";
-      });
-      (function () {
-        var t = Verity.tenant();
-        var f = Verity.$("know-tenant");
-        if (f && t) f.placeholder = "(active: " + t + ")";
-      })();
+    onShow: function () {
+      var p = V.navParams();
+      if (p && p.view) switchView(p.view === "all" ? "all" : "review");
+      if (!V.tenant()) renderNoTenant();
     },
   });
+
+  /* =========================================================== loading */
+
+  function renderNoTenant() {
+    var teach = el("know-teach");
+    if (!teach) return;
+    el("know-out").innerHTML = "";
+    el("know-state").innerHTML = V.stateChip("off", "no tenant");
+    teach.innerHTML =
+      '<div class="empty-teach sp-a">' +
+        '<div class="et-title">Pick a tenant to see its lessons</div>' +
+        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle &mdash; the tenant ' +
+          "fills in automatically and this screen loads itself.</div>" +
+        '<div class="et-actions"><button class="primary" id="know-teach-mint">Mint a scope handle</button></div>' +
+      "</div>";
+    el("know-teach-mint").onclick = function () { V.openMint(); };
+  }
+
+  async function loadAll(tenant) {
+    tenantNow = tenant;
+    V.clearErr("know-err");
+    el("know-teach").innerHTML = "";
+    el("know-state").innerHTML = V.stateChip("wait", "loading");
+    try {
+      var res = await V.api("/v1/knowledge?tenant_id=" + encodeURIComponent(tenant), { admin: true });
+      data.items = (res && res.items) || [];
+      data.byId = {};
+      data.items.forEach(function (it) { data.byId[it.id] = it; });
+      data.loadedAt = Date.now();
+      // Rail count = the SAME query + filter this panel's review view renders.
+      V.setCount("knowledge", data.items.filter(isWaiting).length);
+      renderAll();
+    } catch (e) {
+      el("know-state").innerHTML = V.stateChip("fail");
+      V.err("know-err", e);
+      if (String(e && e.message).indexOf("401") !== -1) {
+        el("know-teach").innerHTML =
+          '<div class="note">This read needs the admin token &mdash; paste it in the session bar above ' +
+          "(it lives in this tab only and is never stored).</div>";
+      }
+    }
+  }
+
+  function renderAll() {
+    var waiting = data.items.filter(isWaiting);
+    el("know-state").innerHTML = waiting.length
+      ? V.stateChip("attn", waiting.length + " lesson" + (waiting.length === 1 ? "" : "s") + " awaiting review")
+      : V.stateChip("ok", "queue clear");
+    el("know-asof").textContent =
+      waiting.length + " awaiting · " + data.items.length + " total · checked " +
+      new Date().toTimeString().slice(0, 8);
+    el("know-view-review").textContent = "Needs your review" + (waiting.length ? " (" + waiting.length + ")" : "");
+    el("know-view-all").textContent = "All lessons" + (data.items.length ? " (" + data.items.length + ")" : "");
+    renderList();
+  }
+
+  function switchView(v) {
+    view = v === "all" ? "all" : "review";
+    el("know-view-review").className = view === "review" ? "on" : "";
+    el("know-view-all").className = view === "all" ? "on" : "";
+    if (data.loadedAt) renderList();
+  }
+
+  /* =========================================================== the list */
+
+  function renderList() {
+    var host = el("know-out");
+    var rows = view === "review" ? data.items.filter(isWaiting) : data.items;
+
+    if (!rows.length) {
+      if (!data.items.length) {
+        // Species A — nothing proposed yet: teach where lessons come from.
+        host.innerHTML =
+          '<div class="empty-teach sp-a">' +
+            '<div class="et-title">No lessons proposed yet</div>' +
+            '<div class="et-body">A lesson is a cross-customer generalization an agent or the consolidation worker ' +
+              "proposes from the conversations Verity has ingested <span class=\"ref\">POST /v1/knowledge</span>. " +
+              "Every proposal stops here for a person &mdash; nothing publishes itself. Once something is proposed " +
+              "for this tenant, it appears here on its own.</div>" +
+            '<div class="et-actions"><button class="primary" id="know-empty-check">Check again</button></div>' +
+          "</div>";
+        el("know-empty-check").onclick = function () { V.reload("knowledge"); };
+        return;
+      }
+      // Species C — the review queue is drained, with evidence.
+      var byStatus = {};
+      data.items.forEach(function (it) {
+        var s = String(it.status || "").toLowerCase();
+        byStatus[s] = (byStatus[s] || 0) + 1;
+      });
+      var evidence = [];
+      if (byStatus.published) evidence.push(byStatus.published + " published");
+      if (byStatus.rejected) evidence.push(byStatus.rejected + " rejected");
+      if (byStatus.quarantined) evidence.push(byStatus.quarantined + " held back");
+      if (byStatus.invalidated) evidence.push(byStatus.invalidated + " withdrawn");
+      host.innerHTML =
+        '<div class="empty-teach sp-c">' +
+          '<div class="et-title">Nothing awaiting your review</div>' +
+          '<div class="et-body">Every proposed lesson has been decided by a person &mdash; ' +
+            V.esc(evidence.join(" · ") || "0 on record") +
+            " · checked " + new Date().toTimeString().slice(0, 8) +
+            ". Publishing stays a human gate; new proposals will stop here the moment they arrive.</div>" +
+          '<div class="et-actions"><button id="know-empty-all">See all ' + data.items.length + " lesson" +
+            (data.items.length === 1 ? "" : "s") + " &rsaquo;</button></div>" +
+        "</div>";
+      el("know-empty-all").onclick = function () { switchView("all"); };
+      return;
+    }
+
+    // Longest-waiting flag: display heuristic only (threshold disclosed in
+    // the tooltip), never a re-sort — server order is rendered as-is.
+    var maxWait = 0;
+    rows.forEach(function (it) {
+      if (!isWaiting(it)) return;
+      var t = Date.parse(it.first_seen);
+      if (isFinite(t)) { var w = (Date.now() - t) / 1000; if (w > maxWait) maxWait = w; }
+    });
+    var flagActive = maxWait >= 86400; // amber only past 1 day — disclosed below
+
+    host.innerHTML = rows.map(function (it) { return lessonCard(it, flagActive, maxWait); }).join("");
+    wire(host, ".know-detail", function (btn) { openDetail(btn.getAttribute("data-id")); });
+    wire(host, ".know-pub-open", function (btn) { openPublish(btn.getAttribute("data-id")); });
+    wire(host, ".know-rej-open", function (btn) { openReject(btn.getAttribute("data-id")); });
+  }
+
+  // One lesson → one readable card.
+  function lessonCard(it, flagActive, maxWait) {
+    var s = String(it.status || "").toLowerCase();
+    var actionable = s === "candidate" || s === "eligible";
+    var waitSecs = null;
+    var t = Date.parse(it.first_seen);
+    if (isFinite(t)) waitSecs = (Date.now() - t) / 1000;
+    var oldest = flagActive && actionable && waitSecs != null && Math.abs(waitSecs - maxWait) < 1;
+
+    var chips = lifeChip(it);
+    if (actionable && waitSecs != null) {
+      chips += ' <span class="badge b-kind"' +
+        (oldest ? ' style="color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)"' : "") +
+        ' title="time since this lesson was proposed' +
+        (oldest ? " — the longest-waiting lesson (over a day); decide it so it is never buried" : "") +
+        '">waiting ' + V.esc(V.fmtAge(waitSecs)) + "</span>";
+    }
+    chips += (it.categories || []).map(function (c) { return " " + V.kindBadge(c); }).join("");
+
+    var actions = actionable
+      ? '<button class="good know-pub-open" data-id="' + V.esc(it.id) + '" ' +
+          'title="opens the publish gate — you pick the named people and groups; there is no default audience">' +
+          "Publish to people&hellip;</button>" +
+        '<button class="danger know-rej-open" data-id="' + V.esc(it.id) + '" ' +
+          'title="refuses this lesson with a reason — remembered so it will not be proposed again">' +
+          "Reject&hellip;</button>" +
+        '<button class="know-detail" data-id="' + V.esc(it.id) + '">See the evidence</button>'
+      : '<button class="know-detail" data-id="' + V.esc(it.id) + '">See the full story</button>';
+
+    return '<div class="decision-card' + (oldest ? " dc-flag" : "") + '">' +
+      '<div class="dc-topline">' + chips + "</div>" +
+      '<div class="dc-question">' +
+        (it.statement ? V.esc(it.statement)
+          : '<span style="color:var(--dim);font-weight:400">no statement on record</span>') + "</div>" +
+      '<div class="dc-evidence">' + supportSentence(it) + "</div>" +
+      '<div class="dc-meta">' + V.esc(it.id) + " · status: " + V.esc(s) +
+        " · customers: " + V.esc(it.distinct_entities == null ? "—" : it.distinct_entities) +
+        " · independent writers: " + V.esc(it.writer_count == null ? "—" : it.writer_count) +
+        " · evidence tier: " + V.esc(it.support_tier || "—") +
+        (it.merge_reason ? " · merged because: " + V.esc(it.merge_reason) : "") +
+        " · GET /v1/admin/knowledge/{id}</div>" +
+      '<div class="dc-actions">' + actions + "</div>" +
+    "</div>";
+  }
+
+  /* =========================================================== detail drawer */
+
+  function setDrawerActions(status) {
+    var s = status == null ? null : String(status).toLowerCase();
+    var actionable = s === "candidate" || s === "eligible";
+    var pub = el("know-drawer-publish"), rej = el("know-drawer-reject");
+    pub.disabled = !actionable;
+    rej.disabled = !actionable;
+    if (s === "published") {
+      pub.title = "Already published — there is no un-publish; retraction is Erasure / forget.";
+      rej.title = "A published lesson cannot be rejected — retraction is Erasure / forget's job.";
+    } else if (!actionable && s != null) {
+      pub.title = "Only a lesson still waiting for review can be published (this one is " + s + ").";
+      rej.title = "Only a lesson still waiting for review can be rejected (this one is " + s + ").";
+    } else {
+      pub.title = "opens the publish gate — you pick the named people and groups; there is no default audience";
+      rej.title = "refuses this lesson with a reason — remembered so it will not be proposed again";
+    }
+  }
+
+  async function openDetail(id) {
+    var body = el("know-drawer-body");
+    current = { id: id, statement: "", status: "", item: null };
+    el("know-drawer-title").textContent = "Lesson";
+    body.innerHTML = '<div class="note">loading&hellip; <span class="ref">GET /v1/admin/knowledge/' + V.esc(id) + "</span></div>";
+    setDrawerActions(null);
+    V.dialog("know-drawer").open();
+    try {
+      var item = await V.api(
+        "/v1/admin/knowledge/" + encodeURIComponent(id) + "?tenant_id=" + encodeURIComponent(tenantNow),
+        { admin: true });
+      current = { id: id, statement: item.statement || "", status: item.status, item: item };
+      setDrawerActions(item.status);
+      renderDetail(item);
+    } catch (e) {
+      body.innerHTML = '<div class="err on">' + V.esc((e && e.message) || String(e)) + "</div>";
+    }
+  }
+
+  // The lifecycle as a strip of plain state chips: done → current → not yet.
+  // Quarantine/rejection/withdrawal render as the honest exits they are.
+  function lifeStrip(it) {
+    var s = String(it.status || "").toLowerCase();
+    var arrow = ' <span style="color:var(--faint)">&rarr;</span> ';
+    if (s === "quarantined") {
+      return V.stateChip("ok", "proposed") + arrow + V.stateChip("fail", "held back — identifying details");
+    }
+    if (s === "rejected") {
+      return V.stateChip("ok", "proposed") + arrow + V.stateChip("off", "rejected by a person");
+    }
+    if (s === "invalidated") {
+      return V.stateChip("ok", "proposed") + arrow + V.stateChip("off", "withdrawn — sources forgotten");
+    }
+    var stage = s === "published" ? 3 : (s === "eligible" || kSupport(it).pass) ? 2 : 1;
+    var steps = [
+      ["proposed", "ok"],
+      ["gathering support", "wait"],
+      ["awaiting your review", "attn"],
+      ["published", "ok"],
+    ];
+    return steps.map(function (st, i) {
+      if (i < stage) return V.stateChip("ok", st[0]);
+      if (i === stage) return V.stateChip(st[1], st[0]);
+      return V.stateChip("off", st[0]);
+    }).join(arrow);
+  }
+
+  function renderDetail(item) {
+    var body = el("know-drawer-body");
+    var k = kSupport(item);
+    var bucket = agentBucket(item);
+    var gate = item.deid_gate || {};
+    var deidPassed = gate.passed !== false;
+    var ev = item.evidence || [];
+    var s = String(item.status || "").toLowerCase();
+
+    var head =
+      '<div style="font-size:var(--fs-md);font-weight:650;color:var(--bright)">' +
+        (item.statement ? V.esc(item.statement)
+          : '<span style="color:var(--dim);font-weight:400">no statement on record</span>') + "</div>" +
+      '<div style="margin-top:8px;display:flex;align-items:center;gap:4px;flex-wrap:wrap">' + lifeStrip(item) + "</div>" +
+      '<div class="note" style="margin-top:6px">' +
+        (item.first_seen ? "Proposed <b>" + V.esc(V.timeAgo(item.first_seen)) + "</b>" : "Proposal time not on record") +
+        (item.last_reinforced ? " · last supported <b>" + V.esc(V.timeAgo(item.last_reinforced)) + "</b>" : "") +
+        (item.published_at ? " · published <b>" + V.esc(V.timeAgo(item.published_at)) + "</b>" : "") +
+        ((item.categories || []).length
+          ? " · " + (item.categories || []).map(function (c) { return V.kindBadge(c); }).join(" ") : "") +
+      "</div>";
+
+    var support =
+      '<div class="card" style="margin-top:12px"><h2>Support ' +
+        '<span class="sub">customers / independent writers / evidence tier · exact counts, admin-only</span></h2>' +
+      '<div class="note" style="margin-top:0">' + supportSentence(item) + "</div>" +
+      '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px">' +
+        V.stateChip(k.entOk ? "ok" : "wait", "3+ customers — has " + k.d) +
+        V.stateChip(k.writerOk ? "ok" : "wait", "2+ writers or an authoritative source — has " + k.w +
+          (item.has_tier1_evidence ? " + authoritative" : "")) +
+        V.stateChip(k.catOk ? "ok" : "wait", "has a category — " +
+          ((item.categories || []).length ? (item.categories || []).join(", ") : "none yet")) +
+      "</div>" +
+      '<div class="note" style="margin-top:8px">All three must pass before a lesson can be published, so no single ' +
+        "customer&rsquo;s situation can be inferred from it. The chips only explain &mdash; the server enforces.</div>" +
+      '<div class="note" style="margin-top:6px">Agents that recall this lesson only ever see a coarse bucket &mdash; ' +
+        (bucket ? V.badge(bucket + " customers", "b-trust", true)
+                : V.badge("below the floor — agents see nothing", "b-st-candidate")) +
+        " &mdash; never the exact counts on this page.</div>" +
+      "</div>";
+
+    var deid =
+      '<div class="card" style="margin-top:8px"><h2>Anonymity check <span class="sub">de-identification gate · deterministic</span></h2>' +
+      '<div class="note" style="margin-top:0">Before review, every lesson is checked for details that could identify a ' +
+        "specific customer &mdash; a lesson that names or singles one out is refused, never indexed. " +
+        (deidPassed
+          ? "This lesson <b>passed</b> that check. " + V.stateChip("ok", "passed")
+          : "This lesson <b>failed</b> it and was held back" +
+            (gate.reason ? ": <b>" + V.esc(gate.reason) + "</b>" : "") + ". " +
+            V.stateChip("fail", "held back")) +
+      "</div></div>";
+
+    var evRows = ev.map(function (e) {
+      var tier = e.trust_tier;
+      var tierChip = (tier === 1 || tier === "1")
+        ? V.badge("authoritative source", "b-tier")
+        : V.badge("observation", "b-trust");
+      return '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 0;border-bottom:1px solid var(--border)">' +
+        principalEvidenceChip(e.entity) +
+        '<span class="note" style="margin-top:0">written by <b>' +
+          (e.writer_azp ? V.esc(e.writer_azp) : "unknown writer") + "</b></span>" +
+        tierChip +
+        V.refSpan(e.episode_id || "—") +
+      "</div>";
+    }).join("");
+    var evidence =
+      '<div class="card" style="margin-top:8px"><h2>The evidence ' +
+        '<span class="sub">' + ev.length + " conversation" + (ev.length === 1 ? "" : "s") + " · audit-scope-only</span></h2>" +
+      '<div class="note" style="margin-top:0">' +
+        (ev.length
+          ? "Supported by <b>" + ev.length + " conversation" + (ev.length === 1 ? "" : "s") + "</b>. "
+          : "<b>No evidence rows on record</b> &mdash; a lesson with no evidence cannot gather support. ") +
+        "This lineage is shown here for your review only &mdash; agents never see which customers a lesson " +
+        "came from (provenance firewall).</div>" +
+      (ev.length ? '<div style="margin-top:6px">' + evRows + "</div>" : "") +
+      "</div>";
+
+    var retraction = s === "published"
+      ? '<div class="card" style="margin-top:8px"><h2>Taking it back <span class="sub">no un-publish endpoint exists</span></h2>' +
+        '<div class="note" style="margin-top:0">Publishing is one-way here. Retracting a published lesson is ' +
+          "<b>Erasure / forget</b>&rsquo;s job &mdash; when its source conversations are forgotten, the lesson is " +
+          "invalidated automatically. This button is a designed seam, not a fake:</div>" +
+        '<div class="actions"><button disabled title="No un-publish endpoint exists — retraction is Erasure / forget. This seam is designed, never faked.">' +
+          "Retract via Erasure / forget (no endpoint yet)</button></div></div>"
+      : "";
+
+    body.innerHTML = head + support + deid + evidence + retraction;
+  }
+
+  // Evidence entities look like "account:acme" — name first, kind secondary.
+  function principalEvidenceChip(entity) {
+    if (!entity) return V.entityChip(null);
+    var p = String(entity);
+    var i = p.indexOf(":");
+    return i < 0 ? V.entityChip(p) : V.entityChip(p.slice(i + 1), p.slice(0, i));
+  }
+
+  /* =========================================================== publish gate */
+
+  function openPublish(id) {
+    var it = (current.item && current.id === id) ? current.item : data.byId[id];
+    if (!it) return;
+    current = { id: id, statement: it.statement || "", status: it.status, item: it };
+    pubSel = {};
+    V.clearErr("know-pub-err");
+    el("know-pub-stmt").textContent = it.statement || "no statement on record";
+    el("know-pub-support").innerHTML = supportSentence(it);
+    el("know-pub-filter").value = "";
+    el("know-pub-raw").value = "";
+    el("know-pub-kmin").value = "3";
+    updatePubCount();
+    V.dialog("know-pub-dialog").open();
+    loadDirectory(); // async — the picker fills in when the read lands
+  }
+
+  async function loadDirectory() {
+    dir = { state: "loading", rows: [], truncated: false, error: "" };
+    renderDir();
+    try {
+      var rows = [], after = 0;
+      for (var page = 0; page < 4; page++) {
+        var res = await V.api(
+          "/v1/admin/principals?tenant_id=" + encodeURIComponent(tenantNow) +
+            "&after_token=" + after + "&limit=500",
+          { admin: true });
+        rows = rows.concat((res && res.principals) || []);
+        if (!res || res.next_after_token == null) {
+          dir = { state: "ready", rows: rows, truncated: false, error: "" };
+          renderDir();
+          return;
+        }
+        after = res.next_after_token;
+      }
+      dir = { state: "ready", rows: rows, truncated: true, error: "" };
+    } catch (e) {
+      dir = { state: "error", rows: [], truncated: false, error: (e && e.message) || String(e) };
+    }
+    renderDir();
+  }
+
+  function renderDir() {
+    var host = el("know-pub-dir");
+    if (!host) return;
+    if (dir.state === "loading") {
+      host.innerHTML = '<div class="note" style="margin-top:0">loading the people &amp; groups directory&hellip;</div>';
+      return;
+    }
+    if (dir.state === "error") {
+      host.innerHTML = '<div class="note" style="margin-top:0"><b>Could not load the directory</b> (' +
+        V.esc(dir.error) + ") &mdash; you can still publish with raw tokens below.</div>";
+      return;
+    }
+    if (!dir.rows.length) {
+      host.innerHTML = '<div class="note" style="margin-top:0">No named people or groups exist for this tenant yet ' +
+        "&mdash; create them on <b>People &amp; groups</b>, or use raw tokens below (dev mode). An empty directory " +
+        "never publishes to anyone by default.</div>";
+      return;
+    }
+    var q = el("know-pub-filter").value.trim().toLowerCase();
+    var rows = q
+      ? dir.rows.filter(function (r) { return String(r.principal).toLowerCase().indexOf(q) !== -1; })
+      : dir.rows;
+    if (!rows.length) {
+      host.innerHTML = '<div class="note" style="margin-top:0">no names match &ldquo;' + V.esc(q) + "&rdquo;</div>";
+      return;
+    }
+    host.innerHTML = rows.map(function (r) {
+      var checked = pubSel[String(r.token)] ? " checked" : "";
+      return '<label style="display:flex;align-items:center;gap:8px;padding:3px 2px;cursor:pointer">' +
+        '<input type="checkbox" class="know-pub-cb" data-token="' + V.esc(r.token) + '" data-name="' + V.esc(r.principal) + '"' + checked + ">" +
+        principalChip(r.principal) + V.refSpan("#" + r.token) +
+      "</label>";
+    }).join("") +
+    (dir.truncated
+      ? '<div class="note">showing the first ' + dir.rows.length +
+        " directory entries &mdash; more exist; narrow with the filter or use raw tokens</div>"
+      : "");
+    var cbs = host.querySelectorAll(".know-pub-cb");
+    for (var i = 0; i < cbs.length; i++) {
+      cbs[i].onchange = function () {
+        var tok = String(this.getAttribute("data-token"));
+        if (this.checked) pubSel[tok] = this.getAttribute("data-name");
+        else delete pubSel[tok];
+        updatePubCount();
+      };
+    }
+  }
+
+  // Parse the dev-mode raw-token field. Empty is FINE (named picks may carry
+  // the publish); an unparsable entry is an error only at submit time.
+  function parseRawTokens(raw) {
+    var parts = String(raw || "").split(/[\s,]+/).filter(function (s) { return s.length; });
+    var tokens = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (!/^-?\d+$/.test(parts[i])) return { tokens: null, bad: parts[i] };
+      tokens.push(parseInt(parts[i], 10));
+    }
+    return { tokens: tokens, bad: null };
+  }
+
+  function selectedTokens() {
+    var out = [], seen = {};
+    Object.keys(pubSel).forEach(function (t) {
+      var n = parseInt(t, 10);
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+    });
+    var raw = parseRawTokens(el("know-pub-raw").value);
+    (raw.tokens || []).forEach(function (n) {
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+    });
+    return { tokens: out, bad: raw.bad };
+  }
+
+  function updatePubCount() {
+    var sel = selectedTokens();
+    var names = Object.keys(pubSel).map(function (t) { return pubSel[t]; });
+    var line;
+    if (!sel.tokens.length) {
+      line = V.stateChip("attn", "no one selected") +
+        ' <span class="note" style="margin-top:0">publishing will refuse &mdash; there is no default audience</span>';
+    } else {
+      var shown = names.slice(0, 5).map(function (n) { return principalChip(n); }).join(" ");
+      var extra = sel.tokens.length - Math.min(names.length, 5);
+      line = "will be visible to <b>" + sel.tokens.length + "</b> principal" +
+        (sel.tokens.length === 1 ? "" : "s") + ": " + shown +
+        (extra > 0 ? ' <span class="note" style="margin-top:0">+ ' + extra + " more</span>" : "");
+    }
+    el("know-pub-count").innerHTML = line;
+    var go = el("know-pub-go");
+    go.disabled = !sel.tokens.length;
+    go.textContent = sel.tokens.length
+      ? "Publish to " + sel.tokens.length + " principal" + (sel.tokens.length === 1 ? "" : "s")
+      : "Publish";
+  }
+
+  async function submitPublish() {
+    V.clearErr("know-pub-err");
+    var sel = selectedTokens();
+    if (sel.bad != null) {
+      V.err("know-pub-err", new Error('not an integer principal token: "' + sel.bad + '"'));
+      return;
+    }
+    if (!sel.tokens.length) {
+      // Omission REFUSES — never a permissive default.
+      V.err("know-pub-err", new Error(
+        "pick at least one person or group (or cancel) — there is no default audience; omission refuses"));
+      return;
+    }
+    var kmin = parseInt(el("know-pub-kmin").value, 10);
+    if (isNaN(kmin) || kmin < 3) kmin = 3; // honesty clamp; the server re-clamps as the authority
+    var btn = el("know-pub-go");
+    btn.disabled = true;
+    try {
+      await V.api("/v1/knowledge/" + encodeURIComponent(current.id) + "/publish",
+        { admin: true, json: { tenant_id: tenantNow, visibility: sel.tokens, k_min: kmin } });
+      V.dialog("know-pub-dialog").close();
+      V.dialog("know-drawer").close();
+      var names = Object.keys(pubSel).map(function (t) { return pubSel[t]; });
+      var named = names.slice(0, 6).map(function (n) { return principalChip(n); }).join(" ");
+      var unnamed = sel.tokens.length - names.length;
+      el("know-receipt").innerHTML =
+        '<div class="card" style="border-left:3px solid var(--green)">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", "published") +
+            "<b>" + V.esc(current.statement || current.id) + "</b>" +
+          "</div>" +
+          '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> principal" +
+            (sel.tokens.length === 1 ? "" : "s") + ": " + named +
+            (names.length > 6 ? " + " + (names.length - 6) + " more named" : "") +
+            (unnamed > 0 ? " + " + unnamed + " raw token" + (unnamed === 1 ? "" : "s") : "") +
+            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure / forget. " +
+            '<span class="ref">POST /v1/knowledge/' + V.esc(current.id) + "/publish</span></div>" +
+        "</div>";
+      await loadAll(tenantNow);
+    } catch (e) {
+      // Server refusals surface verbatim — they are the teaching moment.
+      V.err("know-pub-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  /* =========================================================== reject gate */
+
+  function openReject(id) {
+    var it = (current.item && current.id === id) ? current.item : data.byId[id];
+    if (!it) return;
+    current = { id: id, statement: it.statement || "", status: it.status, item: it };
+    V.clearErr("know-rej-err");
+    el("know-rej-stmt").textContent = it.statement || "no statement on record";
+    el("know-rej-reason").value = "";
+    el("know-rej-go").disabled = true; // the reason is the gate — required
+    V.dialog("know-rej-dialog").open();
+  }
+
+  async function submitReject() {
+    V.clearErr("know-rej-err");
+    var reason = el("know-rej-reason").value.trim();
+    if (!reason) {
+      V.err("know-rej-err", new Error("a reason is required — this decision is remembered forever and goes on the record"));
+      return;
+    }
+    var btn = el("know-rej-go");
+    btn.disabled = true;
+    try {
+      await V.api("/v1/admin/knowledge/" + encodeURIComponent(current.id) + "/reject",
+        { admin: true, json: { tenant_id: tenantNow, reason: reason } });
+      V.dialog("know-rej-dialog").close();
+      V.dialog("know-drawer").close();
+      el("know-receipt").innerHTML =
+        '<div class="card" style="border-left:3px solid var(--green)">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", "rejected — remembered") +
+            "<b>" + V.esc(current.statement || current.id) + "</b>" +
+          "</div>" +
+          '<div class="note">This exact lesson will not be proposed again. Reason on record: <b>' +
+            V.esc(reason) + "</b> " +
+            '<span class="ref">POST /v1/admin/knowledge/' + V.esc(current.id) + "/reject</span></div>" +
+        "</div>";
+      await loadAll(tenantNow);
+    } catch (e) {
+      V.err("know-rej-err", e);
+      btn.disabled = false;
+    }
+  }
 })();

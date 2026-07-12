@@ -25,6 +25,8 @@ mod manifests;
 mod media;
 #[cfg(test)]
 mod media_tests;
+#[cfg(test)]
+mod principals_tests;
 mod purpose;
 mod rebac;
 mod rebac_watch;
@@ -384,7 +386,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/tag-suggestions/{id}/approve",
             post(consolidation::approve_tag_suggestion),
         )
-        .route("/v1/admin/principals", post(admin_principals))
+        .route(
+            "/v1/admin/principals",
+            post(admin_principals).get(admin_list_principals),
+        )
         .route("/v1/admin/rebac-watch", get(rebac_watch::admin_status))
         .route(
             "/v1/admin/groups",
@@ -1865,6 +1870,60 @@ async fn admin_principals(
     Ok(Json(serde_json::json!({ "mappings": mappings })))
 }
 
+#[derive(Deserialize)]
+struct ListPrincipalsQuery {
+    tenant_id: TenantId,
+    /// Keyset cursor: return rows with `token > after_token` (tokens are
+    /// allocated from 1, so the default 0 starts at the beginning).
+    #[serde(default)]
+    after_token: PrincipalToken,
+    /// Page size, clamped to 1..=1000.
+    #[serde(default = "default_principals_limit")]
+    limit: i64,
+}
+
+fn default_principals_limit() -> i64 {
+    500
+}
+
+/// GET /v1/admin/principals (admin): LIST the tenant's principal directory —
+/// the string ↔ materialized-token map the POST upsert writes (UI-ACTIONS N5).
+/// Ordered by token, keyset-paginated (`after_token`, `limit`); the response's
+/// `next_after_token` is non-null when another page may exist. Read-only and
+/// admin-bearer-gated; the token map never renders in any scope-handle
+/// context, and an unknown tenant simply reads as empty — nothing is created.
+async fn admin_list_principals(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ListPrincipalsQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let limit = q.limit.clamp(1, 1000);
+    let rows = state
+        .storage
+        .inner()
+        .list_principals(q.tenant_id, q.after_token, limit)
+        .await
+        .map_err(internal)?;
+    // A full page means more MAY exist; the client walks until a short page.
+    let next_after_token = if rows.len() as i64 == limit {
+        rows.last().map(|(_, t)| *t)
+    } else {
+        None
+    };
+    let principals: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(principal, token)| serde_json::json!({ "principal": principal, "token": token }))
+        .collect();
+    let count = principals.len();
+    Ok(Json(serde_json::json!({
+        "tenant_id": q.tenant_id,
+        "principals": principals,
+        "count": count,
+        "next_after_token": next_after_token,
+    })))
+}
+
 // ---------- admin: group membership (task 10 — the tuple plane) ----------
 
 #[derive(Deserialize)]
@@ -2735,6 +2794,11 @@ async fn admin_debug_recall(
             "kind": c.kind,
             "entity_tags": c.entity_tags,
             "visibility_token_count": c.visibility.len(),
+            // The member tokens themselves, not just the count: the endpoint
+            // is admin-gated and audited, and the console names tokens via
+            // GET /v1/admin/principals (UI-ACTIONS N5). Agent-facing surfaces
+            // never see this trace — the provenance firewall is untouched.
+            "visibility_tokens": c.visibility,
             "confidentiality": confidentiality_name(c.confidentiality),
             "acl_provenance": c.acl_provenance,
             "trust_tier": if c.trust_tier == 1 { "authoritative" } else { "observation" },
