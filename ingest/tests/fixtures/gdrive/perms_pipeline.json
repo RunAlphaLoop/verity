@@ -1,0 +1,21 @@
+{
+  "kind": "drive#permissionList",
+  "permissions": [
+    {
+      "kind": "drive#permission",
+      "id": "01234567890123456789",
+      "type": "user",
+      "emailAddress": "alice@corp.example",
+      "role": "owner",
+      "deleted": false
+    },
+    {
+      "kind": "drive#permission",
+      "id": "22222222222222222222",
+      "type": "group",
+      "emailAddress": "eng-leads@corp.example",
+      "role": "reader",
+      "deleted": false
+    }
+  ]
+}

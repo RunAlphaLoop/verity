@@ -1,7 +1,12 @@
 //! MediaObject + signed URIs (roadmap task 9): blobs live in the `media`
 //! table, addressed by uuid, served ONLY through HMAC-signed, expiring URLs
 //! minted under a scope handle. Text-like media additionally chunks into the
-//! retrieval index under the uploader's scope; binary media is store-only.
+//! retrieval index under the uploader's scope; PDF / PPTX / XLS(X) go through
+//! the Tier-1 extractor (extract.rs — deterministic, Rust-native, no OCR) and
+//! index the extracted text, with the method + truncation recorded in
+//! provenance and typed extraction failures stored metadata-only, disclosed
+//! in both the response and the episode record. Other binary media is
+//! store-only.
 //!
 //! v0.2 seam, stated honestly: the signed GET enforces signature + expiry
 //! (and the sign step enforces the tenant match), but per-principal media
@@ -166,7 +171,8 @@ pub(crate) fn split_text(text: &str, max: usize) -> Vec<String> {
     chunks
 }
 
-/// text/*, application/json, and .md files chunk into the index; everything
+/// text/*, application/json, and .md files chunk into the index verbatim;
+/// PDF/PPTX/XLS(X) are handled by extract.rs before this check; everything
 /// else is store-only in v0.1.
 fn is_text_like(mime: &str, filename: Option<&str>) -> bool {
     mime.starts_with("text/")
@@ -252,67 +258,139 @@ pub(crate) async fn upload_file(
     .await
     .map_err(internal)?;
 
-    // Text-like media joins the retrieval index; binary (or non-UTF-8) media
-    // is store-only. Invalid UTF-8 under a text mime is treated as binary
-    // rather than lossily indexed.
-    let text = if is_text_like(&mime, filename.as_deref()) {
-        std::str::from_utf8(&bytes).ok().map(str::to_string)
-    } else {
-        None
-    };
-    let mut chunks_indexed = 0usize;
-    if let Some(text) = text {
-        let episode_id = state
-            .storage
-            .append_episode(NewEpisode {
-                tenant_id: payload.tenant_id,
-                source: "file".into(),
-                source_entity: entities.first().cloned(),
-                kind: EpisodeKind::DocVersion,
-                payload: serde_json::json!({
-                    "media_id": media_id, "filename": filename,
-                    "mime": mime, "sha256": sha256, "size_bytes": bytes.len(),
-                }),
-                content_hash: sha256.clone(),
-                trust_tier: TrustTier::Observation,
-                writer_sub: payload.actor_sub.clone(),
-                writer_azp: payload.actor_azp.clone(),
-            })
-            .await
-            .map_err(internal)?;
-
-        let now = Utc::now();
-        let mut writes = Vec::new();
-        for (seq, content) in split_text(&text, CHUNK_CHARS).into_iter().enumerate() {
-            let embedding = state.encode(&content).await.ok().flatten();
-            writes.push(ChunkWrite {
-                tenant_id: payload.tenant_id,
-                source: "file".into(),
-                document_id: format!("media:{media_id}"),
-                seq: seq as i32,
-                content,
-                content_hash: format!("{sha256}-{seq}"),
-                embedding,
-                visibility: payload.principals.clone(),
-                entity_tags: entities.clone(),
-                confidentiality: payload.max_confidentiality,
-                trust_tier: TrustTier::Observation,
-                valid_from: now,
-                provenance: episode_id,
-                acl_provenance: AclProvenance::AdminAssigned,
-            });
+    // What joins the retrieval index (fail-visible, never silently empty):
+    //   * PDF / PPTX / XLS(X) → Tier-1 extraction (extract.rs). Success
+    //     indexes the extracted text with method + truncation in provenance;
+    //     a typed failure stores the episode METADATA-ONLY with the reason
+    //     disclosed on the record and in the response — the same fail-visible
+    //     pattern the Drive connector uses for non-extractable mimetypes.
+    //   * text-like media indexes verbatim. Invalid UTF-8 under a text mime
+    //     is treated as binary rather than lossily indexed.
+    //   * everything else is store-only in v0.1 (no episode, as before).
+    enum Plan {
+        Index {
+            text: String,
+            method: &'static str,
+            truncated: bool,
+        },
+        Refuse(crate::extract::ExtractFailure),
+        StoreOnly,
+    }
+    let plan = match crate::extract::extract(&bytes, filename.as_deref()) {
+        crate::extract::ExtractOutcome::Extracted(ex) => Plan::Index {
+            text: ex.text,
+            method: ex.method,
+            truncated: ex.truncated,
+        },
+        crate::extract::ExtractOutcome::Failed(f) => Plan::Refuse(f),
+        crate::extract::ExtractOutcome::NotHandled => {
+            match is_text_like(&mime, filename.as_deref())
+                .then(|| std::str::from_utf8(&bytes).ok())
+                .flatten()
+            {
+                Some(s) => Plan::Index {
+                    text: s.to_string(),
+                    method: "utf-8",
+                    truncated: false,
+                },
+                None => Plan::StoreOnly,
+            }
         }
-        chunks_indexed = state
-            .storage
-            .upsert_chunks(writes)
-            .await
-            .map_err(internal)?;
+    };
+
+    let mut chunks_indexed = 0usize;
+    let mut extraction_receipt: Option<serde_json::Value> = None;
+    match plan {
+        Plan::Index {
+            text,
+            method,
+            truncated,
+        } => {
+            let episode_id = state
+                .storage
+                .append_episode(NewEpisode {
+                    tenant_id: payload.tenant_id,
+                    source: "file".into(),
+                    source_entity: entities.first().cloned(),
+                    kind: EpisodeKind::DocVersion,
+                    payload: serde_json::json!({
+                        "media_id": media_id, "filename": filename,
+                        "mime": mime, "sha256": sha256, "size_bytes": bytes.len(),
+                        "extraction": { "method": method, "truncated": truncated },
+                    }),
+                    content_hash: sha256.clone(),
+                    trust_tier: TrustTier::Observation,
+                    writer_sub: payload.actor_sub.clone(),
+                    writer_azp: payload.actor_azp.clone(),
+                })
+                .await
+                .map_err(internal)?;
+
+            let now = Utc::now();
+            let mut writes = Vec::new();
+            for (seq, content) in split_text(&text, CHUNK_CHARS).into_iter().enumerate() {
+                let embedding = state.encode(&content).await.ok().flatten();
+                writes.push(ChunkWrite {
+                    tenant_id: payload.tenant_id,
+                    source: "file".into(),
+                    document_id: format!("media:{media_id}"),
+                    seq: seq as i32,
+                    content,
+                    content_hash: format!("{sha256}-{seq}"),
+                    embedding,
+                    visibility: payload.principals.clone(),
+                    entity_tags: entities.clone(),
+                    confidentiality: payload.max_confidentiality,
+                    trust_tier: TrustTier::Observation,
+                    valid_from: now,
+                    provenance: episode_id,
+                    acl_provenance: AclProvenance::AdminAssigned,
+                });
+            }
+            chunks_indexed = state
+                .storage
+                .upsert_chunks(writes)
+                .await
+                .map_err(internal)?;
+            extraction_receipt = Some(serde_json::json!({
+                "method": method,
+                "truncated": truncated,
+            }));
+        }
+        Plan::Refuse(failure) => {
+            let reason = failure.reason();
+            state
+                .storage
+                .append_episode(NewEpisode {
+                    tenant_id: payload.tenant_id,
+                    source: "file".into(),
+                    source_entity: entities.first().cloned(),
+                    kind: EpisodeKind::DocVersion,
+                    payload: serde_json::json!({
+                        "media_id": media_id, "filename": filename,
+                        "mime": mime, "sha256": sha256, "size_bytes": bytes.len(),
+                        "extraction": { "failure": reason },
+                    }),
+                    content_hash: sha256.clone(),
+                    trust_tier: TrustTier::Observation,
+                    writer_sub: payload.actor_sub.clone(),
+                    writer_azp: payload.actor_azp.clone(),
+                })
+                .await
+                .map_err(internal)?;
+            extraction_receipt = Some(serde_json::json!({ "failure": reason }));
+        }
+        Plan::StoreOnly => {}
     }
 
-    Ok(Json(serde_json::json!({
+    let mut resp = serde_json::json!({
         "media_id": media_id,
         "chunks_indexed": chunks_indexed,
-    })))
+    });
+    if let Some(x) = extraction_receipt {
+        resp["extraction"] = x;
+    }
+    Ok(Json(resp))
 }
 
 // ---------- signing ----------

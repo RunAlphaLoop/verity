@@ -10,6 +10,7 @@ No live API calls anywhere in this file.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 from pathlib import Path
@@ -29,6 +30,7 @@ from verity_ingest.connectors.gdrive import (
     StaticRegistry,
     VerityDocumentSink,
     build_document_request,
+    is_binary_extractable,
     map_permissions,
     run_once,
 )
@@ -40,17 +42,25 @@ GONE_ID = "1GoneFileBBBBBBBBBBBBBBBBBBBBBBBB"
 TXT_ID = "1OncallTxtCCCCCCCCCCCCCCCCCCCCCC"
 PDF_ID = "1PricingPdfDDDDDDDDDDDDDDDDDDDDD"
 TRASHED_ID = "1OldNotesTrashEEEEEEEEEEEEEEEEEE"
+XLSX_ID = "1PipelineXlsxFFFFFFFFFFFFFFFFFFF"
+
+# The binary lane treats file bytes as opaque (extraction is server-side), so
+# the fixture bytes only need to LOOK like an office file — generated inline,
+# no binary fixture files in the repo.
+XLSX_BYTES = b"PK\x03\x04 tiny xlsx stand-in bytes \x00\x01\x02"
 
 _FILE_FIXTURES = {
     DOC_ID: "file_doc.json",
     TXT_ID: "file_notes.json",
     PDF_ID: "file_pricing.json",
     TRASHED_ID: "file_trashed.json",
+    XLSX_ID: "file_pipeline.json",
 }
 _PERM_FIXTURES = {
     DOC_ID: "perms_doc.json",
     TXT_ID: "perms_notes.json",
     PDF_ID: "perms_pricing.json",
+    XLSX_ID: "perms_pipeline.json",
 }
 _CHANGES_PAGES = {
     "387": "changes_page1.json",
@@ -96,6 +106,8 @@ class FixtureTransport:
             return (FIXTURES / "doc_export.txt").read_bytes()
         if path == f"files/{TXT_ID}" and params.get("alt") == "media":
             return (FIXTURES / "oncall_notes.txt").read_bytes()
+        if path == f"files/{XLSX_ID}" and params.get("alt") == "media":
+            return XLSX_BYTES
         raise AssertionError(f"unexpected content fetch: GET {path} {params}")
 
 
@@ -180,9 +192,16 @@ def test_first_poll_returns_start_page_token_and_no_events():
 def test_poll_paginates_and_advances_cursor():
     _, events, cursor = _poll("387")
     assert cursor == "412"
-    # doc, removed file, text file, anyone-pdf, trashed file; the
+    # doc, removed file, text file, anyone-pdf, trashed file, xlsx; the
     # changeType="drive" entry is skipped (identity plane's job, not ours).
-    assert [e.document_id for e in events] == [DOC_ID, GONE_ID, TXT_ID, PDF_ID, TRASHED_ID]
+    assert [e.document_id for e in events] == [
+        DOC_ID,
+        GONE_ID,
+        TXT_ID,
+        PDF_ID,
+        TRASHED_ID,
+        XLSX_ID,
+    ]
     assert all(isinstance(e, GDriveDocumentEvent) for e in events)
 
 
@@ -217,9 +236,24 @@ def test_anyone_shared_file_quarantines_and_content_is_never_fetched():
     pdf = events[3]
     assert pdf.acl == AclEnvelope(resolvable=False, principals=[], groups=[])
     assert pdf.content == b""
-    # ACL-before-content (§5a): no bytes were pulled for the quarantined item,
-    # and none for the non-extractable PDF mimetype either way.
+    # ACL-before-content (§5a): PDFs ARE binary-extractable now, so the ONLY
+    # thing keeping these bytes unfetched is the quarantine — which is
+    # exactly the ordering guarantee this test pins.
+    assert is_binary_extractable("application/pdf")
     assert all(not path.startswith(f"files/{PDF_ID}") for path, _ in transport.bytes_calls)
+
+
+def test_office_file_downloads_bytes_for_server_side_extraction():
+    _, events, _ = _poll("387")
+    xlsx = events[5]
+    assert xlsx.mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert xlsx.content == XLSX_BYTES
+    assert xlsx.name == "q3-pipeline.xlsx"
+    assert xlsx.acl == AclEnvelope(
+        resolvable=True,
+        principals=["user:alice@corp.example"],
+        groups=["group:eng-leads@corp.example"],
+    )
 
 
 def test_removed_and_trashed_files_emit_removal_markers():
@@ -347,6 +381,20 @@ def test_sink_request_bodies_exact():
             "removed": True,
             "valid_from": "2026-07-09T10:09:01.000Z",
         },
+        {
+            # binary lane: raw bytes for server-side Tier-1 extraction —
+            # content_base64 + filename INSTEAD of "content", same mirrored
+            # visibility mapping as text deliveries.
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": XLSX_ID,
+            "content_base64": base64.b64encode(XLSX_BYTES).decode("ascii"),
+            "filename": "q3-pipeline.xlsx",
+            "entities": [],
+            "valid_from": "2026-07-09T10:11:12.000Z",
+            "visibility": [101, 202],
+            "acl_provenance": "mirrored",
+        },
     ]
 
 
@@ -363,6 +411,17 @@ def test_all_principals_unresolvable_quarantines():
     body = build_document_request(events[0], registry=StaticRegistry({}), tenant_id=TENANT)
     assert "visibility" not in body
     assert body["acl_provenance"] == "quarantined"
+
+
+def test_binary_lane_with_unresolvable_principals_also_quarantines():
+    _, events, _ = _poll("387")
+    body = build_document_request(events[5], registry=StaticRegistry({}), tenant_id=TENANT)
+    assert "visibility" not in body
+    assert body["acl_provenance"] == "quarantined"
+    # The bytes still ride along (the server's choke point holds quarantined
+    # items un-indexed) and "content" is never doubled up next to base64.
+    assert body["content_base64"] == base64.b64encode(XLSX_BYTES).decode("ascii")
+    assert "content" not in body
 
 
 def test_verity_sink_posts_to_documents_endpoint():
@@ -449,10 +508,10 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
     assert run_once(connector, registry, sink, state_file) == 0
     assert json.loads(state_file.read_text()) == {"cursor": "387"}
 
-    # Second run: polls from 387, delivers all five requests, advances to 412.
+    # Second run: polls from 387, delivers all six requests, advances to 412.
     connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
     sink = DryRunSink(stream=io.StringIO())
-    assert run_once(connector, registry, sink, state_file) == 5
+    assert run_once(connector, registry, sink, state_file) == 6
     assert json.loads(state_file.read_text()) == {"cursor": "412"}
     assert [r["document_id"] for r in sink.requests] == [
         DOC_ID,
@@ -460,4 +519,5 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
         TXT_ID,
         PDF_ID,
         TRASHED_ID,
+        XLSX_ID,
     ]

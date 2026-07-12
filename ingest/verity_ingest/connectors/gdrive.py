@@ -13,7 +13,19 @@ file: ``files.get`` for metadata, ``permissions.list`` for the ACL, then —
 and only if the ACL is resolvable (ACL-before-content, §5a) — content:
 
 - Google Docs → ``files.export`` as ``text/plain``
-- ``text/*`` and ``application/json`` → direct download (``alt=media``)
+- ``text/*`` and ``application/json`` → direct download (``alt=media``),
+  delivered inline as ``content`` text
+- PDF / PPTX / XLS(X) → direct download (``alt=media``), delivered as raw
+  bytes in ``content_base64`` (+ ``filename``); the SERVER runs the Tier-1
+  extractor (verity-server extract.rs: Rust-native, deterministic, no OCR).
+  This was chosen over posting bytes to ``POST /v1/files`` because /v1/files
+  writes under a scope handle whose principals would REPLACE the mirrored
+  per-file ACL this connector computed — the whole point of a Tier-A
+  connector. Riding the existing documents endpoint keeps one sink, the same
+  visibility/entity mapping, and ACL-before-content ordering; the smallest
+  honest change. Typed extraction failures (encrypted PDF, scanned/image PDF
+  with no text layer, parse failure) land METADATA-ONLY server-side with the
+  reason disclosed on the stored record — never silently indexed as empty.
 - everything else → metadata + ACL only, no content bytes
 
 ACL mapping (fail-closed, §5e.6 / §6b):
@@ -54,6 +66,11 @@ bodies, integration lands later):
         "source":         "gdrive",
         "document_id":    "<drive file id>",
         "content":        "<extracted text>" | null,   # null = metadata-only
+        # binary lane (PDF/PPTX/XLS(X)): raw bytes for server-side Tier-1
+        # extraction; mutually exclusive with "content", filename is the
+        # detection hint (magic bytes win server-side):
+        "content_base64": "<base64 bytes>",            # instead of "content"
+        "filename":       "<drive file name>",
         "entities":       ["<entity tag>", ...],       # optional, may be []
         "visibility":     [<int token>, ...],          # only when mirrored
         "acl_provenance": "mirrored" | "quarantined",
@@ -73,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -123,23 +141,44 @@ class GDriveConfig:
 
 @dataclass
 class GDriveDocumentEvent(DocumentEvent):
-    """DocumentEvent + the Drive timestamp and the removal marker.
+    """DocumentEvent + the Drive timestamp, file name, and removal marker.
 
     ``removed=True`` means the file was hard-deleted at the source or moved
     to trash; content/mime/acl are empty and the sink emits a removal body.
+    ``name`` rides along for the binary lane's ``filename`` detection hint.
     """
 
     modified_time: str = ""
+    name: str = ""
     removed: bool = False
 
 
+# Binary formats the server's Tier-1 extractor handles (verity-server
+# extract.rs): text-based PDF, PPTX, XLS(X). Deliberately NOT .doc/.docx or
+# legacy .ppt — Google Docs already export as text, and anything else stays
+# honestly metadata-only until a later tier.
+BINARY_EXTRACTABLE_MIMES = frozenset(
+    {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }
+)
+
+
 def is_extractable(mime_type: str) -> bool:
-    """Mimetypes whose content we deliver as text in v0.x."""
+    """Mimetypes whose content we deliver as inline text."""
     return (
         mime_type == GOOGLE_DOC_MIME
         or mime_type.startswith("text/")
         or mime_type == "application/json"
     )
+
+
+def is_binary_extractable(mime_type: str) -> bool:
+    """Mimetypes delivered as raw bytes for SERVER-side Tier-1 extraction."""
+    return mime_type in BINARY_EXTRACTABLE_MIMES
 
 
 # ---------------------------------------------------------------------------
@@ -468,8 +507,9 @@ class GDriveConnector(Connector):
         mime_type = meta.get("mimeType", "")
         content = b""
         # ACL before content (§5a): never pull bytes for an item we already
-        # know will quarantine.
-        if acl.resolvable and is_extractable(mime_type):
+        # know will quarantine. Binary-extractable formats (PDF/PPTX/XLS(X))
+        # download the same alt=media way; extraction happens server-side.
+        if acl.resolvable and (is_extractable(mime_type) or is_binary_extractable(mime_type)):
             if mime_type == GOOGLE_DOC_MIME:
                 content = self._transport.get_bytes(
                     f"files/{file_id}/export", {"mimeType": DOC_EXPORT_MIME}
@@ -484,6 +524,7 @@ class GDriveConnector(Connector):
             version=str(meta.get("version", "")),
             acl=acl,
             modified_time=meta.get("modifiedTime", ""),
+            name=meta.get("name", ""),
         )
 
     def _list_permissions(self, file_id: str) -> list[dict]:
@@ -534,14 +575,21 @@ def build_document_request(
         "tenant_id": tenant_id,
         "source": event.source,
         "document_id": event.document_id,
-        "content": (
-            event.content.decode("utf-8", errors="replace")
-            if event.acl.resolvable and is_extractable(event.mime_type)
-            else None
-        ),
         "entities": list(event.entity_tags),
         "valid_from": event.modified_time,
     }
+    if event.acl.resolvable and is_binary_extractable(event.mime_type):
+        # Binary lane: raw bytes, extracted SERVER-side (extract.rs, Tier 1).
+        # Mutually exclusive with "content"; filename is the detection hint.
+        body["content_base64"] = base64.b64encode(event.content).decode("ascii")
+        if event.name:
+            body["filename"] = event.name
+    else:
+        body["content"] = (
+            event.content.decode("utf-8", errors="replace")
+            if event.acl.resolvable and is_extractable(event.mime_type)
+            else None
+        )
     if not event.acl.resolvable:
         body["acl_provenance"] = "quarantined"
         return body

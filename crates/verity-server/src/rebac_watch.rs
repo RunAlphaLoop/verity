@@ -1,5 +1,13 @@
 //! SpiceDB Watch-driven revocation materialization (SPEC §7b, opt-in).
 //!
+//! INVARIANT — one consumer per database: the durable cursor
+//! (`rebac_watch_cursor`) is a single row, owned by exactly one running
+//! consumer. Two consumers sharing a database fight over it (each resumes
+//! past events the other processed) and both go quietly blind. Replicas
+//! therefore need leader election before enabling the watch on more than one
+//! process — a disclosed v0 limitation. Tests spawn their own scratch
+//! database for the same reason.
+//!
 //! A background consumer of SpiceDB's `/v1/watch` stream. On every
 //! `group#member` tuple DELETE observed on the stream — including deletes
 //! performed DIRECTLY against SpiceDB (zed CLI, a SCIM bridge, another
@@ -684,7 +692,31 @@ mod tests {
             eprintln!("spicedb unreachable; skipping");
             return None;
         }
-        let pg = verity_storage::PostgresAdapter::connect(&dsn)
+        // ISOLATED DATABASE, not the shared dev db: the watch cursor
+        // (rebac_watch_cursor) is a single row per database, owned by exactly
+        // ONE consumer. A dev server with VERITY_SPICEDB_WATCH=1 running
+        // against the shared db (the default since dev wires every plane)
+        // advances that cursor continuously, so a second in-test consumer
+        // resumes past its own events and the assertion times out — found
+        // 2026-07-12 the first night dev ran fully wired. One consumer per
+        // database is the design invariant (see the module docs); tests
+        // honor it by owning a scratch db.
+        let scratch = {
+            let base = sqlx::PgPool::connect(&dsn).await.expect("connect base");
+            sqlx::query("DROP DATABASE IF EXISTS verity_watch_unit WITH (FORCE)")
+                .execute(&base)
+                .await
+                .expect("drop scratch");
+            sqlx::query("CREATE DATABASE verity_watch_unit")
+                .execute(&base)
+                .await
+                .expect("create scratch");
+            // No url-crate dep: swap the database segment by string surgery
+            // (the DSN's last path segment is the database name).
+            let cut = dsn.rfind('/').expect("dsn has a path");
+            format!("{}/verity_watch_unit", &dsn[..cut])
+        };
+        let pg = verity_storage::PostgresAdapter::connect(&scratch)
             .await
             .expect("connect");
         pg.migrate().await.expect("migrate");

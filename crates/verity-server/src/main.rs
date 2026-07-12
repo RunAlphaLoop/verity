@@ -16,6 +16,9 @@ mod consolidation;
 mod consolidation_tests;
 #[cfg(test)]
 mod entity_resolution_tests;
+mod extract;
+#[cfg(test)]
+mod extract_tests;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
@@ -1632,7 +1635,21 @@ struct IngestDocumentsRequest {
     tenant_id: TenantId,
     source: String,
     document_id: String,
-    content: String,
+    /// Pre-extracted text. `None` (with no `content_base64`) is a declared
+    /// metadata-only delivery — an episode is recorded, nothing is indexed.
+    #[serde(default)]
+    content: Option<String>,
+    /// Binary path (Tier-1 extraction, extract.rs): raw file bytes, base64.
+    /// The SERVER extracts text (PDF/PPTX/XLS(X), deterministic, no OCR) so
+    /// connectors stay extraction-free. Chosen over posting to /v1/files
+    /// because /v1/files stamps the uploader scope's principals — it would
+    /// REPLACE the connector's mirrored per-item ACL, which is the whole
+    /// point of Tier-A connectors. Mutually exclusive with `content`.
+    #[serde(default)]
+    content_base64: Option<String>,
+    /// Filename hint for format detection (magic bytes still win).
+    #[serde(default)]
+    filename: Option<String>,
     #[serde(default)]
     entities: Vec<String>,
     /// Materialized principal tokens (see POST /v1/admin/principals).
@@ -1648,7 +1665,9 @@ struct IngestDocumentsRequest {
 /// POST /v1/ingest/documents (admin): one document version in → one L0
 /// episode + deterministic paragraph chunks out, under connector-supplied
 /// visibility and ACL provenance. The contract the Google Drive connector
-/// codes against.
+/// codes against. `content` carries pre-extracted text; `content_base64`
+/// carries raw PDF/PPTX/XLS(X) bytes for server-side Tier-1 extraction
+/// (extract.rs); neither = declared metadata-only.
 async fn ingest_documents(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1665,7 +1684,78 @@ async fn ingest_documents(
         ));
     }
     let valid_from = req.valid_from.unwrap_or_else(Utc::now);
-    let content_hash = format!("{:x}", md5ish(&req.content));
+
+    // Resolve what (if anything) gets indexed. Three delivery shapes:
+    //   * `content`         — pre-extracted text, indexed as before;
+    //   * `content_base64`  — raw bytes; the server runs Tier-1 extraction
+    //     (extract.rs). Success indexes the text with the method recorded in
+    //     provenance; a typed failure lands METADATA-ONLY with the reason on
+    //     the episode AND in the response (fail-visible, never silent);
+    //   * neither           — declared metadata-only (the Drive connector's
+    //     long-standing shape for content it cannot deliver).
+    if req.content.is_some() && req.content_base64.is_some() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "send content OR content_base64, not both".into(),
+        ));
+    }
+    let mut extraction_receipt: Option<serde_json::Value> = None;
+    let text: Option<String> = match (&req.content, &req.content_base64) {
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(b64)) => {
+            use base64::Engine as _;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("content_base64 is not valid base64: {e}"),
+                    )
+                })?;
+            match extract::extract(&raw, req.filename.as_deref()) {
+                extract::ExtractOutcome::Extracted(ex) => {
+                    extraction_receipt = Some(serde_json::json!({
+                        "method": ex.method, "truncated": ex.truncated,
+                    }));
+                    Some(ex.text)
+                }
+                extract::ExtractOutcome::Failed(f) => {
+                    extraction_receipt = Some(serde_json::json!({ "failure": f.reason() }));
+                    None
+                }
+                // Bytes we have no Tier-1 extractor for: disclosed, not
+                // guessed at — the connector should have inlined text.
+                extract::ExtractOutcome::NotHandled => {
+                    extraction_receipt = Some(serde_json::json!({
+                        "failure": extract::ExtractFailure::UnrecognizedFormat.reason(),
+                    }));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Idempotency hash covers what was DELIVERED (text or raw base64), not
+    // what extraction produced — a changed file re-ingests even if extraction
+    // failed both times.
+    let delivered = req
+        .content
+        .as_deref()
+        .or(req.content_base64.as_deref())
+        .unwrap_or("");
+    let content_hash = format!("{:x}", md5ish(delivered));
+    let mut episode_payload = serde_json::json!({
+        "document_id": req.document_id,
+        "content_hash": content_hash,
+        "bytes": text.as_ref().map_or(0, |t| t.len()),
+    });
+    if let Some(name) = &req.filename {
+        episode_payload["filename"] = serde_json::json!(name);
+    }
+    if let Some(x) = &extraction_receipt {
+        episode_payload["extraction"] = x.clone();
+    }
     let episode_id = state
         .storage
         .append_episode(NewEpisode {
@@ -1673,11 +1763,7 @@ async fn ingest_documents(
             source: req.source.clone(),
             source_entity: Some(req.document_id.clone()),
             kind: EpisodeKind::DocVersion,
-            payload: serde_json::json!({
-                "document_id": req.document_id,
-                "content_hash": content_hash,
-                "bytes": req.content.len(),
-            }),
+            payload: episode_payload,
             content_hash: content_hash.clone(),
             // Connector-mirrored documents track a system of record.
             trust_tier: TrustTier::Authoritative,
@@ -1688,7 +1774,7 @@ async fn ingest_documents(
         .map_err(internal)?;
 
     let mut writes = Vec::new();
-    for (seq, content) in media::split_text(&req.content, media::CHUNK_CHARS)
+    for (seq, content) in media::split_text(text.as_deref().unwrap_or(""), media::CHUNK_CHARS)
         .into_iter()
         .enumerate()
     {
@@ -1719,10 +1805,14 @@ async fn ingest_documents(
     // (new entity_tags/aliases can feed resolution). Never affects the response.
     state.resolution.mark_dirty(req.tenant_id);
     slo::record_sample(state.pool(), req.tenant_id, &req.source, received_at).await;
-    Ok(Json(serde_json::json!({
+    let mut resp = serde_json::json!({
         "episode_id": episode_id,
         "chunks_indexed": chunks_indexed,
-    })))
+    });
+    if let Some(x) = extraction_receipt {
+        resp["extraction"] = x;
+    }
+    Ok(Json(resp))
 }
 
 // ---------- remember ----------

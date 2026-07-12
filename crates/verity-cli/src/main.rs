@@ -14,6 +14,7 @@ mod backup;
 mod config;
 mod connect;
 mod dev;
+mod doctor;
 mod manifest;
 mod mcp;
 mod query;
@@ -160,6 +161,10 @@ dimension change needs a wider column (docs/EMBEDDING_MIGRATION.md)."
     },
     /// Server health, config, tenant, and the decoded scope handle.
     Status,
+    /// Plane-by-plane OBSERVED health of the running dev stack (identity,
+    /// ReBAC watch, signing key, media tier, encoder, auto-resolve,
+    /// Temporal) — the same live probes `dev` prints, re-runnable anytime.
+    Doctor,
     /// Back up the dockerized Postgres (pg_dump -Fc) into <dir>, with a
     /// manifest.json recording schema version, timestamp, and KEK flag.
     Backup {
@@ -394,6 +399,7 @@ async fn run() -> Result<()> {
             },
         },
         Command::Status => status::run(&ctx).await,
+        Command::Doctor => doctor::run(&ctx).await,
         Command::Backup { dir } => backup::backup(&dir).await,
         Command::Restore { file } => backup::restore(&file).await,
     }

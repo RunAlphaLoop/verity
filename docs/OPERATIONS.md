@@ -5,6 +5,56 @@ Operational companion to SPEC §8 (deletion, retention & compliance) and
 actually ships; where the spec promises more than the code does, the gap is
 listed explicitly rather than implied away.
 
+## The dev stack — `verity-cli dev`, `verity-cli doctor`, and the E2E proof
+
+`verity-cli dev` brings up the **whole** local plane and wires every piece of
+infrastructure into the server it spawns — dev mode is not a reduced mode:
+
+- **Postgres** (ParadeDB pg17) — fatal if unhealthy; nothing works without it.
+- **SpiceDB identity plane** (`VERITY_SPICEDB_URL/KEY`) **+ the watch
+  consumer** (`VERITY_SPICEDB_WATCH=1`) when the container is healthy — see
+  "SpiceDB Watch-driven revocation materialization" below.
+- **MinIO media tier** (`VERITY_MEDIA_*`, bucket `verity-media` via the
+  one-shot `minio-init` bootstrap) — see "Media storage" below.
+- **Persistent dev signing key**: generated once into
+  `~/.verity/dev-signing-key` (0600, never printed) and passed as
+  `VERITY_SCOPE_KEY`, so scope handles and purge-report signatures survive
+  server restarts instead of dying with each process.
+- **Temporal** — health-checked and reported only; the Rust server has no
+  Temporal client (the Python connector workers in `ingest/` do), and dev
+  never blocks on it.
+
+Every plane degrades **honestly and independently**: a plane whose container
+never turns healthy is left unwired with a printed fallback (raw-key sessions,
+Postgres-bytea blobs, windowed-baseline revocations…), and if the server
+refuses to boot with a plane configured, dev retries dropping one plane at a
+time (watch → SpiceDB → media), announcing each drop. The summary lines are
+**observed, not configured**: they come from live probes against the running
+server (a real subject mint, `GET /v1/admin/rebac-watch`, a blob round-trip
+through a signed URL, a debug-recall trace reporting which query leg ran, the
+server's own boot log). A reused already-running server keeps whatever wiring
+it booted with — the probes report *its* truth; stop it and re-run
+`verity-cli dev` to re-wire.
+
+`verity-cli doctor` re-runs the same probe functions anytime and prints the
+plane-by-plane table (✓ live / ! degraded-with-stated-fallback / ?
+unobservable).
+
+The functional proof lives in `crates/verity-server/tests/dev_stack_e2e.rs` —
+black-box HTTP tests against the running stack covering identity minting,
+watch-driven out-of-band revocation, the media round-trip (including
+blob-actually-in-MinIO when the media envs are set), live entity resolution,
+encoder-backed scoped recall, and freshness SLO sampling; sections skip
+cleanly (naming the missing env) when a plane isn't present:
+
+```
+VERITY_TEST_DSN=postgres://verity:verity@localhost:5433/verity \
+VERITY_SPICEDB_URL=http://localhost:8443 \
+VERITY_MEDIA_S3_ENDPOINT=http://localhost:9000 VERITY_MEDIA_BUCKET=verity-media \
+VERITY_MEDIA_ACCESS_KEY=minioadmin VERITY_MEDIA_SECRET_KEY=minioadmin \
+cargo test -p verity-server --test dev_stack_e2e -- --nocapture
+```
+
 ## Backup
 
 ```

@@ -53,5 +53,16 @@ ort = "2.0.0-rc.12"
 tokenizers = "0.23"
 hf-hub = "0.5"
 rmcp = { version = "2.2", features = ["schemars", "transport-io"] }
+# Tier-1 file extraction (POST /v1/files): Rust-native, deterministic, no OCR.
+# calamine: xlsx/xls/xlsb/ods sheet text, pure Rust, magic-byte autodetection.
+calamine = "0.36"
+# zip + quick-xml: pptx is a zip of XML; we pull a:t runs ourselves — no
+# heavyweight office suite dep. deflate-read only; fixtures are written Stored.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "0.41"
+# pdf-extract: text-layer extraction (fonts/ToUnicode CMaps/ordering) on top of
+# lopdf — the part we refuse to reimplement. Known to panic on hostile files;
+# every call is wrapped in catch_unwind (see extract.rs).
+pdf-extract = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 schemars = { version = "1", features = ["chrono04"] }

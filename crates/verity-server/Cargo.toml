@@ -39,6 +39,12 @@ moka = { workspace = true }
 # Media object-store seam (task 47): S3/MinIO blob tier behind object_store.
 object_store = { workspace = true }
 bytes = "1"
+# Tier-1 file extraction (extract.rs): PDF/PPTX/XLS(X) → text, deterministic,
+# no OCR. Dep choices justified at the workspace root Cargo.toml.
+calamine = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+pdf-extract = { workspace = true }
 # SSE subscriptions (task 21): poll-loop event streams.
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

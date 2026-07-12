@@ -14,8 +14,13 @@
      • POST /v1/episodes — paste-text path: { scope_handle, observation,
        entities[] } → { episode_id }
      • POST /v1/files — upload path: multipart scope_handle / file /
-       entities (comma-sep) → { media_id, chunks_indexed }; 32 MB server
-       body cap; text-like files index, others are store-only in v0.1
+       entities (comma-sep) → { media_id, chunks_indexed, extraction? };
+       32 MB server body cap; text-like files index verbatim; PDF/PPTX/
+       XLS(X) go through Tier-1 server-side extraction (deterministic, no
+       OCR) — the response's `extraction` object reports the method +
+       truncation on success or a typed failure reason (encrypted PDF,
+       scanned PDF, parse failure), and the receipt renders it verbatim;
+       other types are store-only in v0.1
      • URLs are NOT fetched by the console (zero outside requests) or the
        server (no fetch endpoint, by design) — the tab writes the exact
        `verity-cli add <url> --visibility …` command instead.
@@ -190,8 +195,13 @@
 
         '<div id="ing-view-file" hidden>' +
           '<label for="ing-file">choose a file</label>' +
-          '<input type="file" id="ing-file" style="display:block;color:var(--dim)">' +
+          '<input type="file" id="ing-file" style="display:block;color:var(--dim)" ' +
+            'accept=".txt,.md,.json,.pdf,.pptx,.xlsx,.xls,text/*,application/json,application/pdf,' +
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation,' +
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">' +
           '<div class="note">Text-like files (<span class="mono">.txt .md .json</span>, any <span class="mono">text/*</span>) are chunked and indexed for recall. ' +
+            "PDFs, decks, and spreadsheets — text is extracted; scanned PDFs need OCR (later) and land metadata-only, disclosed. " +
+            "Extraction is capped at ~200&nbsp;KB of text (the receipt says when it was truncated). Encrypted PDFs are refused with the reason. " +
             "Other types are <b>stored but not searchable</b> in v0.1 — the receipt will say which happened. Server caps uploads at <b>32&nbsp;MB</b>.</div>" +
         "</div>" +
 
@@ -502,15 +512,31 @@
         fd.append("file", el("ing-file").files[0]);
         res = await V.api("/v1/files", { method: "POST", body: fd });
         var chunks = res ? Number(res.chunks_indexed) : 0;
+        // Server-reported extraction receipt (PDF/PPTX/XLS(X) go through the
+        // Tier-1 extractor): {method, truncated} on success, {failure} on a
+        // typed refusal. Absent for plain text-like and store-only files.
+        var extraction = (res && res.extraction) || null;
+        var line;
+        if (extraction && extraction.failure) {
+          line = "File stored, <b>metadata-only</b> — no text was extracted: <b>" +
+            esc(extraction.failure) + "</b>. The refusal is recorded on the memory itself, not hidden.";
+        } else if (chunks > 0) {
+          line = "File stored — <b>" + chunks + " chunk" + (chunks === 1 ? "" : "s") + "</b> indexed for recall" +
+            (extraction && extraction.method && extraction.method !== "utf-8"
+              ? " (text extracted via <span class=\"mono\">" + esc(extraction.method) + "</span>" +
+                (extraction.truncated ? ", <b>truncated</b> at the ~200 KB extraction cap — the stored file is complete, the index is not" : "") + ")."
+              : ".");
+        } else {
+          line = "File stored — <b>0 chunks indexed</b>: this file type is store-only in v0.1 (not searchable).";
+        }
         receipt = {
           kind: "file",
           idLabel: "media",
           id: res && res.media_id,
           chunks: chunks,
+          extraction: extraction,
           filename: el("ing-file").files[0].name,
-          line: chunks > 0
-            ? "File stored — <b>" + chunks + " chunk" + (chunks === 1 ? "" : "s") + "</b> indexed for recall."
-            : "File stored — <b>0 chunks indexed</b>: this file type is store-only in v0.1 (not searchable).",
+          line: line,
           endpoint: "POST /v1/files",
         };
       }
@@ -551,8 +577,17 @@
     }).join(" ") + (names.length > 4 ? ' <span class="asof">+' + (names.length - 4) + " more</span>" : "");
     var handleForProbe = pass.handle;
     var stateChip = (r.kind === "file" && r.chunks === 0)
-      ? V.stateChip("attn", "stored, not searchable")
+      ? V.stateChip("attn", (r.extraction && r.extraction.failure) ? "stored, extraction refused" : "stored, not searchable")
       : V.stateChip("ok", "in memory");
+    // Extraction provenance, server-reported: method + truncation on success,
+    // the typed reason on refusal — verbatim, never paraphrased away.
+    var extractionMeta = "";
+    if (r.extraction) {
+      extractionMeta = r.extraction.failure
+        ? " · extraction refused: " + esc(r.extraction.failure)
+        : " · extracted via " + esc(r.extraction.method || "?") +
+          (r.extraction.truncated ? " · truncated at ~200 KB" : "");
+    }
 
     el("ing-receipt").innerHTML =
       '<div class="card" style="margin-top:12px;margin-bottom:0">' +
@@ -566,6 +601,7 @@
         '<div class="dc-meta" style="margin-top:8px">' + esc(r.endpoint) + " · " + esc(r.idLabel) + " " +
           (r.id != null ? '<span class="ref">' + esc(String(r.id)) + "</span>" : "—") +
           (r.filename ? ' · <span class="ref">' + esc(r.filename) + "</span>" : "") +
+          extractionMeta +
           " · visibility inherited from the write pass" +
         "</div>" +
         '<div class="actions" style="justify-content:flex-start;margin-top:10px">' +
