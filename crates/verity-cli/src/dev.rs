@@ -15,6 +15,14 @@ use crate::{config, ui, util, Ctx};
 /// the org-wide scope over its token — no bare magic numbers in the summary.
 const DEV_PRINCIPAL: &str = "user:dev";
 
+/// The SpiceDB HTTP gateway as deploy/docker-compose.yml publishes it:
+/// service `spicedb`, `--http-enabled` on host port 8443, preshared key
+/// `verity-dev-key` (VERITY_SPICEDB_KEY's documented default in rebac.rs).
+/// Dev ships with the identity plane ON — these are handed to the spawned
+/// server whenever the container comes up healthy.
+const SPICEDB_URL: &str = "http://localhost:8443";
+const SPICEDB_KEY: &str = "verity-dev-key";
+
 pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
     ui::banner("verity dev — local memory plane, five minutes");
     println!();
@@ -33,8 +41,12 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
         let repo = repo.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
         docker_up(repo)?;
         wait_for_postgres().await?;
+        // Identity plane (SPEC §7a): dev ships with it ON. The wait is
+        // bounded and NON-FATAL — SpiceDB trouble degrades to raw-key
+        // sessions, disclosed in the summary; it never blocks dev.
+        let spicedb_up = wait_for_spicedb().await;
         let bin = ensure_server_built(repo)?;
-        spawn_and_wait(ctx, repo, &bin).await?;
+        spawn_and_wait(ctx, repo, &bin, spicedb_up).await?;
     }
 
     // (d) first-run setup: tenant → named principal → scope → config. All
@@ -54,6 +66,12 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
         ),
     );
 
+    // The identity-plane summary line reports OBSERVED server behavior, not
+    // what this process configured: a reused server may or may not have
+    // ReBAC wired, so probe with a real subject-based mint (the production
+    // shape) and let the outcome speak.
+    let identity_live = identity_plane_live(ctx, &tenant_id).await;
+
     ctx.config.url = Some(ctx.url.clone());
     ctx.config.tenant_id = Some(tenant_id.clone());
     ctx.config.scope_handle = Some(handle);
@@ -67,6 +85,7 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
         &tenant_id,
         dev_token,
         &expiry_note,
+        identity_live,
         repo.ok().as_deref(),
     );
     Ok(())
@@ -96,7 +115,9 @@ fn docker_up(repo: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    ui::step_ok("postgres", "docker compose up -d (paradedb pg17)");
+    // No service filter on purpose: `up -d` starts EVERY compose service,
+    // spicedb (the identity plane) included.
+    ui::step_ok("compose", "docker compose up -d (paradedb pg17 + spicedb)");
     Ok(())
 }
 
@@ -127,6 +148,51 @@ async fn wait_for_postgres() -> Result<()> {
                 "postgres (container verity-postgres) did not report healthy within 120s\n  \
                  → inspect it with `docker logs verity-postgres`, then re-run `verity-cli dev`"
             );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+// ---------- (b2) wait for spicedb health — bounded, never fatal ----------
+
+/// Wait (up to 45s — the container boots in seconds) for `verity-spicedb`
+/// to report healthy. Returns whether the identity plane can be wired into
+/// the spawned server. NON-FATAL BY DESIGN: the server treats a configured-
+/// but-unusable SpiceDB as a startup error (main.rs boot contract), so we
+/// only hand it the env when the container actually answers — anything else
+/// degrades honestly to raw-key sessions and never blocks dev.
+async fn wait_for_spicedb() -> bool {
+    let started = Instant::now();
+    loop {
+        let health = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{.State.Health.Status}}",
+                "verity-spicedb",
+            ])
+            .output();
+        if let Ok(out) = health {
+            if String::from_utf8_lossy(&out.stdout).trim() == "healthy" {
+                ui::step_ok(
+                    "spicedb",
+                    &format!(
+                        "healthy after {:.1}s — identity plane wired into the server",
+                        started.elapsed().as_secs_f32()
+                    ),
+                );
+                return true;
+            }
+        }
+        if started.elapsed() > Duration::from_secs(45) {
+            println!(
+                "  {} {}  spicedb (container verity-spicedb) not healthy within 45s — \
+                 continuing without it; sessions use raw keys (dev fallback). \
+                 Inspect with `docker logs verity-spicedb`, then re-run `verity-cli dev`",
+                ui::yellow("…"),
+                ui::pad("spicedb", 8)
+            );
+            return false;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -166,7 +232,13 @@ fn ensure_server_built(repo: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
-async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path) -> Result<()> {
+/// One spawn attempt's terminal state: healthy, or exited before /healthz.
+enum SpawnOutcome {
+    Ready,
+    ExitedEarly(std::process::ExitStatus),
+}
+
+async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path, spicedb: bool) -> Result<()> {
     let log_path = ctx
         .config_path
         .parent()
@@ -175,10 +247,41 @@ async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path) -> Result<()> {
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
+    if spicedb {
+        // A server configured with ReBAC refuses to boot when SpiceDB turns
+        // unusable between our health check and its schema write. Dev never
+        // blocks on SpiceDB: one honest retry without the identity plane.
+        match try_spawn(ctx, repo, bin, &log_path, true).await? {
+            SpawnOutcome::Ready => return Ok(()),
+            SpawnOutcome::ExitedEarly(status) => println!(
+                "  {} {}  the server exited immediately with the identity plane configured \
+                 ({status}, see {}) — retrying without it; sessions use raw keys (dev fallback)",
+                ui::yellow("…"),
+                ui::pad("spicedb", 8),
+                log_path.display()
+            ),
+        }
+    }
+    match try_spawn(ctx, repo, bin, &log_path, false).await? {
+        SpawnOutcome::Ready => Ok(()),
+        SpawnOutcome::ExitedEarly(status) => bail!(
+            "the server exited immediately ({status})\n  → read {} for the reason (usually the DB DSN or a port already in use)",
+            log_path.display()
+        ),
+    }
+}
+
+async fn try_spawn(
+    ctx: &Ctx,
+    repo: &Path,
+    bin: &Path,
+    log_path: &Path,
+    spicedb: bool,
+) -> Result<SpawnOutcome> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(log_path)
         .with_context(|| format!("cannot open server log {}", log_path.display()))?;
     // The spawned server must listen where this invocation expects it
     // (--url may point off the 7717 default).
@@ -187,12 +290,20 @@ async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path) -> Result<()> {
         .strip_prefix("http://")
         .or_else(|| ctx.url.strip_prefix("https://"))
         .unwrap_or("127.0.0.1:7717");
-    let mut child = Command::new(bin)
-        .args(["--listen", listen])
+    let mut cmd = Command::new(bin);
+    cmd.args(["--listen", listen])
         .current_dir(repo)
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("log handle clones")?)
-        .stderr(log)
+        .stderr(log);
+    if spicedb {
+        // rebac.rs reads exactly these: URL enables ReBAC, KEY is the
+        // preshared bearer. The server writes the SpiceDB schema itself at
+        // boot (ensure_schema) — no separate bootstrap call is needed.
+        cmd.env("VERITY_SPICEDB_URL", SPICEDB_URL)
+            .env("VERITY_SPICEDB_KEY", SPICEDB_KEY);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start {}", bin.display()))?;
     let pid = child.id();
@@ -210,13 +321,10 @@ async fn spawn_and_wait(ctx: &Ctx, repo: &Path, bin: &Path) -> Result<()> {
                     started.elapsed().as_secs_f32()
                 ),
             );
-            return Ok(());
+            return Ok(SpawnOutcome::Ready);
         }
         if let Some(status) = child.try_wait().ok().flatten() {
-            bail!(
-                "the server exited immediately ({status})\n  → read {} for the reason (usually the DB DSN or a port already in use)",
-                log_path.display()
-            );
+            return Ok(SpawnOutcome::ExitedEarly(status));
         }
         if started.elapsed() > Duration::from_secs(180) {
             bail!(
@@ -297,6 +405,32 @@ async fn register_dev_principal(ctx: &Ctx, tenant_id: &str) -> Result<i32> {
     Ok(token)
 }
 
+// ---------- (d3) identity-plane probe ----------
+
+/// Is subject-based minting live on THIS server? Attempt the production
+/// shape — mint a short-lived scope as `user:dev` — and read the outcome:
+/// 2xx means the identity plane resolved the subject's keys; the specific
+/// 422 (ReBAC off) or any other failure reports "not available". A probe,
+/// not a switch: the summary line states what was observed, nothing more.
+async fn identity_plane_live(ctx: &Ctx, tenant_id: &str) -> bool {
+    let body = serde_json::json!({
+        "tenant_id": tenant_id,
+        "subject": DEV_PRINCIPAL,
+        "actor_sub": DEV_PRINCIPAL,
+        "actor_azp": "cli:dev-identity-probe",
+        "ttl_seconds": 60,
+    });
+    match util::send(
+        ctx.http.post(format!("{}/v1/scopes", ctx.url)).json(&body),
+        &ctx.url,
+    )
+    .await
+    {
+        Ok((status, _)) => status.is_success(),
+        Err(_) => false,
+    }
+}
+
 // ---------- (e) the copy-paste summary ----------
 
 fn print_summary(
@@ -304,6 +438,7 @@ fn print_summary(
     tenant_id: &str,
     dev_token: i32,
     expiry_note: &str,
+    identity_live: bool,
     repo: Option<&Path>,
 ) {
     let mcp_bin = repo
@@ -333,6 +468,16 @@ fn print_summary(
             "{DEV_PRINCIPAL} (token {dev_token}) — the org-wide key your dev session holds; \
              see People & groups in the console"
         ),
+    );
+    // Observed, not configured: identity_plane_live() minted (or failed to
+    // mint) a real subject-based scope against this very server.
+    kv(
+        "identity plane",
+        if identity_live {
+            "connected (SpiceDB) — mint by person works"
+        } else {
+            "not available — sessions use raw keys (dev fallback)"
+        },
     );
     match &ctx.config.scope_handle {
         Some(handle) => {

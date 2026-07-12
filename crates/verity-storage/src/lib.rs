@@ -11,5 +11,8 @@ pub mod resolve;
 pub use cache::CachedAdapter;
 pub use crypto::Kek;
 pub use erasure::{CoverageGaps, ErasurePreview, ErasureReport};
-pub use postgres::{EntityTagDirectory, EntityTagRow, PostgresAdapter};
+pub use postgres::{
+    EntityTagDirectory, EntityTagRow, MemoryBrowseFilter, MemoryBrowsePage, MemoryBrowseRow,
+    MemorySourceCount, PostgresAdapter,
+};
 pub use resolve::{fold, refold_incremental, FoldConfig, FoldPlan, DEFAULT_LARGE_COMPONENT_FLOOR};

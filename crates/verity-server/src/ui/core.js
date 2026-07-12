@@ -29,6 +29,11 @@
    the ONE chips+typeahead component for every field that names an entity;
    the mint dialog's "limit to entities" field is its first surface.
 
+   v5 ADDS (additive): Verity.principalPicker — the ONE sectioned chooser
+   (People / Groups / Agents, always-visible filter, chips, keyboard) for
+   every field that names principals, over GET /v1/admin/principals; the
+   ingest panel's pick-viewers list is its first surface.
+
    READ-PATH PURITY: nothing here makes an LLM or live-ReBAC call. api() is a
    thin fetch wrapper; decodeHandle() is pure client-side base64url→JSON.
    ============================================================================ */
@@ -1532,6 +1537,398 @@ function openMint(prefill) {
   dialog("core-mint").open();
 }
 
+/* ============================================================================
+   v5 · PRINCIPAL PICKER — the ONE chooser for fields that name principals
+   ----------------------------------------------------------------------------
+   Sectioned (People / Groups / Agents / Other), alphabetized, filterable
+   checkbox directory over GET /v1/admin/principals — the same admin read the
+   ingest panel has always made (same path + response shape:
+   { principals:[{principal, token}], next_after_token }). Selected
+   principals render as removable chips (the entityPicker chip look) above
+   the list; value() — the chips, and ONLY the chips — is THE submission
+   path. Honesty + fail-closed rules unchanged:
+     • selection is explicit — never preselected, never defaulted; the
+       caller's empty-selection refusal at submit stays exactly where it is;
+     • an empty directory renders the teach-state (go create people), never
+       an invented list; 401 renders honestly (admin read, no permissive
+       fallback); a failed read says "failed" — none of these are "empty";
+     • typed text is a FILTER, never a value — there is no free-entry path
+       through this component (raw dev-mode tokens stay a caller concern).
+   Zero LLM/ReBAC calls; admin-plane read only, never on the recall path.
+   All additive — no frozen signature changes; reuses the .epk-* chip/box/
+   row/section classes + the empty-teach block from core.css (no new CSS).
+   ============================================================================ */
+
+const _PPK_SECTIONS = [
+  ["user", "People"],
+  ["group", "Groups"],
+  ["agent", "Agents"],
+  ["other", "Other"],
+];
+/** Kind from the principal string prefix — user:/group:/agent:, else "other". */
+function _ppkKind(principal) {
+  const s = String(principal || "");
+  const i = s.indexOf(":");
+  const k = i > 0 ? s.slice(0, i) : "";
+  return k === "user" || k === "group" || k === "agent" ? k : "other";
+}
+/** "user:alice@corp.example" → "alice@corp.example" (name-first, LAW #1). */
+function _ppkName(principal) {
+  const s = String(principal || "");
+  const i = s.indexOf(":");
+  return i < 0 ? s : s.slice(i + 1);
+}
+
+/**
+ * Verity.principalPicker(mountEl, opts) → picker
+ *
+ * opts (all optional):
+ *   tenantId        () => Verity.tenant() — re-read by load()/refresh()
+ *   onChange        (selected) => {} — [{principal, token}] on every change
+ *   onError         (e) => {} — a FAILED directory read (never fired for
+ *                   unauth/empty — those render honestly in place)
+ *   onOpenDirectory () => Verity.show("principals") — the teach-state button
+ *   placeholder     filter-box placeholder
+ *   emptyTitle      "No people or groups on record yet"
+ *   emptyBody       teach-state body — caller-authored trusted HTML
+ *   emptyAction     "Open People & groups" (the teach-state button label)
+ *   unauthNote      401 explainer — caller-authored trusted HTML
+ *   partialNote     shown when next_after_token was non-null
+ *   maxHeight       list scroll cap, default "190px"
+ *
+ * picker.value()      → [{principal, token}] — the chips, and ONLY the
+ *                       chips. In-progress filter text is NEVER part of
+ *                       value(). THE submission path.
+ * picker.tokens()     → number[] ascending (the POST /v1/scopes shape)
+ * picker.principals() → string[] (named chips only)
+ * picker.set(items)     replace selection ([{principal,token}] or tokens)
+ * picker.clear()
+ * picker.load(tenant?)→ Promise — (re)fetch the directory and render
+ * picker.refresh()    → re-fetch for the last-loaded tenant
+ * picker.state()      → "idle"|"loading"|"ok"|"empty"|"unauth"|"fail"
+ * picker.focus() / picker.destroy(); picker.onChange(fn) subscribes.
+ *
+ * Keyboard (from the always-visible filter box): ↓/↑ move the highlight,
+ * Enter toggles the highlighted row, Backspace on an empty filter removes
+ * the last chip, Escape clears the filter.
+ */
+function principalPicker(mountEl, opts) {
+  if (!mountEl) throw new Error("principalPicker: mount element required");
+  opts = opts || {};
+  const tenantFn = typeof opts.tenantId === "function" ? opts.tenantId : tenant;
+  const changeSubs = typeof opts.onChange === "function" ? [opts.onChange] : [];
+  const openDirFn = typeof opts.onOpenDirectory === "function"
+    ? opts.onOpenDirectory : () => show("principals");
+
+  const st = {
+    dir: [],            // [{principal, token}] straight from the server
+    state: "idle",      // idle | loading | ok | empty | unauth | fail
+    error: "",
+    partial: false,     // next_after_token was non-null (directory larger)
+    checkedAt: 0,
+    sel: [],            // [{principal, token}] — the value, nothing else
+    hl: -1,             // highlighted row (-1 = none)
+    rows: [],           // currently visible rows, keyboard order
+    lastTenant: "",
+    loadSeq: 0,         // stale-response guard across tenant switches
+    destroyed: false,
+  };
+
+  /* ------------------------------------------------------------- DOM */
+  mountEl.classList.add("epk");
+  mountEl.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "epk-box";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "epk-input";
+  input.spellcheck = false;
+  input.setAttribute("autocomplete", "off");
+  input.placeholder = opts.placeholder || "filter names — matches name or id";
+  box.appendChild(input);
+  const list = document.createElement("div");
+  list.style.cssText = "margin-top:6px;max-height:" + (opts.maxHeight || "190px") +
+    ";overflow:auto;border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 8px";
+  const foot = document.createElement("div");
+  foot.className = "asof";
+  foot.style.cssText = "display:none;margin-top:4px";
+  mountEl.appendChild(box);
+  mountEl.appendChild(list);
+  mountEl.appendChild(foot);
+
+  /* ----------------------------------------------------------- value */
+  function value() { return st.sel.map((p) => ({ principal: p.principal, token: p.token })); }
+  function isSel(tok) { return st.sel.some((p) => String(p.token) === String(tok)); }
+  function emit() {
+    const v = value();
+    changeSubs.forEach((f) => { try { f(v); } catch (e) { console.error(e); } });
+  }
+  function setSelected(row, on) {
+    if (on) {
+      if (!isSel(row.token)) st.sel.push({ principal: String(row.principal || ""), token: row.token });
+    } else {
+      st.sel = st.sel.filter((p) => String(p.token) !== String(row.token));
+    }
+    renderChips();
+    renderList(true);
+    emit();
+  }
+
+  /* ------------------------------------------------------------ chips */
+  function chipLabel(p) { return p.principal ? _ppkName(p.principal) : "token " + p.token; }
+  function renderChips() {
+    box.querySelectorAll(".epk-chip").forEach((c) => c.remove());
+    st.sel.forEach((p, i) => {
+      const s = document.createElement("span");
+      s.className = "epk-chip";
+      s.title = (p.principal ? p.principal + " · " : "") + "token " + p.token;
+      s.appendChild(document.createTextNode(chipLabel(p)));
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "epk-x";
+      x.setAttribute("aria-label", "remove " + chipLabel(p));
+      x.innerHTML = "&times;";
+      x.onclick = () => {
+        st.sel.splice(i, 1);
+        renderChips();
+        renderList(true);
+        emit();
+        input.focus();
+      };
+      s.appendChild(x);
+      box.insertBefore(s, input);
+    });
+  }
+
+  /* ------------------------------------------------------------- list */
+  function renderList(preserveScroll) {
+    if (st.state !== "ok") return;
+    const keep = preserveScroll ? list.scrollTop : 0;
+    const q = input.value.trim().toLowerCase();
+    const groups = _PPK_SECTIONS.map((s) => ({ kind: s[0], label: s[1], all: 0, rows: [] }));
+    const byKind = {};
+    groups.forEach((g) => { byKind[g.kind] = g; });
+    st.dir.forEach((r) => {
+      const g = byKind[_ppkKind(r.principal)];
+      g.all++;
+      // the filter matches the whole principal string — which contains the name
+      if (!q || String(r.principal).toLowerCase().indexOf(q) >= 0) g.rows.push(r);
+    });
+    groups.forEach((g) => g.rows.sort((a, b) => {
+      const an = _ppkName(a.principal).toLowerCase();
+      const bn = _ppkName(b.principal).toLowerCase();
+      if (an !== bn) return an < bn ? -1 : 1;
+      return a.principal < b.principal ? -1 : a.principal > b.principal ? 1 : 0;
+    }));
+    const total = groups.reduce((n, g) => n + g.rows.length, 0);
+    if (st.hl >= total) st.hl = total - 1;
+    st.rows = [];
+    let html = "";
+    groups.forEach((g) => {
+      if (!g.rows.length) return;
+      html += '<div class="epk-ns">' + esc(g.label) +
+        " (" + (q ? g.rows.length + " of " + g.all : g.all) + ")</div>";
+      g.rows.forEach((r) => {
+        const i = st.rows.length;
+        st.rows.push(r);
+        html += '<label class="epk-row' + (i === st.hl ? " hl" : "") + '">' +
+          '<input type="checkbox" tabindex="-1" style="accent-color:var(--accent)" data-i="' + i + '"' +
+            (isSel(r.token) ? " checked" : "") + ">" +
+          '<b style="font-family:var(--sans);color:var(--text)">' + esc(_ppkName(r.principal)) + "</b>" +
+          '<span class="epk-cnt"><span class="ref">' + esc(String(r.principal)) +
+            " · token " + esc(String(r.token)) + "</span></span>" +
+        "</label>";
+      });
+    });
+    if (!st.rows.length) {
+      html = '<div class="epk-ns epk-teachline">no names match &ldquo;' + esc(q) +
+        "&rdquo; &mdash; " + st.dir.length + " on record</div>";
+    }
+    list.innerHTML = html;
+    if (preserveScroll) list.scrollTop = keep;
+    const hlEl = list.querySelector(".epk-row.hl");
+    if (hlEl) hlEl.scrollIntoView({ block: "nearest" });
+  }
+
+  function render() {
+    renderChips();
+    list.removeAttribute("title");
+    foot.style.display = "none";
+    if (st.state === "ok") {
+      renderList();
+      foot.innerHTML = "directory checked " + new Date(st.checkedAt).toTimeString().slice(0, 8) +
+        (st.partial
+          ? " &middot; " + esc(opts.partialNote ||
+              "showing the first 1000 names — the directory is larger; narrow with the filter.")
+          : "");
+      foot.style.display = "block";
+      return;
+    }
+    st.rows = [];
+    st.hl = -1;
+    if (st.state === "unauth") {
+      list.innerHTML =
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+          stateChip("attn", "admin token required") +
+          '<span style="color:var(--dim);font-size:var(--fs-sm)">' +
+            (opts.unauthNote ||
+              "Listing names is an admin read. Paste an admin token in the session bar to see them. There is no permissive fallback.") +
+          "</span></div>";
+    } else if (st.state === "fail") {
+      list.innerHTML = stateChip("fail", "directory read failed");
+      if (st.error) list.title = st.error;
+    } else if (st.state === "empty") {
+      list.innerHTML =
+        '<div class="empty-teach sp-a" style="margin:2px 0">' +
+          '<div class="et-title">' + esc(opts.emptyTitle || "No people or groups on record yet") + "</div>" +
+          '<div class="et-body">' + (opts.emptyBody ||
+            "This tenant&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
+            "Create people and groups in <b>People &amp; groups</b>.") + "</div>" +
+          '<div class="et-actions"><button type="button">' +
+            esc(opts.emptyAction || "Open People & groups") + "</button></div>" +
+        "</div>";
+      const b = list.querySelector(".et-actions button");
+      if (b) b.onclick = () => openDirFn();
+    } else if (st.state === "loading") {
+      list.innerHTML = stateChip("wait", "loading names…");
+    } else { // idle — nothing asked for yet; never fake a spinner
+      list.innerHTML = '<span class="asof">directory not loaded yet — it loads once a tenant is known</span>';
+    }
+  }
+
+  /* -------------------------------------------------------- directory */
+  function load(t) {
+    const tn = String(t == null ? (tenantFn() || "") : t).trim();
+    st.lastTenant = tn;
+    const seq = ++st.loadSeq;
+    if (!tn) {
+      st.state = "idle";
+      st.dir = [];
+      render();
+      return Promise.resolve(null);
+    }
+    st.state = "loading";
+    st.error = "";
+    render();
+    return api("/v1/admin/principals?tenant_id=" + encodeURIComponent(tn) + "&limit=1000", { admin: true })
+      .then((res) => {
+        if (st.destroyed || seq !== st.loadSeq) return null;
+        st.dir = (res && res.principals) || [];
+        st.partial = !!(res && res.next_after_token != null);
+        st.state = st.dir.length ? "ok" : "empty";
+        st.checkedAt = Date.now();
+        st.hl = -1;
+        // a token-only chip (set() before the directory landed) earns its name
+        st.sel.forEach((p) => {
+          if (!p.principal) {
+            const hit = st.dir.find((d) => String(d.token) === String(p.token));
+            if (hit) p.principal = String(hit.principal);
+          }
+        });
+        render();
+        return res;
+      })
+      .catch((e) => {
+        if (st.destroyed || seq !== st.loadSeq) return null;
+        st.error = String((e && e.message) || e);
+        st.state = /HTTP 401\b/.test(st.error) ? "unauth" : "fail";
+        render();
+        if (st.state === "fail" && typeof opts.onError === "function") {
+          try { opts.onError(e); } catch (err) { console.error(err); }
+        }
+        return null;
+      });
+  }
+
+  /* ------------------------------------------------------------ wiring */
+  input.addEventListener("input", () => { st.hl = -1; renderList(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (st.rows.length) { st.hl = Math.min(st.hl + 1, st.rows.length - 1); renderList(true); }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (st.rows.length) { st.hl = Math.max(st.hl - 1, -1); renderList(true); }
+    } else if (e.key === "Enter") {
+      // Enter toggles the highlighted row. Typed text is a filter, never a
+      // value — Enter with no highlight does nothing (no free-text commit).
+      e.preventDefault();
+      const row = st.hl >= 0 ? st.rows[st.hl] : null;
+      if (row) setSelected(row, !isSel(row.token));
+    } else if (e.key === "Backspace") {
+      if (!input.value && st.sel.length) {
+        st.sel.pop();
+        renderChips();
+        renderList(true);
+        emit();
+      }
+    } else if (e.key === "Escape") {
+      if (input.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        input.value = "";
+        st.hl = -1;
+        renderList();
+      }
+    }
+  });
+  box.addEventListener("mousedown", (e) => {
+    if (e.target === box) { e.preventDefault(); input.focus(); }
+  });
+  list.addEventListener("change", (e) => {
+    const t = e.target;
+    if (!t || t.type !== "checkbox") return;
+    const row = st.rows[parseInt(t.getAttribute("data-i"), 10)];
+    if (row) setSelected(row, t.checked);
+  });
+
+  /* -------------------------------------------------------- public API */
+  function set(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const out = [];
+    arr.forEach((it) => {
+      let tok;
+      let pr = "";
+      if (it && typeof it === "object") { tok = it.token; pr = String(it.principal || ""); }
+      else tok = it;
+      if (tok == null || String(tok).trim() === "") return;
+      if (!pr) {
+        const hit = st.dir.find((d) => String(d.token) === String(tok));
+        if (hit) pr = String(hit.principal);
+      }
+      if (!out.some((p) => String(p.token) === String(tok))) out.push({ principal: pr, token: tok });
+    });
+    st.sel = out;
+    renderChips();
+    renderList(true);
+    emit();
+  }
+  function clear() { set([]); }
+  function tokensOut() {
+    return st.sel.map((p) => Number(p.token))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+  }
+  function principalsOut() { return st.sel.map((p) => p.principal).filter(Boolean); }
+  function refresh() { return load(st.lastTenant || tenantFn()); }
+  function destroy() {
+    st.destroyed = true;
+    mountEl.innerHTML = "";
+    mountEl.classList.remove("epk");
+  }
+
+  render();
+
+  return {
+    value, set, clear, load, refresh, destroy,
+    tokens: tokensOut,
+    principals: principalsOut,
+    state: () => st.state,
+    focus: () => input.focus(),
+    onChange: (fn) => { if (typeof fn === "function") changeSubs.push(fn); },
+  };
+}
+
 /* ---------------------------------------------------------- the namespace */
 const Verity = {
   // helpers
@@ -1551,6 +1948,8 @@ const Verity = {
   openMint, onMint,
   // v4 · entity directory + picker (docs/design/ENTITY-PICKER.md)
   entityDirectory, entityPicker,
+  // v5 · principal picker — the sectioned who-chooser over /v1/admin/principals
+  principalPicker,
   // shared state
   tenant, setTenant, onTenant, buildHash,
   // v3 · FTUE: tenant directory + create-space + working handle + sample label

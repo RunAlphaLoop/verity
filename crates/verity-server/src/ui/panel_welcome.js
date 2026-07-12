@@ -288,7 +288,13 @@
   /* ====================================================================
      THE WIZARD PANEL
      ==================================================================== */
-  var W = { open: null, info: null, expectMint: false, deriving: false, queued: false, groupNote: "" };
+  /* mode: null (not yet discovered) | "identity" (ReBAC live — subject-based
+     minting works) | "dev" (raw keys, disclosed). Discovered from real call
+     outcomes (the membership write, or the step-3 mint attempt) and held
+     IN MEMORY ONLY — never persisted; server truth re-derives on every load.
+     mintNote is the mode disclosure step 3 shows once a mint happened. */
+  var W = { open: null, info: null, expectMint: false, deriving: false, queued: false,
+            groupNote: "", mode: null, mintNote: "" };
 
   /* Step 3 stores the minted handle ONLY when this wizard asked for the
      mint — disclosed in the step copy before the dialog opens. */
@@ -463,13 +469,26 @@
         "(defaults to internal).") +
       '<div class="note">Setup keeps the minted handle <b>for this tab only</b> (cleared when the tab closes) so the ' +
         "proof step can run recalls through it. The console never writes handles to disk.</div>" +
+      /* Mode-aware wording — the production path is tried first; nothing is
+         claimed before an actual call outcome has been observed. */
+      (W.mode === "identity"
+        ? '<div class="note">The identity plane is on: the handle is minted <b>as ' +
+            V.esc(info.firstUser ? info.firstUser.principal : "you") + "</b> and the server assembles the keys " +
+            "(the person plus every group they belong to) — nobody types key lists by hand.</div>"
+        : (W.mode === "dev"
+          ? '<div class="note">Identity plane not available on this server — the handle names your raw keys ' +
+              "directly (dev fallback, disclosed). Every fail-closed rule is identical either way.</div>"
+          : "")) +
+      '<div class="err" id="wz-mint-err"></div>' +
       '<div class="toolbar" style="margin:12px 0 0">' +
         '<button class="primary" id="wz-mint"' + (info.tenant ? "" : " disabled") + ">Mint my working handle</button>" +
         (info.tenant ? "" : '<span class="asof">create your space first (step 1)</span>') +
       "</div>";
     html += stepShell(3, "Open a session", items[2],
       items[2].done
-        ? '<div class="asof">' + V.esc(items[2].evidence) + '</div><div class="toolbar" style="margin:10px 0 0"><button id="wz-remint">Re-mint (one click)</button></div>'
+        ? (W.mintNote ? '<div class="note" style="margin-top:0">' + V.esc(W.mintNote) + "</div>" : "") +
+          '<div class="asof">' + V.esc(items[2].evidence) + '</div><div class="err" id="wz-mint-err"></div>' +
+          '<div class="toolbar" style="margin:10px 0 0"><button id="wz-remint">Re-mint (one click)</button></div>'
         : s3body,
       V.esc(items[2].evidence));
 
@@ -642,12 +661,25 @@
         if (gk) {
           try {
             await V.api("/v1/admin/groups", { json: { tenant_id: info.tenant, group: gk, member: uk }, admin: true });
-            W.groupNote = "";
+            // Membership landed in the identity plane — that only succeeds
+            // with ReBAC live, so the mode is discovered right here.
+            W.mode = "identity";
+            W.groupNote = "membership recorded: " + uk + " now carries " + gk +
+              "’s shared key — the identity plane assembles it into handles automatically";
           } catch (ge) {
             // Stashed on W (not innerHTML) so the disclosure SURVIVES the
-            // re-render that advances the wizard — step 3 shows it.
-            W.groupNote = "group key " + gk + " created; the membership tuple needs ReBAC " +
-              "(VERITY_SPICEDB_URL) — the shared key itself still works, and setup pre-checks it on your handle";
+            // re-render that advances the wizard — step 3 shows it. Only the
+            // server's own "requires ReBAC" answer means dev mode; any other
+            // failure is disclosed as what it is, never mislabeled.
+            var gm = String((ge && ge.message) || ge);
+            if (/requires ReBAC/.test(gm)) {
+              W.mode = "dev";
+              W.groupNote = "group key " + gk + " created; the membership tuple needs ReBAC " +
+                "(VERITY_SPICEDB_URL) — the shared key itself still works, and setup pre-checks it on your handle";
+            } else {
+              W.groupNote = "group key " + gk + " created, but recording the membership failed (" +
+                gm.slice(0, 90) + ") — the shared key itself still works, and setup pre-checks it on your handle";
+            }
           }
         }
         W.open = 3;
@@ -660,8 +692,12 @@
     var skipKeys = el("wz-keys-skip");
     if (skipKeys) skipKeys.onclick = function () { W.open = 3; render(host, info); };
 
-    /* step 3: mint — reuses the global dialog, prefilled + tenant locked */
-    function openWizardMint() {
+    /* step 3: try the PRODUCTION path first — mint AS the person from step 2
+       (subject-based; the server resolves their keys through the identity
+       plane). Only the server's specific 422 ("subject-based scopes require
+       ReBAC") degrades to the raw-token dialog, disclosed in place; any
+       other failure surfaces loudly — never a silent downgrade. */
+    function openRawMint() {
       var tokens = [];
       if (info.firstUser) tokens.push(info.firstUser.token);
       info.groups.forEach(function (g) { tokens.push(g.token); });
@@ -674,10 +710,54 @@
         confidentiality: "internal",
       });
     }
+    async function wizardMint(btn) {
+      V.clearErr("wz-mint-err");
+      var u = info.firstUser;
+      if (!u || W.mode === "dev") {
+        // No person to mint as, or this session already learned the plane
+        // is off — go straight to the disclosed raw-token dialog.
+        if (u && W.mode === "dev" && !W.mintNote) {
+          W.mintNote = "identity plane not available — this handle names raw keys directly (dev fallback)";
+        }
+        openRawMint();
+        return;
+      }
+      if (btn) btn.disabled = true;
+      try {
+        var who = u.principal.replace(/^user:/, "");
+        var res = await V.api("/v1/scopes", {
+          json: {
+            tenant_id: info.tenant,
+            subject: u.principal,       // the server assembles the keys
+            actor_sub: u.principal,
+            actor_azp: "console:setup",
+            max_confidentiality: "internal",
+            ttl_seconds: 43200,
+          },
+        });
+        if (!res || !res.scope_handle) throw new Error("mint returned no scope_handle");
+        W.mode = "identity";
+        W.mintNote = "minted as " + who + " — the identity plane assembled their keys " +
+          "(them plus every group they belong to; nothing was typed by hand)";
+        W.open = 4;
+        V.setWorkingHandle(res.scope_handle); // fires onWorkingHandle → kick
+        kick();
+      } catch (e) {
+        var m = String((e && e.message) || e);
+        if (/subject-based scopes require ReBAC/.test(m)) {
+          W.mode = "dev";
+          W.mintNote = "identity plane not available — this handle names raw keys directly (dev fallback)";
+          openRawMint();
+        } else {
+          V.err("wz-mint-err", e);
+          if (btn) btn.disabled = false;
+        }
+      }
+    }
     var mint = el("wz-mint");
-    if (mint) mint.onclick = openWizardMint;
+    if (mint) mint.onclick = function () { wizardMint(mint); };
     var remint = el("wz-remint");
-    if (remint) remint.onclick = openWizardMint;
+    if (remint) remint.onclick = function () { wizardMint(remint); };
 
     /* step 4: the fork */
     var seed = el("wz-seed");

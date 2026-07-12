@@ -122,6 +122,111 @@ pub struct QuarantineRow {
     pub resolution_note: Option<String>,
 }
 
+/// One row of the console's Memories browser (`GET /v1/admin/memories`): a
+/// chunk, fact, or action projected into a common shape, tagged with its
+/// `kind` and stable `id`. Content is a PREVIEW (≤240 chars) on list reads;
+/// only the single-row `id` lookup returns the full text. Visibility is
+/// surfaced as a COUNT of principal tokens, never the tokens themselves.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryBrowseRow {
+    /// "chunk" | "fact" | "action".
+    pub kind: String,
+    pub id: Uuid,
+    /// Chunk/fact source column; actions always report "agent" (the source
+    /// their L0 provenance episode is stamped with in `record_action`).
+    pub source: String,
+    /// Content (chunk) / JSON value (fact) / summary (action), ≤240 chars on
+    /// list reads; full on an `id` lookup.
+    pub preview: String,
+    /// True when `preview` was cut at 240 chars (list reads only).
+    pub preview_truncated: bool,
+    /// Chunk `entity_tags` / action `entities`; a fact carries its synthetic
+    /// source-native tag `source:entity_id` so the one containment filter
+    /// covers all three kinds.
+    pub entities: Vec<String>,
+    /// COUNT of materialized visibility tokens (chunks/actions). None for
+    /// facts — L1 rows carry no per-row tokens; `get` is tenant-gated.
+    pub visible_to: Option<i32>,
+    /// 0 public … 3 restricted; None for facts (no per-row class).
+    pub confidentiality: Option<i32>,
+    pub acl_provenance: Option<String>,
+    /// 1 authoritative / 2 observation; chunks only.
+    pub trust_tier: Option<i32>,
+    /// Event time: chunk/fact `valid_from`, action `occurred_at`.
+    pub valid_from: DateTime<Utc>,
+    /// Some = replaced/invalidated (never deleted); actions never supersede.
+    pub valid_to: Option<DateTime<Utc>>,
+    /// Fact supersession chain link (the row that replaced this one).
+    pub superseded_by: Option<Uuid>,
+    /// The L0 provenance episode — every row's citation.
+    pub provenance: Uuid,
+    /// Fact key parts (facts only).
+    pub entity_id: Option<String>,
+    pub field: Option<String>,
+    /// Chunk version key parts (chunks only) — lets the console reconstruct a
+    /// chunk's supersession chain client-side.
+    pub document_id: Option<String>,
+    pub seq: Option<i32>,
+    /// Action verb + outcome (actions only).
+    pub action_type: Option<String>,
+    pub outcome: Option<String>,
+    /// Ingestion time — the browse ordering / keyset-pagination key.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Per-source row count for the browser's source dropdown. Computed from the
+/// SAME filtered union as the browse rows (all filters applied EXCEPT the
+/// source filter itself and pagination), so the dropdown never advertises a
+/// source the current filters can't reach.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemorySourceCount {
+    pub source: String,
+    pub count: i64,
+}
+
+/// One page of the Memories browser ([`PostgresAdapter::browse_memories`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryBrowsePage {
+    /// Newest first by `recorded_at` (ties broken by id, descending).
+    pub rows: Vec<MemoryBrowseRow>,
+    pub sources: Vec<MemorySourceCount>,
+    /// Keyset cursor: pass back as `before` to fetch the next-older page.
+    /// None = this page reached the end.
+    pub next_before: Option<DateTime<Utc>>,
+    /// Tie-breaker half of the cursor (rows written in one transaction share
+    /// `recorded_at`): pass back as `before_id` with `next_before` so a page
+    /// boundary inside a same-instant batch never skips rows.
+    pub next_before_id: Option<Uuid>,
+}
+
+/// Filters for [`PostgresAdapter::browse_memories`]. All optional; absent =
+/// unfiltered (within the tenant — the tenant partition is never optional).
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBrowseFilter {
+    pub source: Option<String>,
+    /// Entity-tag containment: chunk `entity_tags` / action `entities` /
+    /// a fact's synthetic `source:entity_id` tag.
+    pub entity: Option<String>,
+    /// "chunk" | "fact" | "action"; anything else is refused (InvalidInput).
+    pub kind: Option<String>,
+    /// Case-insensitive substring over content / value / summary.
+    pub q: Option<String>,
+    /// false (default) = live rows only (`valid_to IS NULL`); true also shows
+    /// replaced rows — bi-temporal history, never deleted.
+    pub include_superseded: bool,
+    /// Clamped to 1..=200.
+    pub limit: i64,
+    /// Keyset pagination: only rows with `recorded_at` strictly before this
+    /// (or, when `before_id` is also given, `(recorded_at, id)` row-wise
+    /// strictly before `(before, before_id)` — the tie-safe form).
+    pub before: Option<DateTime<Utc>>,
+    /// Tie-breaker half of the cursor; meaningful only with `before`.
+    pub before_id: Option<Uuid>,
+    /// Single-row detail lookup (the console drawer): full untruncated
+    /// content/value, superseded rows included, per-source counts skipped.
+    pub id: Option<Uuid>,
+}
+
 pub struct PostgresAdapter {
     pool: PgPool,
     /// Deployment KEK (SPEC §8a, crypto.rs). None = envelope encryption
@@ -1359,6 +1464,228 @@ impl PostgresAdapter {
             truncated,
             namespaces,
             tags,
+        })
+    }
+
+    /// The console's Memories browser (`GET /v1/admin/memories`): one tenant's
+    /// chunk ∪ fact ∪ action rows in a common shape, newest-recorded first,
+    /// keyset-paginated. **ADMIN plane** — a plain filtered SQL read: zero LLM,
+    /// zero live ReBAC, never consulted by `recall`/`get` (read-path purity
+    /// holds). It surfaces visibility as a token COUNT (never the tokens) and
+    /// bypasses no enforcement for agents: per-scope retrievability is decided
+    /// at read time on the scoped paths; this is the operator's evidence view.
+    ///
+    /// Semantics:
+    /// - the tenant partition is mandatory; every other filter optional;
+    /// - `include_superseded=false` (default) shows LIVE rows only; true adds
+    ///   replaced rows (invalidate-don't-delete — history persists until the
+    ///   §8 crypto-shredding pipeline);
+    /// - `entity` is containment over the same arrays the scope filter
+    ///   enforces on (facts match their synthetic `source:entity_id` tag);
+    /// - `sources` counts come from the SAME filtered union minus the source
+    ///   filter itself, so the dropdown reflects what the other filters match;
+    /// - an `id` lookup returns that single row with FULL content (superseded
+    ///   included — a replaced row must stay inspectable) and skips counts.
+    pub async fn browse_memories(
+        &self,
+        tenant: TenantId,
+        f: &MemoryBrowseFilter,
+    ) -> Result<MemoryBrowsePage> {
+        if let Some(k) = f.kind.as_deref() {
+            if !matches!(k, "chunk" | "fact" | "action") {
+                return Err(StorageError::InvalidInput(format!(
+                    "kind must be one of chunk | fact | action (got {k:?})"
+                )));
+            }
+        }
+        let limit = f.limit.clamp(1, 200);
+        // An id lookup must be able to show a replaced row (the drawer opens
+        // it from a history listing); list reads honor the toggle.
+        let include_invalidated = f.include_superseded || f.id.is_some();
+
+        // The ONE union both statements share. Placeholders:
+        //   $1 tenant  $2 include_invalidated  $3 kind  $4 source
+        //   $5 entity  $6 q  $7 id
+        // Previews are cut at 240 chars EXCEPT on an id lookup (the drawer's
+        // full-content read). Actions are append-only (no valid_to) and their
+        // provenance episodes are always source='agent' (record_action).
+        const UNION_SQL: &str = "
+            SELECT 'chunk'::text AS kind, id, source,
+                   CASE WHEN $7::uuid IS NOT NULL THEN content
+                        ELSE left(content, 240) END AS preview,
+                   ($7::uuid IS NULL AND length(content) > 240) AS preview_truncated,
+                   entity_tags AS entities,
+                   cardinality(visibility) AS visible_to,
+                   confidentiality::int4 AS confidentiality,
+                   acl_provenance,
+                   trust_tier::int4 AS trust_tier,
+                   valid_from, valid_to,
+                   NULL::uuid AS superseded_by,
+                   provenance,
+                   NULL::text AS entity_id, NULL::text AS field,
+                   document_id, seq,
+                   NULL::text AS action_type, NULL::text AS outcome,
+                   recorded_at
+              FROM chunks
+             WHERE tenant_id = $1
+               AND ($2 OR valid_to IS NULL)
+               AND ($3::text IS NULL OR $3 = 'chunk')
+               AND ($4::text IS NULL OR source = $4)
+               AND ($5::text IS NULL OR entity_tags @> ARRAY[$5])
+               AND ($6::text IS NULL OR content ILIKE '%' || $6 || '%')
+               AND ($7::uuid IS NULL OR id = $7)
+            UNION ALL
+            SELECT 'fact', id, source,
+                   CASE WHEN $7::uuid IS NOT NULL THEN value::text
+                        ELSE left(value::text, 240) END,
+                   ($7::uuid IS NULL AND length(value::text) > 240),
+                   ARRAY[source || ':' || entity_id],
+                   NULL::int4,
+                   NULL::int4,
+                   acl_provenance,
+                   NULL::int4,
+                   valid_from, valid_to,
+                   superseded_by,
+                   provenance,
+                   entity_id, field,
+                   NULL::text, NULL::int4,
+                   NULL::text, NULL::text,
+                   recorded_at
+              FROM facts
+             WHERE tenant_id = $1
+               AND ($2 OR valid_to IS NULL)
+               AND ($3::text IS NULL OR $3 = 'fact')
+               AND ($4::text IS NULL OR source = $4)
+               AND ($5::text IS NULL OR source || ':' || entity_id = $5)
+               AND ($6::text IS NULL OR value::text ILIKE '%' || $6 || '%')
+               AND ($7::uuid IS NULL OR id = $7)
+            UNION ALL
+            SELECT 'action', id, 'agent'::text,
+                   CASE WHEN $7::uuid IS NOT NULL THEN summary
+                        ELSE left(summary, 240) END,
+                   ($7::uuid IS NULL AND length(summary) > 240),
+                   entities,
+                   cardinality(visibility),
+                   confidentiality::int4,
+                   NULL::text,
+                   NULL::int4,
+                   occurred_at, NULL::timestamptz,
+                   NULL::uuid,
+                   provenance,
+                   NULL::text, NULL::text,
+                   NULL::text, NULL::int4,
+                   action_type, outcome,
+                   recorded_at
+              FROM actions
+             WHERE tenant_id = $1
+               AND ($3::text IS NULL OR $3 = 'action')
+               AND ($4::text IS NULL OR $4 = 'agent')
+               AND ($5::text IS NULL OR entities @> ARRAY[$5])
+               AND ($6::text IS NULL OR summary ILIKE '%' || $6 || '%')
+               AND ($7::uuid IS NULL OR id = $7)";
+
+        // Page: limit+1 detects a further page without a second count. The
+        // statement text is assembled ONLY from const fragments (every dynamic
+        // value is a bind parameter), so AssertSqlSafe is honest here.
+        let raw = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT * FROM ({UNION_SQL}) m
+              WHERE ($8::timestamptz IS NULL
+                     OR ($10::uuid IS NOT NULL AND (m.recorded_at, m.id) < ($8, $10))
+                     OR ($10::uuid IS NULL AND m.recorded_at < $8))
+              ORDER BY m.recorded_at DESC, m.id DESC
+              LIMIT $9"
+        )))
+        .bind(tenant)
+        .bind(include_invalidated)
+        .bind(f.kind.as_deref())
+        .bind(f.source.as_deref())
+        .bind(f.entity.as_deref())
+        .bind(f.q.as_deref())
+        .bind(f.id)
+        .bind(f.before)
+        .bind(limit + 1)
+        .bind(f.before_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let has_more = raw.len() as i64 > limit;
+        let rows = raw
+            .iter()
+            .take(limit as usize)
+            .map(|r| {
+                Ok(MemoryBrowseRow {
+                    kind: r.try_get("kind").map_err(db_err)?,
+                    id: r.try_get("id").map_err(db_err)?,
+                    source: r.try_get("source").map_err(db_err)?,
+                    preview: r.try_get("preview").map_err(db_err)?,
+                    preview_truncated: r.try_get("preview_truncated").map_err(db_err)?,
+                    entities: r.try_get("entities").map_err(db_err)?,
+                    visible_to: r.try_get("visible_to").map_err(db_err)?,
+                    confidentiality: r.try_get("confidentiality").map_err(db_err)?,
+                    acl_provenance: r.try_get("acl_provenance").map_err(db_err)?,
+                    trust_tier: r.try_get("trust_tier").map_err(db_err)?,
+                    valid_from: r.try_get("valid_from").map_err(db_err)?,
+                    valid_to: r.try_get("valid_to").map_err(db_err)?,
+                    superseded_by: r.try_get("superseded_by").map_err(db_err)?,
+                    provenance: r.try_get("provenance").map_err(db_err)?,
+                    entity_id: r.try_get("entity_id").map_err(db_err)?,
+                    field: r.try_get("field").map_err(db_err)?,
+                    document_id: r.try_get("document_id").map_err(db_err)?,
+                    seq: r.try_get("seq").map_err(db_err)?,
+                    action_type: r.try_get("action_type").map_err(db_err)?,
+                    outcome: r.try_get("outcome").map_err(db_err)?,
+                    recorded_at: r.try_get("recorded_at").map_err(db_err)?,
+                })
+            })
+            .collect::<Result<Vec<MemoryBrowseRow>>>()?;
+        let (next_before, next_before_id) = if has_more {
+            (
+                rows.last().map(|r| r.recorded_at),
+                rows.last().map(|r| r.id),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Per-source counts: the SAME union, all filters EXCEPT source (bound
+        // NULL) and pagination — the dropdown shows every source the other
+        // filters can reach, with honest counts. Skipped on an id lookup.
+        let sources = if f.id.is_some() {
+            Vec::new()
+        } else {
+            // Const fragments only — every dynamic value is a bind parameter.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT m.source, count(*)::bigint AS n
+                   FROM ({UNION_SQL}) m
+                  GROUP BY m.source
+                  ORDER BY n DESC, m.source"
+            )))
+            .bind(tenant)
+            .bind(include_invalidated)
+            .bind(f.kind.as_deref())
+            .bind(Option::<&str>::None) // source: never filtered here
+            .bind(f.entity.as_deref())
+            .bind(f.q.as_deref())
+            .bind(Option::<Uuid>::None)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+            .iter()
+            .map(|r| {
+                Ok(MemorySourceCount {
+                    source: r.try_get("source").map_err(db_err)?,
+                    count: r.try_get("n").map_err(db_err)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+        };
+
+        Ok(MemoryBrowsePage {
+            rows,
+            sources,
+            next_before,
+            next_before_id,
         })
     }
 

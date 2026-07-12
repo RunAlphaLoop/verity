@@ -4,8 +4,10 @@
    --------------------------------------------------------------------------
    Reads / writes:
      • GET  /v1/admin/principals?tenant_id&limit — the named directory that
-       feeds the viewer picker (admin read; 401 renders honestly and falls
-       back to raw tokens, never to a permissive default)
+       feeds the viewer picker, now Verity.principalPicker (core.js v5):
+       sectioned People/Groups/Agents, alphabetized, filterable, selected
+       viewers as removable chips (admin read; 401 renders honestly and
+       falls back to raw tokens, never to a permissive default)
      • POST /v1/scopes — mints the WRITE PASS (jargon: scope handle) whose
        principals become the memory's visibility; actor console:ingest;
        15-minute TTL disclosed (server floor is 60 s)
@@ -34,13 +36,11 @@
 
   var PASS_TTL_SECONDS = 900; // 15 min, disclosed in copy; server floor 60 s
 
-  var data = {
-    dir: [],            // [{principal, token}] from GET /v1/admin/principals
-    dirState: "idle",   // idle | loading | ok | empty | unauth | fail
-    dirPartial: false,  // next_after_token was non-null (directory larger)
-    checkedAt: 0,
-  };
-  var sel = {};         // token (string) → principal string — picked viewers
+  // Viewer chooser (Verity.principalPicker, core.js v5): the sectioned
+  // People/Groups/Agents directory with an always-visible filter and
+  // removable chips. Its value()/tokens() (the chips) are the ONLY
+  // named-viewer submission path; the raw-token field stays the dev escape.
+  var viewersPicker = null;
   var pass = { handle: "", claims: null, how: "" };
   var view = "text";    // text | file | url
   var tenantNow = "";
@@ -70,7 +70,7 @@
   }
 
   function selectedTokens() {
-    var toks = Object.keys(sel).map(Number);
+    var toks = viewersPicker ? viewersPicker.tokens() : [];
     var raw = el("ing-raw") ? el("ing-raw").value.trim() : "";
     if (raw) {
       var extra = raw.split(",").map(function (s) { return s.trim(); })
@@ -107,7 +107,7 @@
     // known (re-runs on tenant change; deduped by the router).
     load: function (_section, tenant) {
       if (tenantNow && tenantNow !== tenant) {
-        sel = {};
+        if (viewersPicker) viewersPicker.clear(); // another tenant's people don't carry over
         if (entsPicker) entsPicker.clear(); // another tenant's tags don't carry over
         if (pass.claims && pass.claims.tenant_id !== tenant) {
           pass = { handle: "", claims: null, how: "" };
@@ -147,15 +147,13 @@
           "No pass means no audience, and Verity <b>refuses rather than guesses</b>. There is no “everyone” option, here or anywhere.</div>" +
         '<div id="ing-pass-line" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 4px"></div>' +
         '<div id="ing-pass-meta" class="dc-meta" style="margin-top:2px"></div>' +
-        '<div style="margin-top:10px"><label for="ing-filter">pick viewers — people &amp; groups on record for this tenant</label>' +
-          '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
-            '<input type="text" id="ing-filter" placeholder="filter names…" spellcheck="false" style="max-width:280px">' +
-            '<span class="asof" id="ing-dir-asof"></span>' +
+        '<div style="margin-top:10px">' +
+          '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">' +
+            '<label style="margin-bottom:0">pick viewers — people &amp; groups on record for this tenant</label>' +
             '<span class="spacer" style="flex:1"></span>' +
             '<button id="ing-dir-refresh">Refresh names</button>' +
           "</div>" +
-          '<div id="ing-dir" style="margin-top:6px;max-height:190px;overflow:auto;border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 8px"></div>' +
-          '<div id="ing-dir-note" class="asof" style="display:block;margin-top:4px"></div>' +
+          '<div id="ing-viewers" style="margin-top:6px"></div>' +
         "</div>" +
         '<div class="row" style="margin-top:10px">' +
           '<div><label for="ing-raw">or raw principal tokens <span style="font-weight:400">(dev mode; comma-separated, e.g. 1, 11)</span></label>' +
@@ -224,14 +222,20 @@
 
   function wire() {
     el("ing-dir-refresh").onclick = function () { V.reload("ingest"); };
-    el("ing-filter").oninput = function () { renderDirList(); };
-    el("ing-dir").addEventListener("change", function (e) {
-      var t = e.target;
-      if (!t || t.type !== "checkbox") return;
-      if (t.checked) sel[t.getAttribute("data-tok")] = t.getAttribute("data-principal");
-      else delete sel[t.getAttribute("data-tok")];
-      updateMintLabel();
-      updateUrlCmd();
+    // The sectioned viewer chooser (core primitive; adopted by other panels
+    // later). Chips are the only named-viewer path into a mint; the copy
+    // overrides keep this panel's raw-token (dev mode) escape hatch named
+    // in every honest state, exactly as before.
+    viewersPicker = V.principalPicker(el("ing-viewers"), {
+      placeholder: "filter names — people, groups, agents…",
+      tenantId: function () { return tenantNow || V.tenant(); },
+      onChange: function () { updateMintLabel(); updateUrlCmd(); },
+      onError: function (e) { V.err("ing-pass-err", e); },
+      unauthNote: "Listing names is an admin read. Paste an admin token in the session bar to see them &mdash; " +
+        "or use raw principal tokens (dev mode) below. There is no permissive fallback.",
+      emptyBody: "This tenant&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
+        "Create people and groups in <b>People &amp; groups</b>, or type raw principal tokens (dev mode) below.",
+      partialNote: "showing the first 1000 names — the directory is larger; narrow with the filter or use raw tokens.",
     });
     el("ing-raw").oninput = function () { updateMintLabel(); updateUrlCmd(); };
     el("ing-mint").onclick = mintPass;
@@ -263,86 +267,14 @@
   }
 
   /* ===================================================== viewer directory */
+  // The fetch, states (loading / unauth / fail / empty-teach with the "Open
+  // People & groups" button), sectioning, alphabetizing, filtering, chips,
+  // and keyboard all live in ONE shared primitive — Verity.principalPicker
+  // (core.js v5). This is just the hook the router's autoload calls.
 
-  async function refreshDir(tenant) {
-    data.dirState = "loading";
-    renderDirList();
+  function refreshDir(tenant) {
     V.clearErr("ing-pass-err");
-    try {
-      var res = await V.api(
-        "/v1/admin/principals?tenant_id=" + encodeURIComponent(tenant) + "&limit=1000",
-        { admin: true }
-      );
-      data.dir = (res && res.principals) || [];
-      data.dirPartial = !!(res && res.next_after_token != null);
-      data.dirState = data.dir.length ? "ok" : "empty";
-      data.checkedAt = Date.now();
-    } catch (e) {
-      if (/HTTP 401/.test(String(e.message))) data.dirState = "unauth";
-      else { data.dirState = "fail"; V.err("ing-pass-err", e); }
-    }
-    renderDirList();
-  }
-
-  function renderDirList() {
-    var host = el("ing-dir");
-    if (!host) return;
-    var note = el("ing-dir-note");
-    var asof = el("ing-dir-asof");
-    asof.textContent = data.checkedAt ? "directory checked " + new Date(data.checkedAt).toTimeString().slice(0, 8) : "";
-    note.textContent = "";
-
-    if (data.dirState === "loading" || data.dirState === "idle") {
-      host.innerHTML = V.stateChip("wait", "loading names…");
-      return;
-    }
-    if (data.dirState === "unauth") {
-      host.innerHTML =
-        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-          V.stateChip("attn", "admin token required") +
-          '<span style="color:var(--dim);font-size:var(--fs-sm)">Listing names is an admin read. Paste an admin token in the session bar to see them — or use raw principal tokens (dev mode) below. There is no permissive fallback.</span>' +
-        "</div>";
-      return;
-    }
-    if (data.dirState === "fail") {
-      host.innerHTML = V.stateChip("fail", "directory read failed");
-      return;
-    }
-    if (data.dirState === "empty") {
-      host.innerHTML =
-        '<div class="empty-teach sp-a" style="margin:2px 0">' +
-          '<div class="et-title">No people or groups on record yet</div>' +
-          '<div class="et-body">This tenant’s directory is empty — an empty list is an honest answer, not an error. ' +
-            "Create people and groups in <b>People &amp; groups</b>, or type raw principal tokens (dev mode) below.</div>" +
-          '<div class="et-actions"><button id="ing-open-principals">Open People &amp; groups</button></div>' +
-        "</div>";
-      var b = el("ing-open-principals");
-      if (b) b.onclick = function () { V.show("principals"); };
-      return;
-    }
-
-    var q = (el("ing-filter").value || "").trim().toLowerCase();
-    var rows = data.dir.filter(function (r) {
-      return !q || String(r.principal).toLowerCase().indexOf(q) >= 0;
-    });
-    if (!rows.length) {
-      host.innerHTML = '<span class="asof">no names match “' + esc(q) + '” — ' + data.dir.length + " on record</span>";
-    } else {
-      host.innerHTML = rows.map(function (r) {
-        var tok = String(r.token);
-        var checked = Object.prototype.hasOwnProperty.call(sel, tok) ? " checked" : "";
-        return '<label class="checkline" style="display:flex;margin:3px 0;font-size:var(--fs-sm)">' +
-          '<input type="checkbox" data-tok="' + esc(tok) + '" data-principal="' + esc(r.principal) + '"' + checked + ">" +
-          "<b style=\"color:var(--text)\">" + esc(principalName(r.principal)) + "</b>" +
-          '<span style="color:var(--dim)">· ' + esc(principalKind(r.principal)) + "</span>" +
-          '<span class="ref">' + esc(r.principal) + " · token " + esc(tok) + "</span>" +
-        "</label>";
-      }).join("");
-    }
-    if (data.dirPartial) {
-      note.textContent = "showing the first 1000 names — the directory is larger; narrow with the filter or use raw tokens.";
-    }
-    updateMintLabel();
+    return viewersPicker ? viewersPicker.load(tenant) : null;
   }
 
   function updateMintLabel() {
@@ -611,7 +543,9 @@
       : (n === 0
         ? "<b>no one</b> — the pass named no viewers (fail-closed: stored, never readable)"
         : "<b>" + n + " viewer" + (n === 1 ? "" : "s") + "</b>");
-    var names = Object.keys(sel).map(function (k) { return sel[k]; });
+    var names = viewersPicker
+      ? viewersPicker.value().map(function (x) { return x.principal; }).filter(Boolean)
+      : [];
     var nameChips = names.slice(0, 4).map(function (p) {
       return V.entityChip(principalName(p), principalKind(p));
     }).join(" ") + (names.length > 4 ? ' <span class="asof">+' + (names.length - 4) + " more</span>" : "");

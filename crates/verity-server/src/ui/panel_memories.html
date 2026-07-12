@@ -1,0 +1,19 @@
+<!-- ==========================================================================
+     panel_memories.html — Memories  [frozen design contract]
+     --------------------------------------------------------------------------
+     The founder-requested memory browser: look into everything the tenant's
+     memory holds — chunks, facts, actions — and filter by source, entity,
+     kind, text, and bi-temporal history, backed by GET /v1/admin/memories
+     (admin token). This is an ADMIN-plane read like the audit panel: it sees
+     across all scopes and says so; it bypasses no enforcement for agents —
+     their reads stay scope-gated at read time.
+
+     OWNS: this file + panel_memories.js. Panel id "memories", mount
+     #mem-mount, rail entry data-nav="memories" ("Prove & inspect"). Reuses
+     frozen theme/core classes and Verity.* helpers only.
+     ========================================================================== -->
+<section class="panel" id="panel-memories">
+  <h1>Memories</h1>
+  <div class="lede"><b>Everything in this tenant&rsquo;s memory</b> &mdash; the admin-plane view across all scopes; agent reads stay scope-gated.</div>
+  <div id="mem-mount"></div>
+</section>

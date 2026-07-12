@@ -54,6 +54,62 @@
 
   function el(id) { return V.$(id); }
 
+  // Starter manifest for the install dialog: a trimmed, commented, VALID
+  // manifest derived from registry/manifests/linear.yaml (one entity, every
+  // required part). Installing it still only creates a draft — the human
+  // activate gate is unchanged.
+  var LINEAR_EXAMPLE = `# validate offline: cargo run -p verity-manifest --bin manifest-test -- <file>
+# Trimmed from registry/manifests/linear.yaml — one entity, the parts every
+# manifest needs. Installing stores a DRAFT; a named human activates it.
+
+manifest_version: 1
+
+source:
+  name: linear
+  # Tier B: webhooks + API under your key, but no per-item ACL API —
+  # container approximation only (declared honestly in acl_policy below).
+  tier: B
+  auth:
+    # Secrets are referenced by name and read from the environment, never
+    # pasted inline: secret://linear-service-key resolves to the
+    # VERITY_SECRET_LINEAR_SERVICE_KEY env var on the server.
+    ref: secret://linear-service-key
+    shape: static_key
+  webhook:
+    # Deliveries are signature-verified before anything is stored.
+    signature:
+      scheme: hmac_sha256          # hex HMAC-SHA256 of the raw request body
+      header: Linear-Signature
+      secret_ref: secret://linear-webhook-secret
+
+entities:
+  - type: issue
+    route:
+      # Which incoming payloads this entity claims; anything unrouted
+      # quarantines (fail closed, never mis-filed).
+      when: "type = 'Issue' and action in ['create','update']"
+      operation: upsert
+    primary_key: "data.id"         # which field is the ID — updates replace, never duplicate
+    valid_from: "data.updatedAt"   # which timestamp is the event time (bi-temporal)
+    map:                           # which fields become queryable facts
+      identifier: "data.identifier"
+      title: "data.title"
+      state: "data.state.name"
+      team: "data.team.key"
+
+# Who may see each item. This is the human-gated block: an admin reviews
+# exactly this and approves it in the separate activate step.
+acl_policy:
+  mode: map
+  identity_namespace: source_native_id
+  principals: "organizationId"
+  approximation: true
+  note: >-
+    Linear exposes no per-issue ACL API (Tier B). Workspace membership
+    (organizationId) approximates visibility; private-team boundaries are
+    NOT reconstructed.
+`;
+
   /* ------------------------------------------------------------ helpers */
 
   function ageMs(iso) {
@@ -173,7 +229,8 @@
         /* ---- manifests ---- */
         '<div class="card">' +
           '<h2>Manifests — how each source&rsquo;s permissions map in <span class="sub">GET /v1/manifests</span></h2>' +
-          '<div class="note" style="margin-top:0">A manifest is the reviewed blueprint for a source: what its payloads mean and <b>who gets to see what it writes</b>. ' +
+          '<div class="note" style="margin-top:0"><b>When you need one:</b> free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest. ' +
+            "It is the recipe that tells Verity, per event: which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item — YAML because connectors are config you can review, diff, and approve. " +
             "Two lanes, labeled, never blurred: <b>mirrored</b> = the source&rsquo;s own permission lists are copied exactly; <b>assigned</b> = an admin chose who can see it. " +
             "Installing creates a <b>draft that never runs</b> — a named human must approve it in a separate step, and that approval is written to the audit log.</div>" +
           '<div id="src-manifests"></div>' +
@@ -260,9 +317,12 @@
         /* ---- install manifest (draft) ---- */
         '<div class="dialog-backdrop" id="src-manifest-dialog"><div class="dialog" style="max-width:640px">' +
           "<h3>Install a manifest (draft)</h3>" +
-          '<div class="note" style="margin-top:0">Paste the manifest YAML. It is validated and stored as a <b>draft — it never runs</b> until a named human approves it in the separate activate step. ' +
+          '<div class="note" style="margin-top:0"><b>When you need one:</b> free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest. ' +
+            "It is the recipe that tells Verity, per event: which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item — YAML because connectors are config you can review, diff, and approve.</div>" +
+          '<div class="note">Paste (or start from the example below) — it is validated and stored as a <b>draft — it never runs</b> until a named human approves it in the separate activate step. ' +
             "Re-installing an existing name replaces its YAML and <b>demotes it back to draft</b>: every change re-crosses the human gate.</div>" +
           '<div style="margin-top:12px"><label for="src-manifest-yaml">manifest YAML</label>' +
+            '<div style="margin:4px 0 6px"><button id="src-manifest-example" title="fills the box with a trimmed, commented Linear manifest — edit freely; nothing is sent until you click Install, and even then it is only a draft">Start from the Linear example</button></div>' +
             '<textarea id="src-manifest-yaml" style="min-height:180px" placeholder="source:&#10;  name: hubspot&#10;  &hellip;" spellcheck="false"></textarea></div>' +
           '<div class="err" id="src-manifest-err"></div>' +
           '<div id="src-manifest-result"></div>' +
@@ -304,6 +364,10 @@
       el("src-manifest-open").onclick = openManifestDialog;
       el("src-manifest-cancel").onclick = function () { V.dialog("src-manifest-dialog").close(); };
       el("src-manifest-go").onclick = installManifest;
+      el("src-manifest-example").onclick = function () {
+        el("src-manifest-yaml").value = LINEAR_EXAMPLE;
+        V.clearErr("src-manifest-err");
+      };
 
       el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
       el("src-activate-go").onclick = activateManifest;
@@ -501,7 +565,8 @@
       host.innerHTML =
         '<div class="empty-teach sp-a">' +
           '<div class="et-title">No manifests installed</div>' +
-          '<div class="et-body">A manifest lets a real connector (HubSpot, Drive, Slack&hellip;) map its payloads <b>and its permissions</b> into Verity. ' +
+          '<div class="et-body">Free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest: ' +
+            "the recipe that tells Verity, per event, which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item. " +
             "Installing one creates a draft that never runs; a named human approves it in a separate step, on the record.</div>" +
           '<div class="et-actions"><button class="primary" id="src-m-teach">Install a manifest</button></div>' +
         "</div>";
@@ -565,9 +630,17 @@
     }
     var body = rows.map(function (r) {
       var breach = tgt != null && r.p95_ms != null && r.p95_ms > tgt;
+      // Honesty at tiny sample counts: below 10 samples a "percentile" is
+      // not a distribution — say so, dimly, without hiding the row.
+      var samplesCell = fmtCount(r.samples);
+      if (r.samples != null && r.samples > 0 && r.samples < 10) {
+        samplesCell += '<div class="ref">' + (r.samples === 1
+          ? "1 sample — one measurement, not a distribution"
+          : r.samples + " samples — at this count percentiles are just min/max") + "</div>";
+      }
       return "<tr" + (breach ? ' class="flag"' : "") + ">" +
         "<td><b>" + V.esc(r.source) + "</b></td>" +
-        '<td class="num">' + fmtCount(r.samples) + "</td>" +
+        '<td class="num">' + samplesCell + "</td>" +
         '<td class="num">' + pctCell(r.p50_ms, tgt) + "</td>" +
         '<td class="num">' + pctCell(r.p95_ms, tgt) + "</td>" +
         '<td class="num">' + pctCell(r.p99_ms, tgt) + "</td>" +

@@ -319,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/entities/{canonical}", get(get_merged_entity))
         .route("/v1/admin/entities", get(admin_list_entities))
         .route("/v1/admin/entity-tags", get(admin_entity_tags))
+        .route("/v1/admin/memories", get(admin_memories))
         .route("/v1/admin/entity-aliases", post(admin_entity_aliases))
         .route("/v1/admin/entity-precedence", post(admin_entity_precedence))
         .route("/v1/admin/entity-evidence", post(admin_evidence_insert))
@@ -885,6 +886,78 @@ async fn admin_entity_tags(
         .await
         .map_err(internal)?;
     Ok(Json(directory))
+}
+
+#[derive(Deserialize)]
+struct MemoriesQuery {
+    tenant_id: TenantId,
+    /// Chunk/fact `source`; actions match the literal "agent" (the source
+    /// their provenance episodes carry).
+    source: Option<String>,
+    /// Entity-tag containment over the same arrays the scope filter enforces
+    /// on; facts match their synthetic `source:entity_id` tag.
+    entity: Option<String>,
+    /// "chunk" | "fact" | "action" — anything else is a 422.
+    kind: Option<String>,
+    /// Case-insensitive substring (ILIKE) over content / value / summary.
+    q: Option<String>,
+    /// Default false = live rows only; true also shows replaced values
+    /// (bi-temporal history, never deleted).
+    #[serde(default)]
+    include_superseded: bool,
+    /// Default 50, clamped 1..=200 in storage.
+    #[serde(default = "default_memories_limit")]
+    limit: i64,
+    /// Keyset pagination: rows recorded strictly before this instant (the
+    /// previous page's `next_before`).
+    before: Option<DateTime<Utc>>,
+    /// Tie-breaker half of the cursor (the previous page's `next_before_id`);
+    /// same-transaction rows share `recorded_at`, so pass both.
+    before_id: Option<uuid::Uuid>,
+    /// Single-row detail lookup for the console drawer: full untruncated
+    /// content/value, superseded rows included.
+    id: Option<uuid::Uuid>,
+}
+
+fn default_memories_limit() -> i64 {
+    50
+}
+
+/// GET /v1/admin/memories (admin): the console's Memories browser — one
+/// tenant's chunk ∪ fact ∪ action rows, newest-recorded first, filterable by
+/// source / entity / kind / substring / superseded-visibility, keyset-
+/// paginated, plus per-source counts for the filter dropdown (computed from
+/// the same filtered union). This is an ADMIN-plane read like the audit
+/// panel: it sees across all scopes and the UI says so; it grants agents
+/// nothing — scoped reads stay enforced at read time. Read-only, ZERO LLM,
+/// ZERO live ReBAC (read-path purity holds; this never touches recall/get).
+/// Visibility is returned as a token COUNT per row, never the tokens.
+async fn admin_memories(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<MemoriesQuery>,
+) -> HandlerResult<Json<verity_storage::MemoryBrowsePage>> {
+    state.admin.check(&headers)?;
+    let page = state
+        .storage
+        .inner()
+        .browse_memories(
+            q.tenant_id,
+            &verity_storage::MemoryBrowseFilter {
+                source: q.source,
+                entity: q.entity,
+                kind: q.kind,
+                q: q.q,
+                include_superseded: q.include_superseded,
+                limit: q.limit,
+                before: q.before,
+                before_id: q.before_id,
+                id: q.id,
+            },
+        )
+        .await
+        .map_err(storage_status)?;
+    Ok(Json(page))
 }
 
 #[derive(Deserialize)]
