@@ -77,6 +77,42 @@
     return sorted[Math.min(sorted.length - 1, Math.floor(q * (sorted.length - 1) + 0.5))];
   }
 
+  // The read split, derived ONLY from the response (turns[].tool_calls + the
+  // deduped evidence[]) — never hardcoded. Reconciles the three numbers that
+  // must literally agree on screen: the evidence cards actually shown
+  // (`unique`), the memory-search results the key let through (`searchHits`,
+  // which dedup to `unique`), the point-lookup facts (`factHits`, shown in the
+  // trace, not the evidence list), and their sum (`total` = the session
+  // table's "returned" column = the server's visible_hits_total).
+  function readSplit(run) {
+    var searchHits = 0, factHits = 0, searchCalls = 0, factCalls = 0;
+    (run.turns || []).forEach(function (turn) {
+      (turn.tool_calls || []).forEach(function (tc) {
+        if (tc.tool === "search_memory") { searchCalls++; searchHits += (tc.hits || 0); }
+        else if (tc.tool === "get_fact") { factCalls++; factHits += (tc.hits || 0); }
+      });
+    });
+    var unique = (run.evidence || []).length;
+    return {
+      searchHits: searchHits, factHits: factHits,
+      searchCalls: searchCalls, factCalls: factCalls,
+      unique: unique, total: searchHits + factHits,
+    };
+  }
+
+  // Anthropic's raw stop_reason → plain language; the raw value is preserved
+  // in a title attribute at every call site (LAW #1: jargon glossed, nothing
+  // invented — an unmapped reason renders verbatim).
+  function stopPlain(reason) {
+    switch (String(reason || "")) {
+      case "tool_use": return "paused to read memory";
+      case "end_turn": return "finished its answer";
+      case "max_tokens": return "stopped at the length cap";
+      case "pause_turn": return "paused mid-turn";
+      default: return String(reason || "no stop reason given");
+    }
+  }
+
   /* ------------------------------------------------------ claims helpers */
   function isExpired(p) {
     return !!(p && p.expires_at) && new Date(p.expires_at).getTime() - Date.now() <= 0;
@@ -137,11 +173,18 @@
     return (S.dir.map && S.dir.map[t]) ? humanName(S.dir.map[t]) : null;
   }
   // One principal as a humane chip: name first, #token mono-small (LAW #1).
+  // The #N is the key's number inside this space — its principal token; the
+  // title says so on hover (the chips appear in many places, so a per-chip
+  // gloss beats repeating microcopy everywhere).
   function pChip(t) {
+    var tip = (typeof t === "string")
+      ? "an email-string principal — it names itself; no numbered token"
+      : "#" + t + " is this key’s number inside this space — its principal token";
     var n = tokName(t);
-    if (n) return V.entityChip(n, "#" + t);
-    return '<span class="entity-chip"><b>token #' + esc(t) +
-      '</b><span class="src">name unknown</span></span>';
+    var chip = n
+      ? V.entityChip(n, "#" + t)
+      : '<span class="entity-chip"><b>token #' + esc(t) + '</b><span class="src">name unknown</span></span>';
+    return '<span title="' + esc(tip) + '">' + chip + "</span>";
   }
   // Short label for a "recently asked as" chip: "priya + sales".
   function labelFor(p) {
@@ -455,6 +498,21 @@
     return ' <span class="asof">names unavailable — the token→name directory needs the admin token (session bar)</span>';
   }
 
+  // The real classification ladder (verity_core::Confidentiality is a total
+  // order: Public=0 < Internal=1 < Confidential=2 < Restricted=3). Names come
+  // from core's CONF_NAMES so this never invents an ordering; the key's own
+  // ceiling is bolded, and the top tier is marked.
+  function confLadder(ceiling) {
+    var names = V.CONF_NAMES || ["public", "internal", "confidential", "restricted"];
+    var active = (typeof ceiling === "number")
+      ? ceiling
+      : names.indexOf(String(ceiling).toLowerCase());
+    return names.map(function (name, i) {
+      var label = esc(name) + (i === names.length - 1 ? " (highest)" : "");
+      return i === active ? "<b>" + label + "</b>" : label;
+    }).join(" &lt; ");
+  }
+
   function entityLimitHtml(p) {
     return (p.entity_scope && p.entity_scope.length)
       ? V.entityBadges(p.entity_scope)
@@ -488,7 +546,9 @@
         "<dt>reads as</dt><dd>" + principalChips(p) + "</dd>" +
         "<dt>limited to</dt><dd>" + entityLimitHtml(p) + "</dd>" +
         "<dt>ceiling</dt><dd>" + V.confBadge(p.max_confidentiality) +
-          ' <span class="asof">nothing classified above this can come back &mdash; no question can raise it</span></dd>' +
+          ' <span class="asof">the classification ladder, lowest to highest: ' +
+          confLadder(p.max_confidentiality) +
+          ' &mdash; nothing above this key&rsquo;s ceiling can come back, and no question can raise it</span></dd>' +
       "</dl>" +
       '<div style="margin-top:6px"><button class="pg-goto-scope" style="padding:1px 7px;font-size:11px">inspect &rarr; Scope Inspector</button></div>';
     renderAskingAs();
@@ -521,14 +581,17 @@
     var chips = list.map(function (c, i) {
       var isActive = S.active && S.active.handle === c.handle;
       return '<span class="epk-chip"' + (isActive ? ' style="outline:1px solid var(--accent)"' : "") + ">" +
-        '<a class="pg-recent-chip" data-i="' + i + '" style="cursor:pointer">' + esc(c.label) + "</a>" +
-        '<button type="button" class="epk-x pg-recent-x" data-i="' + i + '" aria-label="forget ' + esc(c.label) + '">&times;</button>' +
+        '<a class="pg-recent-chip" data-i="' + i + '" style="cursor:pointer" ' +
+          'title="switch to this key, then press Ask to re-run your question as it">' + esc(c.label) + "</a>" +
+        '<button type="button" class="epk-x pg-recent-x" data-i="' + i + '" ' +
+          'title="forget this entry" aria-label="forget this entry: ' + esc(c.label) + '">&times;</button>' +
       "</span>";
     }).join(" ");
     host.innerHTML =
       '<div>recently asked as: ' + chips + "</div>" +
-      '<div class="asof" style="margin-top:3px">this tab only &mdash; click to re-ask the same question as a ' +
-        "different key. That two-click swap IS the boundary demo.</div>";
+      '<div class="asof" style="margin-top:3px">this tab only. Click a key to <b>switch to it</b>, then press ' +
+        "<b>Ask</b> to re-run your question as that key &mdash; the &times; <b>forgets</b> the entry. That two-click " +
+        "swap IS the boundary demo.</div>";
     host.querySelectorAll(".pg-recent-chip").forEach(function (a) {
       a.onclick = function () {
         var c = recentGet()[parseInt(a.getAttribute("data-i"), 10)];
@@ -866,9 +929,12 @@
         '<h2>4 &middot; This session <span class="sub">panel memory only — dies with this tab</span></h2>' +
         pctHtml +
         '<div class="tablewrap" style="margin-top:8px"><table><thead><tr>' +
-          "<th>#</th><th>model</th><th>turns</th><th>reads</th><th>hits</th><th>server ms</th><th>in/out tok</th><th>when</th>" +
+          "<th>#</th><th>model</th><th>turns</th><th>reads</th><th>returned</th><th>server ms</th><th>in/out tok</th><th>when</th>" +
         "</tr></thead><tbody>" + rows + "</tbody></table></div>" +
-        '<div class="asof" style="margin-top:6px">session-local · this hardware · model time includes ' +
+        '<div class="asof" style="margin-top:6px"><b>reads</b> = times the agent consulted memory (searches + fact ' +
+          "lookups) &middot; <b>returned</b> = memories that came back visible to this key across those reads &middot; " +
+          "<b>turns</b> = model round-trips</div>" +
+        '<div class="asof" style="margin-top:4px">session-local · this hardware · model time includes ' +
           "Anthropic network · repeats sequential · dies with this tab · NOT the milestone-A benchmark</div>" +
       "</div>";
   }
@@ -900,10 +966,18 @@
           "in this scope’s memory. Treat it as the model’s own invention, or ask again.</div>" +
         answerHtml(run.answer, true);
     } else {
-      var nh = t.visible_hits_total != null ? t.visible_hits_total : 0;
+      // COUNT HONESTY (§0 THE LAW): lead with what is actually on screen — the
+      // unique evidence cards (+ any facts pinned in the trace) — then disclose
+      // the full read split so the chip, the evidence list, and the session
+      // table's "returned" column literally agree. All derived, never canned.
+      var sp = readSplit(run);
+      var shown = [];
+      if (sp.unique > 0) shown.push(sp.unique + (sp.unique === 1 ? " memory" : " memories"));
+      if (sp.factHits > 0) shown.push(sp.factHits + (sp.factHits === 1 ? " fact" : " facts"));
+      var shownLabel = shown.length ? shown.join(" + ") : "0 memories";
       body =
-        "<div>" + V.stateChip("ok", "answered from " + nh +
-          (nh === 1 ? " memory" : " memories") + " visible to this key") + "</div>" +
+        "<div>" + V.stateChip("ok", "answered from " + shownLabel + " visible to this key") + "</div>" +
+        readSplitLine(sp) +
         answerHtml(run.answer, false);
     }
 
@@ -926,6 +1000,29 @@
     }
     return '<div class="content" style="margin-top:8px' + (dim ? ";color:var(--dim)" : "") + '">' +
       esc(answer) + "</div>";
+  }
+
+  // The disclosure sub-line under the grounded chip — reconciles the evidence
+  // cards shown, the search results (which dedup to those cards), the pinned
+  // facts (shown in the trace), and their sum (the "returned" total). Every
+  // number is derived from the response; nothing is hardcoded.
+  function readSplitLine(sp) {
+    var searchPhrase = sp.searchHits +
+      (sp.searchHits === 1 ? " result from memory search" : " results from memory search");
+    if (sp.searchHits > sp.unique) {
+      searchPhrase += " (deduped to " + sp.unique + " unique, shown below)";
+    } else if (sp.unique > 0) {
+      searchPhrase += " (shown below)";
+    }
+    var parts = [searchPhrase];
+    if (sp.factHits > 0) {
+      parts.push(sp.factHits +
+        (sp.factHits === 1 ? " direct fact lookup" : " direct fact lookups") +
+        " (shown in the trace below)");
+    }
+    return '<div class="asof" style="margin-top:4px">' + sp.total +
+      " results in total this key let through &mdash; " + parts.join(" &middot; ") +
+      ". The session table counts this as &ldquo;returned.&rdquo;</div>";
   }
 
   // §7C — THE DENIAL, the hero. Counts are the measured totals, never canned.
@@ -1053,18 +1150,22 @@
     } else if (turn.stop_reason === "end_turn") {
       what = "model wrote the answer";
     } else {
-      what = "model responded (stop: " + esc(turn.stop_reason) + ")";
+      what = "model responded — " + stopPlain(turn.stop_reason);
     }
     var cache = (u.cache_read_input_tokens > 0)
       ? " " + V.badge("cache read: " + intFmt(u.cache_read_input_tokens) + " tok", "b-kind")
       : "";
+    // raw Anthropic stop_reason kept verbatim in a title (item 8 / LAW #1)
+    var stopTitle = 'title="raw stop_reason: ' + esc(turn.stop_reason) + '"';
     var fold = turn.text
-      ? '<details style="margin-left:22px"><summary style="cursor:pointer;color:var(--dim);font-size:var(--fs-sm)">the turn’s text · stop_reason ' +
-        esc(turn.stop_reason) + '</summary><div class="dc-meta" style="margin-top:4px;white-space:pre-wrap">' +
+      ? '<details style="margin-left:22px"><summary style="cursor:pointer;color:var(--dim);font-size:var(--fs-sm)">the turn’s text · ' +
+        '<span ' + stopTitle + ">" + esc(stopPlain(turn.stop_reason)) + "</span></summary>" +
+        '<div class="dc-meta" style="margin-top:4px;white-space:pre-wrap">' +
         esc(turn.text) + "</div></details>"
       : "";
     return (
-      '<div style="margin-top:6px"><span class="ref">' + step + "</span> " + esc(what) +
+      '<div style="margin-top:6px"><span class="ref">' + step + "</span> " +
+        "<span " + stopTitle + ">" + esc(what) + "</span>" +
         (turn.llm_ms != null ? " · " + ms1(turn.llm_ms) : "") +
         (u.input_tokens != null ? " · " + intFmt(u.input_tokens) + " in / " + intFmt(u.output_tokens) + " out tok" : "") +
         cache +
@@ -1132,9 +1233,9 @@
         "</div>" +
         '<div class="dc-meta">' +
           (e.score != null ? "score " + Number(e.score).toFixed(3) + " (raw rank score, not a probability)" : "") +
-          " · doc " + esc(e.document_id) + " · seq " + esc(e.seq) +
+          " · doc " + V.refSpan(e.document_id) +
           (e.valid_from ? " · valid_from " + esc(V.fmtTime(e.valid_from)) : "") +
-          (e.provenance != null ? " · citation→L0 episode " + esc(e.provenance) : "") +
+          (e.provenance != null ? " · traces to the raw event log (L0), episode " + V.refSpan(e.provenance) : "") +
         "</div>" +
       "</div>"
     );
@@ -1143,9 +1244,17 @@
   function evidenceBlock(run) {
     var ev = run.evidence || [];
     if (!ev.length) return "";
+    // Keep the claim literally true of what is displayed: these cards are the
+    // deduped memory-SEARCH results. If the agent also pinned facts (get_fact),
+    // those are in the trace above, not here — so we say so rather than
+    // over-claim "saw nothing else."
+    var sp = readSplit(run);
+    var claim = sp.factHits > 0
+      ? "the only memories search returned to this key &mdash; point-lookups are in the trace above"
+      : "these are all of them &mdash; the agent saw nothing else";
     return (
-      '<h3 style="margin-top:14px;font-size:12px">Evidence — what this key let through ' +
-        '<span class="refreshed">the agent saw nothing else</span></h3>' +
+      '<h3 style="margin-top:14px;font-size:12px">Evidence — the memories this key let through ' +
+        '<span class="refreshed">' + claim + "</span></h3>" +
       ev.map(evCard).join("")
     );
   }
