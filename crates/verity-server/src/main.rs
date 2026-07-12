@@ -28,6 +28,7 @@ mod manifests;
 mod media;
 #[cfg(test)]
 mod media_tests;
+mod playground;
 #[cfg(test)]
 mod principals_tests;
 mod purpose;
@@ -318,6 +319,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/ui", get(ui::ui_page))
         .route("/v1/scopes", post(open_scope))
         .route("/v1/recall", post(recall))
+        // Playground (docs/design/PLAYGROUND.md): the LLM sits ABOVE the read
+        // path, calling recall/get as tools — recall/get themselves stay
+        // LLM-free (read-path purity holds; see playground.rs module docs).
+        .route("/v1/playground/status", get(playground::status))
+        .route("/v1/playground/ask", post(playground::ask))
         .route("/v1/records/{source}/{entity}/{field}", get(get_record))
         .route("/v1/entities/{canonical}", get(get_merged_entity))
         .route("/v1/admin/entities", get(admin_list_entities))

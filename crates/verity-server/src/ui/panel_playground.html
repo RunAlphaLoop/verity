@@ -1,0 +1,25 @@
+<!-- ==========================================================================
+     panel_playground.html — Playground  [build contract: docs/design/PLAYGROUND.md]
+     --------------------------------------------------------------------------
+     "Ask the memory, through one key": pick a scope handle, ask in plain
+     language, and a model answers using ONLY what that key can see, with
+     every storage/model span measured server-side and labeled.
+
+     READ-PATH PURITY IS NOT VIOLATED HERE: recall/get stay LLM-free; the
+     playground is a CONSUMER of the read path — the LLM sits above it, in
+     POST /v1/playground/ask, calling recall/get as tools through the SAME
+     enforced, fail-closed, audited pipeline the public handlers use.
+
+     OWNS: this file + panel_playground.js. Panel id "playground", mount
+     #pg-mount, rail entry data-nav="playground" ("Prove & inspect", directly
+     after Scope Inspector). Reuses frozen theme/core classes and Verity.*
+     helpers only.
+     ========================================================================== -->
+<section class="panel" id="panel-playground">
+  <h1>Playground <span style="font-weight:400">&mdash; ask the memory, through one key</span></h1>
+  <div class="lede">Pick a <b>scope handle</b> &mdash; the signed key an agent reads with &mdash; ask in plain
+    language, and a model answers using <b>only</b> what that key can see. Every number below is
+    <b>measured, never estimated</b>. A zero here is enforcement working, not a bug. Recall itself never
+    calls a model &mdash; the model sits <em>above</em> the read path, calling it as a tool.</div>
+  <div id="pg-mount"></div>
+</section>
