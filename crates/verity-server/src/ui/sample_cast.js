@@ -371,8 +371,8 @@
       '<div class="dialog" style="max-width:560px">' +
         "<h3>Remove sample data</h3>" +
         '<div class="note" style="margin-top:0">This runs Verity&rsquo;s <b>real erasure pipeline</b> — the same ' +
-          "crypto-shredding path you&rsquo;d use for a GDPR request: preview first, typed confirm, then " +
-          "<span class=\"ref\">POST /v1/admin/erasure</span> per sample subject/entity. Sample memories are purged; " +
+          "crypto-shredding path you&rsquo;d use for a GDPR request: preview first, typed confirm, then one " +
+          "hard-erase per sample subject/entity<span class=\"api-crumb\"> &middot; POST /v1/admin/erasure</span>. Sample memories are purged; " +
           "the audit record of their lifecycle remains. The sample <i>keys</i> (user:jordan, group:sales, " +
           "user:sample-blind, …) stay in the key directory — keys aren&rsquo;t memories.</div>" +
         '<div id="sample-remove-preview"><div class="asof">previewing what a real erasure would delete&hellip;</div></div>' +

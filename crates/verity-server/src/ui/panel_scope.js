@@ -110,7 +110,7 @@
 
         // ---- 3. prove it: live reads through the handle ----------------
         '<div class="card">' +
-          '<h2>Prove it — real reads through this exact handle <span class="sub">POST /v1/recall &middot; GET /v1/briefs/{entity} &middot; GET /v1/activity — pure reads</span></h2>' +
+          '<h2>Prove it — real reads through this exact handle <span class="sub">pure reads<span class="api-crumb"> · POST /v1/recall &middot; GET /v1/briefs/{entity} &middot; GET /v1/activity</span></span></h2>' +
           '<div class="row">' +
             '<div><label for="sc-q">search as this agent would</label><input type="text" id="sc-q" placeholder="e.g. renewal risk at acme"></div>' +
             '<div class="tight" style="width:70px"><label for="sc-k">results</label><input type="number" id="sc-k" value="8" min="1" max="100" style="width:70px"></div>' +
@@ -137,10 +137,10 @@
 
         // ---- 4. why filtered? (admin, audited, off the read path) ------
         '<div class="card">' +
-          '<h2>Why were things held back? <span class="sub">POST /v1/admin/debug/recall &middot; admin bearer &middot; audited &middot; OFF the read path</span></h2>' +
-          '<div class="note">Asks the server to re-check the top candidates for the search text above and say, per item, exactly why it was returned or held back &mdash; with the people and groups who <em>can</em> see each item <b>named</b>. Needs the admin token (session bar) and a live handle; every run is written to the audit log (verb <code>debug_recall</code>). It explains the index as of <b>now</b>, never a past read. No LLM, no live permission-graph call &mdash; restricted-class rechecks are flagged, not run.</div>' +
+          '<h2>Why were things held back? <span class="sub">admin &middot; audited &middot; OFF the read path<span class="api-crumb"> · POST /v1/admin/debug/recall &middot; admin bearer</span></span></h2>' +
+          '<div class="note">Asks the server to re-check the top candidates for the search text above and say, per item, exactly why it was returned or held back &mdash; with the people and shared keys who <em>can</em> see each item <b>named</b>. Needs the admin token (session bar) and a live handle; every run is written to the audit log<span class="api-crumb"> · verb <code>debug_recall</code></span>. It explains the index as of <b>now</b>, never a past read. No LLM, no live permission-graph (ReBAC) call &mdash; restricted-class rechecks are flagged, not run.</div>' +
           '<div class="row" style="margin-top:8px">' +
-            '<div class="tight" style="width:110px"><label for="sc-why-n" title="how many top-N tenant-only candidates to trace (server clamps 1..500)">candidates to check</label><input type="number" id="sc-why-n" value="50" min="1" max="500" style="width:110px"></div>' +
+            '<div class="tight" style="width:110px"><label for="sc-why-n" title="how many top-N space-wide candidates to trace (server clamps 1..500)">candidates to check</label><input type="number" id="sc-why-n" value="50" min="1" max="500" style="width:110px"></div>' +
             '<div class="tight"><button id="sc-why">Explain the filtering</button></div>' +
             '<span class="asof" id="sc-dir-note"></span>' +
           '</div>' +
@@ -159,7 +159,7 @@
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
         '<div class="et-title">No handle to inspect yet</div>' +
-        '<div class="et-body">A scope handle is the signed pass an agent reads with — it names who the agent reads as, which entities it is limited to, and its confidentiality ceiling. Mint one from the button in the top bar (or right here), or copy the <span class="ref">vs_&hellip;</span> string printed by <span class="ref">verity-cli dev</span>, then paste it above.</div>' +
+        '<div class="et-body">A scope handle is the signed pass an agent reads with — it names who the agent reads as, which entities it is limited to, and its ceiling (the widest confidentiality this handle may ever read). Mint one from the button in the top bar (or right here), or paste a <span class="ref">vs_&hellip;</span> string you already have above.<span class="api-crumb"> The dev CLI prints one: <span class="ref">verity-cli dev</span>.</span></div>' +
         '<div class="et-actions"><button class="primary" id="sc-teach-mint">Mint a scope handle</button></div>' +
       '</div>';
     var b = el("sc-teach-mint");
@@ -311,7 +311,7 @@
     return lead + p.principals.map(function (t) {
       if (typeof t === "string" && /@/.test(t)) {
         return V.entityChip(t, "email-mapped") +
-          ' <span class="badge b-downgrade" title="Email-mapped principals are weaker than resolved identity: membership is a point-in-time string match, not a live group-graph resolution, so a revoked email can lag one read behind. Prefer a resolved user:&lt;id&gt; subject.">weaker identity</span>';
+          ' <span class="badge b-downgrade" title="Email-mapped keys are weaker than resolved identity: membership is a point-in-time string match, not a live group-graph resolution, so a revoked email can lag one read behind. Prefer a resolved user:&lt;id&gt; subject.">weaker identity</span>';
       }
       return tokChip(t);
     }).join(" ") + dirHintInline();
@@ -402,7 +402,7 @@
     if (!n) return;
     if (S.dir.map) {
       var c = Object.keys(S.dir.map).length;
-      n.textContent = "name directory loaded — " + c + " principal" + (c === 1 ? "" : "s") + " known";
+      n.textContent = "name directory loaded — " + c + " key" + (c === 1 ? " (principal)" : "s (principals)") + " known";
     } else if (S.dir.error) {
       n.textContent = "names unavailable (admin token required) — tokens will show as #numbers";
     } else n.textContent = "";
@@ -606,8 +606,8 @@
      =================================================================== */
   var DROP_PLAIN = {
     stale_superseded: ["an older version", "a newer value replaced this row (its validity window is closed); current-truth reads exclude it"],
-    visibility_empty: ["visible to no one", "the item carries zero visibility permissions — invisible to everyone; Verity never guesses permissions (fail closed)"],
-    visibility_no_overlap: ["not visible to this handle", "none of the people/groups who can see this item are on this handle"],
+    visibility_empty: ["visible to no one", "the item records no one who can see it (visibility) — invisible to everyone; Verity never guesses permissions (fail closed)"],
+    visibility_no_overlap: ["not visible to this handle", "none of the people or shared keys who can see this item are on this handle"],
     confidentiality_above_ceiling: ["above the ceiling", "classified higher than this handle's confidentiality ceiling — filtered before ranking; no query can raise the ceiling"],
     entity_scope_untagged: ["no entity label", "this handle is limited to specific entities and the item carries no entity label — denied by default"],
     entity_scope_outside: ["about a different entity", "the item's entities fall outside what this handle is limited to"],
@@ -685,13 +685,13 @@
     var cards = cands.length
       ? cands.map(function (c) { return whyCard(c, sc); }).join("")
       : '<div class="empty-teach sp-b" style="margin-top:8px"><div class="et-title">Nothing to trace</div>' +
-        '<div class="et-body">The tenant-wide candidate search surfaced nothing for this text. An item that was never indexed (quarantined) or fell outside the top-N is invisible to this tracer — by its own admission. If a write vanished entirely, check Quarantine.</div>' +
+        '<div class="et-body">The space-wide candidate search surfaced nothing for this text. An item that was never indexed (quarantined) or fell outside the top-N is invisible to this tracer — by its own admission. If a write vanished entirely, check Quarantine.</div>' +
         '<div class="et-actions"><button class="sc-goto-quar">Check Quarantine &rsaquo;</button></div></div>';
 
     el("sc-why-out").innerHTML =
       '<div class="card" style="margin-top:10px">' +
         '<div class="note"><span class="badge b-defense">admin &middot; audited &middot; OFF the read path</span> ' +
-        "This run was written to the audit log (verb <code>debug_recall</code>; every disclosed id recorded). It explains the index as of now, not any past read.</div>" +
+        "This run was written to the audit log<span class=\"api-crumb\"> · verb <code>debug_recall</code></span>; every disclosed id recorded. It explains the index as of now, not any past read.</div>" +
         head + hist + honesty +
       "</div>" + cards;
   }
@@ -709,7 +709,7 @@
     var visTokens = c.visibility_tokens || [];
     var who;
     if (!visTokens.length) {
-      who = '<span class="expired">no one — it carries zero visibility permissions (fail closed)</span>';
+      who = '<span class="expired">no one — it records no one who can see it (visibility); fail closed</span>';
     } else {
       who = visTokens.map(tokChip).join(" ");
     }
@@ -723,7 +723,7 @@
         visTokens.map(function (t) { var n = tokHumanName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") +
         "; this handle carries " +
         (mine.length ? mine.map(function (t) { var n = tokHumanName(t); return n ? "<b>" + esc(n) + "</b>" : "token #" + esc(t); }).join(", ") : "<b>no one</b>") +
-        " — no overlap. To see it, the reader needs one of those groups/people on its handle (granted at mint, never here).</div>";
+        " — no overlap. To see it, the reader needs one of those shared keys or people on its handle (granted at mint, never here).</div>";
     }
 
     var notes = (c.notes || []).map(function (n) {
@@ -817,7 +817,7 @@
     if (!actions || !actions.length) return "";
     return (
       '<div class="tablewrap"><table><thead><tr>' +
-        "<th>when</th><th>what</th><th>by</th><th>outcome</th><th>summary</th><th>entities</th><th>evidence&rarr;L0</th>" +
+        "<th>when</th><th>what</th><th>by</th><th>outcome</th><th>summary</th><th>entities</th><th title=\"pointer into the raw source-event store (L0) that this row cites\">evidence&rarr;L0</th>" +
       "</tr></thead><tbody>" +
       actions.map(function (a) {
         return "<tr><td>" + esc(V.fmtTime(a.occurred_at)) + "</td><td>" + esc(a.action_type) +

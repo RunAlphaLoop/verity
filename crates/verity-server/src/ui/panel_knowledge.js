@@ -203,21 +203,21 @@
             "lesson in their scoped recalls, and there is <b>no un-publish</b> — retraction happens only through " +
             "Erasure &amp; data export.</div>" +
           '<div class="card" style="margin-top:10px">' +
-            '<h2>Who can see it <span class="sub">required · GET /v1/admin/principals</span></h2>' +
-            '<div class="note" style="margin-top:0">Pick the people and groups this lesson becomes visible to. ' +
+            '<h2>Who can see it (visibility) <span class="sub">required<span class="api-crumb"> · GET /v1/admin/principals</span></span></h2>' +
+            '<div class="note" style="margin-top:0">Pick the keys (principals) — the people and shared keys — this lesson becomes visible to. ' +
               "Picking <b>no one</b> refuses to publish — there is no default audience, here or anywhere.</div>" +
             '<input type="text" id="know-pub-filter" placeholder="filter people &amp; groups&hellip;" autocomplete="off" style="margin-top:6px">' +
             '<div id="know-pub-dir" style="max-height:220px;overflow-y:auto;margin-top:6px"></div>' +
-            '<div style="margin-top:8px"><label for="know-pub-raw">raw principal tokens ' +
-              '<span style="font-weight:400">(dev mode — comma-separated integers, for principals with no name in the directory)</span></label>' +
+            '<div class="api-crumb-block" style="margin-top:8px"><label for="know-pub-raw">raw key tokens ' +
+              '<span style="font-weight:400">(dev mode — comma-separated integers, for keys with no name in the directory)</span></label>' +
               '<input type="text" id="know-pub-raw" placeholder="e.g. 11, 1001" autocomplete="off" spellcheck="false"></div>' +
             '<div class="note" id="know-pub-count" style="margin-top:6px"></div>' +
           "</div>" +
-          '<div style="margin-top:10px"><label for="know-pub-kmin">privacy floor &mdash; fewest supporting customers allowed</label>' +
+          '<div style="margin-top:10px"><label for="know-pub-kmin">privacy floor &mdash; fewest supporting customers allowed (the ceiling here is a floor: the fewest supporters a lesson may ever be published with)</label>' +
             '<input type="number" id="know-pub-kmin" min="3" step="1" value="3" style="max-width:130px">' +
             '<div class="note">Minimum <b>3</b> &mdash; and the server re-clamps it even if a smaller number is sent: ' +
-              "at 2, either supporting customer could infer the other&rsquo;s situation. " +
-              '<span class="ref">k_min · POST /v1/knowledge/{id}/publish</span></div></div>' +
+              "at 2, either supporting customer could infer the other&rsquo;s situation." +
+              '<span class="api-crumb"> <span class="ref">k_min · POST /v1/knowledge/{id}/publish</span></span></div></div>' +
           '<div class="err" id="know-pub-err"></div>' +
           '<div class="actions">' +
             '<button id="know-pub-cancel">Cancel</button>' +
@@ -231,8 +231,8 @@
           '<div id="know-rej-stmt" style="font-size:var(--fs-md);font-weight:650;color:var(--bright)"></div>' +
           '<div class="note" style="margin-top:8px">Rejecting is <b>remembered</b>: the same lesson will not be proposed ' +
             "again. Only a lesson still waiting for review can be rejected — a published one is refused (retraction is " +
-            "Erasure &amp; data export&rsquo;s job). " +
-            '<span class="ref">POST /v1/admin/knowledge/{id}/reject</span></div>' +
+            "Erasure &amp; data export&rsquo;s job)." +
+            '<span class="api-crumb"> <span class="ref">POST /v1/admin/knowledge/{id}/reject</span></span></div>' +
           '<div style="margin-top:10px"><label for="know-rej-reason">why <span style="font-weight:400">(required &mdash; stored with the decision, on the record)</span></label>' +
             '<input type="text" id="know-rej-reason" placeholder="e.g. too specific to one industry to generalize" autocomplete="off"></div>' +
           '<div class="err" id="know-rej-err"></div>' +
@@ -278,11 +278,11 @@
     var teach = el("know-teach");
     if (!teach) return;
     el("know-out").innerHTML = "";
-    el("know-state").innerHTML = V.stateChip("off", "no tenant");
+    el("know-state").innerHTML = V.stateChip("off", "no space");
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a space to see its lessons</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle &mdash; the tenant ' +
+        '<div class="et-title">Pick a space (tenant) to see its lessons</div>' +
+        '<div class="et-body">Paste a space id in the session bar above, or mint a scope handle &mdash; the space ' +
           "fills in automatically and this screen loads itself.</div>" +
         '<div class="et-actions"><button class="primary" id="know-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
@@ -312,7 +312,7 @@
         // words first; the verbatim server error stays, dimmed, below.
         var errEl = el("know-err");
         errEl.innerHTML =
-          "That looks like a space name, not a tenant id &mdash; Verity needs the id " +
+          "That looks like a space name, not a space id &mdash; Verity needs the id " +
           "(it looks like 019f53b8-&hellip;). Pick the space from the menu in the session bar " +
           "and this screen reloads itself." +
           '<div style="color:var(--dim);margin-top:4px">' + V.esc(msg) + "</div>";
@@ -372,8 +372,8 @@
           '<div class="empty-teach sp-a">' +
             '<div class="et-title">No lessons proposed yet</div>' +
             '<div class="et-body">A lesson is a pattern Verity notices across several customers&rsquo; ' +
-              "conversations. Verity proposes them automatically in the background (agents can also propose one " +
-              "&mdash; <span class=\"ref\">POST /v1/knowledge</span>); every proposal stops here for a person " +
+              "conversations. Verity proposes them automatically in the background (agents can also propose one" +
+              "<span class=\"api-crumb\"> &mdash; POST /v1/knowledge</span>); every proposal stops here for a person " +
               "&mdash; nothing publishes itself. To give Verity something to learn from, start with " +
               "<b>Add memory</b>.</div>" +
             '<div class="et-actions"><button class="primary" id="know-empty-check">Check again</button></div>' +
@@ -477,7 +477,7 @@
         " · evidence tier: " + V.esc(it.support_tier || "—") +
         seenAtMeta(it) +
         (it.merge_reason ? " · merged because: " + V.esc(it.merge_reason) : "") +
-        " · GET /v1/admin/knowledge/{id}</div>" +
+        '<span class="api-crumb"> · GET /v1/admin/knowledge/{id}</span></div>' +
       '<div class="dc-actions">' + actions + "</div>" +
     "</div>";
   }
@@ -520,7 +520,7 @@
     var body = el("know-drawer-body");
     current = { id: id, statement: "", status: "", item: null };
     el("know-drawer-title").textContent = "Lesson";
-    body.innerHTML = '<div class="note">loading&hellip; <span class="ref">GET /v1/admin/knowledge/' + V.esc(id) + "</span></div>";
+    body.innerHTML = '<div class="note">loading&hellip;<span class="api-crumb"> <span class="ref">GET /v1/admin/knowledge/' + V.esc(id) + "</span></span></div>";
     setDrawerActions(null);
     V.dialog("know-drawer").open();
     try {
@@ -716,7 +716,7 @@
       return;
     }
     if (!dir.rows.length) {
-      host.innerHTML = '<div class="note" style="margin-top:0">No named people or groups exist for this tenant yet ' +
+      host.innerHTML = '<div class="note" style="margin-top:0">No named people or groups exist for this space yet ' +
         "&mdash; create them on <b>People &amp; groups</b>, or use raw tokens below (dev mode). An empty directory " +
         "never publishes to anyone by default.</div>";
       return;
@@ -801,7 +801,7 @@
     V.clearErr("know-pub-err");
     var sel = selectedTokens();
     if (sel.bad != null) {
-      V.err("know-pub-err", new Error('not an integer principal token: "' + sel.bad + '"'));
+      V.err("know-pub-err", new Error('not an integer key token: "' + sel.bad + '"'));
       return;
     }
     if (!sel.tokens.length) {
@@ -828,11 +828,11 @@
             V.stateChip("ok", "published") +
             "<b>" + V.esc(current.statement || current.id) + "</b>" +
           "</div>" +
-          '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> people &amp; groups (principals): " + named +
+          '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> people &amp; groups: " + named +
             (names.length > 6 ? " + " + (names.length - 6) + " more named" : "") +
             (unnamed > 0 ? " + " + unnamed + " raw token" + (unnamed === 1 ? "" : "s") : "") +
-            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure &amp; data export. " +
-            '<span class="ref">POST /v1/knowledge/' + V.esc(current.id) + "/publish</span></div>" +
+            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure &amp; data export." +
+            '<span class="api-crumb"> <span class="ref">POST /v1/knowledge/' + V.esc(current.id) + "/publish</span></span></div>" +
         "</div>";
       await loadAll(tenantNow);
     } catch (e) {
@@ -876,8 +876,8 @@
             "<b>" + V.esc(current.statement || current.id) + "</b>" +
           "</div>" +
           '<div class="note">This exact lesson will not be proposed again. Reason on record: <b>' +
-            V.esc(reason) + "</b> " +
-            '<span class="ref">POST /v1/admin/knowledge/' + V.esc(current.id) + "/reject</span></div>" +
+            V.esc(reason) + "</b>" +
+            '<span class="api-crumb"> <span class="ref">POST /v1/admin/knowledge/' + V.esc(current.id) + "/reject</span></span></div>" +
         "</div>";
       await loadAll(tenantNow);
     } catch (e) {

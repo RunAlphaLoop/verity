@@ -251,13 +251,13 @@ acl_policy:
 
         /* ---- source health ---- */
         '<div class="card">' +
-          '<h2>Your sources <span class="sub">GET /v1/admin/connector-status · /v1/admin/backfill</span></h2>' +
+          '<h2>Your sources <span class="sub api-crumb">GET /v1/admin/connector-status · /v1/admin/backfill</span></h2>' +
           '<div id="src-health"></div>' +
         "</div>" +
 
         /* ---- manifests ---- */
         '<div class="card">' +
-          '<h2>Manifests — how each source&rsquo;s permissions map in <span class="sub">GET /v1/manifests</span></h2>' +
+          '<h2>Manifests — how each source&rsquo;s permissions map in <span class="sub api-crumb">GET /v1/manifests</span></h2>' +
           '<div class="note" style="margin-top:0"><b>When you need one:</b> free-text in → a plain webhook (zero config). Structured records (tickets, deals, invoices) you want queryable field-by-field with permissions → a manifest. ' +
             "It is the recipe that tells Verity, per event: which field is the ID (so updates replace instead of duplicate), which fields become facts, which timestamp is the event time, and who may see each item — YAML because connectors are config you can review, diff, and approve. " +
             "Two lanes, labeled, never blurred: <b>mirrored</b> = the source&rsquo;s own permission lists are copied exactly; <b>assigned</b> = an admin chose who can see it. " +
@@ -267,7 +267,7 @@ acl_policy:
 
         /* ---- freshness ---- */
         '<div class="card">' +
-          '<h2>Ingest freshness — how fast new data becomes searchable <span class="sub">GET /v1/slo/freshness</span></h2>' +
+          '<h2>Ingest freshness — how fast new data becomes searchable <span class="sub api-crumb">GET /v1/slo/freshness</span></h2>' +
           '<div class="row" style="margin-top:0">' +
             '<div class="tight"><label for="src-window">measured over the last (hours)</label>' +
               '<input type="number" id="src-window" value="24" min="1" max="2160" style="width:110px"></div>' +
@@ -304,7 +304,7 @@ acl_policy:
           '<div class="row" style="margin-top:10px">' +
             '<div><label>limit to entities <span style="font-weight:400">(optional)</span></label>' +
               '<div id="src-mint-entities"></div></div>' +
-            '<div class="tight" style="min-width:170px"><label for="src-mint-conf">confidentiality ceiling</label>' +
+            '<div class="tight" style="min-width:170px"><label for="src-mint-conf">confidentiality ceiling <span style="font-weight:400">— the widest visibility this source may ever grant</span></label>' +
               // No preselection — the ceiling is an explicit choice, same
               // no-default stance as every other dialog (audit advisory fix).
               '<select class="field" id="src-mint-conf">' +
@@ -332,7 +332,7 @@ acl_policy:
           "<h3>Shut off a source</h3>" +
           '<div class="note" style="margin-top:0">Revoking kills the private URL <b>immediately</b> — deliveries stop and the URL can never be revived. ' +
             "Nothing already ingested is deleted (history is invalidated elsewhere, never erased here). " +
-            "You need the <b>webhook id</b> from when the source was minted — the console cannot list webhooks yet (<code>GET /v1/webhooks</code> is on the roadmap).</div>" +
+            "You need the <b>webhook id</b> from when the source was minted — the console cannot list webhooks yet, so keep it from the connect step.<span class=\"api-crumb\"> · listing them (GET /v1/webhooks) is on the roadmap</span></div>" +
           '<div style="margin-top:12px"><label for="src-revoke-id">webhook id</label>' +
             '<input type="text" id="src-revoke-id" placeholder="the uuid shown when you minted it" autocomplete="off" spellcheck="false"></div>' +
           '<div style="margin-top:10px"><label for="src-revoke-word">this is permanent — type <b>REVOKE</b> to continue</label>' +
@@ -423,11 +423,11 @@ acl_policy:
   /* =========================================================== loading */
 
   function renderNoTenant() {
-    el("src-state").innerHTML = V.stateChip("off", "no tenant");
+    el("src-state").innerHTML = V.stateChip("off", "no space");
     el("src-health").innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see its sources</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle — the tenant fills in automatically and this screen loads itself.</div>' +
+        '<div class="et-title">Pick a space (tenant) to see its sources</div>' +
+        '<div class="et-body">Paste a space id in the session bar above, or mint a scope handle (the signed key an agent reads with) — the space fills in automatically and this screen loads itself.</div>' +
         '<div class="et-actions"><button class="primary" id="src-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("src-manifests").innerHTML = "";
@@ -478,7 +478,7 @@ acl_policy:
       var uniq = data.errs.filter(function (m, i) { return data.errs.indexOf(m) === i; });
       if (uniq.some(function (m) { return /HTTP 400/.test(m) && /UUID parsing failed/.test(m); })) {
         var ebox = el("src-err");
-        ebox.innerHTML = "This tenant id isn't valid — Verity tenant ids are UUIDs " +
+        ebox.innerHTML = "This space id isn't valid — Verity space ids are UUIDs " +
           "(they look like 019f53b8-…). Pick a real space in the session bar above." +
           '<div class="ref" style="margin-top:4px">' + V.esc(uniq.join("\n")) + "</div>";
         ebox.classList.add("on");
@@ -751,7 +751,7 @@ acl_policy:
     var rows = data.backfill;
     if (!rows.length) {
       host.innerHTML =
-        '<div class="empty">No catch-up imports have run for this tenant. Connectors report them as they replay history — nothing to show is a real state, not an error.</div>';
+        '<div class="empty">No catch-up imports have run for this space. Connectors report them as they replay history — nothing to show is a real state, not an error.</div>';
       return;
     }
     var body = rows.map(function (r) {
@@ -815,14 +815,14 @@ acl_policy:
 
     // Who-can-see picker: names from the principal directory, not bare ints.
     var box = el("src-mint-principals");
-    box.innerHTML = '<span class="ref">loading the principal directory&hellip;</span>';
+    box.innerHTML = '<span class="ref">loading the directory of people &amp; groups&hellip;</span>';
     try {
       var res = await V.api(
         "/v1/admin/principals?tenant_id=" + encodeURIComponent(tenantNow) + "&limit=1000",
         { admin: true });
       var list = (res && res.principals) || [];
       if (!list.length) {
-        box.innerHTML = '<span class="ref">the principal directory is empty for this tenant — ' +
+        box.innerHTML = '<span class="ref">the directory of people &amp; groups is empty for this space — ' +
           "add people on the People &amp; groups screen, or use raw tokens below (dev mode)</span>";
       } else {
         box.innerHTML = list.map(function (p) {
@@ -834,7 +834,7 @@ acl_policy:
         }).join("");
       }
     } catch (e) {
-      box.innerHTML = '<span class="ref">could not read the principal directory (' +
+      box.innerHTML = '<span class="ref">could not read the directory of people &amp; groups (' +
         V.esc((e && e.message) || e) + ") — enter raw tokens below</span>";
     }
   }

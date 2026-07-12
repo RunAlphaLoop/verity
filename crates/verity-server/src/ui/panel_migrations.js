@@ -78,10 +78,11 @@
     host.innerHTML =
       /* 1 · rebuild */
       '<div class="card">' +
-        '<h2>1 · Rebuild the search index <span class="sub">POST /v1/admin/reembed/batch · “re-embed”</span></h2>' +
+        '<h2>1 · Rebuild the search index <span class="sub">re-embed<span class="api-crumb"> · POST /v1/admin/reembed/batch</span></span></h2>' +
         '<div class="note">Re-encodes stored text into the new model’s index, in batches. Safe to stop at any ' +
           "time — it resumes where it left off, and it <b>never re-fetches source data</b>. Needs the server’s " +
-          "built-in encoder: a text-search-only (sparse) server answers 503, shown verbatim.</div>" +
+          "built-in encoder: a keyword-search-only (sparse) server refuses, and the reason is shown as-is" +
+          '<span class="api-crumb"> · 503</span>.</div>' +
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight"><label for="mig-model">New model <span class="note">(target model id)</span></label> ' +
             '<input type="text" id="mig-model" class="field" value="' + V.esc(DEFAULT_MODEL) + '" size="24" spellcheck="false"></div>' +
@@ -89,7 +90,7 @@
             '<input type="number" id="mig-batch" class="field" min="1" max="10000" step="1" value="512"></div>' +
           '<div class="tight"><label style="display:flex;gap:8px;align-items:center;margin-top:18px">' +
             '<input type="checkbox" id="mig-global" style="width:auto;min-width:0">' +
-            '<span>All tenants <span class="note">(unchecked = the active tenant only)</span></span></label></div>' +
+            '<span>All spaces <span class="note">(unchecked = the active space <span class="api-crumb">(tenant)</span> only)</span></span></label></div>' +
         "</div>" +
         '<div style="margin-top:12px"><b>How much is ready</b></div>' +
         '<div id="mig-cov-bar" style="margin-top:6px"></div>' +
@@ -100,13 +101,13 @@
           '<button id="mig-run-stop" disabled title="Stop after the in-flight batch returns — never mid-write.">Stop</button>' +
           '<span class="asof" id="mig-run-status"></span>' +
         "</div>" +
-        '<div class="dc-meta">re-embed → embedding_v2 · model registered idempotently · dims must match (384-d today; a true dim change needs docs/EMBEDDING_MIGRATION.md)</div>' +
+        '<div class="dc-meta api-crumb-block">re-embed → embedding_v2 · model registered idempotently · dims must match (384-d today; a true dim change needs docs/EMBEDDING_MIGRATION.md)</div>' +
       "</div>" +
 
       /* backfill (auto-loaded) — NOT a numbered step of the index upgrade */
       '<div class="card">' +
         '<h2>Source history backfill — separate from the index upgrade ' +
-          '<span class="sub">GET /v1/admin/backfill · latest run per source · auto-loaded</span> ' +
+          '<span class="sub">latest run per source · auto-loaded<span class="api-crumb"> · GET /v1/admin/backfill</span></span> ' +
           '<span id="mig-state"></span> <span class="asof" id="mig-asof"></span></h2>' +
         '<div class="note">This watches connected sources pulling in their history. It is not a step of the ' +
           "index switch — shown here so you can see data landing while you rebuild. Progress is posted " +
@@ -117,22 +118,23 @@
 
       /* 2 · cutover */
       '<div class="card">' +
-        '<h2>2 · Switch searches to the new index <span class="sub">POST /v1/admin/reembed/cutover · coverage-gated</span></h2>' +
+        '<h2>2 · Switch searches to the new index <span class="sub">coverage-gated<span class="api-crumb"> · POST /v1/admin/reembed/cutover</span></span></h2>' +
         '<div class="note">Flips recall queries to the rebuilt index. Below 100% readiness the server refuses ' +
-          "(409) unless you explicitly force it. Switching back to the old index is always safe — its data " +
+          "unless you explicitly force it" +
+          '<span class="api-crumb"> · 409</span>. Switching back to the old index is always safe — its data ' +
           "still exists, so no gate applies.</div>" +
         '<div id="mig-route-state" style="margin-top:8px"></div>' +
         '<div class="actions" style="justify-content:flex-start;margin-top:12px">' +
           '<button class="good" id="mig-cutover">Switch to the new index…</button>' +
           '<button id="mig-rollback">Switch back to the old index…</button>' +
         "</div>" +
-        '<div class="dc-meta">dense route v1→v2 cutover · embedding_route() has no GET — the live route is not readable over HTTP</div>' +
+        '<div class="dc-meta api-crumb-block">dense route v1→v2 cutover · embedding_route() has no GET — the live route is not readable over HTTP</div>' +
       "</div>" +
 
       /* 3 · briefs */
       '<div class="card">' +
-        '<h2>3 · Refresh entity summaries <span class="sub">POST /v1/admin/briefs/refresh?tenant=</span></h2>' +
-        '<div class="note">After a rebuild, re-computes every <b>stale</b> entity summary for the active tenant ' +
+        '<h2>3 · Refresh entity summaries <span class="sub"><span class="api-crumb">POST /v1/admin/briefs/refresh?tenant=</span></span></h2>' +
+        '<div class="note">After a rebuild, re-computes every <b>stale</b> entity summary for the active space ' +
           "so downstream reads stay fresh. Summaries that are already current are left alone.</div>" +
         '<div class="row" style="margin-top:8px">' +
           '<div class="tight"><button id="mig-briefs">Refresh summaries</button></div>' +
@@ -146,7 +148,7 @@
         '<div class="note" id="mig-cut-stmt"></div>' +
         '<div class="card" id="mig-cut-force-card" style="margin-top:10px;display:none">' +
           '<div class="note" style="margin-bottom:8px"><b>Readiness is below 100% (or unmeasured).</b> ' +
-            "The server will refuse a plain switch (409). Forcing it flips anyway — items not yet rebuilt " +
+            "The server refuses a plain switch<span class=\"api-crumb\"> · 409</span>. Forcing it flips anyway — items not yet rebuilt " +
             "<b>fall back to keyword-only search</b> until the rebuild finishes. An explicit, acknowledged " +
             "degradation, never a silent one.</div>" +
           '<label class="tight" style="display:flex;gap:8px;align-items:center">' +
@@ -178,11 +180,11 @@
     return null;
   }
   function scopeSentence(scope) {
-    return scope.global ? "<b>all tenants</b> (global)" : "tenant " + V.refSpan(scope.tenant);
+    return scope.global ? "<b>all spaces</b> (global)" : "space " + V.refSpan(scope.tenant);
   }
   function noScopeError() {
     return new Error(
-      "no active tenant — set one in the session bar, or tick “All tenants” to run globally (this screen never widens a write silently)");
+      "no active space — set one in the session bar, or tick “All spaces” to run globally (this screen never widens a write silently)");
   }
 
   /* ------------------------------------------------- coverage painting */
@@ -233,21 +235,21 @@
         V.stateChip("ok", isV2 ? "new index" : "old index") + " " + V.refSpan(lastCutover.route) +
         ' <span class="note">as flipped by this session at ' + V.esc(V.fmtTime(lastCutover.at)) +
         (lastCutover.forced ? " — <b>forced below 100%</b>" : "") +
-        (lastCutover.tenant ? " · tenant " + V.esc(lastCutover.tenant) : " · all tenants") +
+        (lastCutover.tenant ? " · space " + V.esc(lastCutover.tenant) : " · all spaces") +
         "</span></dd>";
     } else {
       // The honest seam: no GET exists for the live route; we will not guess.
       routeLine = "<dt>Live index now</dt><dd>" + V.stateChip("off", "not known yet") +
         ' <span class="note">the console only learns which index is live when you switch it from this ' +
         "screen, and no switch has happened this session. A server that has never been switched serves " +
-        "the old index. " +
-        "</span>" + V.refSpan("embedding_route() — storage-only, no HTTP GET") + "</dd>";
+        "the old index." +
+        "</span>" + '<span class="api-crumb"> ' + V.refSpan("embedding_route() — storage-only, no HTTP GET") + "</span></dd>";
     }
 
     var covLine;
     if (lastCoverage == null) {
       covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("off", "unmeasured") +
-        ' <span class="note">run a rebuild batch first — the server will 409 an unforced switch below 100%</span></dd>';
+        ' <span class="note">run a rebuild batch first — the server refuses an unforced switch below 100%<span class="api-crumb"> · 409</span></span></dd>';
     } else if (lastCoverage.total == null) {
       covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("off", "total unknown") + "</dd>";
     } else if (coverageComplete(lastCoverage)) {
@@ -400,14 +402,14 @@
   function paintNoTenant() {
     var out = el("mig-bf-out");
     if (!out) return;
-    el("mig-state").innerHTML = V.stateChip("off", "no tenant");
+    el("mig-state").innerHTML = V.stateChip("off", "no space");
     el("mig-asof").textContent = "";
     out.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant</div>' +
-        '<div class="et-body">Backfill progress and summary refresh are per-tenant. Paste a tenant id in the ' +
+        '<div class="et-title">Pick a space</div>' +
+        '<div class="et-body">Backfill progress and summary refresh are per-space. Paste a space id in the ' +
           "session bar, or mint a scope handle to adopt one. (The rebuild and switch above can still run " +
-          "globally via “All tenants”.)</div>" +
+          "globally via “All spaces”.)</div>" +
         '<div class="et-actions"><button class="primary" id="mig-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("mig-mint").onclick = function () { V.openMint(); };
@@ -487,8 +489,8 @@
 
       if (toV2) {
         el("mig-cut-stmt").innerHTML =
-          "Point search queries at the <b>new index</b> for " + scopeSentence(scope) + ". " +
-          V.refSpan("route=v2 · recall/brief read embedding_v2");
+          "Point search queries at the <b>new index</b> for " + scopeSentence(scope) + "." +
+          '<span class="api-crumb"> ' + V.refSpan("route=v2 · recall/brief read embedding_v2") + "</span>";
         // The force acknowledgment appears ONLY when readiness is sub-100% or
         // unmeasured — when the server is the authority and would 409.
         var measured = lastCoverage != null && lastCoverage.total != null;
@@ -497,7 +499,7 @@
         forceCard.style.display = "none";
         el("mig-cut-stmt").innerHTML =
           "Point search queries back at the <b>old index</b> for " + scopeSentence(scope) + ". " +
-          "Always safe — the old index still exists, so no gate applies. " + V.refSpan("route=v1 · un-gated rollback");
+          "Always safe — the old index still exists, so no gate applies." + '<span class="api-crumb"> ' + V.refSpan("route=v1 · un-gated rollback") + "</span>";
       }
       cutDlg.open();
     }
@@ -554,7 +556,7 @@
       if (!tenant) {
         // briefs/refresh REQUIRES a tenant (AdminTenantParam) — fail closed
         // with the reason instead of firing a doomed POST.
-        out.innerHTML = '<div class="err on">summary refresh needs a tenant — set one in the session bar</div>';
+        out.innerHTML = '<div class="err on">summary refresh needs a space — set one in the session bar</div>';
         return;
       }
       var btn = el("mig-briefs");

@@ -174,7 +174,7 @@ pub(crate) async fn run_full_fold(
             justifying_evidence: m.justifying_evidence.clone(),
             evidence_count: m.evidence_count,
         };
-        storage
+        let newly_linked = storage
             .upsert_entity_link_meta(&meta)
             .await
             .map_err(crate::internal)?;
@@ -182,8 +182,10 @@ pub(crate) async fn run_full_fold(
 
         // §4.3 audit extension: log which evidence justified this link. Only the
         // alias_member links (canonical merges) are logged — the load-bearing
-        // security decision — not every chunk tag.
-        if m.subject_kind == "alias_member" {
+        // security decision — not every chunk tag. And only when the link is
+        // NEW: the fold re-upserts its whole plan every run, and re-logging
+        // unchanged links drowned the audit trail in duplicate rows.
+        if newly_linked && m.subject_kind == "alias_member" {
             let evidence: Vec<Uuid> = m.justifying_evidence.clone();
             spawn_fold_audit(state, tenant, &m.canonical_entity, &m.subject_ref, evidence);
         }

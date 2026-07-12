@@ -54,14 +54,18 @@
   <div id="sessionbar">
     <span class="sess-field" id="tenantField">
       <label for="tenantInput" title="a space = one tenant: the company that owns this memory. Self-hosting means exactly one — yours; your customers live inside it as entities.">space</label>
-      <select id="tenantPick" class="field" style="display:none;width:220px;padding:3px 6px;font-size:var(--fs-sm)" title="the tenant is the company that owns this memory space — that's you; your customers live inside it as entities"></select>
-      <input type="text" id="tenantInput" placeholder="paste a tenant id — every screen loads itself once this is set" spellcheck="false" title="the active tenant_id — auto-filled from a decoded handle or a mint; remembered in this browser (it is an id, not a secret)">
-      <span class="ref" id="tenantIdLabel" title="tenant id — the space's raw id, shown for copy/paste, never something you have to type"></span>
+      <select id="tenantPick" class="field" style="display:none;width:220px;padding:3px 6px;font-size:var(--fs-sm)" title="the space is the company that owns this memory — that's you; your customers live inside it as entities"></select>
+      <input type="text" id="tenantInput" placeholder="paste a space id — every screen loads itself once this is set" spellcheck="false" title="the active tenant_id — auto-filled from a decoded scope handle or a mint; remembered in this browser (it is an id, not a secret)">
+      <span class="ref" id="tenantIdLabel" title="space id — the space's raw id, shown for copy/paste, never something you have to type"></span>
       <button id="tenantSetup" style="display:none;padding:3px 10px;font-size:var(--fs-sm)">Set up Verity</button>
     </span>
     <span class="sess-field">
       <label for="adminToken">admin token</label>
       <input type="password" id="adminToken" placeholder="empty = dev mode" autocomplete="off" title="admin bearer for admin-plane reads/writes — sessionStorage only, cleared when the tab closes">
+    </span>
+    <span class="sess-field">
+      <label for="apiDetailsToggle" title="reveals the exact endpoints and technical identifiers behind each screen">show API details</label>
+      <input type="checkbox" id="apiDetailsToggle" title="reveals the exact endpoints and technical identifiers behind each screen">
     </span>
     <span class="asof" id="sessionHint">checking this server&rsquo;s spaces&hellip;</span>
     <span class="err" id="tenantGhost" style="margin-top:0"></span>
@@ -144,6 +148,15 @@
     // global mint (UI-ACTIONS N1 — the front door)
     var mint = document.getElementById("mintBtn");
     if (mint) mint.addEventListener("click", function () { Verity.openMint(); });
+
+    // "show API details" — reveals developer plumbing (endpoints, status codes,
+    // {id} templates) that is hidden by default. Persisted in localStorage via
+    // Verity; boot() already applied the body class, so just reflect + wire.
+    var apiToggle = document.getElementById("apiDetailsToggle");
+    if (apiToggle) {
+      apiToggle.checked = Verity.apiDetails();
+      apiToggle.addEventListener("change", function () { Verity.setApiDetails(apiToggle.checked); });
+    }
 
     // admin token → sessionStorage, reflected in the badge honestly.
     // A token change can unlock the admin plane, so the tenant directory is
@@ -259,7 +272,7 @@
             if (dir.total > dir.tenants.length) {
               opts += '<option value="" disabled>… showing newest ' + dir.tenants.length + " of " + dir.total + "</option>";
             }
-            opts += '<option value="__paste">paste a tenant id…</option>';
+            opts += '<option value="__paste">paste a space id…</option>';
             opts += '<option value="__new">+ create a new space</option>';
             tenantPick.innerHTML = opts;
             tenantPick.value = t || "";
@@ -269,7 +282,7 @@
           if (tenantSetup) tenantSetup.style.display = "none";
           if (tenantIdLabel) tenantIdLabel.textContent = inList ? shortId(t) : "";
           if (hint) hint.textContent = t && inList
-            ? "screens auto-load for this tenant"
+            ? "screens auto-load for this space"
             : (t ? "" : "pick a space by name — every screen loads itself once one is set");
         }
       } else if (dir.status === "locked") {
@@ -278,13 +291,13 @@
         if (tenantInput) tenantInput.style.display = "";
         if (tenantSetup) tenantSetup.style.display = "none";
         if (tenantIdLabel) tenantIdLabel.textContent = "";
-        if (hint) hint.textContent = "Enter your admin token to list tenants and run setup. Already know your tenant id? Paste it.";
+        if (hint) hint.textContent = "Enter your admin token to list spaces and run setup. Already know your space id? Paste it.";
       } else if (dir.status === "error") {
         if (tenantPick) tenantPick.style.display = "none";
         if (tenantInput) tenantInput.style.display = "";
         if (tenantSetup) tenantSetup.style.display = "none";
         if (tenantIdLabel) tenantIdLabel.textContent = "";
-        if (hint) hint.textContent = "couldn't list this server's spaces (" + dir.error.slice(0, 80) + ") — paste a tenant id, or retry";
+        if (hint) hint.textContent = "couldn't list this server's spaces (" + dir.error.slice(0, 80) + ") — paste a space id, or retry";
       } else {
         // unsupported (old server) or not-asked-yet: today's paste behavior.
         if (tenantPick) tenantPick.style.display = "none";
@@ -293,8 +306,8 @@
         if (tenantIdLabel) tenantIdLabel.textContent = "";
         if (hint) hint.textContent = dir.status === "unknown"
           ? "checking this server's spaces…"
-          : (t ? "screens auto-load for this tenant"
-               : "no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id");
+          : (t ? "screens auto-load for this space"
+               : "no space yet — mint a scope handle, decode one on Scope Inspector, or paste an id");
       }
 
       if (tenantGhost) {

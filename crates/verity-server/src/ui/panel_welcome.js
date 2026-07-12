@@ -134,7 +134,7 @@
           i1.evidence = "“" + (c.name || "(unnamed)") + "” exists on this server — older than the newest " + dir.tenants.length + " the picker lists (this server has " + dirTotal + "), loaded by id";
         } else if (c.state === "ghost") {
           i1.ghost = true;
-          i1.evidence = "this tenant id is NOT on this server — showing it as set up would be a lie, so it stays red";
+          i1.evidence = "this space id is NOT on this server — showing it as set up would be a lie, so it stays red";
         } else {
           i1.needsAdmin = !!c.locked;
           i1.evidence = c.locked
@@ -144,9 +144,9 @@
       }
     } else if (dir.status === "locked") {
       i1.needsAdmin = true;
-      i1.evidence = "needs the admin token to verify against GET /v1/admin/tenants";
+      i1.evidence = "needs the admin token to verify this space against the server’s space directory";
     } else {
-      i1.evidence = "this server build can't list tenants — existence unverifiable here";
+      i1.evidence = "this server build can't list spaces — existence unverifiable here";
     }
 
     /* --- item 2 · keys added ----------------------------------------- */
@@ -260,7 +260,7 @@
         "<h2>Next, when you’re ready</h2>" +
         '<div class="dc-sides">' +
           '<div class="dc-side"><div class="dc-name">Connect Claude Code</div>' +
-            '<div class="dc-src">copy-paste MCP block, pre-filled with your url, tenant, and key' +
+            '<div class="dc-src">copy-paste MCP block, pre-filled with your url, space, and key' +
               (u ? "" : " (add a key in step 2 to fill in the token)") + "</div>" +
             '<textarea readonly id="ftue-mcp" style="margin-top:8px;min-height:120px;font-size:11px">' + V.esc(mcp) + "</textarea>" +
             '<div class="dc-actions"><button id="ftue-mcp-copy">Copy MCP block</button></div></div>' +
@@ -419,10 +419,10 @@
             "end of setup you’ll see exactly why that’s the feature.</div></div>" +
           '<div class="et-actions">' +
             '<button class="primary" id="wz-start">Set up Verity — about 5 minutes</button>' +
-            (info.dir.status === "ok" && !virgin ? '<button id="wz-have-id">I already have a tenant id</button>' : "") +
+            (info.dir.status === "ok" && !virgin ? '<button id="wz-have-id">I already have a space id</button>' : "") +
           "</div>" +
           '<div id="wz-have-id-row" style="display:none;margin-top:10px;max-width:420px">' +
-            '<label for="wz-have-id-in">tenant id — checked against this server’s list; an id that isn’t on it is rejected, never silently accepted</label>' +
+            '<label for="wz-have-id-in">space id — checked against this server’s list; an id that isn’t on it is rejected, never silently accepted</label>' +
             '<input type="text" id="wz-have-id-in" spellcheck="false" placeholder="paste the id an operator gave you">' +
             '<div class="err" id="wz-have-id-err"></div>' +
           "</div>" +
@@ -434,8 +434,8 @@
       '<div class="dc-question" style="margin-bottom:6px">Name your space</div>' +
       '<div class="note" style="margin-top:0"><b>The company that owns this memory space — self-hosting means ' +
         "that’s you, and there’s exactly one.</b></div>" +
-      whatsThis("&#9432; You are the <b>tenant</b>; your customers are <b>entities</b> — things memories are " +
-        "<i>about</i>, scoped inside your space. Customers never get their own tenant.") +
+      whatsThis("&#9432; You are the <b>space (tenant)</b>; your customers are <b>entities</b> — things memories are " +
+        "<i>about</i>, scoped inside your space. Customers never get their own space.") +
       '<div class="row" style="margin-top:10px;max-width:520px">' +
         '<div><label for="wz-space-name">Space name</label>' +
           '<input type="text" id="wz-space-name" placeholder="Acme Logistics" autocomplete="off"></div>' +
@@ -453,11 +453,11 @@
     /* ---- Step 2 — Who can ask ---- */
     var s2body =
       '<div class="dc-question" style="margin-bottom:6px">Add the first keys</div>' +
-      '<div class="note" style="margin-top:0">A <b>principal is a key</b> — one identity that memories can be ' +
-        "shared with. A <b>user is the person carrying the keyring</b>; a <b>group is a shared key</b> many people " +
+      '<div class="note" style="margin-top:0">A <b>key (principal)</b> is one identity that memories can be ' +
+        "shared with. A <b>user is the person carrying the keyring</b>; a <b>shared key (group)</b> is one key many people " +
         "hold at once. Sharing rules are written against keys, never against logins.</div>" +
-      whatsThis("<b>user</b> → the person · <b>principal</b> → a key that person (or an agent, or a group) holds · " +
-        "<b>group</b> → one shared key many keyrings carry. Verity numbers each key internally; you never handle the numbers.") +
+      whatsThis("<b>user</b> → the person · <b>key</b> → an identity that person (or an agent, or a team) holds · " +
+        "<b>shared key</b> → one key many keyrings carry. Verity numbers each key internally; you never handle the numbers.") +
       '<div class="row" style="margin-top:10px;max-width:640px">' +
         '<div><label for="wz-you-name">Add yourself — your name</label>' +
           '<input type="text" id="wz-you-name" placeholder="Matt" autocomplete="off"></div>' +
@@ -489,10 +489,10 @@
         "keys are asking + which customers + how sensitive it may go. Every read is filtered through it — a session " +
         "can narrow it, never widen it. It is not an API token: it’s a pre-computed answer to <i>what this session " +
         "may see</i>.</div>" +
-      whatsThis("The four fields: <b>tenant</b> — the space (locked to yours) · <b>who</b> — the keys asking (you + " +
-        "your groups; empty = sees nothing, on purpose) · <b>entities</b> — entity limits appear here once your " +
-        "data carries tags — nothing to limit to yet · <b>ceiling</b> — how sensitive it may go: public &lt; internal &lt; confidential &lt; restricted " +
-        "(defaults to internal).") +
+      whatsThis("The four fields: <b>space</b> — locked to yours · <b>who</b> — the keys asking (you + " +
+        "your shared keys; empty = sees nothing, on purpose) · <b>entities</b> — entity limits appear here once your " +
+        "data carries tags — nothing to limit to yet · <b>ceiling</b> — the widest sensitivity this session may ever " +
+        "reach: public &lt; internal &lt; confidential &lt; restricted (defaults to internal).") +
       '<div class="note">Setup keeps the minted handle <b>for this tab only</b> (cleared when the tab closes) so the ' +
         "proof step can run recalls through it. The console never writes handles to disk.</div>" +
       /* Mode-aware wording — the production path is tried first; nothing is
@@ -500,7 +500,7 @@
       (W.mode === "identity"
         ? '<div class="note">The identity plane is on: the handle is minted <b>as ' +
             V.esc(info.firstUser ? info.firstUser.principal : "you") + "</b> and the server assembles the keys " +
-            "(the person plus every group they belong to) — nobody types key lists by hand.</div>"
+            "(the person plus every shared key they carry) — nobody types key lists by hand.</div>"
         : (W.mode === "dev"
           ? '<div class="note">Identity plane not available on this server — the handle names your raw keys ' +
               "directly (dev fallback, disclosed). Every fail-closed rule is identical either way.</div>"
@@ -557,7 +557,7 @@
               '<button class="primary" id="wz-seed"' + (sampleReady && info.tenant ? "" : " disabled") + ">Seed the sample org</button>" +
             "</div>" +
             (sampleReady ? "" :
-              '<div class="asof" style="margin-top:6px">the sample seeder (sample_cast.js) isn’t in this build yet — this button stays honestly disabled; “Start clean” works today</div>') +
+              '<div class="asof" style="margin-top:6px">the sample seeder<span class="api-crumb"> · sample_cast.js</span> isn’t in this build yet — this button stays honestly disabled; “Start clean” works today</div>') +
             '<div class="err" id="wz-seed-err"></div><div id="wz-seed-out"></div>' +
           "</div>" +
           '<div class="dc-side">' +
@@ -642,7 +642,7 @@
         var dir = V.tenantDir();
         var hit = dir.tenants.find(function (t) { return t.tenant_id === v; });
         if (hit) { V.clearErr("wz-have-id-err"); V.setTenant(v); }
-        else V.err("wz-have-id-err", new Error("This tenant doesn’t exist on this server. Pick a real one, or set one up."));
+        else V.err("wz-have-id-err", new Error("This space doesn’t exist on this server. Pick a real one, or set one up."));
       };
     };
 
@@ -655,7 +655,7 @@
       create.disabled = true;
       try {
         var res = await V.api("/v1/admin/tenants", { json: { name: name }, admin: true });
-        if (!res || !res.tenant_id) throw new Error("the server returned no tenant_id");
+        if (!res || !res.tenant_id) throw new Error("the server created no space id");
         await V.refreshTenantDir();
         W.open = 2;
         V.setTenant(res.tenant_id); // auto-adopt; triggers re-derive via onTenant
@@ -690,8 +690,8 @@
             // Membership landed in the identity plane — that only succeeds
             // with ReBAC live, so the mode is discovered right here.
             W.mode = "identity";
-            W.groupNote = "membership recorded: " + uk + " now carries " + gk +
-              "’s shared key — the identity plane assembles it into handles automatically";
+            W.groupNote = "membership recorded: " + uk + " now carries the shared key " + gk +
+              " — the identity plane assembles it into handles automatically";
           } catch (ge) {
             // Stashed on W (not innerHTML) so the disclosure SURVIVES the
             // re-render that advances the wizard — step 3 shows it. Only the
@@ -700,11 +700,11 @@
             var gm = String((ge && ge.message) || ge);
             if (/requires ReBAC/.test(gm)) {
               W.mode = "dev";
-              W.groupNote = "group key " + gk + " created — but this server can't record who belongs to it " +
-                "(that needs the permissions engine: ReBAC, set via VERITY_SPICEDB_URL). The shared key itself " +
+              W.groupNote = "shared key " + gk + " created — but this server can't record who belongs to it " +
+                "(that needs the relationship-based permissions engine (ReBAC), set via VERITY_SPICEDB_URL). The shared key itself " +
                 "still works, and setup adds it to your handle for you";
             } else {
-              W.groupNote = "group key " + gk + " created, but recording the membership failed (" +
+              W.groupNote = "shared key " + gk + " created, but recording the membership failed (" +
                 gm.slice(0, 90) + ") — the shared key itself still works, and setup pre-checks it on your handle";
             }
           }
@@ -765,7 +765,7 @@
         if (!res || !res.scope_handle) throw new Error("mint returned no scope_handle");
         W.mode = "identity";
         W.mintNote = "minted as " + who + " — the identity plane assembled their keys " +
-          "(them plus every group they belong to; nothing was typed by hand)";
+          "(them plus every shared key they carry; nothing was typed by hand)";
         W.open = 4;
         V.setWorkingHandle(res.scope_handle); // fires onWorkingHandle → kick
         kick();
@@ -946,7 +946,7 @@
             '<div class="et-actions"><button class="primary" id="wz-proof-continue">Continue — finish setup</button></div>' +
           "</div>"
         : "") +
-      '<div class="asof" style="margin-top:6px">two ordinary POST /v1/recall calls, composed client-side · ' + asofNow() + "</div>";
+      '<div class="asof" style="margin-top:6px">two ordinary recall calls — the same read path agents use, composed in this tab<span class="api-crumb"> · POST /v1/recall ×2</span> · ' + asofNow() + "</div>";
 
     var trace = el("wz-trace");
     if (trace) trace.onclick = async function () {

@@ -91,8 +91,8 @@
         '<span class="spacer"></span>' +
         '<input type="text" id="prn-filter" placeholder="filter by name…" ' +
           'style="max-width:220px" autocomplete="off" spellcheck="false">' +
-        '<button id="prn-refresh" title="GET /v1/admin/principals — re-reads the directory">Refresh</button>' +
-        '<button class="primary" id="prn-open-add" title="POST /v1/admin/principals — adding an existing name is safe; it keeps its number">Add a person or group</button>' +
+        '<button id="prn-refresh" title="re-reads the directory · GET /v1/admin/principals">Refresh</button>' +
+        '<button class="primary" id="prn-open-add" title="adding an existing name is safe; it keeps its number · POST /v1/admin/principals">Add a person or group</button>' +
       "</div>" +
       '<div class="err" id="prn-err"></div>' +
       '<div id="prn-hint"></div>' +
@@ -119,7 +119,7 @@
         '<div style="margin-top:10px"><label for="prn-add-raw">raw principal strings ' +
           '<span style="font-weight:400">(advanced — connector-style, one per line, e.g. team:eng)</span></label>' +
           '<textarea id="prn-add-raw" rows="2" autocomplete="off" spellcheck="false"></textarea></div>' +
-        '<div class="dc-meta">POST /v1/admin/principals · people are written as user:&lt;id&gt;, groups as group:&lt;name&gt;</div>' +
+        '<div class="dc-meta api-crumb-block">POST /v1/admin/principals · people are written as user:&lt;id&gt;, groups as group:&lt;name&gt;</div>' +
         '<div class="err" id="prn-add-err"></div>' +
         '<div class="actions">' +
           '<button id="prn-add-cancel">Cancel</button>' +
@@ -141,8 +141,9 @@
             '<input type="text" id="prn-mem-member" list="prn-all-list" placeholder="alice@corp.example" ' +
               'autocomplete="off" spellcheck="false"></div>' +
         "</div>" +
-        '<div class="note">Names not yet in the directory are added automatically and get their numbers here.</div>' +
-        '<div class="dc-meta">POST /v1/admin/groups · writes a membership tuple · requires the permissions engine (ReBAC); without it the server refuses with a 503, surfaced verbatim</div>' +
+        '<div class="note">Names not yet in the directory are added automatically and get their numbers here. ' +
+          'This needs the relationship-based permissions engine (ReBAC) running; without it the server refuses and the reason is shown as-is.</div>' +
+        '<div class="dc-meta api-crumb-block">POST /v1/admin/groups · writes a membership tuple · requires the permissions engine (ReBAC); without it the server refuses with a 503, surfaced verbatim</div>' +
         '<div class="err" id="prn-mem-err"></div>' +
         '<div class="actions">' +
           '<button id="prn-mem-cancel">Cancel</button>' +
@@ -169,7 +170,7 @@
           "nothing is removed (it over-hides, never under-hides). Removing an inner group hides access " +
           "for everyone inside it too. Already-issued scope handles are affected immediately — there is " +
           "no permissive gap to wait out.</div>" +
-        '<div class="dc-meta">DELETE /v1/admin/groups · revocation tombstones written first · fail-closed ordering</div>' +
+        '<div class="dc-meta api-crumb-block">DELETE /v1/admin/groups · revocation tombstones written first · fail-closed ordering</div>' +
         '<div style="margin-top:12px">' +
           '<label for="prn-rm-word">this hides access immediately — type <b>REMOVE</b> to continue</label>' +
           '<input type="text" id="prn-rm-word" autocomplete="off" spellcheck="false">' +
@@ -202,14 +203,14 @@
   function renderNoTenant() {
     var out = el("prn-out");
     if (!out) return;
-    el("prn-state").innerHTML = V.stateChip("off", "no tenant");
+    el("prn-state").innerHTML = V.stateChip("off", "no space");
     el("prn-receipt").innerHTML = "";
     el("prn-hint").innerHTML = "";
     out.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see its people and groups</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle — ' +
-          "the tenant fills in automatically and this directory loads itself.</div>" +
+        '<div class="et-title">Pick a space to see its people and groups</div>' +
+        '<div class="et-body">Paste a space&rsquo;s <span class="ref">tenant_id</span> in the session bar above, or mint a scope handle — ' +
+          "the space fills in automatically and this directory loads itself.</div>" +
         '<div class="et-actions"><button class="primary" id="prn-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("prn-teach-mint").onclick = function () { V.openMint(); };
@@ -323,8 +324,8 @@
       out.innerHTML =
         '<div class="empty-teach sp-a">' +
           '<div class="et-title">No people or groups yet</div>' +
-          '<div class="et-body">This tenant&rsquo;s directory is empty — a valid answer, not an error. ' +
-            "Entries appear when you add them here, when a group membership is written, or when a " +
+          '<div class="et-body">This space&rsquo;s directory is empty — a valid answer, not an error. ' +
+            "Entries appear when you add them here, when a shared-key (group) membership is written, or when a " +
             "connector mirrors source permissions in. Each entry gets a <b>number</b> that " +
             "&ldquo;who can see this&rdquo; rules and scope handles reference.</div>" +
           '<div class="et-actions"><button id="prn-empty-add">Add a person or group</button></div>' +
@@ -353,13 +354,13 @@
     }
 
     /* ---- groups ---- */
-    html += '<div class="card"><h2>Groups (' + gShown.length + ') ' +
-      '<span class="sub">group:* rows of GET /v1/admin/principals</span></h2>';
+    html += '<div class="card"><h2>Shared keys / groups (' + gShown.length + ') ' +
+      '<span class="sub">group:* rows<span class="api-crumb"> of GET /v1/admin/principals</span></span></h2>';
     if (!gShown.length) {
-      html += '<div class="note">No groups' + (filter ? " match the filter" : " yet") +
-        ". A group lets one rule cover many people — add one with <b>Add a person or group</b>.</div>";
+      html += '<div class="note">No shared keys' + (filter ? " match the filter" : " yet") +
+        ". A shared key (group) lets one rule cover many people — add one with <b>Add a person or group</b>.</div>";
     } else {
-      html += '<div class="note" style="margin-top:0">Who is <em>inside</em> each group is not listable yet ' +
+      html += '<div class="note" style="margin-top:0">Who is <em>inside</em> each shared key is not listable yet ' +
         "(the membership read endpoint is planned) — this screen writes membership and shows the " +
         "server&rsquo;s receipts.</div>" +
         '<div class="tablewrap"><table><thead><tr><th>group</th><th>number · raw string</th><th class="num">actions</th></tr></thead><tbody>' +
@@ -379,8 +380,8 @@
     html += "</div>";
 
     /* ---- people ---- */
-    html += '<div class="card"><h2>People (' + pShown.length + ') ' +
-      '<span class="sub">user:* rows of GET /v1/admin/principals</span></h2>';
+    html += '<div class="card"><h2>People / keys (' + pShown.length + ') ' +
+      '<span class="sub">user:* rows<span class="api-crumb"> of GET /v1/admin/principals</span></span></h2>';
     if (!pShown.length) {
       html += '<div class="note">No people' + (filter ? " match the filter" : " yet") +
         ". Add one with <b>Add a person or group</b> — or mint a scope handle for a person (top bar) " +

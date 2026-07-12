@@ -897,8 +897,12 @@ impl PostgresAdapter {
     /// component overwrites the confidence/method/justifying-evidence in place.
     /// This is a DERIVED view the read path may see; it is never the source of
     /// truth (that is `entity_evidence`).
-    pub async fn upsert_entity_link_meta(&self, meta: &EntityLinkMeta) -> Result<()> {
-        sqlx::query(
+    /// Returns `true` when the link row was newly CREATED (vs refreshed) so the
+    /// caller can audit only genuinely new links — the fold re-upserts its whole
+    /// plan every run, and re-logging unchanged links buried the audit trail in
+    /// duplicates (founder's cold reviewer read them as data-credibility bugs).
+    pub async fn upsert_entity_link_meta(&self, meta: &EntityLinkMeta) -> Result<bool> {
+        let row = sqlx::query(
             "INSERT INTO entity_link_meta
                  (tenant_id, subject_kind, subject_ref, canonical_entity,
                   confidence, strongest_method, justifying_evidence,
@@ -910,7 +914,8 @@ impl PostgresAdapter {
                  strongest_method    = EXCLUDED.strongest_method,
                  justifying_evidence = EXCLUDED.justifying_evidence,
                  evidence_count      = EXCLUDED.evidence_count,
-                 updated_at          = now()",
+                 updated_at          = now()
+             RETURNING (xmax = 0) AS inserted",
         )
         .bind(meta.tenant_id)
         .bind(&meta.subject_kind)
@@ -920,10 +925,10 @@ impl PostgresAdapter {
         .bind(&meta.strongest_method)
         .bind(&meta.justifying_evidence)
         .bind(meta.evidence_count)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        row.try_get("inserted").map_err(db_err)
     }
 
     /// Materialize the fold's chunk-tag decision (§4.3 item 2, §5): set the

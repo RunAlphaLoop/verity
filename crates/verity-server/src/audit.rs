@@ -76,10 +76,18 @@ pub(crate) fn spawn_fold_audit(
     justifying_evidence: Vec<Uuid>,
 ) {
     let pool = state.pool().clone();
-    let summary: String = format!("{canonical} <= {member_ref}")
-        .chars()
-        .take(120)
-        .collect();
+    // The canonical is NAMED after its lexically-min member, so the anchor
+    // member's own link row would read "canon:X <= X" — a legitimate event
+    // that looks like a self-link bug (a cold reviewer flagged exactly this).
+    // Phrase the anchor case as what it is instead.
+    let summary: String = if canonical == format!("canon:{member_ref}") {
+        format!("{canonical} anchored at {member_ref}")
+    } else {
+        format!("{canonical} <= {member_ref}")
+    }
+    .chars()
+    .take(120)
+    .collect();
     tokio::spawn(async move {
         let result = sqlx::query(
             "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,

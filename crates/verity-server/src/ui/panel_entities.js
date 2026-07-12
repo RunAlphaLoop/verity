@@ -174,11 +174,11 @@
         /* ---- run-matching dialog ---- */
         '<div class="dialog-backdrop" id="ent-run-dialog"><div class="dialog" style="max-width:560px">' +
           "<h3>Run matching now?</h3>" +
-          '<div class="note" style="margin-top:0">Scans this tenant&rsquo;s current facts for identity matches across sources.' +
+          '<div class="note" style="margin-top:0">Scans this space&rsquo;s (tenant&rsquo;s) current facts for identity matches across sources.' +
             '<ul style="margin:8px 0 0 18px">' +
             "<li><b>Exact identifiers</b> (same external ID, DUNS, email) merge deterministically.</li>" +
             "<li><b>Anything uncertain</b> goes to the review queue for a human — it is never merged automatically.</li>" +
-            "<li>Running twice is safe — an unchanged tenant produces no new evidence.</li></ul></div>" +
+            "<li>Running twice is safe — an unchanged space produces no new evidence.</li></ul></div>" +
           '<div class="err" id="ent-run-err"></div>' +
           '<div class="actions">' +
             '<button id="ent-run-cancel">Cancel</button>' +
@@ -191,7 +191,7 @@
           '<h3 id="ent-drawer-title">Entity</h3>' +
           '<div id="ent-drawer-head"></div>' +
           '<div class="card" style="margin-top:12px">' +
-            '<h2>Which source wins <span class="sub">GET /v1/entities/{canonical} · scope-gated</span></h2>' +
+            '<h2>Which source wins <span class="sub">scope-gated<span class="api-crumb"> · GET /v1/entities/{canonical}</span></span></h2>' +
             '<div class="note" style="margin-top:0">Every field below is merged from all sources. When sources disagree, the <b>highest-ranked source wins</b>; where you have set no ranking, the newest value wins. This view reads through a scope handle — the same fail-closed path agents use.</div>' +
             '<div class="row" style="margin-top:8px">' +
               '<div><label for="ent-scope-handle">scope handle</label>' +
@@ -254,11 +254,11 @@
     if (!teach) return;
     el("ent-queue-view").innerHTML = "";
     el("ent-browser-view").innerHTML = "";
-    el("ent-state").innerHTML = V.stateChip("off", "no tenant");
+    el("ent-state").innerHTML = V.stateChip("off", "no space");
     teach.innerHTML =
       '<div class="empty-teach sp-a">' +
         '<div class="et-title">Pick a space to see its entities</div>' +
-        '<div class="et-body">Pick a space in the session bar above (or paste its tenant id), or mint a scope handle — the space fills in automatically and this screen loads itself.</div>' +
+        '<div class="et-body">Pick a space in the session bar above (or paste its space id), or mint a scope handle — the space fills in automatically and this screen loads itself.</div>' +
         '<div class="et-actions"><button class="primary" id="ent-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("ent-teach-mint").onclick = function () { V.openMint(); };
@@ -335,7 +335,7 @@
               "not that a merge happened silently. Exact-identifier merges keep happening automatically; anything " +
               "uncertain will stop here for you."
             : "The queue fills when matching finds two records that <b>might</b> be the same thing but is not " +
-              "certain. Run matching to scan this tenant&rsquo;s sources for cross-source matches now.") + "</div>" +
+              "certain. Run matching to scan this space&rsquo;s sources for cross-source matches now.") + "</div>" +
           '<div class="et-actions">' +
             '<button class="primary" id="ent-q-run">Run matching now</button>' +
             (hasEntities ? '<button id="ent-q-browse">See the ' + data.entities.length + " merged entit" + (data.entities.length === 1 ? "y" : "ies") + " &rsaquo;</button>" : "") +
@@ -408,7 +408,8 @@
         sideCol(c.right_ref, c.right_summary) +
       "</div>" +
       '<div class="dc-evidence">' + evidence + "</div>" +
-      '<div class="dc-meta">' + V.esc(c.method) + " · " + V.esc(tierPlain(c.tier)) + " (tier " + V.esc(c.tier) + ")" +
+      '<div class="dc-meta">' + V.esc(c.method) + " · " + V.esc(tierPlain(c.tier)) +
+        '<span class="api-crumb"> (tier ' + V.esc(c.tier) + ")</span>" +
         " · proposed " + V.esc(V.fmtTime(c.valid_from)) +
         (c.rationale ? " · rationale: " + V.esc(c.rationale) : "") + "</div>" +
       '<div class="dc-actions">' +
@@ -464,11 +465,11 @@
       ? "<b>" + V.esc(lLabel) + "</b> and <b>" + V.esc(rLabel) + "</b> become one entity everywhere — recall, briefs, " +
         "and the merged record. Your confirmation is saved as evidence and outranks automatic matching, and matching " +
         "re-runs immediately. You can split them later from the entity&rsquo;s page, though a split permanently " +
-        'forbids re-merging. <span class="ref">human_confirmed · tier 2, +1</span>'
+        'forbids re-merging. <span class="ref api-crumb">human_confirmed · tier 2, +1</span>'
       : "Verity will record a <b>permanent do-not-link rule</b> between <b>" + V.esc(lLabel) + "</b> and <b>" +
         V.esc(rLabel) + "</b>: matching will keep them apart forever, even if stronger evidence appears later, and " +
         "will split them if they are currently merged. Your rejection is saved so these are never re-matched. " +
-        '<b>This cannot be undone.</b> <span class="ref">human_rejected · tier 2, −1</span>';
+        '<b>This cannot be undone.</b> <span class="ref api-crumb">human_rejected · tier 2, −1</span>';
     el("ent-decide-typed").style.display = confirming ? "none" : "block";
     var go = el("ent-decide-go");
     go.textContent = confirming ? "Merge them" : "Keep separate forever";
@@ -484,7 +485,7 @@
 
   async function submitDecision() {
     V.clearErr("ent-decide-err");
-    if (!tenantNow) { V.err("ent-decide-err", new Error("no tenant selected")); return; }
+    if (!tenantNow) { V.err("ent-decide-err", new Error("no space selected")); return; }
     if (pending.decision === "reject" && el("ent-decide-word").value.trim() !== "SEPARATE") {
       V.err("ent-decide-err", new Error('type SEPARATE to confirm — this decision is permanent'));
       return;
@@ -538,7 +539,7 @@
 
   async function runMatching() {
     V.clearErr("ent-run-err");
-    if (!tenantNow) { V.err("ent-run-err", new Error("no tenant selected")); return; }
+    if (!tenantNow) { V.err("ent-run-err", new Error("no space selected")); return; }
     var btn = el("ent-run-go");
     btn.disabled = true;
     try {
@@ -849,7 +850,7 @@
 
   async function savePrecedence(btn, fi) {
     V.clearErr("ent-merged-err");
-    if (!tenantNow) { V.err("ent-merged-err", new Error("no tenant selected")); return; }
+    if (!tenantNow) { V.err("ent-merged-err", new Error("no space selected")); return; }
     var star = fi === "*";
     var field = star ? "*" : prec.names[parseInt(fi, 10)];
     var order = star ? prec.star : prec.orders[field];

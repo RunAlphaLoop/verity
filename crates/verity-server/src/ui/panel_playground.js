@@ -271,18 +271,18 @@
 
       // ---- 1 · WHO IS ASKING -------------------------------------------
       '<div class="card">' +
-        '<h2>1 &middot; Who is asking? <span class="sub">a principal is a key; a person carries a keyring; groups are shared keys</span></h2>' +
+        '<h2>1 &middot; Who is asking? <span class="sub">a key (principal) is one identity; the person carrying the keyring holds several; a shared key stands in for a whole team</span></h2>' +
         '<div id="pg-mode-working" style="display:none;margin-top:6px">' +
           '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
             '<input type="radio" name="pg-src" id="pg-r-working" value="working">' +
-            '<span>This tab&rsquo;s working handle <span class="asof">(kept in this tab only, gone on close)</span></span>' +
+            '<span>This tab&rsquo;s working scope handle <span class="asof">(kept in this tab only, gone on close)</span></span>' +
           '</label>' +
           '<div id="pg-working-claims" style="margin:4px 0 8px 24px"></div>' +
         '</div>' +
         '<div style="margin-top:6px">' +
           '<label style="display:flex;gap:8px;align-items:baseline;cursor:pointer;text-transform:none;letter-spacing:0">' +
             '<input type="radio" name="pg-src" id="pg-r-paste" value="paste" checked>' +
-            '<span>Paste a handle <span class="asof">(it decodes as you type)</span></span>' +
+            '<span>Paste a scope handle <span class="asof">(it decodes as you type)</span></span>' +
           '</label>' +
           '<div style="margin:4px 0 0 24px">' +
             '<input type="text" id="pg-paste" placeholder="vs_&hellip;" spellcheck="false" autocomplete="off">' +
@@ -302,7 +302,7 @@
 
       // ---- 2 · ASK -------------------------------------------------------
       '<div class="card" id="pg-asksec" style="display:none">' +
-        '<h2>2 &middot; Ask <span class="sub">POST /v1/playground/ask &mdash; the model calls recall/get as tools; the reads stay scope-gated</span></h2>' +
+        '<h2>2 &middot; Ask <span class="sub">the model calls recall/get as tools; the reads stay scope-gated<span class="api-crumb"> &middot; POST /v1/playground/ask</span></span></h2>' +
         '<div id="pg-asking-as" class="note" style="margin-top:4px"></div>' +
         '<div class="row" style="margin-top:8px">' +
           '<div><label for="pg-q">your question</label>' +
@@ -719,7 +719,7 @@
         body: JSON.stringify(body),
       });
     } catch (e) {
-      throw new Error("/v1/playground/ask — network error: " + e.message);
+      throw new Error("couldn’t reach the server to ask — network error: " + e.message);
     }
     var text = await res.text();
     var clientMs = performance.now() - t0; // the one browser-side number
@@ -1125,7 +1125,8 @@
     });
     html +=
       '<div class="asof" style="margin-top:6px">storage ms is the same in-process read the public ' +
-        "POST /v1/recall performs, measured without HTTP framing.</div>" +
+        "recall endpoint performs, measured without HTTP framing." +
+        '<span class="api-crumb"> &middot; POST /v1/recall</span></div>' +
       '<div class="note" style="margin-top:6px">the model is instructed to answer only from these results; ' +
         "this trace is how you check it kept its word. " +
         '<button class="pg-prove" style="padding:1px 7px;font-size:11px">prove this boundary &rarr; Scope Inspector</button></div>';

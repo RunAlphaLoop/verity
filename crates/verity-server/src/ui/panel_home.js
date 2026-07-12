@@ -66,8 +66,8 @@
             '<div style="margin-top:8px">One thing to know before you start: <b>when Verity isn’t sure someone may ' +
             "see a memory, it shows them nothing.</b> An empty result here is a safety answer, not a bug — and by " +
             "the end of setup you’ll see exactly why that’s the feature.</div>" +
-            '<div style="margin-top:8px" class="asof">this server has no spaces yet (checked live against ' +
-            "GET /v1/admin/tenants) — there is nothing to paste; setup creates the first one</div></div>" +
+            '<div style="margin-top:8px" class="asof">this server has no spaces yet (checked live against the server just now' +
+            '<span class="api-crumb"> · GET /v1/admin/tenants</span>) — there is nothing to paste; setup creates the first one</div></div>' +
           '<div class="et-actions">' +
             '<button class="primary" id="home-setup">Set up Verity — about 5 minutes</button>' +
           "</div>" +
@@ -104,10 +104,10 @@
       // State C — prod admin plane locked: no wizard until a token exists.
       host.innerHTML =
         '<div class="empty-teach sp-a">' +
-          '<div class="et-title">Enter your admin token to list tenants and run setup</div>' +
+          '<div class="et-title">Enter your admin token to list spaces and run setup</div>' +
           '<div class="et-body">This server’s admin plane is locked (a good sign in production). Set the ' +
-            "<b>admin token</b> in the session bar above to see this server’s spaces by name. Already know your " +
-            "tenant id? Paste it in the bar — every screen loads itself once it’s set. The token stays in this " +
+            "<b>admin token</b> in the session bar above to see this server’s spaces (tenants) by name. Already know your " +
+            "space id? Paste it in the bar — every screen loads itself once it’s set. The token stays in this " +
             "tab only, never on disk.</div>" +
         "</div>";
       return;
@@ -117,13 +117,13 @@
     // today's teach card, unchanged.
     host.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Connect to a tenant to see what needs you</div>' +
-        '<div class="et-body">Verity scopes everything to one <b>tenant</b>. Give the console one, three ways:' +
+        '<div class="et-title">Connect to a space to see what needs you</div>' +
+        '<div class="et-body">Verity scopes everything to one <b>space (tenant)</b>. Give the console one, three ways:' +
           "<ul style=\"margin:8px 0 0 18px;color:var(--dim)\">" +
-          "<li><b>Paste a tenant id</b> into the session bar above and press Enter.</li>" +
-          "<li><b>Mint a scope handle</b> — the tenant fills in automatically.</li>" +
-          "<li><b>Decode a handle</b> you already hold on the Scope Inspector.</li></ul>" +
-          '<div style="margin-top:8px">Running locally? <span class="ref">verity-cli dev</span> prints your dev tenant and a ready-made handle.</div>' +
+          "<li><b>Paste a space id</b> into the session bar above and press Enter.</li>" +
+          "<li><b>Mint a scope handle</b> — the signed key an agent reads with; the space fills in automatically.</li>" +
+          "<li><b>Decode a scope handle</b> you already hold on the Scope Inspector.</li></ul>" +
+          '<div style="margin-top:8px">Running locally? <span class="ref">verity-cli dev</span> prints your dev space and a ready-made scope handle.</div>' +
           (dir.status === "error" ? '<div class="asof" style="margin-top:6px">couldn’t list this server’s spaces: ' + V.esc(dir.error.slice(0, 120)) + "</div>" : "") +
         "</div>" +
         '<div class="et-actions">' +
@@ -143,15 +143,20 @@
   function dirLookup(dir, tenant) {
     if (dir.status !== "ok") return "unknown";
     if (dir.tenants.some(function (x) { return x.tenant_id === tenant; })) return "listed";
-    var total = typeof dir.total === "number" ? dir.total : dir.tenants.length;
-    return total > dir.tenants.length ? "unlisted" : "ghost";
+    // Off the (possibly truncated) directory page: resolve DEFINITIVELY via
+    // the point lookup instead of guessing from page arithmetic. Memoized;
+    // re-emits onTenantDir when it lands, which re-runs this panel's derive.
+    V.confirmTenantById(tenant);
+    var c = V.confirmedTenant(tenant);
+    if (!c) return "unknown"; // in flight — neutral, never a premature ghost
+    return c.state === "confirmed" ? "unlisted" : c.state === "ghost" ? "ghost" : "unknown";
   }
 
   function renderGhost(host, tenant) {
     host.innerHTML =
       '<div class="empty-teach sp-a" style="border-left-color:var(--red)">' +
         '<div class="et-title">This space doesn’t exist on this server</div>' +
-        '<div class="et-body">The id <span class="ref">' + V.esc(tenant) + "</span> is not in this server’s tenant " +
+        '<div class="et-body">The id <span class="ref">' + V.esc(tenant) + "</span> is not in this server’s space " +
           "list (confirmed against the server just now). A made-up or stale id would otherwise show a permanently empty console that looks " +
           "plausible — so this is a loud stop, never a green all-clear. Pick a real space in the bar above, or set " +
           "one up.</div>" +
@@ -433,13 +438,6 @@
     var allClear = results.every(function (c) { return c.tone === "ok"; });
     var anyFail = results.some(function (c) { return c.tone === "fail"; });
 
-    // Absent from the truncated picker page but within the server's total:
-    // a dim disclosure, never a red stop (the probes above answered live).
-    var unlistedNote = dirLookup(dir, tenant) === "unlisted"
-      ? '<span class="asof">this space is older than the newest ' + dir.tenants.length +
-        " this picker lists (this server has " + dir.total + ") — loaded by id</span>"
-      : "";
-
     var grid = results.map(cardHtml).join("");
     var banner = "";
     if (allClear) {
@@ -455,8 +453,9 @@
       '<div class="toolbar">' +
         V.stateChip(anyFail ? "fail" : allClear ? "ok" : "attn",
           anyFail ? "some checks failed" : allClear ? "all clear" : "decisions waiting") +
+        // No off-page "loaded by id" note here — the top bar already carries it
+        // on every screen (the cold reviewer flagged the per-panel repeats).
         '<span class="asof">counts come from the same queries as the panels they open &middot; ' + asofNow() + "</span>" +
-        unlistedNote +
         '<span class="spacer"></span>' +
         '<button id="home-refresh">Refresh</button>' +
       "</div>" +

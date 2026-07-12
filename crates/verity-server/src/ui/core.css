@@ -245,6 +245,19 @@ a:hover { color: var(--accent); text-decoration: underline; }
 /* raw machine text: NEVER primary — small, mono, dim */
 .ref { font-size: var(--fs-xs); color: var(--faint); word-break: break-all; }
 
+/* ---------------------------------------- developer plumbing, hidden by default */
+/* Endpoint paths, HTTP status codes, {id} templates, repo doc paths — the
+   "how it works under the hood" crumbs. Hidden until the operator flips
+   "show API details" (Verity.setApiDetails → body.api-details; see core.js).
+   Wrap inline crumbs in <span class="api-crumb">; whole developer lines/cards
+   in <div class="api-crumb-block">. Muted + mono when shown, so plain copy
+   still leads. */
+.api-crumb { display: none; }
+.api-crumb-block { display: none; }
+body.api-details .api-crumb { display: inline; }
+body.api-details .api-crumb-block { display: block; }
+.api-crumb, .api-crumb-block { color: var(--faint); font-size: var(--fs-xs); }
+
 /* ---------------------------------------- v2 · empty state that teaches */
 /* Species (UI-ACTIONS N7): .sp-a nothing-yet → teach + button;
    .sp-b filtered-by-scope → forensic CTA, never a fill-it button;

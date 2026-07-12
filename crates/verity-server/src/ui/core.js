@@ -57,6 +57,29 @@ function setAdminToken(t) {
   else sessionStorage.removeItem(ADMIN_KEY);
 }
 
+/* -------------------------------------------------- "show API details" pref */
+/* A persisted UI preference (localStorage — it is a display choice, not a
+   secret) that reveals developer plumbing hidden by default: exact endpoint
+   paths, HTTP status codes, un-substituted {id} templates, repo doc paths.
+   Panels mark that copy with class="api-crumb"; core.css hides it unless
+   body.api-details is set. Default OFF — a first-time operator never sees a
+   raw route. Applied at boot and on every change. */
+const API_DETAILS_KEY = "verity.ui.apiDetails";
+function apiDetails() {
+  try { return localStorage.getItem(API_DETAILS_KEY) === "1"; } catch (e) { return false; }
+}
+function setApiDetails(on) {
+  on = !!on;
+  try {
+    if (on) localStorage.setItem(API_DETAILS_KEY, "1");
+    else localStorage.removeItem(API_DETAILS_KEY);
+  } catch (e) { /* private mode — fall back to this session only */ }
+  applyApiDetails();
+}
+function applyApiDetails() {
+  if (document.body) document.body.classList.toggle("api-details", apiDetails());
+}
+
 /* ---------------------------------------------------------- api() wrapper */
 /**
  * api(path, opts?) → parsed JSON (or null on empty body).
@@ -368,6 +391,9 @@ function reload(id) {
  * registered panel — the home panel registers first by assembly order).
  */
 function boot() {
+  // Reflect the persisted "show API details" preference before first paint so
+  // developer crumbs are hidden (or shown) from the very first panel.
+  applyApiDetails();
   // Adopt the tenant BEFORE first show so autoload fires (#3):
   // 1. `?tenant=<uuid>` deep link (what the CLI/demo print) wins;
   // 2. else the tenant remembered in localStorage from a previous visit.
@@ -585,9 +611,9 @@ function _buildCreateTenantDialog() {
       '<div class="note" style="margin-top:0"><b>The company that owns this memory space — self-hosting ' +
         "means that's you, and there's exactly one.</b></div>" +
       '<details class="note"><summary style="cursor:pointer">what&rsquo;s this?</summary>' +
-        '<div style="margin-top:6px">&#9432; You are the <b>tenant</b>; your customers are <b>entities</b> ' +
+        '<div style="margin-top:6px">&#9432; You are the <b>space (tenant)</b>; your customers are <b>entities</b> ' +
         "&mdash; things memories are <i>about</i>, scoped inside your space. Customers never get their own " +
-        "tenant.</div></details>" +
+        "space.</div></details>" +
       '<div class="row" style="margin-top:12px">' +
         '<div><label for="newtenant-name">Space name</label>' +
           '<input type="text" id="newtenant-name" placeholder="Acme Logistics" autocomplete="off"></div>' +
@@ -611,7 +637,7 @@ function _buildCreateTenantDialog() {
     try {
       const res = await api("/v1/admin/tenants", { json: { name }, admin: true });
       const id = res && res.tenant_id;
-      if (!id) throw new Error("the server returned no tenant_id");
+      if (!id) throw new Error("the server returned no space id");
       await refreshTenantDir();
       // Belt-and-suspenders: whatever the page ordering, the tenant the user
       // JUST created must be in the dropdown. Prepend if the refresh missed it.
@@ -733,7 +759,7 @@ function _epkLev(a, b) {
    change it there first. */
 const _EPK_MODES = {
   scope: {
-    teach: (t) => "new — no memory carries this tag yet. A handle limited to it sees nothing until data arrives tagged " + t + ".",
+    teach: (t) => "new — no memory carries this tag yet. A scope handle limited to it sees nothing until data arrives tagged " + t + ".",
     warn: "this limit includes a tag with 0 memories — reads through this handle will return nothing for it until data carries it.",
     emptyHide: "No entities yet — nothing to limit to. Entity tags appear as your data carries them (like account:acme).",
     reveal: "limit to a future entity anyway →",
@@ -1347,21 +1373,21 @@ function _buildMintDialog() {
         "can see. Everything below narrows it; nothing widens it. Leave <b>who</b> empty and the handle can see " +
         "<b>nothing</b> — Verity fails closed, on purpose.</div>" +
       '<div class="row" style="margin-top:12px">' +
-        '<div><label for="mint-tenant">tenant <span style="font-weight:400">(the company that owns this space — that&rsquo;s you)</span></label>' +
+        '<div><label for="mint-tenant">space <span style="font-weight:400">(the company that owns this space — that&rsquo;s you)</span></label>' +
           '<select class="field" id="mint-tenant-pick" style="display:none;margin-bottom:6px"></select>' +
-          '<input type="text" id="mint-tenant" placeholder="tenant id (uuid)" spellcheck="false">' +
+          '<input type="text" id="mint-tenant" placeholder="space id (uuid)" spellcheck="false">' +
           '<div class="asof" id="mint-tenant-name" style="margin-top:3px"></div></div>' +
       "</div>" +
       '<div class="row" style="margin-top:10px">' +
         '<div><label for="mint-subject">who — as a person <span style="font-weight:400">(resolved server-side when identity is live)</span></label>' +
           '<input type="text" id="mint-subject" placeholder="user:alice@corp.example" spellcheck="false"></div>' +
-        '<div><label for="mint-principals">or — raw principal tokens <span style="font-weight:400">(dev mode; comma-separated)</span></label>' +
+        '<div><label for="mint-principals">or — raw key (principal) tokens <span style="font-weight:400">(dev mode; comma-separated)</span></label>' +
           '<input type="text" id="mint-principals" placeholder="e.g. 11, 1001" spellcheck="false"></div>' +
       "</div>" +
       '<div class="row" style="margin-top:10px">' +
         '<div><label>limit to entities <span style="font-weight:400">(optional)</span></label>' +
           '<div id="mint-entities"></div></div>' +
-        '<div class="tight" style="min-width:170px"><label for="mint-conf">confidentiality ceiling</label>' +
+        '<div class="tight" style="min-width:170px"><label for="mint-conf">confidentiality ceiling <span style="font-weight:400">(the highest confidentiality this handle may ever see)</span></label>' +
           '<select class="field" id="mint-conf">' +
             '<option value="public">public</option>' +
             '<option value="internal" selected>internal</option>' +
@@ -1412,13 +1438,13 @@ function _buildMintDialog() {
     clearErr("mint-err");
     $("mint-result").innerHTML = "";
     const t = $("mint-tenant").value.trim();
-    if (!t) { showErr("mint-err", new Error("tenant is required — paste a tenant id (uuid)")); return; }
+    if (!t) { showErr("mint-err", new Error("space is required — paste a space id (uuid)")); return; }
     // Refuse a malformed id in plain language BEFORE the server's serde
     // error can (it says things like "invalid character `m` at column 26").
     if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(t)) {
       showErr("mint-err", new Error(
-        "that doesn't look like a tenant id — it's a uuid like 019f53b8-6f10-71b2-b308-83a025f1cf67. " +
-        "Find yours where the server/demo printed it, or in the tenant box at the top of this page."));
+        "that doesn't look like a space id — it's a uuid like 019f53b8-6f10-71b2-b308-83a025f1cf67. " +
+        "Find yours where the server/demo printed it, or in the space box at the top of this page."));
       return;
     }
     const body = { tenant_id: t, actor_azp: "console:mint" };
@@ -1438,7 +1464,7 @@ function _buildMintDialog() {
     if (principalsRaw) {
       const toks = principalsRaw.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
       if (toks.some((n) => !Number.isInteger(n))) {
-        showErr("mint-err", new Error("principal tokens must be integers (comma-separated), e.g. 11, 1001"));
+        showErr("mint-err", new Error("key tokens must be integers (comma-separated), e.g. 11, 1001"));
         return;
       }
       body.principals = toks;
@@ -1469,7 +1495,7 @@ function _buildMintDialog() {
         throw e;
       }
       const handle = res && res.scope_handle;
-      if (!handle) throw new Error("mint returned no scope_handle");
+      if (!handle) throw new Error("mint returned no scope handle");
       let claims = null;
       try { claims = decodeHandle(handle); } catch (e) { /* still usable */ }
       setTenant(t);
@@ -1478,7 +1504,7 @@ function _buildMintDialog() {
         '<div class="card" style="margin-top:12px;margin-bottom:0">' +
           '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
             stateChip("ok", "minted") +
-            (seesNothing ? stateChip("attn", "sees nothing — no principals were named") : "") +
+            (seesNothing ? stateChip("attn", "sees nothing — no keys were named") : "") +
             '<span class="asof">shown once — the console does not store handles</span>' +
           "</div>" +
           '<textarea id="mint-handle-out" readonly style="margin-top:8px;min-height:74px">' + esc(handle) + "</textarea>" +
@@ -1524,14 +1550,21 @@ function _mintSyncTenantUi() {
     const n = tenantName(t);
     if (n) {
       nameEl.innerHTML = "&#10003; " + esc(n);
-    } else if (dir.total > dir.tenants.length) {
-      // The directory page is truncated — absence from it proves nothing.
-      // A neutral note, never a red "doesn't exist" false positive.
-      nameEl.innerHTML = '<span style="color:var(--dim)">this space isn&rsquo;t in the newest ' +
-        dir.tenants.length + " the picker lists (this server has " + dir.total +
-        " spaces) — loaded by its id.</span>";
     } else {
-      nameEl.innerHTML = '<span style="color:var(--red)">this space doesn&rsquo;t exist on this server — pick a real one, or set one up</span>';
+      // Off the (possibly truncated) directory page: resolve DEFINITIVELY via
+      // the point lookup instead of a page-arithmetic guess. Memoized; kick a
+      // re-check of this field when the async confirm lands.
+      const c = confirmedTenant(t);
+      if (!c) {
+        confirmTenantById(t).then(() => { if ($("mint-tenant") && $("mint-tenant").value.trim() === t) _mintSyncTenantUi(); });
+        nameEl.innerHTML = '<span style="color:var(--dim)">confirming this space by its id&hellip;</span>';
+      } else if (c.state === "confirmed") {
+        nameEl.innerHTML = "&#10003; " + esc(c.name || "(unnamed)") + ' <span style="color:var(--dim)">(confirmed by id)</span>';
+      } else if (c.state === "ghost") {
+        nameEl.innerHTML = '<span style="color:var(--red)">this space doesn&rsquo;t exist on this server — pick a real one, or set one up</span>';
+      } else {
+        nameEl.innerHTML = '<span style="color:var(--dim)">couldn&rsquo;t confirm this space by its id just now</span>';
+      }
     }
   } else {
     nameEl.textContent = "";
@@ -1559,7 +1592,7 @@ function openMint(prefill) {
     if (dir.status === "ok" && dir.tenants.length) {
       pick.innerHTML = dir.tenants.map((t) =>
         '<option value="' + esc(t.tenant_id) + '">' + esc(t.name || "(unnamed)") + "</option>"
-      ).join("") + '<option value="">paste a tenant id&hellip;</option>';
+      ).join("") + '<option value="">paste a space id&hellip;</option>';
       pick.style.display = "";
       const known = dir.tenants.some((t) => t.tenant_id === tin.value.trim());
       pick.value = known ? tin.value.trim() : "";
@@ -1850,7 +1883,7 @@ function principalPicker(mountEl, opts) {
         '<div class="empty-teach sp-a" style="margin:2px 0">' +
           '<div class="et-title">' + esc(opts.emptyTitle || "No people or groups on record yet") + "</div>" +
           '<div class="et-body">' + (opts.emptyBody ||
-            "This tenant&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
+            "This space&rsquo;s directory is empty &mdash; an empty list is an honest answer, not an error. " +
             "Create people and groups in <b>People &amp; groups</b>.") + "</div>" +
           '<div class="et-actions"><button type="button">' +
             esc(opts.emptyAction || "Open People & groups") + "</button></div>" +
@@ -1860,7 +1893,7 @@ function principalPicker(mountEl, opts) {
     } else if (st.state === "loading") {
       list.innerHTML = stateChip("wait", "loading names…");
     } else { // idle — nothing asked for yet; never fake a spinner
-      list.innerHTML = '<span class="asof">directory not loaded yet — it loads once a tenant is known</span>';
+      list.innerHTML = '<span class="asof">directory not loaded yet — it loads once a space is known</span>';
     }
   }
 
@@ -2004,6 +2037,8 @@ const Verity = {
   err: showErr, clearErr,
   // admin token
   getAdminToken, setAdminToken,
+  // "show API details" UI preference (developer-plumbing toggle)
+  apiDetails, setApiDetails,
   // badges + humane builders
   badge, provenanceBadge, confBadge, trustBadge, statusBadge,
   entityBadges, tagDerivationBadge, kindBadge, CONF_NAMES,

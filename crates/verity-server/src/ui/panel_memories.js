@@ -91,13 +91,13 @@
   function visiblePhrase(r) {
     if (r.visible_to == null) {
       return r.kind === "fact"
-        ? "visible to the whole space at read time — structured facts carry no per-row visibility list (jargon: L1)"
-        : "visibility not recorded";
+        ? "who can see it (visibility): the whole space at read time — the structured current-truth store (L1) carries no per-row visibility list"
+        : "who can see it (visibility): not recorded";
     }
-    if (r.visible_to === 0) return "visible to nobody — fail closed";
-    var noun = r.visible_to === 1 ? "person or group" : "people & groups";
+    if (r.visible_to === 0) return "who can see it (visibility): nobody — fail closed";
+    var noun = r.visible_to === 1 ? "key" : "keys";
     if (!visGlossShown) {
-      noun += r.visible_to === 1 ? " (a principal)" : " (principals)";
+      noun += r.visible_to === 1 ? " (a principal)" : " (principals — the keys and shared keys that read)";
       visGlossShown = true;
     }
     return "visible to " + r.visible_to + " " + noun;
@@ -114,7 +114,7 @@
       host.innerHTML =
         /* ---- toolbar ---- */
         '<div class="toolbar">' +
-          '<span id="mem-state">' + V.stateChip("off", "waiting for a tenant") + '</span>' +
+          '<span id="mem-state">' + V.stateChip("off", "waiting for a space") + '</span>' +
           '<span class="asof" id="mem-asof"></span>' +
           '<span class="spacer"></span>' +
           '<button id="mem-refresh">Refresh</button>' +
@@ -142,7 +142,7 @@
             '<input type="text" id="mem-f-q" placeholder="substring of content / value / summary&hellip;" autocomplete="off"></div>' +
           '<div class="tight"><label class="checkline" style="margin-bottom:7px" ' +
               'title="replaced rows keep their valid_to + supersession link — Verity invalidates, it never deletes">' +
-            '<input type="checkbox" id="mem-f-sup"> show replaced values too &mdash; bi-temporal history, never deleted</label></div>' +
+            '<input type="checkbox" id="mem-f-sup"> show replaced values too &mdash; the full history of what changed and when (bi-temporal), never deleted</label></div>' +
           '<div class="tight"><button id="mem-f-clear">Clear</button></div>' +
         '</div>' +
 
@@ -268,7 +268,7 @@
         // The server's serde text is honest but unreadable — translate it,
         // keep the raw refusal dimmed beneath.
         var box = el("mem-err");
-        box.innerHTML = "This tenant id isn't valid — Verity tenant ids are UUIDs " +
+        box.innerHTML = "This space (tenant) id isn't valid — Verity space ids are UUIDs " +
           "(they look like 019f53b8-…). Pick a real space in the session bar above." +
           '<div class="ref" style="margin-top:4px">' + V.esc(msg) + "</div>";
         box.classList.add("on");
@@ -491,9 +491,10 @@
       '</div>';
     }).join('<div style="color:var(--faint);padding-left:14px">&darr; replaced by</div>');
     return steps +
-      '<div class="note">old rows keep <code>valid_to</code>' +
-      (full.kind === "fact" ? ' + <code>superseded_by</code>' : '') +
-      ' — invalidated, never deleted (hard purge is the crypto-shredding pipeline only).' +
+      '<div class="note">old rows are stamped with the time they stopped being true and a link to the row that replaced them' +
+      '<span class="api-crumb"> · <code>valid_to</code>' +
+      (full.kind === "fact" ? ' + <code>superseded_by</code>' : '') + '</span>' +
+      ' — invalidated, never deleted (hard purge only ever happens through the crypto-shredding pipeline).' +
       (capped ? ' History window shows the newest ' + HISTORY_WINDOW + ' rows of this source; older versions exist beyond it.' : '') +
       '</div>';
   }

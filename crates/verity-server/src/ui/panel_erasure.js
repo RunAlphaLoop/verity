@@ -135,9 +135,9 @@
   // tenant directory has no name for it (never fabricate a name).
   function tenantLabel(id) {
     var name = V.tenantName(id);
-    if (!name) return "tenant " + V.refSpan(id);
+    if (!name) return "space " + V.refSpan(id);
     var short = id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id;
-    return "<b>" + V.esc(name) + "</b> " + V.refSpan("(tenant id " + short + ")");
+    return "<b>" + V.esc(name) + "</b> " + V.refSpan("(space id " + short + ")");
   }
 
   /* ------------------------------------------------------------- state */
@@ -203,7 +203,8 @@
           '<div class="et-title">Unlock with an admin token</div>' +
           '<div class="et-body">Erasing data is permanent, so this screen only builds its controls ' +
             "when an admin token is set — a scope handle can never reach it. That is a structural gate, " +
-            "not a hidden button. The token lives in this tab only (sessionStorage), never on disk. " +
+            "not a hidden button. The token lives in this tab only" +
+            '<span class="api-crumb"> (sessionStorage)</span>, never on disk. ' +
             "On a dev server that enforces no token, any value unlocks it — that is dev mode, " +
             "disclosed, not security.</div>" +
           '<div class="et-actions"><button class="primary" id="er-focus-token">Set the admin token</button></div>' +
@@ -216,13 +217,13 @@
     }
 
     if (!tenant) {
-      el("er-state").innerHTML = V.stateChip("off", "no tenant");
+      el("er-state").innerHTML = V.stateChip("off", "no space");
       el("er-asof").textContent = "";
       body.innerHTML =
         '<div class="empty-teach sp-a">' +
-          '<div class="et-title">Pick a tenant</div>' +
-          '<div class="et-body">Erasure, export, and the file list are all per-tenant. ' +
-            "Paste a tenant id in the session bar, or mint a scope handle to adopt one.</div>" +
+          '<div class="et-title">Pick a space (tenant)</div>' +
+          '<div class="et-body">Erasure, export, and the file list are all per-space. ' +
+            "Paste a space id in the session bar, or mint a scope handle to adopt one.</div>" +
           '<div class="et-actions"><button class="primary" id="er-mint">Mint a scope handle</button></div>' +
         "</div>";
       el("er-mint").onclick = function () { V.openMint(); };
@@ -242,7 +243,7 @@
 
       /* Step 1 — who */
       '<div class="card">' +
-        '<h2>Step 1 · Who is this about? <span class="sub">exact-string match · subject / entity / media_ids</span></h2>' +
+        '<h2>Step 1 · Who is this about? <span class="sub">exact-string match<span class="api-crumb"> · subject / entity / media_ids</span></span></h2>' +
         '<div class="note">Fill in at least one. Matching is <b>exact</b> — a nickname, alias, or different ' +
           "casing will not be found, so double-check the identifier before acting on the counts. " +
           "For any hand-typed identifier, run the preview first: <b>0 everywhere usually means a mistyped id</b>, not clean data.</div>" +
@@ -268,7 +269,7 @@
 
       /* Step 2 — preview */
       '<div class="card">' +
-        '<h2>Step 2 · Preview what would be removed <span class="sub">POST /v1/admin/erasure/preview · true dry run</span></h2>' +
+        '<h2>Step 2 · Preview what would be removed <span class="sub">true dry run<span class="api-crumb"> · POST /v1/admin/erasure/preview</span></span></h2>' +
         '<div class="note">The server walks <b>exactly</b> what an erasure would delete, then rolls the whole ' +
           "thing back — <b>previewing removes nothing</b>, and the counts cannot drift from a real erasure " +
           "because preview and erase share one code path.</div>" +
@@ -282,7 +283,7 @@
 
       /* Step 3 — erase */
       '<div class="card">' +
-        '<h2>Step 3 · Erase permanently <span class="sub">POST /v1/admin/erasure · crypto-shred · no undo</span></h2>' +
+        '<h2>Step 3 · Erase permanently <span class="sub">crypto-shred · no undo<span class="api-crumb"> · POST /v1/admin/erasure</span></span></h2>' +
         '<div class="note">Hard-deletes everything the preview shows and destroys the keys, in one transaction. ' +
           "There is <b>no undo</b> — unlike <i>Take back one item</i> below, which is reversible. " +
           "If the permissions engine is configured and the target is a person, their access grants are deleted " +
@@ -298,7 +299,7 @@
 
       /* DSAR export */
       '<div class="card">' +
-        '<h2>Export instead of erasing <span class="sub">GET /v1/admin/dsar/export · the export self-audits</span></h2>' +
+        '<h2>Export instead of erasing <span class="sub">the export writes its own row in the access log<span class="api-crumb"> · GET /v1/admin/dsar/export</span></span></h2>' +
         '<div class="note">One JSON bundle of what is on record about the <b>person</b> — their conversations / events, ' +
           "the search snippets made from them, the profile facts derived from those events, their actions, access-log rows, " +
           "and proposed lessons — for a data-subject access request. The export runs under admin authority, so it includes " +
@@ -314,10 +315,10 @@
 
       /* forget — reversible */
       '<div class="card">' +
-        '<h2>Take back one item <span class="sub">POST /v1/forget · reversible invalidation · scope-token, not admin</span></h2>' +
+        '<h2>Take back one item <span class="sub">reversible invalidation · runs under a scope handle, not admin<span class="api-crumb"> · POST /v1/forget</span></span></h2>' +
         '<div class="note">' + V.badge("reversible — not a delete", "b-inferred") +
           " Marks a single item expired instead of deleting it — history is kept and it can be reversed. " +
-          "It runs under a <b>scope handle</b> (the tenant comes from the signed handle, never this page), " +
+          "It runs under a <b>scope handle</b> (the space comes from the signed handle, never this page), " +
           "so paste the handle it should run under — mint one with “+ Mint a scope handle” in the top bar " +
           "if you don’t have one. Copy the item id from the Memories panel (every conversation and snippet " +
           "shows its id).</div>" +
@@ -454,7 +455,7 @@
       if (!t.any) {
         // Mirror the server's own 422 refusal instead of firing a doomed POST.
         V.err("er-preview-err", new Error(
-          "nothing to preview — fill in a person, a record, or at least one file in step 1 (the server refuses an empty target with 422)"));
+          "nothing to preview — fill in a person, a record, or at least one file in step 1 (the server refuses an empty target)"));
         return;
       }
       out.innerHTML = '<div class="note">running the dry run… (removes nothing)</div>';
@@ -518,7 +519,7 @@
       var c = confirmTarget();
       if (!t.any || !c) {
         V.err("er-run-err", new Error(
-          "nothing to erase — fill in a person, a record, or at least one file in step 1 (the server refuses an empty target with 422)"));
+          "nothing to erase — fill in a person, a record, or at least one file in step 1 (the server refuses an empty target)"));
         return;
       }
       var previewMatches = lastPreview.at > 0 && lastPreview.key === JSON.stringify(t.body);
@@ -702,8 +703,9 @@
               '<tr><td>access-log rows ' + V.refSpan("audit_log") + '</td><td class="num">' + counts.audit_log + "</td></tr>" +
               '<tr><td>proposed lessons ' + V.refSpan("knowledge") + '</td><td class="num">' + counts.knowledge + "</td></tr>" +
             "</tbody></table></div>" +
-            '<div class="note" style="margin-top:6px">Profile facts are not included in this build’s export — ' +
-              "erase covers them, export does not (yet).</div>" +
+            '<div class="note" style="margin-top:6px">Profile facts are included in the bundle above — ' +
+              "the export runs under admin authority, so every fact attributable to the person is carried, " +
+              "regardless of who could normally see it.</div>" +
             jsonDetails("conversations / events", counts.episodes, b.episodes || []) +
             jsonDetails("search snippets", counts.chunks, b.chunks || []) +
             jsonDetails("recorded actions", counts.actions, b.actions || []) +
@@ -732,7 +734,7 @@
       var kind = el("er-fg-kind").value;
       var id = el("er-fg-id").value.trim();
       var reason = el("er-fg-reason").value.trim();
-      if (!handle) { V.err("er-fg-err", new Error("paste the scope handle to run under — the tenant comes from the signed handle")); return; }
+      if (!handle) { V.err("er-fg-err", new Error("paste the scope handle to run under — the space comes from the signed handle")); return; }
       if (!id) { V.err("er-fg-err", new Error("enter the item id to take back")); return; }
       if (!reason) { V.err("er-fg-err", new Error("a reason is required — it is recorded on the invalidation")); return; }
       var btn = el("er-fg-run");
@@ -771,7 +773,7 @@
       el("er-asof").textContent = "checked " + nowStamp();
       if (!files.length) {
         out.innerHTML =
-          '<div class="note">No files on record for this tenant — nothing to name in an erasure, ' +
+          '<div class="note">No files on record for this space — nothing to name in an erasure, ' +
           "and that is not an error. Files only ever purge when named here.</div>";
         return;
       }

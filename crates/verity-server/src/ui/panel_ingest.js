@@ -150,14 +150,14 @@
     el("ing-cards").innerHTML =
       /* ---------------------------------------- step 1 · who can see it */
       '<div class="card">' +
-        '<h2>1 · Who can see this? <span class="sub">GET /v1/admin/principals · POST /v1/scopes</span></h2>' +
+        '<h2>1 · Who can see this? <span class="sub">required<span class="api-crumb"> · GET /v1/admin/principals · POST /v1/scopes</span></span></h2>' +
         '<div class="note" style="margin-top:0">Everything you add is written under a <b>scope handle for writing</b> — a short-lived signed pass naming exactly who may recall it later. ' +
           "No handle means no audience, and Verity <b>refuses rather than guesses</b>. There is no “everyone” option, here or anywhere.</div>" +
         '<div id="ing-pass-line" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 4px"></div>' +
-        '<div id="ing-pass-meta" class="dc-meta" style="margin-top:2px"></div>' +
+        '<div id="ing-pass-meta" class="dc-meta api-crumb-block" style="margin-top:2px"></div>' +
         '<div style="margin-top:10px">' +
           '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">' +
-            '<label style="margin-bottom:0">pick viewers — people &amp; groups on record for this space</label>' +
+            '<label style="margin-bottom:0">pick viewers — people &amp; groups on record for this space (tenant)</label>' +
             '<span class="spacer" style="flex:1"></span>' +
             '<button id="ing-dir-refresh">Refresh names</button>' +
           "</div>" +
@@ -180,7 +180,7 @@
 
       /* ---------------------------------------------- step 2 · the memory */
       '<div class="card">' +
-        '<h2>2 · What to add <span class="sub">POST /v1/episodes · POST /v1/files</span></h2>' +
+        '<h2>2 · What to add <span class="sub api-crumb">POST /v1/episodes · POST /v1/files</span></h2>' +
         '<div class="toolbar" style="margin-top:2px">' +
           '<span class="seg">' +
             '<button id="ing-tab-text" class="on">Paste text</button>' +
@@ -271,9 +271,9 @@
     if (el("ing-cards")) el("ing-cards").style.display = "none";
     el("ing-nota").innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to start adding memory</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above (<span class="mono">verity-cli dev</span> prints one), ' +
-          "or mint a scope handle — the console adopts its tenant automatically and this screen loads itself.</div>" +
+        '<div class="et-title">Pick a space to start adding memory</div>' +
+        '<div class="et-body">Paste a space id<span class="api-crumb"> (tenant id)</span> in the session bar above (<span class="mono">verity-cli dev</span> prints one), ' +
+          "or mint a scope handle — the console adopts its space automatically and this screen loads itself.</div>" +
         '<div class="et-actions"><button class="primary" id="ing-nota-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("ing-nota-mint").onclick = function () { V.openMint(); };
@@ -310,7 +310,7 @@
 
   async function mintPass() {
     V.clearErr("ing-pass-err");
-    if (!tenantNow) { V.err("ing-pass-err", new Error("no tenant set — paste one in the session bar first")); return; }
+    if (!tenantNow) { V.err("ing-pass-err", new Error("no space set — paste one in the session bar first")); return; }
     if (rawIsBad()) { V.err("ing-pass-err", new Error("raw viewer numbers must be integers, comma-separated — e.g. 1, 11")); return; }
     var toks = selectedTokens();
     if (!toks.length) {
@@ -319,7 +319,7 @@
       // the server and surfaces its 422 verbatim — that path stays open.)
       V.err("ing-pass-err", new Error(
         "no viewers selected — Verity refuses to guess an audience. Pick at least one name (or a raw viewer number). " +
-        "If you add without any handle, the server will refuse with a 422: that refusal is fail-closed working."
+        "If you add without any handle, the server refuses it outright: that refusal is fail-closed working."
       ));
       return;
     }
@@ -391,7 +391,7 @@
       bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle names <b>no viewers</b> — anything written under it is stored but can never be read by anyone. Pick viewers and mint again.</span>');
     } else if (pass.claims && pass.claims.tenant_id && tenantNow && pass.claims.tenant_id !== tenantNow) {
       bits.push(V.stateChip("attn", "different space"));
-      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle belongs to another space (tenant) — writes will land there, not here</span>');
+      bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">this handle belongs to another space — writes will land there, not here</span>');
     } else {
       bits.push(V.stateChip("ok", "write handle ready"));
       bits.push('<span style="color:var(--dim);font-size:var(--fs-sm)">' +
@@ -626,11 +626,12 @@
         '<div style="margin-top:8px">' + r.line + " Readable by " + viewers + (nameChips ? ":" : ".") +
           (nameChips ? '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">' + nameChips + "</div>" : "") +
         "</div>" +
-        '<div class="dc-meta" style="margin-top:8px">' + esc(r.endpoint) + " · " + esc(r.idLabel) + " " +
+        '<div class="dc-meta" style="margin-top:8px">' + esc(r.idLabel) + " " +
           (r.id != null ? '<span class="ref">' + esc(String(r.id)) + "</span>" : "—") +
           (r.filename ? ' · <span class="ref">' + esc(r.filename) + "</span>" : "") +
           extractionMeta +
           " · visibility inherited from the scope handle" +
+          '<span class="api-crumb"> · ' + esc(r.endpoint) + "</span>" +
         "</div>" +
         '<div class="actions" style="justify-content:flex-start;margin-top:10px">' +
           '<button class="good" id="ing-probe">Recall it now — open Scope Inspector</button>' +

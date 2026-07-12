@@ -126,7 +126,7 @@
     var name = PRINC && PRINC[t];
     if (name) return '<b>' + V.esc(name) + '</b> ' + V.refSpan("#" + t);
     return V.refSpan("#" + t) +
-      (PRINC ? ' <span class="refreshed">not in this tenant’s directory</span>'
+      (PRINC ? ' <span class="refreshed">not in this space’s key directory</span>'
              : ' <span class="refreshed">directory unavailable</span>');
   }
 
@@ -177,7 +177,7 @@
       build_hash: V.buildHash(),
       window_rows: rows.length,
       note: "Filtered window from GET /v1/admin/audit. Reading the audit is itself audited. " +
-            "principals_named comes from GET /v1/admin/principals at export time.",
+            "principals_named (named keys) comes from GET /v1/admin/principals at export time.",
       events: rows.map(rowToFlat),
     }, null, 2);
   }
@@ -252,10 +252,10 @@
       host.innerHTML =
         /* ---- toolbar: state + as-of + refresh/export ---- */
         '<div class="toolbar">' +
-          '<span id="au-state">' + V.stateChip("off", "waiting for a tenant") + '</span>' +
+          '<span id="au-state">' + V.stateChip("off", "waiting for a space") + '</span>' +
           '<span class="asof" id="au-asof"></span>' +
           '<span class="spacer"></span>' +
-          '<label class="checkline" title="plain re-read of GET /v1/admin/audit every 5 s — nothing touches the read path">' +
+          '<label class="checkline" title="plain re-read every 5 s — nothing touches the read path (GET /v1/admin/audit)">' +
             '<input type="checkbox" id="au-auto"> auto-refresh (5s)</label>' +
           '<button id="au-csv" title="CSV of the filtered window">Export CSV</button>' +
           '<button id="au-json" title="SIEM-shaped JSON of the filtered window">Export JSON</button>' +
@@ -376,9 +376,9 @@
   function renderNoTenant() {
     el("au-out").innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see its audit tail</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above, or mint a scope handle ' +
-          '&mdash; the audit loads by itself the moment a tenant is known. Every scoped read lands ' +
+        '<div class="et-title">Pick a space (tenant) to see its audit tail</div>' +
+        '<div class="et-body">Paste a space id in the session bar above, or mint a scope handle ' +
+          '&mdash; the audit loads by itself the moment a space is known. Every scoped read lands ' +
           'here as it happens; nothing is sampled or summarized away.</div>' +
         '<div class="et-actions"><button class="primary" id="au-mint">Mint a scope handle</button></div>' +
       '</div>';
@@ -621,14 +621,14 @@
 
         '<h2 style="margin-top:14px">What the reader was allowed to see</h2>' +
         '<div class="note" style="margin:0 0 6px">Read straight off this audit row — fields the row ' +
-          'does not carry are said so, never guessed. Names come from the tenant’s principal directory.</div>' +
+          'does not carry are said so, never guessed. Names come from the space’s key (principal) directory.</div>' +
         '<dl class="kv">' +
           '<dt>acting as</dt><dd>' + actorHtml(r, false) +
             // azp-only rows already show the app id via actorHtml — don't repeat it
             (r.actor_sub && r.actor_azp ? ' <span class="ref">azp: ' + V.esc(r.actor_azp) + '</span>' : '') + '</dd>' +
-          '<dt>held these keys (visibility tokens)</dt><dd>' + who + '</dd>' +
+          '<dt>held these keys — who could see it (visibility)</dt><dd>' + who + '</dd>' +
           '<dt>limited to entities</dt><dd>' + ents + '</dd>' +
-          '<dt>confidentiality ceiling</dt><dd>' + V.confBadge(r.confidentiality) + '</dd>' +
+          '<dt>confidentiality ceiling</dt><dd>' + V.confBadge(r.confidentiality) + ' <span class="note">the ceiling — the widest visibility this read could ever reach</span></dd>' +
           '<dt>purpose limits</dt><dd><span class="refreshed">none recorded — this server doesn’t record a purpose on reads yet</span></dd>' +
           '<dt>action</dt><dd>' + V.esc(verbPlain(r.verb)) + ' <span class="ref">' + V.esc(r.verb) + '</span></dd>' +
           '<dt>audit row</dt><dd>' + V.refSpan(r.id || "") + '</dd>' +
@@ -636,11 +636,11 @@
 
         (ids.length
           ? '<div class="actions" style="margin-top:12px;justify-content:flex-start">' +
-              '<button class="au-jump" title="Switches panels and carries the tenant. An audit row stores no signed vs_… handle, so live probes there still need you to paste or mint one — nothing is fabricated to make this button look live.">' +
+              '<button class="au-jump" title="Switches panels and carries the space. An audit row stores no signed scope handle, so live probes there still need you to paste or mint one — nothing is fabricated to make this button look live.">' +
               'Compare in the Scope Inspector &rarr;</button></div>'
           : '') +
-        '<div class="note" style="margin-top:6px"><em>Honest seam.</em> The jump carries only the tenant. ' +
-          'The row has no signed handle to decode — paste or mint one there to run live probes.</div>' +
+        '<div class="note" style="margin-top:6px"><em>Honest seam.</em> The jump carries only the space. ' +
+          'The row has no signed scope handle to decode — paste or mint one there to run live probes.</div>' +
       '</div>';
   }
 

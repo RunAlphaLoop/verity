@@ -122,7 +122,7 @@
     var out = [], seen = {};
     for (var i = 0; i < parts.length; i++) {
       if (!/^-?\d+$/.test(parts[i])) {
-        throw new Error('"' + parts[i] + '" is not an integer principal token — pick people from the directory or type token numbers');
+        throw new Error('"' + parts[i] + '" is not an integer key token — pick people from the directory or type token numbers');
       }
       var n = parseInt(parts[i], 10);
       if (!seen[n]) { seen[n] = true; out.push(n); }
@@ -165,7 +165,7 @@
       host.innerHTML =
         /* ---- toolbar ---- */
         '<div class="toolbar">' +
-          '<span id="q-state">' + V.stateChip("off", "waiting for a tenant") + '</span>' +
+          '<span id="q-state">' + V.stateChip("off", "waiting for a space") + '</span>' +
           '<span class="asof" id="q-asof"></span>' +
           '<span class="spacer"></span>' +
           '<button id="q-export" title="JSON export of the filtered items — full payloads, never truncated">Export JSON</button>' +
@@ -207,13 +207,13 @@
             'never a default. The original payload is preserved verbatim and the action is audited.' +
           '</div>' +
 
-          '<div style="margin-top:12px"><label>who can see it <span style="font-weight:400">(required — pick from this tenant&rsquo;s directory)</span></label>' +
+          '<div style="margin-top:12px"><label>who can see it (visibility) <span style="font-weight:400">(required — pick from this space&rsquo;s directory)</span></label>' +
             '<div id="qr-dir" style="margin:4px 0 6px"></div>' +
-            '<input type="text" id="qr-vis" placeholder="principal tokens, e.g. 7, 9 (picking names above fills this)" spellcheck="false"></div>' +
+            '<input type="text" id="qr-vis" placeholder="key (principal) token numbers, e.g. 7, 9 (picking names above fills this)" spellcheck="false"></div>' +
           '<label class="checkline" style="margin-top:6px"><input type="checkbox" id="qr-vis-empty">' +
             'I mean <b>nobody</b> can see it &mdash; fail-closed: this writes memory no one can read</label>' +
 
-          '<div style="margin-top:10px"><label>confidentiality ceiling <span style="font-weight:400">(required — there is no default)</span></label>' +
+          '<div style="margin-top:10px"><label>confidentiality ceiling <span style="font-weight:400">(the ceiling — the widest visibility this record may ever grant; required — there is no default)</span></label>' +
             '<select class="field" id="qr-conf">' +
               '<option value="">— choose —</option>' +
               '<option value="Public">public</option>' +
@@ -226,7 +226,7 @@
           '<div style="margin-top:10px"><label>entity tags for the corrected record <span style="font-weight:400">(optional)</span></label>' +
             '<div id="qr-tags"></div></div>' +
           '<div style="margin-top:10px"><label>corrected text extraction <span style="font-weight:400">(optional)</span></label>' +
-            '<textarea id="qr-content" placeholder="Only if the text lives somewhere the parser doesn\'t know. Blank = use the payload\'s own text. Re-ingest never invents content — a payload with nothing ingestible is refused (422)."></textarea></div>' +
+            '<textarea id="qr-content" placeholder="Only if the text lives somewhere the parser doesn\'t know. Blank = use the payload\'s own text. Re-ingest never invents content — a payload with nothing ingestible is refused."></textarea></div>' +
           '<div style="margin-top:10px"><label>note for the record <span style="font-weight:400">(optional — stored with the audit row)</span></label>' +
             '<input type="text" id="qr-note" placeholder="why this mapping is correct"></div>' +
 
@@ -317,11 +317,11 @@
   function renderNoTenant() {
     el("q-out").innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a tenant to see what it refused</div>' +
-        '<div class="et-body">Paste a tenant id in the session bar above &mdash; the queue loads by ' +
-          'itself the moment a tenant is known. Anything Verity refused to index (because it could not ' +
-          'verify who should see it) waits here for a human decision.</div>' +
-        '<div class="et-actions"><button class="primary" id="q-mint">Mint a scope handle</button></div>' +
+        '<div class="et-title">Pick a space (tenant) to see what it refused</div>' +
+        '<div class="et-body">Paste a space id in the session bar above &mdash; the queue loads by ' +
+          'itself the moment a space is known. Anything Verity refused to index (because it could not ' +
+          'verify who can see it) waits here for the person carrying the keyring to decide.</div>' +
+        '<div class="et-actions"><button class="primary" id="q-mint">Mint a scope handle (the signed key an agent reads with)</button></div>' +
       '</div>';
     el("q-mint").onclick = function () { V.openMint(); };
   }
@@ -479,7 +479,7 @@
       el("q-out").innerHTML =
         '<div class="empty-teach sp-c">' +
           '<div class="et-title">Nothing is waiting — the boundary held on its own</div>' +
-          '<div class="et-body">Every payload delivered to this tenant carried permissions Verity could ' +
+          '<div class="et-body">Every payload delivered to this space carried permissions Verity could ' +
             'verify, so everything was indexed under real permissions and <b>nothing had to be refused</b>. ' +
             'An empty queue is the goal, not a gap — and nothing ambiguous was indexed to make it empty. ' +
             'Checked ' + V.esc(new Date().toTimeString().slice(0, 8)) + '.</div>' +
@@ -520,12 +520,12 @@
   function renderDirPicker() {
     var box = el("qr-dir");
     if (DIR === null) {
-      box.innerHTML = '<div class="note" style="margin:0">principal directory unavailable — ' +
+      box.innerHTML = '<div class="note" style="margin:0">directory of people &amp; groups unavailable — ' +
         'type token numbers below</div>';
       return;
     }
     if (!DIR.length) {
-      box.innerHTML = '<div class="note" style="margin:0">this tenant has no principals on record yet — ' +
+      box.innerHTML = '<div class="note" style="margin:0">this space has no people or groups on record yet — ' +
         'create people &amp; groups first <button id="qr-dir-go" style="margin-left:6px">Open People &amp; groups</button></div>';
       var go = el("qr-dir-go");
       if (go) go.onclick = function () { V.dialog("q-reingest-dialog").close(); V.show("principals"); };
@@ -595,7 +595,7 @@
     el("qr-result").innerHTML = "";
     var tokens;
     try {
-      if (!tenantNow) throw new Error("no tenant — the action must name the tenant that owns the item");
+      if (!tenantNow) throw new Error("no space — the action must name the space that owns the item");
       tokens = parseTokens(el("qr-vis").value);
       if (!tokens.length && !el("qr-vis-empty").checked) {
         throw new Error("say who can see it — pick people from the directory, or tick the explicit " +
@@ -697,7 +697,7 @@
   async function doDismiss() {
     if (!ACTIVE) return;
     V.clearErr("qd-err");
-    if (!tenantNow) { V.err("qd-err", new Error("no tenant — the action must name the tenant that owns the item")); return; }
+    if (!tenantNow) { V.err("qd-err", new Error("no space — the action must name the space that owns the item")); return; }
     var body = { tenant_id: tenantNow };
     var note = el("qd-note").value.trim();
     if (note) body.note = note;
