@@ -355,6 +355,9 @@ function boot() {
     try { saved = localStorage.getItem(TENANT_KEY) || ""; } catch (e) { /* private mode */ }
     if (saved) setTenant(saved);
   }
+  // FTUE §1: first-run detection is derived from server truth on EVERY load —
+  // the shell + panels re-render when the directory answer lands.
+  refreshTenantDir();
   document.querySelectorAll('#rail .navitem[data-nav]').forEach((nav) => {
     const id = nav.getAttribute("data-nav");
     if (nav.classList.contains("soon") || !_panels.has(id)) return;
@@ -423,6 +426,157 @@ function setTenant(t) {
 }
 function onTenant(fn) { _tenantSubs.push(fn); }
 
+/* ============================================================================
+   v3 · TENANT DIRECTORY (FTUE §1) — first-run detection from SERVER TRUTH
+   ----------------------------------------------------------------------------
+   One shared read of GET /v1/admin/tenants, refreshed at boot and whenever the
+   admin token changes. Never cached in localStorage — the directory is
+   re-derived on every load so it can never be a stored lie.
+     status: "unknown"      — not asked yet
+             "ok"           — 200; `tenants` is the authoritative list
+             "locked"       — 401; prod admin plane, token needed to list
+             "unsupported"  — 404/405; older server, fall back to paste
+             "error"        — network/5xx; surfaced, never treated as empty
+   ============================================================================ */
+const _tenantDir = { status: "unknown", tenants: [], error: "" };
+const _tenantDirSubs = [];
+/** Verity.tenantDir() → { status, tenants:[{tenant_id,name,created_at}], error }. */
+function tenantDir() { return _tenantDir; }
+/** Verity.onTenantDir(fn) — fn(dir) after every refresh. */
+function onTenantDir(fn) { _tenantDirSubs.push(fn); }
+function _emitTenantDir() {
+  _tenantDirSubs.forEach((f) => { try { f(_tenantDir); } catch (e) { console.error(e); } });
+}
+/** Verity.refreshTenantDir() → Promise<dir>. Re-reads the tenant list. */
+async function refreshTenantDir() {
+  try {
+    const res = await api("/v1/admin/tenants", { admin: true });
+    _tenantDir.status = "ok";
+    _tenantDir.tenants = (res && res.tenants) || [];
+    _tenantDir.error = "";
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const m = msg.match(/HTTP (\d{3})/);
+    const code = m ? m[1] : "";
+    if (code === "401" || code === "403") {
+      _tenantDir.status = "locked"; _tenantDir.tenants = []; _tenantDir.error = "";
+    } else if (code === "404" || code === "405") {
+      _tenantDir.status = "unsupported"; _tenantDir.tenants = []; _tenantDir.error = "";
+    } else {
+      _tenantDir.status = "error"; _tenantDir.error = msg;
+    }
+  }
+  _emitTenantDir();
+  return _tenantDir;
+}
+/** Verity.tenantName(id) → the space's name, or "" when unknown/unlisted. */
+function tenantName(id) {
+  const hit = _tenantDir.tenants.find((t) => t.tenant_id === id);
+  return hit ? String(hit.name || "") : "";
+}
+
+/* ---------------------------------------- v3 · working handle (per-session) */
+/* The session's working scope handle — held in sessionStorage ONLY (exactly
+   like the admin token: this tab, cleared on close, never disk). Set only by
+   an explicit, labeled user action (setup step 3, or the mint dialog's
+   "use as working handle" button) — never silently. */
+const WORK_KEY = "verity.session.handle";
+const _workSubs = [];
+function workingHandle() { return sessionStorage.getItem(WORK_KEY) || ""; }
+function setWorkingHandle(h) {
+  if (h) sessionStorage.setItem(WORK_KEY, h);
+  else sessionStorage.removeItem(WORK_KEY);
+  _workSubs.forEach((f) => { try { f(h || ""); } catch (e) { console.error(e); } });
+}
+function onWorkingHandle(fn) { _workSubs.push(fn); }
+
+/* --------------------------------------------- v3 · sample-data labeling */
+/* THE shared check (FTUE §3 step 4): every record seeded by the sample cast
+   carries a source/tag starting "verity-sample". Panels call these so sample
+   rows are labeled EVERYWHERE and can never masquerade as real data (or leak
+   into a measurement). */
+function isSample(v) {
+  if (v == null) return false;
+  if (Array.isArray(v)) return v.some(isSample);
+  return String(v).indexOf("verity-sample") !== -1;
+}
+/** sampleBadge(v) → a `sample data` chip when v names a verity-sample source/tag. */
+function sampleBadge(v) { return isSample(v) ? badge("sample data", "b-kind") : ""; }
+
+/* ------------------------------------------ v3 · create-a-space dialog */
+/* FTUE §3 step 1: the name field is the only input — NO uuid is ever typed
+   by a human. On success the console auto-adopts the returned tenant_id and
+   shows it only as dim secondary text. Admin-gated exactly like the API. */
+const _tenantCreatedSubs = [];
+function onTenantCreated(fn) { _tenantCreatedSubs.push(fn); }
+
+function _buildCreateTenantDialog() {
+  if ($("core-newtenant")) return;
+  const el = document.createElement("div");
+  el.className = "dialog-backdrop";
+  el.id = "core-newtenant";
+  el.innerHTML =
+    '<div class="dialog" style="max-width:520px">' +
+      "<h3>Name your space</h3>" +
+      '<div class="note" style="margin-top:0"><b>The company that owns this memory space — self-hosting ' +
+        "means that's you, and there's exactly one.</b></div>" +
+      '<details class="note"><summary style="cursor:pointer">what&rsquo;s this?</summary>' +
+        '<div style="margin-top:6px">&#9432; You are the <b>tenant</b>; your customers are <b>entities</b> ' +
+        "&mdash; things memories are <i>about</i>, scoped inside your space. Customers never get their own " +
+        "tenant.</div></details>" +
+      '<div class="row" style="margin-top:12px">' +
+        '<div><label for="newtenant-name">Space name</label>' +
+          '<input type="text" id="newtenant-name" placeholder="Acme Logistics" autocomplete="off"></div>' +
+      "</div>" +
+      '<div class="err" id="newtenant-err"></div>' +
+      '<div id="newtenant-result"></div>' +
+      '<div class="actions">' +
+        '<button id="newtenant-cancel">Close</button>' +
+        '<button class="primary" id="newtenant-go">Create</button>' +
+      "</div>" +
+    "</div>";
+  document.body.appendChild(el);
+  const dlg = dialog("core-newtenant");
+  $("newtenant-cancel").onclick = dlg.close;
+  $("newtenant-go").onclick = async () => {
+    clearErr("newtenant-err");
+    const name = $("newtenant-name").value.trim();
+    if (!name) { showErr("newtenant-err", new Error("give the space a name — that's the only field")); return; }
+    const btn = $("newtenant-go");
+    btn.disabled = true;
+    try {
+      const res = await api("/v1/admin/tenants", { json: { name }, admin: true });
+      const id = res && res.tenant_id;
+      if (!id) throw new Error("the server returned no tenant_id");
+      await refreshTenantDir();
+      setTenant(id);
+      $("newtenant-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          stateChip("ok", "✓ " + name + " created") +
+          '<div style="margin-top:6px">' + refSpan(id) + "</div>" +
+          '<div class="asof" style="margin-top:4px">adopted as this session&rsquo;s space &mdash; every screen now loads it</div>' +
+        "</div>";
+      _tenantCreatedSubs.forEach((f) => { try { f({ tenant_id: id, name }); } catch (e) { console.error(e); } });
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      showErr("newtenant-err", msg.indexOf("401") >= 0
+        ? new Error("creating a space needs the admin token — set it in the session bar above (dev mode needs none)")
+        : e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+/** Verity.openCreateTenant() — the "Name your space" dialog (FTUE step 1). */
+function openCreateTenant() {
+  _buildCreateTenantDialog();
+  clearErr("newtenant-err");
+  $("newtenant-result").innerHTML = "";
+  $("newtenant-name").value = "";
+  dialog("core-newtenant").open();
+  $("newtenant-name").focus();
+}
+
 /* -------------------------------------------------------- build hash */
 function buildHash() { return document.body.getAttribute("data-build-hash") || "unknown"; }
 
@@ -455,8 +609,10 @@ function _buildMintDialog() {
         "can see. Everything below narrows it; nothing widens it. Leave <b>who</b> empty and the handle can see " +
         "<b>nothing</b> — Verity fails closed, on purpose.</div>" +
       '<div class="row" style="margin-top:12px">' +
-        '<div><label for="mint-tenant">tenant</label>' +
-          '<input type="text" id="mint-tenant" placeholder="tenant id (uuid)" spellcheck="false"></div>' +
+        '<div><label for="mint-tenant">tenant <span style="font-weight:400">(the company that owns this space — that&rsquo;s you)</span></label>' +
+          '<select class="field" id="mint-tenant-pick" style="display:none;margin-bottom:6px"></select>' +
+          '<input type="text" id="mint-tenant" placeholder="tenant id (uuid)" spellcheck="false">' +
+          '<div class="asof" id="mint-tenant-name" style="margin-top:3px"></div></div>' +
       "</div>" +
       '<div class="row" style="margin-top:10px">' +
         '<div><label for="mint-subject">who — as a person <span style="font-weight:400">(resolved server-side when identity is live)</span></label>' +
@@ -515,6 +671,16 @@ function _buildMintDialog() {
     const body = { tenant_id: t, actor_azp: "console:mint" };
     const subject = $("mint-subject").value.trim();
     const principalsRaw = $("mint-principals").value.trim();
+    // The two "who" fields are mutually exclusive on the server: a person is
+    // RESOLVED into their keys by the identity plane; raw tokens ARE the keys.
+    // Refuse the impossible combo in plain language before the server does.
+    if (subject && principalsRaw) {
+      showErr("mint-err", new Error(
+        "Choose one way to say who: EITHER a person (Verity looks up all their keys — " +
+        "needs the identity plane connected) OR raw tokens (you supply the keys yourself). " +
+        "Not both — clear one field."));
+      return;
+    }
     if (subject) body.subject = subject;
     if (principalsRaw) {
       const toks = principalsRaw.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
@@ -534,7 +700,18 @@ function _buildMintDialog() {
     const btn = $("mint-go");
     btn.disabled = true;
     try {
-      const res = await api("/v1/scopes", { json: body });
+      let res;
+      try {
+        res = await api("/v1/scopes", { json: body });
+      } catch (e) {
+        if (String(e.message).includes("subject-based scopes require ReBAC")) {
+          throw new Error(
+            "This server runs without the identity plane (dev mode), so it can't look up " +
+            "a person's keys — mint with raw tokens instead. Your people's token numbers " +
+            "are listed on People & groups.");
+        }
+        throw e;
+      }
       const handle = res && res.scope_handle;
       if (!handle) throw new Error("mint returned no scope_handle");
       let claims = null;
@@ -552,6 +729,7 @@ function _buildMintDialog() {
           '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
             '<button id="mint-copy">Copy handle</button>' +
             '<button id="mint-inspect">Inspect in Scope Inspector</button>' +
+            '<button id="mint-keep" title="held in sessionStorage for this tab only — cleared when the tab closes; the setup checklist and proof step run recalls through it">Keep as this tab&rsquo;s working handle</button>' +
           "</div>" +
         "</div>";
       $("mint-copy").onclick = () => {
@@ -561,6 +739,11 @@ function _buildMintDialog() {
         $("mint-copy").textContent = "Copied";
       };
       $("mint-inspect").onclick = () => { dlg.close(); show("scope", { handle }); };
+      $("mint-keep").onclick = () => {
+        setWorkingHandle(handle);
+        $("mint-keep").textContent = "Kept — this tab only, cleared on close";
+        $("mint-keep").disabled = true;
+      };
       _mintSubs.forEach((f) => { try { f({ handle, claims, response: res }); } catch (e) { console.error(e); } });
     } catch (e) {
       // Server refusals (unknown purpose, entity-scope requirement, bad
@@ -572,16 +755,70 @@ function _buildMintDialog() {
   };
 }
 
+/* v3: the mint dialog's tenant field is picker-first when the tenant
+   directory is known (FTUE §1 State B) — the uuid stays dim secondary text
+   and is never something a human has to author. */
+function _mintSyncTenantUi() {
+  const nameEl = $("mint-tenant-name");
+  if (!nameEl) return;
+  const t = $("mint-tenant").value.trim();
+  const dir = tenantDir();
+  if (!t) { nameEl.textContent = ""; return; }
+  if (dir.status === "ok") {
+    const n = tenantName(t);
+    nameEl.innerHTML = n
+      ? "&#10003; " + esc(n)
+      : '<span style="color:var(--red)">this tenant doesn&rsquo;t exist on this server — pick a real one, or set one up</span>';
+  } else {
+    nameEl.textContent = "";
+  }
+}
+
 /**
  * Verity.openMint(prefill?) — open the global mint dialog.
  * prefill: { tenant?, subject?, principals?(string), entities?(string),
- *            purpose?, confidentiality?, ttl? } — tenant defaults to the
- * active tenant. Returns nothing; subscribe with Verity.onMint(fn).
+ *            purpose?, confidentiality?, ttl?, lockTenant? } — tenant
+ * defaults to the active tenant; lockTenant pins the tenant field (setup
+ * step 3 mints against the space just created, shown by name). Returns
+ * nothing; subscribe with Verity.onMint(fn).
  */
 function openMint(prefill) {
   _buildMintDialog();
   prefill = prefill || {};
   $("mint-tenant").value = prefill.tenant || _tenant || "";
+  // Picker-first tenant selection when the server told us the real list.
+  const pick = $("mint-tenant-pick");
+  const tin = $("mint-tenant");
+  const dir = tenantDir();
+  const locked = !!prefill.lockTenant;
+  if (pick) {
+    if (dir.status === "ok" && dir.tenants.length) {
+      pick.innerHTML = dir.tenants.map((t) =>
+        '<option value="' + esc(t.tenant_id) + '">' + esc(t.name || "(unnamed)") + "</option>"
+      ).join("") + '<option value="">paste a tenant id&hellip;</option>';
+      pick.style.display = "";
+      const known = dir.tenants.some((t) => t.tenant_id === tin.value.trim());
+      pick.value = known ? tin.value.trim() : "";
+      tin.style.display = known ? "none" : "";
+      pick.onchange = () => {
+        if (pick.value) { tin.value = pick.value; tin.style.display = "none"; }
+        else { tin.value = ""; tin.style.display = ""; tin.focus(); }
+        _mintSyncTenantUi();
+      };
+    } else {
+      pick.style.display = "none";
+      tin.style.display = "";
+    }
+    pick.disabled = locked;
+  }
+  tin.readOnly = locked;
+  tin.oninput = _mintSyncTenantUi;
+  _mintSyncTenantUi();
+  if (locked) {
+    const n = tenantName(tin.value.trim());
+    $("mint-tenant-name").innerHTML =
+      "locked to <b>" + esc(n || tin.value.trim()) + "</b> — the space this setup is for";
+  }
   if (prefill.subject !== undefined) $("mint-subject").value = prefill.subject;
   if (prefill.principals !== undefined) $("mint-principals").value = prefill.principals;
   if (prefill.entities !== undefined) $("mint-entities").value = prefill.entities;
@@ -612,5 +849,10 @@ const Verity = {
   openMint, onMint,
   // shared state
   tenant, setTenant, onTenant, buildHash,
+  // v3 · FTUE: tenant directory + create-space + working handle + sample label
+  tenantDir, onTenantDir, refreshTenantDir, tenantName,
+  openCreateTenant, onTenantCreated,
+  workingHandle, setWorkingHandle, onWorkingHandle,
+  isSample, sampleBadge,
 };
 window.Verity = Verity;

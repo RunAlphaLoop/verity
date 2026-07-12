@@ -30,6 +30,7 @@
 //! server-side by the pasted scope handle or the admin bearer token the
 //! viewer supplies (held in `sessionStorage` only, never persisted to disk).
 
+use axum::http::header;
 use axum::response::Html;
 
 /// The build hash surfaced in the header. The served page is `include_str!`-
@@ -62,6 +63,8 @@ const PANEL_MARKER: &str = "<!-- __PANEL_SECTIONS__ -->";
 /// attention-first home when the URL carries no hash (UI-ACTIONS N3).
 const PANEL_SECTIONS: &str = concat!(
     include_str!("panel_home.html"),
+    "\n",
+    include_str!("panel_welcome.html"),
     "\n",
     include_str!("panel_ingest.html"),
     "\n",
@@ -100,7 +103,17 @@ const UI_SCRIPTS: &str = concat!(
     "\n",
     // ---- panel JS fragments — APPEND ONE LINE PER PANEL ----
     // home FIRST: registration order decides the default panel (see above).
+    // panel_welcome.js also defines `window.VerityFtue` (the shared setup/
+    // checklist derivation); panel_home reads it lazily at load time, so the
+    // relative order of the two files does not matter.
     include_str!("panel_home.js"),
+    "\n",
+    // sample_cast.js defines `window.VeritySample` (the Acme Logistics sample
+    // seeder + honest removal); panel_welcome's fork card reads it lazily, so
+    // order relative to panel_welcome.js does not matter — core-first does.
+    include_str!("sample_cast.js"),
+    "\n",
+    include_str!("panel_welcome.js"),
     "\n",
     include_str!("panel_ingest.js"),
     "\n",
@@ -152,7 +165,14 @@ fn assembled_body() -> &'static str {
 /// the build hash into the header placeholder (`data-build-hash` marker). The
 /// result is one self-contained page: zero `<link>`, zero `<script src>`, no
 /// second HTTP request.
-pub(crate) async fn ui_page() -> Html<String> {
+///
+/// `Cache-Control: no-store`: the page is embedded in the binary so "the
+/// build hash IS the version" — but without this header a browser
+/// heuristically caches /ui and keeps serving the OLD console after a server
+/// upgrade (found 2026-07-11: a rebuilt server, a reloaded tab, and a stale
+/// bundle running against the new API). One header keeps the no-skew promise
+/// true; the page is a single local response, so there is nothing to cache.
+pub(crate) async fn ui_page() -> ([(header::HeaderName, &'static str); 1], Html<String>) {
     let page = format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n\
          <meta charset=\"utf-8\">\n\
@@ -163,7 +183,7 @@ pub(crate) async fn ui_page() -> Html<String> {
         hash = BUILD_HASH,
         body = assembled_body(),
     );
-    Html(page)
+    ([(header::CACHE_CONTROL, "no-store")], Html(page))
 }
 
 #[cfg(test)]
@@ -182,6 +202,7 @@ mod tests {
             .expect("shell has .content-inner");
         for id in [
             "panel-home",
+            "panel-welcome",
             "panel-ingest",
             "panel-scope",
             "panel-audit",

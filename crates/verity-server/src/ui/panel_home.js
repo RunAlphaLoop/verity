@@ -48,8 +48,67 @@
 
   function asofNow() { return "checked " + new Date().toTimeString().slice(0, 8); }
 
-  /* ---- no-tenant teach state (species A for the whole console) ---------- */
+  /* ---- no-tenant teach state — FTUE §1: driven by SERVER TRUTH ---------- */
+  /* GET /v1/admin/tenants (read once by core, refreshed on token change)
+     decides which of the four states this card teaches. The old circular
+     "paste a tenant id you cannot obtain" advice only survives on servers
+     that cannot list tenants (State D). */
   function renderNoTenant(host) {
+    var dir = V.tenantDir();
+
+    if (dir.status === "ok" && dir.tenants.length === 0) {
+      // State A — virgin server: Home renders the Welcome flow (FTUE step 0).
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">Welcome to Verity</div>' +
+          '<div class="et-body">Verity is shared memory for your AI agents — everything they learn, in one place, ' +
+            "carrying the same sharing rules your company already has." +
+            '<div style="margin-top:8px">One thing to know before you start: <b>when Verity isn’t sure someone may ' +
+            "see a memory, it shows them nothing.</b> An empty result here is a safety answer, not a bug — and by " +
+            "the end of setup you’ll see exactly why that’s the feature.</div>" +
+            '<div style="margin-top:8px" class="asof">this server has no spaces yet (checked live against ' +
+            "GET /v1/admin/tenants) — there is nothing to paste; setup creates the first one</div></div>" +
+          '<div class="et-actions">' +
+            '<button class="primary" id="home-setup">Set up Verity — about 5 minutes</button>' +
+          "</div>" +
+        "</div>";
+      el("home-setup").onclick = function () { V.show("welcome"); };
+      return;
+    }
+
+    if (dir.status === "ok") {
+      // State B — spaces exist: the session strip is a picker of names now.
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">Pick a space to see what needs you</div>' +
+          '<div class="et-body">This server has ' + dir.tenants.length + " space" +
+            (dir.tenants.length === 1 ? "" : "s") + ". Pick one <b>by name</b> in the bar above — no ids to hunt " +
+            "for — or run setup to create a new one.</div>" +
+          '<div class="et-actions">' +
+            '<button class="primary" id="home-setup">Set up Verity</button>' +
+            '<button id="home-newspace">Create a new space</button>' +
+          "</div>" +
+        "</div>";
+      el("home-setup").onclick = function () { V.show("welcome"); };
+      el("home-newspace").onclick = function () { V.openCreateTenant(); };
+      return;
+    }
+
+    if (dir.status === "locked") {
+      // State C — prod admin plane locked: no wizard until a token exists.
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">Enter your admin token to list tenants and run setup</div>' +
+          '<div class="et-body">This server’s admin plane is locked (a good sign in production). Set the ' +
+            "<b>admin token</b> in the session bar above to see this server’s spaces by name. Already know your " +
+            "tenant id? Paste it in the bar — every screen loads itself once it’s set. The token stays in this " +
+            "tab only, never on disk.</div>" +
+        "</div>";
+      return;
+    }
+
+    // State D — old server (can't list tenants) or directory unreachable:
+    // today's teach card, unchanged.
     host.innerHTML =
       '<div class="empty-teach sp-a">' +
         '<div class="et-title">Connect to a tenant to see what needs you</div>' +
@@ -59,6 +118,7 @@
           "<li><b>Mint a scope handle</b> — the tenant fills in automatically.</li>" +
           "<li><b>Decode a handle</b> you already hold on the Scope Inspector.</li></ul>" +
           '<div style="margin-top:8px">Running locally? <span class="ref">verity-cli dev</span> prints your dev tenant and a ready-made handle.</div>' +
+          (dir.status === "error" ? '<div class="asof" style="margin-top:6px">couldn’t list this server’s spaces: ' + V.esc(dir.error.slice(0, 120)) + "</div>" : "") +
         "</div>" +
         '<div class="et-actions">' +
           '<button class="primary" id="home-mint">Mint a scope handle</button>' +
@@ -67,6 +127,24 @@
       "</div>";
     el("home-mint").onclick = function () { V.openMint(); };
     el("home-goscope").onclick = function () { V.show("scope"); };
+  }
+
+  /* ---- ghost tenant (FTUE §1): a uuid the server never birthed ---------- */
+  function renderGhost(host, tenant) {
+    host.innerHTML =
+      '<div class="empty-teach sp-a" style="border-left-color:var(--red)">' +
+        '<div class="et-title">This tenant doesn’t exist on this server</div>' +
+        '<div class="et-body">The id <span class="ref">' + V.esc(tenant) + "</span> is not in this server’s tenant " +
+          "list (checked live). A made-up or stale id would otherwise show a permanently empty console that looks " +
+          "plausible — so this is a loud stop, never a green all-clear. Pick a real space in the bar above, or set " +
+          "one up.</div>" +
+        '<div class="et-actions">' +
+          '<button class="primary" id="home-setup">Set up Verity</button>' +
+          '<button id="home-newspace">Create a new space</button>' +
+        "</div>" +
+      "</div>";
+    el("home-setup").onclick = function () { V.show("welcome"); };
+    el("home-newspace").onclick = function () { V.openCreateTenant(); };
   }
 
   /* ---- the four probes -------------------------------------------------- */
@@ -192,15 +270,123 @@
     };
   }
 
+  /* ---- setup checklist (FTUE §4) — persistent by DERIVATION ------------- */
+  /* Every item's state is recomputed from server truth by VerityFtue.derive
+     (panel_welcome.js) on every Home load. There is no stored checklist
+     state to lie, no "mark as done" anywhere: if the system can't observe
+     it, it isn't an item. Item 3 is honestly labeled per-session. */
+  function checklistItemRow(item) {
+    var chip;
+    if (item.done && item.celebrated) chip = V.stateChip("ok", "denied — correctly ✦");
+    else if (item.done) chip = V.stateChip("ok", "done" + (item.perSession ? " · this tab" : ""));
+    else if (item.needsAdmin) chip = V.stateChip("attn", "needs admin token");
+    else chip = V.stateChip("off", "not yet");
+    var sub = {
+      space: "the space that owns this memory exists",
+      keys: "at least one person or group holds a key",
+      session: "this browser session holds a working handle (per-session — re-mint is one click)",
+      memory: "at least one memory is stored (or quarantined — that counts: it means the gate works)",
+      recall: "a scoped recall returned results",
+      denial: "a session that holds no matching keys got zero results, with the why-trace to show for it",
+      bench: "measure YOUR p50/p95/p99 on YOUR corpus",
+    }[item.id] || "";
+    var action = "";
+    if (!item.done) {
+      if (item.id === "session") action = '<button data-check-mint="1">Mint a handle</button>';
+      else if (item.id === "bench") action = "";
+      else action = '<button data-check-step="' + item.n + '">' +
+        ({ space: "Create the space", keys: "Add keys", memory: "Put memory in", recall: "Run the proof", denial: "Run the proof" }[item.id] || "Open setup") +
+        "</button>";
+    }
+    return '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border)">' +
+      chip +
+      '<span><b style="color:var(--bright)">' + V.esc(item.title) + (item.optional ? " (optional)" : "") + "</b>" +
+        ' <span style="color:var(--dim)">— ' + sub + "</span></span>" +
+      '<span class="asof" style="flex:1;text-align:right">' + V.esc(item.evidence) + "</span>" + action +
+    "</div>";
+  }
+
+  function renderChecklist(container, check, tenant) {
+    var ftue = window.VerityFtue;
+    var core = check.items.slice(0, 6);
+    var allDone = core.every(function (i) { return i.done; });
+
+    if (allDone && ftue.checklistHidden(tenant)) { container.innerHTML = ""; return; }
+
+    if (allDone) {
+      container.innerHTML =
+        '<div class="empty-teach sp-c" style="margin-top:0">' +
+          '<div class="et-title">Setup complete — your memory plane is up, and it already told someone “no.”</div>' +
+          '<div class="et-body">All six facts re-derived from the server just now' +
+            " · the benchmark slot stays honestly empty until your own run: " +
+            '<span class="ref">cargo run -p verity-bench -- run</span></div>' +
+          '<div class="et-actions">' +
+            '<button id="home-next-toggle">Show next steps</button>' +
+            '<button id="home-check-hide">Hide for this session</button>' +
+          "</div>" +
+        "</div>" +
+        '<div id="home-next-cards" style="display:none"></div>';
+      el("home-next-toggle").onclick = function () {
+        var cards = el("home-next-cards");
+        var open = cards.style.display !== "none";
+        cards.style.display = open ? "none" : "";
+        el("home-next-toggle").textContent = open ? "Show next steps" : "Hide next steps";
+        if (!open && !cards.innerHTML) {
+          cards.innerHTML = ftue.nextStepsHtml(check);
+          ftue.wireNextSteps({});
+        }
+      };
+      el("home-check-hide").onclick = function () {
+        ftue.hideChecklist(tenant);
+        container.innerHTML = "";
+      };
+      return;
+    }
+
+    var doneCount = core.filter(function (i) { return i.done; }).length;
+    container.innerHTML =
+      '<div class="card">' +
+        "<h2>Setup checklist <span class=\"sub\">" + doneCount + " of 6 · derived from the server, never stored</span></h2>" +
+        core.map(checklistItemRow).join("") +
+        (core[5].done ? checklistItemRow(check.items[6]) : "") +
+        '<div class="asof" style="margin-top:8px">the celebrated finish is a verified <b>denial</b> — a checklist that ' +
+          "greens-up by opening things would teach the opposite of the product · " + asofNow() + "</div>" +
+      "</div>";
+    var steps = container.querySelectorAll("[data-check-step]");
+    for (var i = 0; i < steps.length; i++) {
+      (function (btn) {
+        btn.onclick = function () { V.show("welcome", { step: Number(btn.getAttribute("data-check-step")) }); };
+      })(steps[i]);
+    }
+    var mint = container.querySelector("[data-check-mint]");
+    if (mint) mint.onclick = function () { V.show("welcome", { step: 3 }); };
+  }
+
   /* ---- render ------------------------------------------------------------ */
   async function refresh(tenant) {
     var host = el("home-mount");
     if (!host) return;
     lastLoadedAt = Date.now();
 
+    // Ghost guard (FTUE §1): a tenant id the server never birthed must be a
+    // loud stop, never a plausible, permanently empty console.
+    var dir = V.tenantDir();
+    if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === tenant; })) {
+      renderGhost(host, tenant);
+      return;
+    }
+
     host.innerHTML =
       '<div class="toolbar"><span class="asof">checking the queues&hellip;</span></div>' +
       '<div class="attn-grid" id="home-grid"></div>';
+
+    // Setup-checklist derivation runs alongside the queue probes (same
+    // honesty rule: every state from server truth, stamped as-of). Skipped
+    // on servers that cannot list tenants (State D — behavior unchanged).
+    var ftue = window.VerityFtue;
+    var checkPromise = (ftue && dir.status !== "unsupported")
+      ? ftue.derive(tenant).catch(function (e) { console.error("ftue derive", e); return null; })
+      : Promise.resolve(null);
 
     var probes = [
       [probeEntities, "home-card-entities", "Same or different?", function () { V.show("entities", { view: "queue" }); }],
@@ -211,6 +397,19 @@
     var results = await Promise.all(probes.map(function (p) {
       return p[0](tenant).catch(function (e) { return failCard(p[1], p[2], e, p[3]); });
     }));
+    var check = await checkPromise;
+
+    // Re-check the ghost guard AFTER the async probes: the tenant directory
+    // often lands mid-flight, and a ghost tenant's probes come back as clean
+    // zeros — writing them would paint the exact plausible-empty-console
+    // (green "all clear" for a space that doesn't exist) FTUE §1 forbids.
+    // Same guard for a tenant switched away from while probes were in flight.
+    if (V.tenant() !== tenant) return;
+    dir = V.tenantDir();
+    if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === tenant; })) {
+      renderGhost(host, tenant);
+      return;
+    }
 
     var allClear = results.every(function (c) { return c.tone === "ok"; });
     var anyFail = results.some(function (c) { return c.tone === "fail"; });
@@ -234,6 +433,7 @@
         '<span class="spacer"></span>' +
         '<button id="home-refresh">Refresh</button>' +
       "</div>" +
+      '<div id="home-checklist"></div>' +
       banner +
       '<div class="attn-grid" id="home-grid">' + grid + "</div>" +
       '<div class="card">' +
@@ -250,6 +450,7 @@
       var btn = el(c.id);
       if (btn) btn.onclick = c.go;
     });
+    if (check) renderChecklist(el("home-checklist"), check, tenant);
     el("home-refresh").onclick = function () { refresh(tenant); };
     el("home-mint2").onclick = function () { V.openMint(); };
     el("home-run-res").onclick = function () { V.show("entities", { view: "queue" }); };
@@ -263,6 +464,22 @@
       if (host && !V.tenant()) renderNoTenant(host);
       V.onTenant(function (t) {
         if (!t) { var h = el("home-mount"); if (h) renderNoTenant(h); }
+      });
+      // FTUE §1: the server's tenant-directory answer decides which teach
+      // state (welcome / picker / locked / legacy) or ghost stop renders —
+      // re-render when it lands or changes (e.g. admin token entered).
+      V.onTenantDir(function (dir) {
+        var h = el("home-mount");
+        if (!h) return;
+        var t = V.tenant();
+        if (!t) { renderNoTenant(h); return; }
+        // Ghost check must win even if a probe pass just started — a dead
+        // uuid must never be left looking like a plausible empty console.
+        if (dir.status === "ok" && !dir.tenants.some(function (x) { return x.tenant_id === t; })) {
+          renderGhost(h, t);
+          return;
+        }
+        if (Date.now() - lastLoadedAt > 1500) refresh(t);
       });
     },
     // v2 AUTOLOAD: the router calls this once the tenant is known.

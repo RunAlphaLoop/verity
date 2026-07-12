@@ -1,0 +1,18 @@
+<!-- ==========================================================================
+     panel_welcome.html — SET UP VERITY · the first-run wizard (FTUE.md §3)
+     --------------------------------------------------------------------------
+     A PAGE, not a modal: the rail stays live and every panel stays explorable
+     throughout. Steps render as a vertical spine of cards; completed steps
+     collapse to one green line; any step can be revisited; every step is
+     skippable. All completion state is DERIVED FROM SERVER TRUTH on every
+     load (tenant directory, principals directory, counts, audit) — the only
+     per-session bits (working handle, proof runs) are honestly labeled as
+     per-session. No human ever types a uuid anywhere in this flow.
+     Owns ONLY this file + panel_welcome.js; consumes frozen theme/core
+     classes + Verity.* helpers.
+     ========================================================================== -->
+<section class="panel" id="panel-welcome">
+  <h1>Set up Verity</h1>
+  <div class="lede">About 5 minutes: one space, the first keys, a working handle, memory in — and the proof that a session holding no keys sees <b>nothing</b>. Every step is skippable and resumable; progress is re-derived from the server, never from this browser.</div>
+  <div id="welcome-mount"></div>
+</section>

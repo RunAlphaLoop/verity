@@ -18,6 +18,15 @@ use crate::types::*;
 pub trait StorageAdapter: Send + Sync {
     async fn create_tenant(&self, name: &str) -> Result<TenantId>;
 
+    /// Tenant directory for the admin plane (FTUE §2.1): the data source for
+    /// the console's tenant picker and first-run detection (empty list =
+    /// virgin server). Ordered by creation time ascending, capped at `limit`.
+    /// Default fails explicit — a profile that hasn't built the admin plane
+    /// must never masquerade as a virgin server by returning an empty list.
+    async fn list_tenants(&self, _limit: i64) -> Result<Vec<TenantRow>> {
+        Err(unsupported("list_tenants"))
+    }
+
     /// Append to the immutable L0 evidence log.
     async fn append_episode(&self, episode: NewEpisode) -> Result<EpisodeId>;
 

@@ -204,11 +204,25 @@ impl PostgresAdapter {
         }
     }
 
-    pub async fn migrate(&self) -> Result<()> {
+    /// Run pending migrations and return how many were applied, so boot can
+    /// print `applied N migrations` (FTUE §2.3 — a bare `./verity` on a fresh
+    /// database must say what it did). The count-before read is best-effort:
+    /// on a virgin database the `_sqlx_migrations` ledger doesn't exist yet
+    /// (sqlx creates it during `run`), which reads as 0.
+    pub async fn migrate(&self) -> Result<u64> {
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
         sqlx::migrate!("../../migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| StorageError::Database(e.to_string()))
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(after.saturating_sub(before) as u64)
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -1969,6 +1983,27 @@ impl StorageAdapter for PostgresAdapter {
         .await
         .map_err(db_err)?;
         row.try_get("id").map_err(db_err)
+    }
+
+    /// Tenant directory (FTUE §2.1): oldest first so the dev/first tenant
+    /// heads the console picker; id is the tiebreak for a stable order.
+    async fn list_tenants(&self, limit: i64) -> Result<Vec<TenantRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, created_at FROM tenants ORDER BY created_at, id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|row| {
+                Ok(TenantRow {
+                    tenant_id: row.try_get("id").map_err(db_err)?,
+                    name: row.try_get("name").map_err(db_err)?,
+                    created_at: row.try_get("created_at").map_err(db_err)?,
+                })
+            })
+            .collect()
     }
 
     async fn append_episode(&self, ep: NewEpisode) -> Result<EpisodeId> {

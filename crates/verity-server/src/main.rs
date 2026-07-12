@@ -38,6 +38,8 @@ mod slo;
 #[cfg(test)]
 mod sse_tests;
 mod subscribe;
+#[cfg(test)]
+mod tenants_tests;
 mod ui;
 mod webhooks;
 
@@ -244,11 +246,21 @@ pub(crate) fn resolve_entities(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // FTUE §2.3: when RUST_LOG is unset, default to `info` — a bare `./verity`
+    // must never look like a hung terminal.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let cli = Cli::parse();
 
     let pg = PostgresAdapter::connect(&cli.dsn).await?;
-    pg.migrate().await?;
+    let applied = pg.migrate().await?;
+    if applied > 0 {
+        println!("applied {applied} migrations");
+    }
     let encoder = match tokio::task::spawn_blocking(verity_encoder::QueryEncoder::load).await? {
         Ok(enc) => Some(Arc::new(enc)),
         Err(e) => {
@@ -342,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/briefs/refresh", post(admin_refresh_briefs))
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
         .route("/v1/admin/reembed/cutover", post(admin_reembed_cutover))
-        .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/admin/tenants", post(create_tenant).get(list_tenants))
         .route(
             "/v1/admin/erasure/preview",
             post(compliance::admin_erasure_preview),
@@ -460,8 +472,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    tracing::info!("verity listening on {}", cli.listen);
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
+    // FTUE §2.3: unconditional stdout on bind, independent of any log filter.
+    println!(
+        "verity v{} listening on http://{} — console: http://{}/ui",
+        env!("CARGO_PKG_VERSION"),
+        cli.listen,
+        cli.listen
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -543,6 +561,25 @@ async fn open_scope(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenScopeRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    // Ghost-tenant trap (FTUE §2.2): a handle minted for a tenant that was
+    // never born yields a fully plausible, permanently empty session — fail-
+    // closed for data must be fail-LOUD at the front door.
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(|e| match e {
+            StorageError::UnknownTenant(_) => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "error": "unknown tenant",
+                    "hint": "create one: POST /v1/admin/tenants, or run verity-cli dev",
+                })
+                .to_string(),
+            ),
+            other => storage_status(other),
+        })?;
     let mut max_confidentiality = req.max_confidentiality;
     if let Some(purpose) = &req.purpose {
         let rule = state.purposes.get(purpose).ok_or((
@@ -1499,6 +1536,9 @@ async fn ingest_documents(
     headers: HeaderMap,
     Json(req): Json<IngestDocumentsRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    // Freshness SLO (task 21): receipt time, not `valid_from` — a connector
+    // backfilling last year's documents is not "a year behind on ingest".
+    let received_at = Utc::now();
     state.admin.check(&headers)?;
     if req.acl_provenance == AclProvenance::Quarantined {
         return Err((
@@ -1560,6 +1600,7 @@ async fn ingest_documents(
     // Auto-resolve trigger: a document version wrote an L0 episode + chunks
     // (new entity_tags/aliases can feed resolution). Never affects the response.
     state.resolution.mark_dirty(req.tenant_id);
+    slo::record_sample(state.pool(), req.tenant_id, &req.source, received_at).await;
     Ok(Json(serde_json::json!({
         "episode_id": episode_id,
         "chunks_indexed": chunks_indexed,
@@ -1580,6 +1621,12 @@ async fn remember(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RememberRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
+    // Freshness SLO event time (task 21): an agent observation carries no
+    // source clock, so receipt time is the event time — the sample measures
+    // receipt→queryable, same convention as webhooks. This also makes a bare
+    // first memory OBSERVABLE server-side (the FTUE checklist's "memory in"
+    // derives from counts; without a sample, the clean path never greened).
+    let received_at = Utc::now();
     let payload = state.verify_scope(&req.scope_handle)?;
     let entities = resolve_entities(&payload, req.entities)?;
 
@@ -1627,6 +1674,7 @@ async fn remember(
         .await
         .map_err(internal)?;
 
+    slo::record_sample(state.pool(), payload.tenant_id, "agent", received_at).await;
     Ok(Json(serde_json::json!({ "episode_id": episode_id })))
 }
 
@@ -1784,6 +1832,40 @@ async fn create_tenant(
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({ "tenant_id": id })))
+}
+
+#[derive(Deserialize)]
+struct ListTenantsQuery {
+    /// Picker page cap; clamped to [1, 1000] server-side.
+    #[serde(default = "default_tenant_limit")]
+    limit: i64,
+}
+
+fn default_tenant_limit() -> i64 {
+    100
+}
+
+/// GET /v1/admin/tenants (admin, FTUE §2.1): the tenant directory. The console
+/// derives first-run state from this on every load — `200` + empty list means
+/// virgin server (State A), non-empty feeds the picker (State B), `401` is the
+/// locked admin plane (State C). Gated exactly like the POST.
+async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ListTenantsQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let limit = q.limit.clamp(1, 1000);
+    let tenants = state
+        .storage
+        .list_tenants(limit)
+        .await
+        .map_err(storage_status)?;
+    let count = tenants.len();
+    Ok(Json(serde_json::json!({
+        "tenants": tenants,
+        "count": count,
+    })))
 }
 
 #[derive(Deserialize)]

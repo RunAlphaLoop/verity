@@ -9,9 +9,10 @@ show() { printf '   %s\n' "$*"; }
 
 curl -sf "$VERITY/healthz" >/dev/null || { echo "verity not reachable at $VERITY"; exit 1; }
 
+TENANT_NAME="demo-$(date +%s)"
 TENANT=$(curl -s -X POST "$VERITY/v1/admin/tenants" -H 'content-type: application/json' \
-  -d "{\"name\":\"demo-$(date +%s)\"}" | jq -r .tenant_id)
-say "Demo tenant: $TENANT"
+  -d "{\"name\":\"$TENANT_NAME\"}" | jq -r .tenant_id)
+say "Verity demo — everything below is SAMPLE data, seeded into its own tenant \"$TENANT_NAME\" ($TENANT)"
 
 mint() { # principals entity actor -> handle
   curl -s -X POST "$VERITY/v1/scopes" -H 'content-type: application/json' -d "{
@@ -140,10 +141,11 @@ QFLAG=$(curl -s -X POST "$VERITY$WH" -H 'content-type: application/json' \
 QN=$(curl -s "$VERITY/v1/admin/quarantine?tenant_id=$TENANT" | jq length)
 show "unmappable webhook payload -> quarantined=$QFLAG ($QN item(s) await triage; never indexed permissively)"
 
-say "Open the console — everything above is inspectable"
+say "Open the console — everything above is inspectable (SAMPLE data, tenant \"$TENANT_NAME\")"
 CONSOLE_HANDLE=$(mint '[11]' '[]' 'agent:console-operator')
-show "console   $VERITY/ui"
+show "console   $VERITY/ui?tenant=$TENANT"
 show "tenant    $TENANT"
 show "handle    $CONSOLE_HANDLE"
-show "paste the handle into the console's Scope panel at $VERITY/ui to decode it and run scoped"
-show "recalls as this principal; the tenant id above unlocks the admin panels."
+show "the link above lands already scoped to the sample tenant; paste the handle into the"
+show "console's Scope panel to decode it and run scoped recalls as this principal — the"
+show "tenant id above unlocks the admin panels."

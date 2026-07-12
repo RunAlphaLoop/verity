@@ -13,11 +13,13 @@
        • rail entries carry data-nav="<panel-id>" matching a
          Verity.register({id}) call; count pills are rendered by
          Verity.setCount(id, n) — panels own their own counts.
-       • #tenantInput / #adminToken are the shared session inputs; the glue
-         below binds them to Verity.setTenant / Verity.setAdminToken. The
-         admin token is sessionStorage-ONLY (never disk); the tenant id is
-         remembered in localStorage (not a secret) so returning operators
-         land on live data, not a Load button.
+       • the tenant field is PICKER-FIRST (FTUE §1): #tenantPick lists spaces
+         by name from Verity.tenantDir() (GET /v1/admin/tenants, server truth
+         on every load); #tenantInput remains the paste fallback for locked /
+         legacy servers; #tenantGhost is the red never-all-clear banner for a
+         uuid the server never birthed. #adminToken stays sessionStorage-ONLY
+         (never disk); the tenant id is remembered in localStorage (not a
+         secret) so returning operators land on live data, not a Load button.
        • #mintBtn opens the global mint dialog (Verity.openMint) — the
          console's front door (UI-ACTIONS N1).
        • the read-only ribbon template (<template id="ribbon-tpl">) is kept
@@ -38,16 +40,28 @@
   </div>
 
   <!-- ------------------------------------------------- session strip -->
+  <!-- FTUE §1: the tenant field is picker-first. GET /v1/admin/tenants decides
+       the mode on every load (server truth, never localStorage):
+         200+list  → dropdown of space NAMES; the uuid is dim secondary text
+         200+empty → nothing to pick — a "Set up Verity" button, no paste advice
+         401       → prod admin plane locked: paste stays for operators
+         404/405   → old server: today's paste behavior unchanged
+       A remembered/deep-linked uuid NOT in the list shows the red ghost
+       banner below — never a green all-clear. -->
   <div id="sessionbar">
-    <span class="sess-field">
+    <span class="sess-field" id="tenantField">
       <label for="tenantInput">tenant</label>
+      <select id="tenantPick" class="field" style="display:none;width:220px;padding:3px 6px;font-size:var(--fs-sm)" title="the tenant is the company that owns this memory space — that's you; your customers live inside it as entities"></select>
       <input type="text" id="tenantInput" placeholder="paste a tenant id — every screen loads itself once this is set" spellcheck="false" title="the active tenant_id — auto-filled from a decoded handle or a mint; remembered in this browser (it is an id, not a secret)">
+      <span class="ref" id="tenantIdLabel" title="the space's raw id — shown for copy/paste, never something you have to type"></span>
+      <button id="tenantSetup" style="display:none;padding:3px 10px;font-size:var(--fs-sm)">Set up Verity</button>
     </span>
     <span class="sess-field">
       <label for="adminToken">admin token</label>
       <input type="password" id="adminToken" placeholder="empty = dev mode" autocomplete="off" title="admin bearer for admin-plane reads/writes — sessionStorage only, cleared when the tab closes">
     </span>
-    <span class="asof" id="sessionHint">no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id</span>
+    <span class="asof" id="sessionHint">checking this server&rsquo;s spaces&hellip;</span>
+    <span class="err" id="tenantGhost" style="margin-top:0"></span>
   </div>
 
   <!-- ------------------------------------------------------------ shell -->
@@ -56,6 +70,7 @@
     <!-- ----------------------------------------------------- left rail -->
     <nav id="rail">
       <div class="navitem" data-nav="home">Needs decision</div>
+      <div class="navitem" data-nav="welcome">Set up Verity</div>
       <div class="navitem" data-nav="ingest">Add memory</div>
 
       <div class="group-label">Review &amp; decide</div>
@@ -125,9 +140,12 @@
     var mint = document.getElementById("mintBtn");
     if (mint) mint.addEventListener("click", function () { Verity.openMint(); });
 
-    // admin token → sessionStorage, reflected in the badge honestly
+    // admin token → sessionStorage, reflected in the badge honestly.
+    // A token change can unlock the admin plane, so the tenant directory is
+    // re-derived from server truth (debounced) — FTUE §1 State C → B.
     var adminInput = document.getElementById("adminToken");
     var adminState = document.getElementById("adminState");
+    var adminDebounce = null;
     function reflectAdmin() {
       if (!adminState) return;
       adminState.textContent = Verity.getAdminToken() ? "set (this tab only)" : "dev-mode (unset)";
@@ -138,28 +156,114 @@
       adminInput.addEventListener("input", function () {
         Verity.setAdminToken(adminInput.value.trim());
         reflectAdmin();
+        if (adminDebounce) clearTimeout(adminDebounce);
+        adminDebounce = setTimeout(function () { Verity.refreshTenantDir(); }, 400);
       });
     }
 
-    // tenant input <-> shared state (+ the hint line)
+    /* ---- tenant field: picker-first, server-truth-driven (FTUE §1) ---- */
     var tenantInput = document.getElementById("tenantInput");
+    var tenantPick = document.getElementById("tenantPick");
+    var tenantIdLabel = document.getElementById("tenantIdLabel");
+    var tenantSetup = document.getElementById("tenantSetup");
+    var tenantGhost = document.getElementById("tenantGhost");
     var hint = document.getElementById("sessionHint");
+    var pasteMode = false; // operator chose "paste an id…" from the picker
+
     if (tenantInput) {
       tenantInput.addEventListener("change", function () { Verity.setTenant(tenantInput.value.trim()); });
       tenantInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") Verity.setTenant(tenantInput.value.trim());
       });
     }
-    function reflectTenant(t) {
-      if (tenantInput && tenantInput.value !== t) tenantInput.value = t;
-      if (hint) hint.textContent = t
-        ? "screens auto-load for this tenant"
-        : "no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id";
+    if (tenantSetup) tenantSetup.addEventListener("click", function () { Verity.show("welcome"); });
+    if (tenantPick) tenantPick.addEventListener("change", function () {
+      var v = tenantPick.value;
+      if (v === "__paste") { pasteMode = true; render(); tenantInput.focus(); return; }
+      if (v === "__new") { render(); Verity.openCreateTenant(); return; }
+      pasteMode = false;
+      if (v) Verity.setTenant(v);
+      render();
+    });
+
+    function shortId(id) { return id.length > 13 ? id.slice(0, 8) + "…" + id.slice(-4) : id; }
+
+    /* One render decides the whole strip from (directory state, tenant). */
+    function render() {
+      var dir = Verity.tenantDir();
+      var t = Verity.tenant();
+      if (tenantInput && tenantInput.value !== t && !pasteMode) tenantInput.value = t;
+
+      var ghostMsg = "";
+      if (dir.status === "ok") {
+        var inList = !!t && dir.tenants.some(function (x) { return x.tenant_id === t; });
+        if (t && !inList) {
+          ghostMsg = "This tenant doesn’t exist on this server. Pick a real one, or set one up.";
+        }
+        if (!dir.tenants.length) {
+          // State A — virgin server: nothing to pick, nothing to paste.
+          if (tenantPick) tenantPick.style.display = "none";
+          if (tenantInput) tenantInput.style.display = "none";
+          if (tenantSetup) tenantSetup.style.display = "";
+          if (tenantIdLabel) tenantIdLabel.textContent = "";
+          if (hint) hint.textContent = "no spaces exist on this server yet — set up Verity to create the first one";
+        } else {
+          // State B — picker of names; uuid stays dim secondary text.
+          if (tenantPick) {
+            var opts = '<option value="">— pick a space —</option>';
+            for (var i = 0; i < dir.tenants.length; i++) {
+              var x = dir.tenants[i];
+              opts += '<option value="' + Verity.esc(x.tenant_id) + '">' + Verity.esc(x.name || "(unnamed)") + "</option>";
+            }
+            opts += '<option value="__paste">paste a tenant id…</option>';
+            opts += '<option value="__new">+ create a new space</option>';
+            tenantPick.innerHTML = opts;
+            tenantPick.value = inList ? t : "";
+            tenantPick.style.display = "";
+          }
+          if (tenantInput) tenantInput.style.display = pasteMode ? "" : "none";
+          if (tenantSetup) tenantSetup.style.display = "none";
+          if (tenantIdLabel) tenantIdLabel.textContent = inList ? shortId(t) : "";
+          if (hint) hint.textContent = t && inList
+            ? "screens auto-load for this tenant"
+            : (t ? "" : "pick a space by name — every screen loads itself once one is set");
+        }
+      } else if (dir.status === "locked") {
+        // State C — prod admin plane locked. Paste stays for operators.
+        if (tenantPick) tenantPick.style.display = "none";
+        if (tenantInput) tenantInput.style.display = "";
+        if (tenantSetup) tenantSetup.style.display = "none";
+        if (tenantIdLabel) tenantIdLabel.textContent = "";
+        if (hint) hint.textContent = "Enter your admin token to list tenants and run setup. Already know your tenant id? Paste it.";
+      } else if (dir.status === "error") {
+        if (tenantPick) tenantPick.style.display = "none";
+        if (tenantInput) tenantInput.style.display = "";
+        if (tenantSetup) tenantSetup.style.display = "none";
+        if (tenantIdLabel) tenantIdLabel.textContent = "";
+        if (hint) hint.textContent = "couldn't list this server's spaces (" + dir.error.slice(0, 80) + ") — paste a tenant id, or retry";
+      } else {
+        // unsupported (old server) or not-asked-yet: today's paste behavior.
+        if (tenantPick) tenantPick.style.display = "none";
+        if (tenantInput) tenantInput.style.display = "";
+        if (tenantSetup) tenantSetup.style.display = "none";
+        if (tenantIdLabel) tenantIdLabel.textContent = "";
+        if (hint) hint.textContent = dir.status === "unknown"
+          ? "checking this server's spaces…"
+          : (t ? "screens auto-load for this tenant"
+               : "no tenant yet — mint a handle, decode one on Scope Inspector, or paste an id");
+      }
+
+      if (tenantGhost) {
+        if (ghostMsg) { tenantGhost.textContent = ghostMsg; tenantGhost.classList.add("on"); }
+        else { tenantGhost.textContent = ""; tenantGhost.classList.remove("on"); }
+      }
     }
-    Verity.onTenant(reflectTenant);
+
+    Verity.onTenant(function () { pasteMode = false; render(); });
+    Verity.onTenantDir(function () { render(); });
     // Verity.boot() may have adopted a tenant (deep link / localStorage)
-    // before this glue subscribed — reflect the current value now.
-    reflectTenant(Verity.tenant());
+    // before this glue subscribed — reflect the current state now.
+    render();
   }
 })();
 </script>

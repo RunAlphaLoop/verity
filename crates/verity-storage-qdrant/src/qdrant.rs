@@ -539,6 +539,12 @@ impl StorageAdapter for QdrantAdapter {
         Ok(tenant)
     }
 
+    async fn list_tenants(&self, limit: i64) -> Result<Vec<TenantRow>> {
+        // Tenants live in the relational inner store; the directory read
+        // (FTUE §2.1) delegates like every other tenant-plane call.
+        self.inner.list_tenants(limit).await
+    }
+
     async fn append_episode(&self, episode: NewEpisode) -> Result<EpisodeId> {
         self.inner.append_episode(episode).await
     }

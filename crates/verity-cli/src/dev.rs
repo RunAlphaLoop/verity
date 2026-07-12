@@ -11,9 +11,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::{config, ui, util, Ctx};
 
-/// Broad dev principal token: `dev` mints the org-wide scope over [1] and
-/// every quickstart example passes `--visibility 1`.
-const DEV_PRINCIPALS: &[i32] = &[1];
+/// The named dev principal (FTUE §5.2): `dev` registers `user:dev` and mints
+/// the org-wide scope over its token — no bare magic numbers in the summary.
+const DEV_PRINCIPAL: &str = "user:dev";
 
 pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
     ui::banner("verity dev — local memory plane, five minutes");
@@ -37,9 +37,11 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
         spawn_and_wait(ctx, repo, &bin).await?;
     }
 
-    // (d) first-run setup: tenant → scope → config. All idempotent.
+    // (d) first-run setup: tenant → named principal → scope → config. All
+    // idempotent.
     let tenant_id = create_tenant(ctx).await?;
-    let (handle, expires) = util::mint_scope(ctx, &tenant_id, DEV_PRINCIPALS, "cli:dev", 43_200)
+    let dev_token = register_dev_principal(ctx, &tenant_id).await?;
+    let (handle, expires) = util::mint_scope(ctx, &tenant_id, &[dev_token], "cli:dev", 43_200)
         .await
         .context("the server is up but scope minting failed")?;
     let expiry_note = chrono::DateTime::parse_from_rfc3339(&expires)
@@ -48,19 +50,25 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
     ui::step_ok(
         "scope",
         &format!(
-            "org-wide handle minted (principals {DEV_PRINCIPALS:?}, expires in {expiry_note})"
+            "org-wide handle minted (principal {DEV_PRINCIPAL} = token {dev_token}, expires in {expiry_note})"
         ),
     );
 
     ctx.config.url = Some(ctx.url.clone());
     ctx.config.tenant_id = Some(tenant_id.clone());
     ctx.config.scope_handle = Some(handle);
-    ctx.config.principals = Some(DEV_PRINCIPALS.to_vec());
+    ctx.config.principals = Some(vec![dev_token]);
     config::save(&ctx.config_path, &ctx.config)?;
     ui::step_ok("config", &ctx.config_path.display().to_string());
 
     // (e) the summary people copy-paste from.
-    print_summary(ctx, &tenant_id, repo.ok().as_deref());
+    print_summary(
+        ctx,
+        &tenant_id,
+        dev_token,
+        &expiry_note,
+        repo.ok().as_deref(),
+    );
     Ok(())
 }
 
@@ -259,13 +267,50 @@ async fn create_tenant(ctx: &Ctx) -> Result<String> {
     Ok(tenant_id)
 }
 
+// ---------- (d2) the named dev principal ----------
+
+/// Register `user:dev` and return its materialized token (FTUE §5.2). The
+/// upsert is idempotent — an existing principal keeps its token forever — so
+/// re-runs mint the same scope. On a fresh "dev" tenant the token is 1.
+async fn register_dev_principal(ctx: &Ctx, tenant_id: &str) -> Result<i32> {
+    let mut req = ctx
+        .http
+        .post(format!("{}/v1/admin/principals", ctx.url))
+        .json(&serde_json::json!({
+            "tenant_id": tenant_id,
+            "principals": [DEV_PRINCIPAL],
+        }));
+    if let Some(token) = &ctx.config.admin_token {
+        req = req.bearer_auth(token);
+    }
+    let (status, body) = util::send(req, &ctx.url).await?;
+    let json = util::expect_json(
+        status,
+        &body,
+        "re-run `verity-cli dev` once the server is healthy",
+    )?;
+    let token = json["mappings"][DEV_PRINCIPAL]
+        .as_i64()
+        .with_context(|| format!("principal response carries the {DEV_PRINCIPAL} token"))?
+        as i32;
+    ui::step_ok("principal", &format!("{DEV_PRINCIPAL} → token {token}"));
+    Ok(token)
+}
+
 // ---------- (e) the copy-paste summary ----------
 
-fn print_summary(ctx: &Ctx, tenant_id: &str, repo: Option<&Path>) {
+fn print_summary(
+    ctx: &Ctx,
+    tenant_id: &str,
+    dev_token: i32,
+    expiry_note: &str,
+    repo: Option<&Path>,
+) {
     let mcp_bin = repo
         .map(|r| r.join("target/release/verity-mcp").display().to_string())
         .unwrap_or_else(|| "/path/to/verity/target/release/verity-mcp".to_string());
     let user = util::actor_sub().unwrap_or_else(|| "user:me".into());
+    let console_link = format!("{}/ui?tenant={tenant_id}", ctx.url);
 
     println!();
     println!("  {}", ui::bold("Verity is up."));
@@ -273,16 +318,30 @@ fn print_summary(ctx: &Ctx, tenant_id: &str, repo: Option<&Path>) {
     let kv =
         |label: &str, value: &str| println!("    {}  {value}", ui::dim(&format!("{label:<13}")));
     kv("server", &ctx.url);
-    kv("console", &format!("{}/ui", ctx.url));
-    kv("tenant (dev)", tenant_id);
+    kv("console", &console_link);
+    kv("tenant", &format!("dev ({tenant_id})"));
+    println!(
+        "    {}",
+        ui::dim(
+            "the tenant is the company that owns this space — that's you; your \
+             customers live inside it as entities"
+        )
+    );
+    kv(
+        "principal",
+        &format!(
+            "{DEV_PRINCIPAL} (token {dev_token}) — the org-wide key your dev session holds; \
+             see People & groups in the console"
+        ),
+    );
     match &ctx.config.scope_handle {
         Some(handle) => {
             kv("scope handle", handle);
             println!(
                 "    {}",
                 ui::dim(&format!(
-                    "org-wide (principals [1]), saved to {} — paste it into the console's \
-                     Scope panel at {}/ui to decode it and run scoped reads",
+                    "org-wide (principals [{dev_token}]), saved to {} — paste it into the \
+                     console's Scope panel at {}/ui to decode it and run scoped reads",
                     ctx.config_path.display(),
                     ctx.url
                 ))
@@ -291,33 +350,49 @@ fn print_summary(ctx: &Ctx, tenant_id: &str, repo: Option<&Path>) {
         None => kv(
             "scope handle",
             &format!(
-                "saved to {} (org-wide, principals [1])",
+                "saved to {} (org-wide, principals [{dev_token}])",
                 ctx.config_path.display()
             ),
         ),
     }
+    println!(
+        "    {}",
+        ui::dim(&format!(
+            "handle expires in {expiry_note} — when verity-cli commands start failing, \
+             rerun 'verity-cli dev' to renew"
+        ))
+    );
     println!();
     println!("  {}", ui::bold("Connect Claude Code (MCP):"));
     println!();
     println!("      claude mcp add verity \\");
     println!("        -e VERITY_URL={} \\", ctx.url);
     println!("        -e VERITY_TENANT_ID={tenant_id} \\");
-    println!("        -e VERITY_PRINCIPALS=1 \\");
+    println!("        -e VERITY_PRINCIPALS={dev_token} \\");
     println!("        -e VERITY_ACTOR_SUB={user} \\");
     println!("        -e VERITY_ACTOR_AZP=agent:claude-code \\");
     println!("        -- {mcp_bin}");
     println!();
     println!("  {}", ui::bold("Next steps:"));
     println!();
+    println!(
+        "    open the console — your setup checklist is waiting: {}",
+        ui::cyan(&console_link)
+    );
+    println!();
     let step = |n: u32, what: &str, cmd: &str| {
         println!("    {n}. {}  {}", ui::pad(what, 18), ui::cyan(cmd));
     };
-    step(1, "add a memory", "verity-cli add README.md --visibility 1");
+    step(
+        1,
+        "add a memory",
+        &format!("verity-cli add README.md --visibility {dev_token}"),
+    );
     step(2, "query it back", "verity-cli query \"what is verity\"");
     step(
         3,
         "wire a webhook",
-        "verity-cli webhook mint my-system --visibility 1",
+        &format!("verity-cli webhook mint my-system --visibility {dev_token}"),
     );
     println!();
     println!(

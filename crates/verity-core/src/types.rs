@@ -12,6 +12,16 @@ pub type ChunkId = Uuid;
 /// once per session and intersected in the index. Empty set = invisible.
 pub type PrincipalToken = i32;
 
+/// One row of the tenant directory (admin plane, FTUE §2.1). Feeds the
+/// console's tenant picker and first-run detection — humans never type a
+/// tenant uuid; they pick a name and the id rides along as secondary text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantRow {
+    pub tenant_id: TenantId,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(i16)]
 pub enum TrustTier {
@@ -24,12 +34,20 @@ pub enum TrustTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(i16)]
 pub enum Confidentiality {
+    /// Serialization stays PascalCase (the existing wire format); the aliases
+    /// additionally ACCEPT the lowercase names every human-facing surface
+    /// (console, FTUE copy, docs) uses — "internal" refused at the mint door
+    /// was the 2026-07-11 first-run dead end.
+    #[serde(alias = "public")]
     Public = 0,
+    #[serde(alias = "internal")]
     Internal = 1,
+    #[serde(alias = "confidential")]
     Confidential = 2,
     /// Pricing, quotes, negotiation terms land here by default; gets a
     /// mandatory live ReBAC recheck at recall time (SPEC §7b) once the
     /// permission plane lands.
+    #[serde(alias = "restricted")]
     Restricted = 3,
 }
 

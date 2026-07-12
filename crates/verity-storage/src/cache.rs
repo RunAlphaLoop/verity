@@ -51,6 +51,10 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.create_tenant(name).await
     }
 
+    async fn list_tenants(&self, limit: i64) -> Result<Vec<TenantRow>> {
+        self.inner.list_tenants(limit).await
+    }
+
     async fn append_episode(&self, episode: NewEpisode) -> Result<EpisodeId> {
         self.inner.append_episode(episode).await
     }
