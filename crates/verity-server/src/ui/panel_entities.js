@@ -31,7 +31,7 @@
    ========================================================================== */
 (function () {
   var V = window.Verity;
-  var LIMIT = 200;
+  var LIMIT = 500;
 
   /* ------------------------------------------------------------ plain words */
 
@@ -121,6 +121,7 @@
 
   var data = { queue: [], entities: [], loadedAt: 0 };
   var view = "queue";           // "queue" | "browser"
+  var browserFilter = "all";    // "all" | "merged" | "single"
   var tenantNow = "";
   var current = { canonical: "", members: [], name: "", row: null };
   var prec = { names: [], orders: {}, star: [], fields: {}, ready: false };
@@ -140,7 +141,7 @@
         '<div class="toolbar">' +
           '<span class="seg">' +
             '<button id="ent-view-queue" class="on">Needs your decision</button>' +
-            '<button id="ent-view-browser">Merged entities</button>' +
+            '<button id="ent-view-browser">Entities</button>' +
           "</span>" +
           '<span id="ent-state"></span>' +
           '<span class="asof" id="ent-asof"></span>' +
@@ -190,7 +191,8 @@
         '<div class="dialog-backdrop" id="ent-drawer"><div class="dialog" style="max-width:860px">' +
           '<h3 id="ent-drawer-title">Entity</h3>' +
           '<div id="ent-drawer-head"></div>' +
-          '<div class="card" style="margin-top:12px">' +
+          '<div id="ent-drawer-single"></div>' +
+          '<div class="card" id="ent-merged-card" style="margin-top:12px">' +
             '<h2>Which source wins <span class="sub">scope-gated<span class="api-crumb"> · GET /v1/entities/{canonical}</span></span></h2>' +
             '<div class="note" style="margin-top:0">Every field below is merged from all sources. When sources disagree, the <b>highest-ranked source wins</b>; where you have set no ranking, the newest value wins. This view reads through a scope handle — the same fail-closed path agents use.</div>' +
             '<div class="row" style="margin-top:8px">' +
@@ -302,10 +304,13 @@
     el("ent-state").innerHTML = q
       ? V.stateChip("attn", q + " decision" + (q === 1 ? "" : "s") + " waiting")
       : V.stateChip("ok", "queue clear");
+    var total = data.entities.length;
+    var mergedN = data.entities.filter(function (e) { return e.merged; }).length;
     el("ent-asof").textContent =
-      q + " waiting · " + data.entities.length + " merged · checked " + new Date().toTimeString().slice(0, 8);
+      q + " waiting · " + total + " entit" + (total === 1 ? "y" : "ies") +
+      " (" + mergedN + " merged) · checked " + new Date().toTimeString().slice(0, 8);
     el("ent-view-queue").textContent = "Needs your decision" + (q ? " (" + q + ")" : "");
-    el("ent-view-browser").textContent = "Merged entities" + (data.entities.length ? " (" + data.entities.length + ")" : "");
+    el("ent-view-browser").textContent = "Entities" + (total ? " (" + total + ")" : "");
     renderQueue();
     renderBrowser();
   }
@@ -567,53 +572,102 @@
 
   function renderBrowser() {
     var host = el("ent-browser-view");
-    var rows = data.entities;
-    if (!rows.length) {
+    var all = data.entities;
+    if (!all.length) {
       host.innerHTML =
         '<div class="empty-teach sp-a">' +
-          '<div class="et-title">No merged entities yet</div>' +
-          '<div class="et-body">An entity appears here once Verity has stitched it together across <b>two or more sources</b>. ' +
-            "Single-source records are healthy — there is simply nothing to merge yet. Run matching to scan for " +
-            "cross-source matches now.</div>" +
+          '<div class="et-title">No entities yet</div>' +
+          '<div class="et-body">Entities appear here as soon as this space has facts — one card per organization or ' +
+            "person. When Verity can stitch two source records together (same email, domain, or external ID) they " +
+            "collapse into a single <b>merged</b> entity; everything else is a healthy <b>single-source</b> entity. " +
+            "Ingest a source or run matching to populate this.</div>" +
           '<div class="et-actions"><button class="primary" id="ent-b-run">Run matching now</button></div>' +
         "</div>";
       el("ent-b-run").onclick = function () { V.clearErr("ent-run-err"); V.dialog("ent-run-dialog").open(); };
       return;
     }
 
-    host.innerHTML = rows.map(function (row, i) {
-      var name = displayName(row.summary);
-      // The summary can miss names the member payloads carry — prefer a
-      // member's real name (source dimmed beside it) over asserting absence.
-      var named = name ? null : memberWithName(row.members);
-      var title = name
-        ? V.esc(name)
-        : named
-          ? V.esc(named.name) + ' <span style="color:var(--dim);font-weight:400;font-size:var(--fs-sm)">from ' + V.esc(named.source) + "</span>"
-          : '<span style="color:var(--dim);font-weight:400">name not loaded</span>';
-      var conf = confidencePlain(row.badge);
-      var n = (row.members || []).length;
-      var memberChips = (row.members || []).map(function (m) {
-        return '<span class="entity-chip"><b>' + V.esc(m.source) + '</b><span class="src ref">' + V.esc(m.entity_id) + "</span></span>";
-      }).join(" ");
-      return '<div class="card ent-card" data-i="' + i + '" style="cursor:pointer">' +
-        '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">' +
-          '<span style="font-size:var(--fs-md);font-weight:650;color:var(--bright)">' + title + "</span>" +
-          (row.summary && row.summary.domain ? '<span class="badge b-kind">' + V.esc(row.summary.domain) + "</span>" : "") +
-          conf.chip +
-          '<span class="spacer" style="flex:1"></span>' +
-          '<span class="asof">inspect &rsaquo;</span>' +
-        "</div>" +
-        '<div class="note" style="margin-top:4px">' + n + " source" + (n === 1 ? "" : "s") + " · " + conf.text +
-          (row.badge ? " · " + V.esc(row.badge.evidence_count) + " piece" + (Number(row.badge.evidence_count) === 1 ? "" : "s") + " of evidence" : "") + "</div>" +
-        '<div style="margin-top:6px">' + memberChips + "</div>" +
-        '<div style="margin-top:4px">' + V.refSpan(row.canonical_entity) + "</div>" +
-      "</div>";
-    }).join("");
+    var merged = all.filter(function (e) { return e.merged; });
+    var single = all.filter(function (e) { return !e.merged; });
+    var shown = browserFilter === "merged" ? merged : browserFilter === "single" ? single : all;
 
-    wire(host, ".ent-card", function (cardEl) {
-      openDetail(rows[parseInt(cardEl.getAttribute("data-i"), 10)]);
+    function fchip(key, label, n) {
+      return '<button class="badge ' + (browserFilter === key ? "b-entity" : "b-kind") +
+        ' ent-bfilter" data-f="' + key + '" style="cursor:pointer;font:inherit">' + label + " " +
+        '<b style="font-variant-numeric:tabular-nums">' + n + "</b></button>";
+    }
+    // A plain-words breakdown so an empty "Merged" is understood as a fact
+    // about the data, not a missing feature — and the singletons are visible.
+    var bar =
+      '<div class="note" style="margin:0 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        '<span>' + all.length + " entit" + (all.length === 1 ? "y" : "ies") + " in this space — " +
+          "<b>" + merged.length + "</b> merged across sources, <b>" + single.length + "</b> single-source.</span>" +
+        '<span class="spacer" style="flex:1"></span>' +
+        fchip("all", "All", all.length) + fchip("merged", "Merged", merged.length) +
+        fchip("single", "Single-source", single.length) +
+      "</div>";
+
+    var cards = shown.length
+      ? shown.map(function (row, i) { return entityCard(row, i); }).join("")
+      : '<div class="note">No ' + (browserFilter === "merged" ? "merged" : "single-source") +
+        " entities" + (browserFilter === "merged"
+          ? " yet — nothing has matched across two or more sources."
+          : ".") + "</div>";
+
+    host.innerHTML = bar + cards;
+
+    wire(host, ".ent-bfilter", function (btn) {
+      browserFilter = btn.getAttribute("data-f");
+      renderBrowser();
     });
+    wire(host, ".ent-card", function (cardEl) {
+      openDetail(shown[parseInt(cardEl.getAttribute("data-i"), 10)]);
+    });
+  }
+
+  // One entity card. Merged entities (a resolution weld) get a green accent and
+  // their confidence badge; single-source entities get a calm neutral badge and
+  // an honest "not yet linked" line — never the misleading "unbadged".
+  function entityCard(row, i) {
+    var name = displayName(row.summary);
+    // The summary can miss names the member payloads carry — prefer a member's
+    // real name (source dimmed beside it) over asserting absence.
+    var named = name ? null : memberWithName(row.members);
+    var title = name
+      ? V.esc(name)
+      : named
+        ? V.esc(named.name) + ' <span style="color:var(--dim);font-weight:400;font-size:var(--fs-sm)">from ' + V.esc(named.source) + "</span>"
+        : '<span style="color:var(--dim);font-weight:400">name not loaded</span>';
+    var n = (row.members || []).length;
+    var memberChips = (row.members || []).map(function (m) {
+      return '<span class="entity-chip"><b>' + V.esc(m.source) + '</b><span class="src ref">' + V.esc(m.entity_id) + "</span></span>";
+    }).join(" ");
+
+    var statusChip, statusNote, accent;
+    if (row.merged) {
+      var conf = confidencePlain(row.badge);
+      statusChip = conf.chip;
+      statusNote = n + " source" + (n === 1 ? "" : "s") + " · " + conf.text +
+        (row.badge ? " · " + V.esc(row.badge.evidence_count) + " piece" + (Number(row.badge.evidence_count) === 1 ? "" : "s") + " of evidence" : "");
+      accent = ";border-left:3px solid var(--green)";
+    } else {
+      statusChip = V.badge("single source", "b-kind");
+      statusNote = n + " source" + (n === 1 ? "" : "s") + " · not yet linked to another record";
+      accent = "";
+    }
+
+    return '<div class="card ent-card" data-i="' + i + '" style="cursor:pointer' + accent + '">' +
+      '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">' +
+        '<span style="font-size:var(--fs-md);font-weight:650;color:var(--bright)">' + title + "</span>" +
+        (row.summary && row.summary.domain ? '<span class="badge b-kind">' + V.esc(row.summary.domain) + "</span>" : "") +
+        statusChip +
+        '<span class="spacer" style="flex:1"></span>' +
+        '<span class="asof">inspect &rsaquo;</span>' +
+      "</div>" +
+      '<div class="note" style="margin-top:4px">' + statusNote + "</div>" +
+      '<div style="margin-top:6px">' + memberChips + "</div>" +
+      '<div style="margin-top:4px">' + V.refSpan(row.canonical_entity) + "</div>" +
+    "</div>";
   }
 
   /* ------------------------------------------------------- detail drawer */
@@ -622,23 +676,51 @@
     var named = memberWithName(row.members);
     var name = displayName(row.summary) || (named ? named.name : null);
     current = { canonical: row.canonical_entity, members: row.members || [], name: name || "", row: row };
-    var conf = confidencePlain(row.badge);
+    var statusChip = row.merged ? confidencePlain(row.badge).chip : V.badge("single source", "b-kind");
+    var statusText = row.merged
+      ? confidencePlain(row.badge).text +
+        (row.badge ? " · " + V.esc(row.badge.evidence_count) + " piece" + (Number(row.badge.evidence_count) === 1 ? "" : "s") + " of evidence" : "")
+      : "one source · not yet linked to another record";
     // A missing summary name is a lookup gap, not proof of namelessness.
     el("ent-drawer-title").textContent = name || "Entity (name not loaded)";
     el("ent-drawer-head").innerHTML =
       '<div>' + V.refSpan(row.canonical_entity) + "</div>" +
-      '<div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + conf.chip +
-        '<span class="note" style="margin-top:0">' + conf.text +
-          (row.badge ? " · " + V.esc(row.badge.evidence_count) + " piece" + (Number(row.badge.evidence_count) === 1 ? "" : "s") + " of evidence" : "") + "</span>" +
+      '<div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + statusChip +
+        '<span class="note" style="margin-top:0">' + statusText + "</span>" +
       "</div>" +
       '<div style="margin-top:6px">' + current.members.map(function (m) {
         return '<span class="entity-chip"><b>' + V.esc(m.source) + '</b><span class="src ref">' + V.esc(m.entity_id) + "</span></span>";
       }).join(" ") + "</div>";
-    el("ent-merged-out").innerHTML = "";
-    V.clearErr("ent-merged-err");
-    prec = { names: [], orders: {}, star: [], fields: {}, ready: false };
-    if (lastHandle) el("ent-scope-handle").value = lastHandle;
-    renderSplit();
+
+    // A single-source entity has nothing to merge and no cross-source winner to
+    // pick — the scope-gated field-merge + split cards are for stitched
+    // entities. Show an honest note instead of a card that can only come back
+    // empty, and hide the two merge cards. Merged entities keep the full UI.
+    var singleNote = el("ent-drawer-single");
+    var mergedCard = el("ent-merged-card");
+    var splitCard = el("ent-split-card");
+    if (row.merged) {
+      singleNote.innerHTML = "";
+      mergedCard.style.display = "";
+      splitCard.style.display = "";
+      el("ent-merged-out").innerHTML = "";
+      V.clearErr("ent-merged-err");
+      prec = { names: [], orders: {}, star: [], fields: {}, ready: false };
+      if (lastHandle) el("ent-scope-handle").value = lastHandle;
+      renderSplit();
+    } else {
+      mergedCard.style.display = "none";
+      splitCard.style.display = "none";
+      singleNote.innerHTML =
+        '<div class="card" style="margin-top:12px">' +
+          "<h2>Single-source entity</h2>" +
+          '<div class="note" style="margin-top:0">This entity comes from a single source record, so there is nothing to ' +
+            "merge and no cross-source winner to choose. It will gain a merged view the moment matching links it to " +
+            "another record (same email, website domain, or external ID)." +
+            (row.summary && row.summary.domain ? " Website domain on record: <b>" + V.esc(row.summary.domain) + "</b>." : "") +
+          "</div>" +
+        "</div>";
+    }
     V.dialog("ent-drawer").open();
   }
 

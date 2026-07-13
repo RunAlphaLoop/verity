@@ -763,6 +763,13 @@ pub struct CanonicalEntitySummary {
     /// The confidence badge from `entity_link_meta` (the `alias_member` row), or
     /// `None` when the canonical has no materialized badge (admin-only / unmapped).
     pub badge: Option<EntityConfidenceBadge>,
+    /// `true` when this entity is a resolution result — an `entity_aliases`
+    /// canonical stitched from a weld (usually 2+ source members). `false` for a
+    /// SINGLE-SOURCE entity synthesized straight from its facts because the
+    /// resolver never welded it to anything. Both are real, browsable entities;
+    /// the flag lets the browser say which is which instead of hiding singletons.
+    #[serde(default)]
+    pub merged: bool,
 }
 
 /// The light name/domain summary for the entities browser (a display hint, not

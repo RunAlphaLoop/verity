@@ -1340,7 +1340,59 @@ impl PostgresAdapter {
                 members,
                 summary,
                 badge,
+                merged: true,
             });
+        }
+
+        // 3. SINGLE-SOURCE entities: every distinct (source, entity_id) that has
+        //    current facts but is NOT aliased to any canonical — i.e. the
+        //    resolver never welded it to anything. Without these the browser is
+        //    empty whenever a corpus has no cross-source duplicate keys (a clean
+        //    inbox of unique domains/emails), hiding entities that plainly exist.
+        //    They carry no badge (nothing was inferred) and merged=false so the
+        //    UI can label them honestly. Fill only the remaining `limit` budget
+        //    so the merged canonicals (the interesting ones) always come first.
+        let clamped = limit.clamp(1, 1000);
+        let remaining = clamped - (out.len() as i64);
+        if remaining > 0 {
+            let singles = sqlx::query(
+                "SELECT DISTINCT f.source, f.entity_id
+                   FROM facts f
+                  WHERE f.tenant_id = $1
+                    AND f.valid_to IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM entity_aliases a
+                         WHERE a.tenant_id = f.tenant_id
+                           AND a.source || ':' || a.entity_id
+                               = f.source || ':' || f.entity_id)
+                  ORDER BY f.source, f.entity_id
+                  LIMIT $2",
+            )
+            .bind(tenant)
+            .bind(remaining)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+            for r in &singles {
+                let source: String = r.try_get("source").map_err(db_err)?;
+                let entity_id: String = r.try_get("entity_id").map_err(db_err)?;
+                let members = vec![AliasMember {
+                    source: source.clone(),
+                    entity_id: entity_id.clone(),
+                }];
+                let summary = self.member_field_summary(tenant, &members).await?;
+                out.push(CanonicalEntitySummary {
+                    tenant_id: tenant,
+                    // Composed ref (source:entity_id) — the same grammar the
+                    // member summary + merged_record compose on.
+                    canonical_entity: format!("{source}:{entity_id}"),
+                    members,
+                    summary,
+                    badge: None,
+                    merged: false,
+                });
+            }
         }
         Ok(out)
     }
