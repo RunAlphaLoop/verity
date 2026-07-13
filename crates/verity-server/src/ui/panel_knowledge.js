@@ -20,8 +20,8 @@
        rule); the decision is remembered so the lesson never resurrects.
 
    THE LAW, applied:
-     • lesson cards read in plain words ("Learned across 3 customers: …" /
-       "Waiting: only 1 customer supports this so far — needs 3");
+     • lesson cards read in plain words ("Learned across 3 sources: …" /
+       "Waiting: only 1 source supports this so far — needs 3");
      • lifecycle as state chips: proposed → gathering support → awaiting
        your review → published (quarantined/rejected shown as honest exits);
      • jargon (status enums, support_tier, distinct_entities, endpoints)
@@ -80,7 +80,7 @@
   // Tooltip for a publish button the privacy floor keeps disabled — built
   // from the live numbers, so it never contradicts the card's own sentence.
   function subFloorTitle(k) {
-    return "Cannot publish yet — only " + k.d + " customer" + (k.d === 1 ? " supports" : "s support") +
+    return "Cannot publish yet — only " + k.d + " source" + (k.d === 1 ? " supports" : "s support") +
       " this and 3 are required (privacy floor). Reject is still available.";
   }
 
@@ -118,7 +118,7 @@
     var d = k.d, w = k.w;
     var ep = it.episode_count == null ? null : Number(it.episode_count);
     if (s === "quarantined") {
-      return "<b>Held back before review:</b> this lesson may identify a specific customer, so Verity refused to consider it." +
+      return "<b>Held back before review:</b> this lesson may identify a specific source, so Verity refused to consider it." +
         (it.quarantine_reason ? " Reason on record: <b>" + V.esc(it.quarantine_reason) + "</b>." : "");
     }
     if (s === "rejected") {
@@ -128,11 +128,11 @@
       return "<b>Withdrawn automatically:</b> the conversations that supported this lesson were forgotten, so the lesson was invalidated with them.";
     }
     var learned = d > 0
-      ? "Learned across <b>" + d + " customer" + (d === 1 ? "" : "s") + "</b>" +
+      ? "Learned across <b>" + d + " source" + (d === 1 ? "" : "s") + "</b>" +
         (ep ? " in " + ep + " conversation" + (ep === 1 ? "" : "s") : "") +
         (w ? ", written down by " + w + " independent writer" + (w === 1 ? "" : "s") : "") +
         (it.has_tier1_evidence ? " (includes an authoritative source)" : "")
-      : "No supporting customers on record yet";
+      : "No supporting sources on record yet";
     if (s === "published") {
       return learned + ". <b>Published</b>" +
         (it.published_at ? " " + V.esc(V.timeAgo(it.published_at)) : "") +
@@ -140,11 +140,11 @@
     }
     if (k.pass) return learned + " — <b>enough independent support to publish</b>. Your call.";
     var needs = [];
-    if (!k.entOk) needs.push("<b>" + Math.max(0, 3 - d) + " more customer" + ((3 - d) === 1 ? "" : "s") + "</b> (3 required)");
+    if (!k.entOk) needs.push("<b>" + Math.max(0, 3 - d) + " more source" + ((3 - d) === 1 ? "" : "s") + "</b> (3 required)");
     if (!k.writerOk) needs.push("a <b>second independent writer</b> or an authoritative source");
     if (!k.catOk) needs.push("a <b>category</b>");
-    var sofar = d === 0 ? "no customers support this yet"
-      : "only " + d + " customer" + (d === 1 ? " supports" : "s support") + " this so far";
+    var sofar = d === 0 ? "no sources support this yet"
+      : "only " + d + " source" + (d === 1 ? " supports" : "s support") + " this so far";
     return "<b>Waiting:</b> " + sofar + " — still needs " + needs.join(" and ") + ". It cannot be published before then.";
   }
 
@@ -213,10 +213,10 @@
               '<input type="text" id="know-pub-raw" placeholder="e.g. 11, 1001" autocomplete="off" spellcheck="false"></div>' +
             '<div class="note" id="know-pub-count" style="margin-top:6px"></div>' +
           "</div>" +
-          '<div style="margin-top:10px"><label for="know-pub-kmin">privacy floor &mdash; fewest supporting customers allowed (the ceiling here is a floor: the fewest supporters a lesson may ever be published with)</label>' +
+          '<div style="margin-top:10px"><label for="know-pub-kmin">privacy floor &mdash; fewest supporting sources allowed (the ceiling here is a floor: the fewest supporters a lesson may ever be published with)</label>' +
             '<input type="number" id="know-pub-kmin" min="3" step="1" value="3" style="max-width:130px">' +
             '<div class="note">Minimum <b>3</b> &mdash; and the server re-clamps it even if a smaller number is sent: ' +
-              "at 2, either supporting customer could infer the other&rsquo;s situation." +
+              "at 2, either supporting source could infer the other&rsquo;s situation." +
               '<span class="api-crumb"> <span class="ref">k_min · POST /v1/knowledge/{id}/publish</span></span></div></div>' +
           '<div class="err" id="know-pub-err"></div>' +
           '<div class="actions">' +
@@ -371,7 +371,7 @@
         host.innerHTML =
           '<div class="empty-teach sp-a">' +
             '<div class="et-title">No lessons proposed yet</div>' +
-            '<div class="et-body">A lesson is a pattern Verity notices across several customers&rsquo; ' +
+            '<div class="et-body">A lesson is a pattern Verity notices across several sources&rsquo; ' +
               "conversations. Verity proposes them automatically in the background (agents can also propose one" +
               "<span class=\"api-crumb\"> &mdash; POST /v1/knowledge</span>); every proposal stops here for a person " +
               "&mdash; nothing publishes itself. To give Verity something to learn from, start with " +
@@ -472,7 +472,7 @@
           : '<span style="color:var(--dim);font-weight:400">no statement on record</span>') + "</div>" +
       '<div class="dc-evidence">' + supportSentence(it) + "</div>" +
       '<div class="dc-meta">' + V.esc(it.id) + " · status: " + V.esc(s) +
-        " · customers: " + V.esc(it.distinct_entities == null ? "—" : it.distinct_entities) +
+        " · sources: " + V.esc(it.distinct_entities == null ? "—" : it.distinct_entities) +
         " · independent writers: " + V.esc(it.writer_count == null ? "—" : it.writer_count) +
         " · evidence tier: " + V.esc(it.support_tier || "—") +
         seenAtMeta(it) +
@@ -587,19 +587,19 @@
 
     var support =
       '<div class="card" style="margin-top:12px"><h2>Support ' +
-        '<span class="sub">customers / independent writers / evidence tier · exact counts, admin-only</span></h2>' +
+        '<span class="sub">sources / independent writers / evidence tier · exact counts, admin-only</span></h2>' +
       '<div class="note" style="margin-top:0">' + supportSentence(item) + "</div>" +
       '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px">' +
-        V.stateChip(k.entOk ? "ok" : "wait", "3+ customers — has " + k.d) +
+        V.stateChip(k.entOk ? "ok" : "wait", "3+ sources — has " + k.d) +
         V.stateChip(k.writerOk ? "ok" : "wait", "2+ writers or an authoritative source — has " + k.w +
           (item.has_tier1_evidence ? " + authoritative" : "")) +
         V.stateChip(k.catOk ? "ok" : "wait", "has a category — " +
           ((item.categories || []).length ? (item.categories || []).join(", ") : "none yet")) +
       "</div>" +
       '<div class="note" style="margin-top:8px">All three must pass before a lesson can be published, so no single ' +
-        "customer&rsquo;s situation can be inferred from it. The chips only explain &mdash; the server enforces.</div>" +
+        "source&rsquo;s situation can be inferred from it. The chips only explain &mdash; the server enforces.</div>" +
       '<div class="note" style="margin-top:6px">Agents that recall this lesson only ever see a coarse bucket &mdash; ' +
-        (bucket ? V.badge(bucket + " customers", "b-trust", true)
+        (bucket ? V.badge(bucket + " sources", "b-trust", true)
                 : V.badge("below the floor — agents see nothing", "b-st-candidate")) +
         " &mdash; never the exact counts on this page.</div>" +
       "</div>";
@@ -607,7 +607,7 @@
     var deid =
       '<div class="card" style="margin-top:8px"><h2>Anonymity check <span class="sub">de-identification gate · deterministic</span></h2>' +
       '<div class="note" style="margin-top:0">Before review, every lesson is checked for details that could identify a ' +
-        "specific customer &mdash; a lesson that names or singles one out is refused, never indexed. " +
+        "specific source &mdash; a lesson that names or singles one out is refused, never indexed. " +
         (deidPassed
           ? "This lesson <b>passed</b> that check. " + V.stateChip("ok", "passed")
           : "This lesson <b>failed</b> it and was held back" +
@@ -635,7 +635,7 @@
         (ev.length
           ? "Supported by <b>" + ev.length + " conversation" + (ev.length === 1 ? "" : "s") + "</b>. "
           : "<b>No evidence rows on record</b> &mdash; a lesson with no evidence cannot gather support. ") +
-        "This lineage is shown here for your review only &mdash; agents never see which customers a lesson " +
+        "This lineage is shown here for your review only &mdash; agents never see which sources a lesson " +
         "came from (provenance firewall).</div>" +
       (ev.length ? '<div style="margin-top:6px">' + evRows + "</div>" : "") +
       "</div>";
@@ -831,7 +831,7 @@
           '<div class="note">Now visible to <b>' + sel.tokens.length + "</b> people &amp; groups: " + named +
             (names.length > 6 ? " + " + (names.length - 6) + " more named" : "") +
             (unnamed > 0 ? " + " + unnamed + " raw token" + (unnamed === 1 ? "" : "s") : "") +
-            " · privacy floor " + kmin + " customers. There is no un-publish — retraction is Erasure &amp; data export." +
+            " · privacy floor " + kmin + " sources. There is no un-publish — retraction is Erasure &amp; data export." +
             '<span class="api-crumb"> <span class="ref">POST /v1/knowledge/' + V.esc(current.id) + "/publish</span></span></div>" +
         "</div>";
       await loadAll(tenantNow);
