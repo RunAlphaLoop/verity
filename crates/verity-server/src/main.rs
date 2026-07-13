@@ -441,8 +441,7 @@ async fn admin_planes(
     // BY DESIGN: SpiceDB sends nothing (not even headers) until the first access
     // change, so a quiet system pends here — healthy, not failing. Only real
     // churn (a prior reconnect or a recorded error) is genuinely reconnecting.
-    let churning =
-        w["reconnects"].as_u64().unwrap_or(0) > 0 || !w["last_error"].is_null();
+    let churning = w["reconnects"].as_u64().unwrap_or(0) > 0 || !w["last_error"].is_null();
     let (rev_status, rev_detail) = if !enabled {
         (
             "off",
@@ -724,9 +723,7 @@ async fn knowledge_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_j
         Some(t) => format!("last ran {}", humanize_ago(t)),
         None => "has never run".to_string(),
     };
-    let detail = format!(
-        "off — {recency}. New memories pile up unread until it runs."
-    );
+    let detail = format!("off — {recency}. New memories pile up unread until it runs.");
     // When not startable, start_hint carries the exact missing-prereq fix.
     let hint = start_hint_for(repo, venv, key);
     let mut row = plane_row(

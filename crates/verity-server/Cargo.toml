@@ -43,6 +43,7 @@ bytes = "1"
 # no OCR. Dep choices justified at the workspace root Cargo.toml.
 calamine = { workspace = true }
 zip = { workspace = true }
+cfb = { workspace = true }
 quick-xml = { workspace = true }
 pdf-extract = { workspace = true }
 # SSE subscriptions (task 21): poll-loop event streams.

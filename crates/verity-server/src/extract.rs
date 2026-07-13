@@ -59,6 +59,8 @@ pub(crate) enum ExtractFailure {
     PdfParse(String),
     SheetParse(String),
     PptxParse(String),
+    DocxParse(String),
+    DocParse(String),
     /// The filename claimed one of our formats but the bytes don't match
     /// (magic wins), or the connector sent bytes we have no extractor for.
     UnrecognizedFormat,
@@ -75,6 +77,8 @@ impl ExtractFailure {
             Self::PdfParse(e) => format!("PDF parse failure: {e}"),
             Self::SheetParse(e) => format!("spreadsheet parse failure: {e}"),
             Self::PptxParse(e) => format!("PPTX parse failure: {e}"),
+            Self::DocxParse(e) => format!("DOCX parse failure: {e}"),
+            Self::DocParse(e) => format!("legacy .doc parse failure: {e}"),
             Self::UnrecognizedFormat => "unrecognized format".into(),
             Self::NoText => "file parsed but contains no extractable text".into(),
         }
@@ -104,6 +108,8 @@ enum Claim {
     Xlsx,
     Pptx,
     Xls,
+    Docx,
+    Doc,
 }
 
 fn claim_from_name(filename: Option<&str>) -> Option<Claim> {
@@ -116,6 +122,10 @@ fn claim_from_name(filename: Option<&str>) -> Option<Claim> {
         Some(Claim::Pptx)
     } else if lower.ends_with(".xls") {
         Some(Claim::Xls)
+    } else if lower.ends_with(".docx") || lower.ends_with(".docm") {
+        Some(Claim::Docx)
+    } else if lower.ends_with(".doc") {
+        Some(Claim::Doc)
     } else {
         None
     }
@@ -154,34 +164,49 @@ fn extract_with_cap(bytes: &[u8], filename: Option<&str>, cap: usize) -> Extract
         return match zip_office_kind(bytes) {
             Ok(Some(Claim::Xlsx)) => finish(extract_sheet(bytes, cap)),
             Ok(Some(Claim::Pptx)) => finish(extract_pptx(bytes, cap)),
+            Ok(Some(Claim::Docx)) => finish(extract_docx(bytes, cap)),
             // A zip that isn't an office package: ours only if the name
             // claimed so (then the claim is wrong — typed, magic wins).
             Ok(_) => match claim {
-                Some(Claim::Xlsx) | Some(Claim::Pptx) | Some(Claim::Xls) | Some(Claim::Pdf) => {
+                Some(Claim::Xlsx) | Some(Claim::Pptx) | Some(Claim::Docx) | Some(Claim::Xls)
+                | Some(Claim::Doc) | Some(Claim::Pdf) => {
                     ExtractOutcome::Failed(ExtractFailure::UnrecognizedFormat)
                 }
                 None => ExtractOutcome::NotHandled,
             },
             Err(e) => match claim {
                 Some(Claim::Pptx) => ExtractOutcome::Failed(ExtractFailure::PptxParse(e)),
+                Some(Claim::Docx) => ExtractOutcome::Failed(ExtractFailure::DocxParse(e)),
                 Some(Claim::Xlsx) | Some(Claim::Xls) => {
                     ExtractOutcome::Failed(ExtractFailure::SheetParse(e))
                 }
-                Some(Claim::Pdf) => ExtractOutcome::Failed(ExtractFailure::UnrecognizedFormat),
+                Some(Claim::Pdf) | Some(Claim::Doc) => {
+                    ExtractOutcome::Failed(ExtractFailure::UnrecognizedFormat)
+                }
                 None => ExtractOutcome::NotHandled,
             },
         };
     }
     if bytes.starts_with(OLE2_MAGIC) {
-        // Legacy OLE2 container: could be .xls, but also .doc/.ppt (not Tier
-        // 1). calamine autodetects; if it can't read it as a workbook and the
-        // name claimed .xls, that's a typed failure — otherwise not ours.
-        return match extract_sheet(bytes, cap) {
-            Ok(ex) => finish(Ok(ex)),
-            Err(f) => match claim {
-                Some(Claim::Xls) | Some(Claim::Xlsx) => ExtractOutcome::Failed(f),
-                _ => ExtractOutcome::NotHandled,
-            },
+        // Legacy OLE2 compound file: .xls (calamine), .doc (the WordDocument
+        // stream), or .ppt (not Tier 1). Try the sheet reader first; a doc
+        // isn't a workbook, so on that failure route by the compound file's
+        // own streams: a WordDocument stream ⇒ .doc, else fall through.
+        if let Ok(ex) = extract_sheet(bytes, cap) {
+            return finish(Ok(ex));
+        }
+        if ole_has_word_stream(bytes) {
+            return finish(extract_doc(bytes, cap));
+        }
+        return match claim {
+            // Name claimed .doc but there's no WordDocument stream ⇒ typed.
+            Some(Claim::Doc) => ExtractOutcome::Failed(ExtractFailure::DocParse(
+                "OLE2 file has no WordDocument stream".into(),
+            )),
+            Some(Claim::Xls) | Some(Claim::Xlsx) => {
+                ExtractOutcome::Failed(ExtractFailure::SheetParse("not a workbook".into()))
+            }
+            _ => ExtractOutcome::NotHandled,
         };
     }
     // No magic matched. If the name claimed one of ours, the bytes lie —
@@ -213,6 +238,9 @@ fn zip_office_kind(bytes: &[u8]) -> Result<Option<Claim>, String> {
     }
     if names.contains(&"ppt/presentation.xml") {
         return Ok(Some(Claim::Pptx));
+    }
+    if names.contains(&"word/document.xml") {
+        return Ok(Some(Claim::Docx));
     }
     Ok(None)
 }
@@ -442,6 +470,192 @@ fn drawingml_text(xml: &str) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// DOCX (OOXML Word): word/document.xml is a zip entry of WordprocessingML.
+// ---------------------------------------------------------------------------
+
+fn extract_docx(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| ExtractFailure::DocxParse(e.to_string()))?;
+    let doc_xml =
+        read_zip_entry(&mut archive, "word/document.xml").map_err(ExtractFailure::DocxParse)?;
+    let text = wordml_text(&doc_xml).map_err(ExtractFailure::DocxParse)?;
+    let mut budget = Budget::new(cap);
+    budget.push(&text);
+    // Word footnotes/endnotes live in sibling parts; pull them too when present.
+    for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+        if let Ok(xml) = read_zip_entry(&mut archive, part) {
+            if let Ok(extra) = wordml_text(&xml) {
+                if !extra.trim().is_empty() && !budget.push(&format!("\n{extra}")) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(Extraction {
+        text: budget.out,
+        method: "docx-xml",
+        truncated: budget.truncated,
+    })
+}
+
+/// Pull visible text from WordprocessingML: `<w:t>` runs are text, `<w:p>` ends
+/// a paragraph (newline), `<w:tab/>`/`<w:br/>`/`<w:cr/>` are whitespace.
+fn wordml_text(xml: &str) -> Result<String, String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = String::new();
+    let mut in_text_run = false;
+    loop {
+        match reader.read_event().map_err(|e| e.to_string())? {
+            Event::Start(e) if e.name().as_ref() == b"w:t" => in_text_run = true,
+            Event::End(e) if e.name().as_ref() == b"w:t" => in_text_run = false,
+            Event::Empty(e) if matches!(e.name().as_ref(), b"w:tab") => out.push('\t'),
+            Event::Empty(e) if matches!(e.name().as_ref(), b"w:br" | b"w:cr") => out.push('\n'),
+            Event::End(e) if e.name().as_ref() == b"w:p" => {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\n');
+                }
+            }
+            Event::Text(t) if in_text_run => {
+                out.push_str(&t.decode().map_err(|e| e.to_string())?);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// DOC (legacy Word 97-2003 binary, OLE2 compound file): the main text is
+// reconstructed from the piece table in the table stream (handles fast-saved
+// docs where text is fragmented), each piece 8-bit CP1252 or 16-bit UTF-16LE.
+// Anything we can't reconstruct cleanly folds to a typed failure (metadata-
+// only), never silently-garbled text.
+// ---------------------------------------------------------------------------
+
+/// Cheap probe: does the OLE2 file carry a `WordDocument` stream (⇒ a .doc)?
+fn ole_has_word_stream(bytes: &[u8]) -> bool {
+    cfb::CompoundFile::open(Cursor::new(bytes))
+        .map(|cf| cf.exists("/WordDocument"))
+        .unwrap_or(false)
+}
+
+fn cp1252_char(b: u8) -> char {
+    // CP1252 is Latin-1 except 0x80-0x9F. Map the printable specials there;
+    // everything else passes through as Latin-1.
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    match b {
+        0x80..=0x9F => HIGH[(b - 0x80) as usize],
+        other => other as char,
+    }
+}
+
+fn extract_doc(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure> {
+    use std::io::Read;
+    let mut cf = cfb::CompoundFile::open(Cursor::new(bytes))
+        .map_err(|e| ExtractFailure::DocParse(e.to_string()))?;
+
+    let mut wds = Vec::new();
+    cf.open_stream("/WordDocument")
+        .and_then(|mut s| s.read_to_end(&mut wds))
+        .map_err(|e| ExtractFailure::DocParse(format!("WordDocument stream: {e}")))?;
+    if wds.len() < 0x0200 || u16::from_le_bytes([wds[0], wds[1]]) != 0xA5EC {
+        return Err(ExtractFailure::DocParse("not a Word FIB".into()));
+    }
+    let rd_u32 = |buf: &[u8], off: usize| -> Option<u32> {
+        buf.get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    // Which table stream holds the piece table (FIB flags bit 9 = fWhichTblStm).
+    let flags = u16::from_le_bytes([wds[0x0A], wds[0x0B]]);
+    let table_name = if flags & 0x0200 != 0 {
+        "/1Table"
+    } else {
+        "/0Table"
+    };
+    let mut tbl = Vec::new();
+    cf.open_stream(table_name)
+        .and_then(|mut s| s.read_to_end(&mut tbl))
+        .map_err(|e| ExtractFailure::DocParse(format!("{table_name} stream: {e}")))?;
+
+    // Clx (piece table container): fcClx/lcbClx at FIB offsets 0x01A2/0x01A6.
+    let fc_clx = rd_u32(&wds, 0x01A2).ok_or(ExtractFailure::DocParse("no fcClx".into()))? as usize;
+    let lcb_clx =
+        rd_u32(&wds, 0x01A6).ok_or(ExtractFailure::DocParse("no lcbClx".into()))? as usize;
+    let clx = tbl
+        .get(fc_clx..fc_clx + lcb_clx)
+        .ok_or(ExtractFailure::DocParse("Clx out of range".into()))?;
+
+    // Skip any leading Prc (0x01) blocks to reach the Pcdt (0x02) plcfPcd.
+    let mut i = 0usize;
+    while i < clx.len() && clx[i] == 0x01 {
+        let n = u16::from_le_bytes([clx[i + 1], clx[i + 2]]) as usize;
+        i += 3 + n;
+    }
+    if clx.get(i) != Some(&0x02) {
+        return Err(ExtractFailure::DocParse("no Pcdt in Clx".into()));
+    }
+    let lcb = rd_u32(clx, i + 1).ok_or(ExtractFailure::DocParse("bad Pcdt len".into()))? as usize;
+    let plc = clx
+        .get(i + 5..i + 5 + lcb)
+        .ok_or(ExtractFailure::DocParse("plcfPcd out of range".into()))?;
+    // plcfPcd: (n+1) CPs (4 bytes each) then n PCDs (8 bytes each).
+    let n = (lcb.saturating_sub(4)) / (4 + 8);
+    if n == 0 {
+        return Err(ExtractFailure::DocParse("empty piece table".into()));
+    }
+    let cps: Vec<u32> = (0..=n).filter_map(|k| rd_u32(plc, k * 4)).collect();
+    let pcd_base = (n + 1) * 4;
+
+    let mut budget = Budget::new(cap);
+    for p in 0..n {
+        let cp_start = cps[p];
+        let cp_end = cps[p + 1];
+        let chars = cp_end.saturating_sub(cp_start) as usize;
+        let fc =
+            rd_u32(plc, pcd_base + p * 8 + 2).ok_or(ExtractFailure::DocParse("bad PCD".into()))?;
+        let compressed = fc & 0x4000_0000 != 0;
+        let piece = if compressed {
+            let off = (fc & 0x3FFF_FFFF) as usize / 2;
+            let end = off + chars;
+            let raw = wds.get(off..end).unwrap_or(&[]);
+            raw.iter().map(|&b| cp1252_char(b)).collect::<String>()
+        } else {
+            let off = fc as usize;
+            let end = off + chars * 2;
+            let raw = wds.get(off..end).unwrap_or(&[]);
+            raw.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .map(|u| char::from_u32(u as u32).unwrap_or('\u{FFFD}'))
+                .collect::<String>()
+        };
+        // Word control glyphs → whitespace; drop field/embedded-object markers.
+        let cleaned: String = piece
+            .chars()
+            .filter_map(|c| match c {
+                '\r' | '\x07' | '\x0b' | '\x0c' => Some('\n'),
+                '\x1e' | '\x1f' => None,
+                '\x00'..='\x08' | '\x0e'..='\x1f' => None,
+                other => Some(other),
+            })
+            .collect();
+        if !budget.push(&cleaned) {
+            break;
+        }
+    }
+    Ok(Extraction {
+        text: budget.out.trim().to_string(),
+        method: "doc-piecetable",
+        truncated: budget.truncated,
+    })
+}
+
 /// Find the notesSlide relationship target in a slide's `.rels` part and
 /// resolve it against `ppt/slides/` (targets look like
 /// `../notesSlides/notesSlide1.xml`).
@@ -564,6 +778,43 @@ pub(crate) mod fixtures {
         }
         body.push_str("</sheetData></worksheet>");
         body
+    }
+
+    /// A minimal but valid legacy .doc (OLE2 compound file) carrying `text` as
+    /// one compressed (CP1252) piece, built with `cfb` — the same round-trip
+    /// path real Word docs take through `extract_doc`'s piece-table reader. No
+    /// external tool, no PII fixture. ASCII `text` only (1 byte/char).
+    pub(crate) fn doc_with_text(text: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        const TEXT_OFF: usize = 0x200; // where the text lives in WordDocument
+        let mut wds = vec![0u8; TEXT_OFF + text.len()];
+        wds[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes()); // FIB magic
+                                                             // flags at 0x0A: fWhichTblStm=0 ⇒ the "0Table" stream holds the Clx.
+        wds[0x1A2..0x1A6].copy_from_slice(&0u32.to_le_bytes()); // fcClx = 0
+        wds[0x1A6..0x1AA].copy_from_slice(&21u32.to_le_bytes()); // lcbClx
+        wds[TEXT_OFF..].copy_from_slice(text.as_bytes());
+
+        // Clx = 0x02, lcb(u32)=16, then plcfPcd = [CP0,CP1] + one 8-byte PCD.
+        let fc: u32 = 0x4000_0000 | ((TEXT_OFF as u32) * 2); // compressed piece
+        let mut plc = Vec::new();
+        plc.extend_from_slice(&0u32.to_le_bytes()); // CP0
+        plc.extend_from_slice(&(text.chars().count() as u32).to_le_bytes()); // CP1
+        plc.extend_from_slice(&0u16.to_le_bytes()); // PCD flags
+        plc.extend_from_slice(&fc.to_le_bytes()); // PCD.fc
+        plc.extend_from_slice(&0u16.to_le_bytes()); // PCD.prm
+        let mut tbl = vec![0x02u8];
+        tbl.extend_from_slice(&(plc.len() as u32).to_le_bytes());
+        tbl.extend_from_slice(&plc);
+
+        let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new()))
+            .expect("create compound file");
+        cf.create_stream("/WordDocument")
+            .and_then(|mut s| s.write_all(&wds))
+            .expect("WordDocument stream");
+        cf.create_stream("/0Table")
+            .and_then(|mut s| s.write_all(&tbl))
+            .expect("0Table stream");
+        cf.into_inner().into_inner()
     }
 
     /// A minimal but valid two-sheet xlsx with known cell text.
@@ -817,6 +1068,62 @@ mod tests {
         bytes.truncate(40); // valid zip magic, mangled central directory
         let f = expect_failed(extract(&bytes, Some("deck.pptx")));
         assert!(matches!(f, ExtractFailure::PptxParse(_)), "got {f:?}");
+    }
+
+    // ---------------- docx / doc (Word) ----------------
+
+    #[test]
+    fn docx_extracts_body_text() {
+        // A real .docx (WordprocessingML zip) written by macOS textutil.
+        let bytes = include_bytes!("testdata/sample.docx");
+        let ex = expect_extracted(extract(bytes, Some("sample.docx")));
+        assert_eq!(ex.method, "docx-xml");
+        assert!(
+            ex.text.contains("Acme Freight renewal risk"),
+            "docx text: {:?}",
+            ex.text
+        );
+        assert!(ex.text.contains("61000"), "docx text: {:?}", ex.text);
+    }
+
+    #[test]
+    fn docx_detected_by_package_structure_even_with_wrong_name() {
+        let bytes = include_bytes!("testdata/sample.docx");
+        // Magic + word/document.xml win over a misleading .pptx name.
+        let ex = expect_extracted(extract(bytes, Some("mislabeled.pptx")));
+        assert_eq!(ex.method, "docx-xml");
+    }
+
+    #[test]
+    fn doc_extracts_body_text_via_piece_table() {
+        // A valid legacy .doc built via cfb — the same OLE2 + piece-table path
+        // real Word docs take (verified against real .doc files during dev).
+        let bytes =
+            fixtures::doc_with_text("Acme Freight renewal risk is high. Revised quote 61000.");
+        let ex = expect_extracted(extract(&bytes, Some("sample.doc")));
+        assert_eq!(ex.method, "doc-piecetable");
+        assert!(
+            ex.text.contains("Acme Freight renewal risk"),
+            "doc text: {:?}",
+            ex.text
+        );
+        assert!(ex.text.contains("61000"), "doc text: {:?}", ex.text);
+    }
+
+    #[test]
+    fn malformed_ole2_claiming_doc_degrades_to_typed_failure() {
+        // OLE2 magic but a garbage body (mirrors real-world .doc files whose
+        // compound structure a strict reader refuses, e.g. textutil output).
+        // The invariant: fail cleanly (metadata-only), never crash, never fake
+        // clean text.
+        let mut bytes = OLE2_MAGIC.to_vec();
+        bytes.resize(bytes.len() + 4096, 0u8);
+        match extract(&bytes, Some("broken.doc")) {
+            ExtractOutcome::Failed(_) | ExtractOutcome::NotHandled => {}
+            ExtractOutcome::Extracted(ex) => {
+                panic!("corrupt .doc must not extract clean text: {:?}", ex.text)
+            }
+        }
     }
 
     // ---------------- pdf ----------------

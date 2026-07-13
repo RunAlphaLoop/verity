@@ -60,6 +60,9 @@ calamine = "0.36"
 # heavyweight office suite dep. deflate-read only; fixtures are written Stored.
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 quick-xml = "0.41"
+# cfb: legacy .doc is an OLE2 compound file; we read its WordDocument + table
+# streams and reconstruct text from the piece table ourselves (no office suite).
+cfb = "0.10"
 # pdf-extract: text-layer extraction (fonts/ToUnicode CMaps/ordering) on top of
 # lopdf — the part we refuse to reimplement. Known to panic on hostile files;
 # every call is wrapped in catch_unwind (see extract.rs).
