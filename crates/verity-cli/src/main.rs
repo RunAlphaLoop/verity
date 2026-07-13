@@ -60,6 +60,13 @@ enum Command {
         /// Default: discovered above the binary, then $VERITY_REPO.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Bring up the knowledge consolidation worker with the stack (SPEC §2
+        /// L2). OFF by default — unlike the free deterministic planes it makes
+        /// LLM calls (needs an Anthropic key at ~/.verity-anthropic-key), so it
+        /// is a deliberate flip, never automatic. Auto-publish stays off: it
+        /// extracts knowledge into the review queue, never straight to memory.
+        #[arg(long)]
+        knowledge: bool,
     },
     /// Ingest a file, a directory (recursive, text-like files), an http(s)
     /// URL, or stdin ('-') into memory — under an explicit visibility.
@@ -324,7 +331,7 @@ async fn run() -> Result<()> {
     };
 
     match cli.command {
-        Command::Dev { repo } => dev::run(&mut ctx, repo).await,
+        Command::Dev { repo, knowledge } => dev::run(&mut ctx, repo, knowledge).await,
         Command::Add {
             target,
             visibility,

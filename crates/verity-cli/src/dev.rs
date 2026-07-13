@@ -23,7 +23,78 @@ const DEV_PRINCIPAL: &str = "user:dev";
 const SPICEDB_URL: &str = "http://localhost:8443";
 const SPICEDB_KEY: &str = "verity-dev-key";
 
-pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
+/// Where the Anthropic key lives (the same file the server reads via
+/// VERITY_ANTHROPIC_KEY_FILE). The knowledge worker needs it as ANTHROPIC_API_KEY.
+fn anthropic_key_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".verity-anthropic-key"))
+}
+
+/// Spawn the knowledge consolidation worker (SPEC §2 L2) as a managed dev
+/// plane: the Python `verity_ingest.consolidation` worker leased against the
+/// dev tenant, extracting knowledge into the review queue (auto-publish stays
+/// off). Detached + logged like the server; non-fatal — a missing venv or key
+/// is disclosed, never a hard stop. Returns the child pid on success.
+fn spawn_knowledge_worker(ctx: &Ctx, repo: &Path, tenant_id: &str) -> Result<u32> {
+    let py = repo.join("ingest/.venv/bin/python");
+    if !py.exists() {
+        bail!(
+            "no ingest virtualenv at {} — create it (cd ingest && python -m venv .venv && \
+             .venv/bin/pip install -e '.[gdrive]') then re-run with --knowledge",
+            py.display()
+        );
+    }
+    let key_path = anthropic_key_path().filter(|p| p.exists()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "knowledge extraction needs an Anthropic key at ~/.verity-anthropic-key \
+             (0600) — add it, then re-run with --knowledge"
+        )
+    })?;
+    let api_key = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("reading {}", key_path.display()))?
+        .trim()
+        .to_string();
+
+    let log_path = ctx
+        .config_path
+        .parent()
+        .map(|d| d.join("consolidation.log"))
+        .unwrap_or_else(|| PathBuf::from("consolidation.log"));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("cannot open worker log {}", log_path.display()))?;
+
+    let mut cmd = Command::new(&py);
+    cmd.args(["-m", "verity_ingest.consolidation", "--base-url"])
+        .arg(&ctx.url)
+        .args(["--tenant-id"])
+        .arg(tenant_id)
+        // Live LLM extraction + judge (the whole reason to flip this on); the
+        // server still gates every candidate through the review queue.
+        .args([
+            "--extractor",
+            "anthropic",
+            "--judge",
+            "anthropic",
+            "--interval",
+            "30",
+        ])
+        .current_dir(repo.join("ingest"))
+        .env("ANTHROPIC_API_KEY", api_key)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().context("log handle clones")?)
+        .stderr(log);
+    if let Some(token) = &ctx.config.admin_token {
+        cmd.env("VERITY_ADMIN_TOKEN", token);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("cannot start the knowledge worker ({})", py.display()))?;
+    Ok(child.id())
+}
+
+pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>, knowledge: bool) -> Result<()> {
     ui::banner("verity dev — local memory plane, five minutes");
     println!();
 
@@ -86,6 +157,41 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>) -> Result<()> {
     ctx.config.principals = Some(vec![dev_token]);
     config::save(&ctx.config_path, &ctx.config)?;
     ui::step_ok("config", &ctx.config_path.display().to_string());
+
+    // (d.5) knowledge consolidation worker (SPEC §2 L2) — opt-in. Part of the
+    // managed stack when flipped on with --knowledge; OFF by default because,
+    // unlike the free deterministic planes, it makes LLM calls. Either way the
+    // state is DISCLOSED here so it's never a silent mystery.
+    if knowledge {
+        match repo.as_ref() {
+            Ok(repo_path) => match spawn_knowledge_worker(ctx, repo_path, &tenant_id) {
+                Ok(pid) => ui::step_ok(
+                    "knowledge",
+                    &format!(
+                        "consolidation worker up (pid {pid}) — anthropic extractor + judge, \
+                         leasing every 30s into the review queue. Auto-publish stays OFF."
+                    ),
+                ),
+                Err(e) => println!(
+                    "  {} {}  --knowledge requested but the worker did not start: {e}",
+                    ui::yellow("…"),
+                    ui::pad("knowledge", 8)
+                ),
+            },
+            Err(_) => println!(
+                "  {} {}  --knowledge needs the repo path (pass --repo or set $VERITY_REPO)",
+                ui::yellow("…"),
+                ui::pad("knowledge", 8)
+            ),
+        }
+    } else {
+        println!(
+            "  {} {}  off — flip on with `verity-cli dev --knowledge` (LLM extraction of \
+             facts/knowledge from your text, into the review queue)",
+            ui::dim("·"),
+            ui::pad("knowledge", 8)
+        );
+    }
 
     // Every plane line reports OBSERVED server behavior, not what this
     // process configured: a reused server may have any wiring, so the probes
