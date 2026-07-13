@@ -118,10 +118,10 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Protocol, Sequence
 
 import httpx
 
@@ -148,10 +148,13 @@ from verity_ingest.connectors.gdrive import (
 
 __all__ = [
     "CONNECTOR_STATUS_PATH",
+    "DEBEZIUM_PATH",
     "DOCUMENTS_PATH",
     "PRINCIPALS_PATH",
     "DocumentSink",
+    "DryRunFactSink",
     "DryRunSink",
+    "FactSink",
     "GmailConfig",
     "GmailConnector",
     "GmailDocumentEvent",
@@ -160,13 +163,19 @@ __all__ = [
     "PrincipalRegistry",
     "StaticRegistry",
     "VerityDocumentSink",
+    "VerityFactSink",
     "build_document_request",
+    "build_org_envelope",
+    "build_person_envelope",
+    "deliver_facts",
     "extract_body",
     "map_participants",
     "message_document_id",
     "parse_valid_from",
     "run_backfill",
     "run_once",
+    "select_org_facts",
+    "select_person_facts",
 ]
 
 # users/me resolves to the impersonated (delegated) subject under DWD, so the
@@ -175,6 +184,11 @@ GMAIL_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 SOURCE_NAME = "gmail"
+
+# The fact lane (selective identity-keyed org/person records) posts here, NOT
+# to /v1/ingest/documents. Debezium-shaped envelopes; verity_acl is a TOP-LEVEL
+# sibling of op/source/after (verity-server ingest.rs::parse_inline_acl).
+DEBEZIUM_PATH = "/v1/ingest/debezium"
 
 # Inline images and huge attachments are skipped-and-counted, not fetched: a
 # 25 MiB cap keeps one fat attachment from stalling the crawl. Server-side
@@ -206,6 +220,13 @@ class GmailConfig:
     # `--query` / `--newer-than` on the CLI override it.
     query: str = "newer_than:30d"
     page_size: int = 100
+    # Fact lane toggles (the document lane is always on and unchanged).
+    emit_facts: bool = True  # --facts/--no-facts
+    emit_people: bool = True  # --emit-people/--no-people (orgs-only when False)
+    strict_people: bool = True  # --strict-people/--no-strict-people (two-way only)
+    # Exclude the mailbox owner's own registrable domain from the ORG lane
+    # (default ON — the owner's employer is not an "org we deal with").
+    exclude_owner_domain: bool = True
 
 
 @dataclass
@@ -314,6 +335,402 @@ def parse_valid_from(headers: Iterable[Mapping[str, Any]], internal_date: str) -
             return ""
         return _to_rfc3339(datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc))
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Selective fact emission: the identity bar (§4.2 denylist parity + heuristics)
+# ---------------------------------------------------------------------------
+#
+# The document lane above emits participant tags + mirrored visibility on every
+# body/attachment (per-person retrieval + ACL — correct, unchanged). This
+# SECOND lane ADDS selective identity-keyed facts so entity RESOLUTION has
+# something to fold: every external corporate DOMAIN becomes an organization
+# entity (high value, near-zero noise), and ONLY addresses that clear the
+# identity bar (real two-way human correspondents) become person entities. Bots,
+# lists, no-reply and role mailboxes never become entities — no "127 bots", no
+# merge-review flood.
+#
+# The Python bar MUST equal the Rust resolver bar, so the three denylist tables
+# below are copied VERBATIM from crates/verity-storage/src/resolve/canon.rs
+# (FREEMAIL_DOMAINS / PLACEHOLDER_DOMAINS / ROLE_LOCALS). If canon.rs changes,
+# these change with it — a fact shipped here that Rust would drop is wasted, a
+# fact dropped here that Rust would keep is a silent resolution loss.
+
+# canon.rs:110 — free-mail / consumer domains (a shared gmail.com is NOT shared
+# identity). Two strangers at gmail.com therefore never become entities and so
+# CAN NEVER weld — the freemail trap is avoided by construction.
+_FREEMAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "ymail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "msn.com",
+        "aol.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "proton.me",
+        "protonmail.com",
+        "gmx.com",
+        "mail.com",
+        "zoho.com",
+        "yandex.com",
+        "pm.me",
+    }
+)
+
+# canon.rs:134 — placeholder / reserved domains (RFC 2606 + common test values).
+_PLACEHOLDER_DOMAINS = frozenset(
+    {
+        "example.com",
+        "example.org",
+        "example.net",
+        "example.edu",
+        "test.com",
+        "localhost",
+        "invalid",
+        "none.com",
+        "noemail.com",
+        "no-reply.com",
+        "noreply.com",
+    }
+)
+
+# canon.rs:150 — role-based / shared-mailbox local-parts (a mailbox, not a
+# person). info@/sales@/no-reply@/notifications@… never form a person edge.
+_ROLE_LOCALS = frozenset(
+    {
+        "info",
+        "sales",
+        "support",
+        "admin",
+        "administrator",
+        "contact",
+        "hello",
+        "help",
+        "office",
+        "team",
+        "marketing",
+        "billing",
+        "accounts",
+        "accounting",
+        "finance",
+        "hr",
+        "jobs",
+        "careers",
+        "press",
+        "media",
+        "legal",
+        "privacy",
+        "security",
+        "abuse",
+        "postmaster",
+        "webmaster",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "mailer-daemon",
+        "notifications",
+        "notification",
+        "newsletter",
+        "enquiries",
+        "inquiries",
+        "service",
+        "customerservice",
+        "orders",
+        "hi",
+    }
+)
+
+# Connector-side EXTRA selectivity (NOT in canon.rs — pure NARROWING, never
+# widening): ESP / bulk-sender infrastructure domains whose mail is machine
+# blast, not a person we correspond with. Subtracted from the PERSON lane only;
+# the ORG lane is unaffected (these are not corporate identities we deal with).
+_LIST_DOMAINS = frozenset(
+    {
+        "sendgrid.net",
+        "mailgun.org",
+        "amazonses.com",
+        "mcsv.net",
+        "mailchimpapp.com",
+        "sparkpostmail.com",
+        "sendinblue.com",
+        "postmarkapp.com",
+        "mailchimp.com",
+        "cmail19.com",
+    }
+)
+
+# List-ish local-parts for the person lane's automation gate (a superset-flavored
+# subset of the role locals plus common bot/build/digest words).
+_LIST_LOCALS = frozenset(
+    {
+        "team",
+        "notifications",
+        "notification",
+        "updates",
+        "newsletter",
+        "digest",
+        "alerts",
+        "alert",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "mailer",
+        "mailer-daemon",
+        "bot",
+        "ci",
+        "builds",
+        "build",
+        "robot",
+        "automated",
+    }
+)
+
+# Automation / list markers in a display name (a "real name" must not be one of
+# these). Case-insensitive; anchored where it matters.
+_VIA_RE = re.compile(r"(?i)\b(via|through)\b")
+_AUTOMATION_TAIL_RE = re.compile(
+    r"(?i)(team|notifications?|bot|ci|cd|updates?|digest|alerts?|reports?|"
+    r"mailer|daemon|jobs?|jenkins|deploy|tickets?|support|newsletter|noreply|"
+    r"no-?reply)\s*$"
+)
+# The eTLD+1 multi-part public-suffix table, mirrored (minimally) from canon.rs
+# registrable_domain's MULTI_PART_SUFFIXES so a `mail.acme.co.uk` collapses to
+# `acme.co.uk`, not `co.uk`. A plain last-two-labels fallback covers the rest.
+_MULTI_PART_SUFFIXES = frozenset(
+    {
+        "co.uk",
+        "org.uk",
+        "me.uk",
+        "ltd.uk",
+        "plc.uk",
+        "net.uk",
+        "sch.uk",
+        "ac.uk",
+        "gov.uk",
+        "com.au",
+        "net.au",
+        "org.au",
+        "edu.au",
+        "gov.au",
+        "asn.au",
+        "id.au",
+        "co.nz",
+        "net.nz",
+        "org.nz",
+        "govt.nz",
+        "ac.nz",
+        "school.nz",
+        "co.jp",
+        "or.jp",
+        "ne.jp",
+        "ac.jp",
+        "go.jp",
+        "com.br",
+        "net.br",
+        "org.br",
+        "gov.br",
+        "co.in",
+        "net.in",
+        "org.in",
+        "gen.in",
+        "firm.in",
+        "ind.in",
+        "co.za",
+        "net.za",
+        "org.za",
+        "gov.za",
+        "com.mx",
+        "com.sg",
+        "com.hk",
+        "com.cn",
+        "com.tr",
+        "com.ar",
+        "com.tw",
+        "com.my",
+        "co.kr",
+        "co.il",
+        "co.id",
+        "co.th",
+        "com.pl",
+        "com.ua",
+        "com.ph",
+        "com.vn",
+    }
+)
+
+
+def _is_denylisted_domain(domain: str) -> bool:
+    """canon.rs is_denied_domain: free-mail or placeholder → never an org, never
+    a person's org."""
+    return domain in _FREEMAIL_DOMAINS or domain in _PLACEHOLDER_DOMAINS
+
+
+def _is_denylisted_email(local: str, domain: str) -> bool:
+    """canon.rs is_denylisted(Email): role-based local (after +tag strip) OR a
+    denylisted domain. Fail closed."""
+    local_base = local.split("+", 1)[0]
+    return local_base in _ROLE_LOCALS or _is_denylisted_domain(domain)
+
+
+def _canonicalize_email(raw: str | None) -> str | None:
+    """Port of canon.rs::canonicalize_email (identity bar parity).
+
+    trim; lowercase; strip a leading ``mailto:``; split on a SINGLE ``@``
+    (None if 0 or >1); strip the ``+tag`` sub-address (None if the local then
+    empties); trim ``.`` off the domain; require the domain to contain ``.`` and
+    no space; drop if denylisted (free-mail / placeholder / role-local). Returns
+    the canonical ``local@domain`` or None. Fail closed on anything malformed."""
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    if s.startswith("mailto:"):
+        s = s[len("mailto:") :].strip()
+    if s.count("@") != 1:
+        return None
+    local_raw, domain_raw = s.split("@", 1)
+    if not local_raw or not domain_raw:
+        return None
+    local = local_raw.split("+", 1)[0] if "+" in local_raw else local_raw
+    if not local:
+        return None
+    domain = domain_raw.strip(".")
+    if "." not in domain or " " in domain:
+        return None
+    if _is_denylisted_email(local, domain):
+        return None
+    return f"{local}@{domain}"
+
+
+def _registrable_domain(host: str | None) -> str | None:
+    """Port of canon.rs::registrable_domain (eTLD+1) over a bare host or a URL.
+
+    Strip scheme/path/query/fragment/port/userinfo down to the bare host, drop a
+    leading ``www.``, then reduce to the registrable domain using the multi-part
+    suffix table (``mail.acme.co.uk`` → ``acme.co.uk``), else the last two
+    labels. None on empty / single-label."""
+    if not host:
+        return None
+    s = host.strip().lower()
+    if not s:
+        return None
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    elif s.startswith("mailto:"):
+        s = s[len("mailto:") :]
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    for sep in ("/", "?", "#"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    if ":" in s:
+        head, _, port = s.rpartition(":")
+        if head and port.isdigit():
+            s = head
+    if s.startswith("www."):
+        s = s[len("www.") :]
+    s = s.strip(".")
+    if not s or "." not in s or " " in s:
+        return None
+    labels = [label for label in s.split(".") if label]
+    if len(labels) < 2:
+        return None
+    last_two = f"{labels[-2]}.{labels[-1]}"
+    if last_two in _MULTI_PART_SUFFIXES and len(labels) >= 3:
+        return f"{labels[-3]}.{last_two}"
+    return last_two
+
+
+_ORG_MARKER_RE = re.compile(
+    r"(?i)\b(inc|llc|ltd|corp|co|gmbh|team|support|notifications?|"
+    r"labs?|technologies|software|systems|group|holdings)\b"
+)
+
+
+def _looks_org_ish(name: str) -> bool:
+    """Whether a From display name reads like an ORGANIZATION / brand rather
+    than a person's full name — a DISPLAY-name chooser only, NEVER a merge key.
+
+    Accepts: a single brand token (``Stripe``, ``GitHub``) or a name carrying an
+    org marker (``Acme Inc``, ``Redis Labs``, ``GitHub Notifications``). Rejects
+    an empty string and a plain two-token human name (``Jane Roe``) so a real
+    person's name never becomes an org's display label."""
+    stripped = name.strip()
+    if not stripped:
+        return False
+    if _ORG_MARKER_RE.search(stripped):
+        return True
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9'\-]*", stripped)
+    # A single token is treated as a brand (Stripe); 2+ alpha tokens with no org
+    # marker read as a personal name, so decline (the domain label is used).
+    return len(tokens) == 1
+
+
+def _is_person_display(name: str | None, address: str) -> bool:
+    """Whether a display name reads like a REAL human name (a quality gate for
+    admitting a person and for choosing an org's display name — NEVER a merge
+    key). Rejects: empty; name == the address or its local-part; only role/list
+    words; a ``via``/``through`` byline; an automation tail ("… Team",
+    "… Notifications", "… Bot", "… CI", "… Updates")."""
+    if not name:
+        return False
+    stripped = name.strip()
+    if not stripped:
+        return False
+    low = stripped.lower()
+    addr_low = address.strip().lower()
+    local = addr_low.split("@", 1)[0] if "@" in addr_low else addr_low
+    if low == addr_low or low == local:
+        return False
+    if _VIA_RE.search(stripped) or _AUTOMATION_TAIL_RE.search(stripped):
+        return False
+    # A real human name reads as at least two alpha tokens (given + family),
+    # none of them a role/list word. This deliberately rejects a single brand
+    # token ("GitHub", "Stripe") — that is an ORG display, not a person — so a
+    # brand never sneaks past the person quality gate.
+    tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", stripped)
+    real = [t for t in tokens if t.lower() not in _ROLE_LOCALS and t.lower() not in _LIST_LOCALS]
+    return len(real) >= 2
+
+
+def _looks_like_list(address: str) -> bool:
+    """Whether an address is bulk/list/automation infrastructure (person lane
+    only): a list-ish local-part OR an ESP/bulk-sender registrable domain."""
+    addr = address.strip().lower()
+    if "@" not in addr:
+        return True
+    local, domain = addr.split("@", 1)
+    local_base = local.split("+", 1)[0]
+    if local_base in _LIST_LOCALS:
+        return True
+    reg = _registrable_domain(domain)
+    return bool(reg and reg in _LIST_DOMAINS)
+
+
+@dataclass
+class _CorrespondentStat:
+    """Crawl-scoped, per-address accumulation of correspondence direction and
+    display/domain evidence. Two-way (both inbound and outbound with the owner)
+    is the primary person-admission signal."""
+
+    inbound: bool = False  # X was the From of a message NOT from the owner (owner received)
+    outbound: bool = False  # X was in To∪Cc of a message the owner SENT (owner wrote to X)
+    display_names: set[str] = field(default_factory=set)
+    domains: set[str] = field(default_factory=set)
+    first_seen_ms: int | None = None
+
+    def note_seen(self, ms: int | None) -> None:
+        if ms is None:
+            return
+        if self.first_seen_ms is None or ms < self.first_seen_ms:
+            self.first_seen_ms = ms
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +870,94 @@ class GmailConnector(Connector):
         # fetch or parse error. Reset at the start of each poll/full_crawl and
         # read by the runners for the end-of-run report.
         self.skipped = 0
+        # Fact lane (§4.2) accumulators — crawl/batch-scoped, filled as a SIDE
+        # EFFECT of the document pass, drained by the runner AFTER the message
+        # loop. The document lane (tags + visibility on bodies) is unchanged;
+        # this is a strictly additive second lane.
+        self._owner = (self.config.delegated_subject or "").strip().lower()
+        self._corr: dict[str, _CorrespondentStat] = {}
+        self._org_domains: dict[str, str] = {}
+        self._org_first_seen: dict[str, int] = {}
+
+    def _reset_fact_accumulators(self) -> None:
+        self._owner = (self.config.delegated_subject or "").strip().lower()
+        self._corr = {}
+        self._org_domains = {}
+        self._org_first_seen = {}
+
+    def _observe_correspondents(
+        self, headers: Iterable[Mapping[str, Any]], internal_date: str
+    ) -> None:
+        """Accumulate correspondence direction + org-domain evidence from one
+        message's participant headers. Wrapped by the caller's skip-and-count so
+        a single malformed header never corrupts the accumulator or aborts the
+        crawl. Owner-as-participant is never recorded as a correspondent."""
+        headers = list(headers)
+        try:
+            ms: int | None = int(internal_date) if internal_date else None
+        except (TypeError, ValueError):
+            ms = None
+        from_values = [v for name in ("From",) if (v := _header(headers, name))]
+        to_cc_values = [v for name in ("To", "Cc") if (v := _header(headers, name))]
+        from_pairs = email.utils.getaddresses(from_values)
+        to_cc_pairs = email.utils.getaddresses(to_cc_values)
+
+        # Owner is the sender iff a raw From address canonicalizes to the owner,
+        # OR (owner may be freemail/denylisted, e.g. a personal gmail inbox) its
+        # lowercased raw address equals the owner.
+        from_raw = {(a or "").strip().lower() for _n, a in from_pairs}
+        owner_is_sender = self._owner in from_raw or any(
+            _canonicalize_email(a) == self._owner for _n, a in from_pairs
+        )
+
+        # ORG accumulation runs off the RAW sender domain even when the address
+        # itself fails the person bar (notifications@github.com still proves the
+        # org github.com). Exclude the owner's own domain later, in select.
+        for _display, addr in from_pairs:
+            raw = (addr or "").strip().lower()
+            if not raw or "@" not in raw:
+                continue
+            reg = _registrable_domain(raw.rsplit("@", 1)[1])
+            if reg is None or _is_denylisted_domain(reg):
+                continue
+            display = (_display or "").strip()
+            candidate = display if _is_person_display(display, raw) else ""
+            org_name = candidate if _looks_org_ish(candidate) else _title_case_label(
+                reg.split(".", 1)[0]
+            )
+            existing = self._org_domains.get(reg)
+            # Prefer a real org-ish display over the title-cased label; otherwise
+            # keep the first one seen (deterministic).
+            if existing is None or (
+                existing == _title_case_label(reg.split(".", 1)[0]) and _looks_org_ish(candidate)
+            ):
+                self._org_domains[reg] = org_name
+            if ms is not None:
+                prev = self._org_first_seen.get(reg)
+                if prev is None or ms < prev:
+                    self._org_first_seen[reg] = ms
+
+        # PERSON stats: direction + display + domain per canonical address.
+        for pairs, is_from in ((from_pairs, True), (to_cc_pairs, False)):
+            for display, addr in pairs:
+                canon = _canonicalize_email(addr)
+                if canon is None or canon == self._owner:
+                    continue
+                stat = self._corr.get(canon)
+                if stat is None:
+                    stat = _CorrespondentStat()
+                    self._corr[canon] = stat
+                if is_from and not owner_is_sender:
+                    stat.inbound = True
+                if not is_from and owner_is_sender:
+                    stat.outbound = True
+                display = (display or "").strip()
+                if _is_person_display(display, canon):
+                    stat.display_names.add(display)
+                reg = _registrable_domain(canon.rsplit("@", 1)[1])
+                if reg:
+                    stat.domains.add(reg)
+                stat.note_seen(ms)
 
     # -- push lane ----------------------------------------------------------
 
@@ -473,6 +978,7 @@ class GmailConnector(Connector):
         is ``full_crawl``'s job (backfill protocol, §5a), not the change feed.
         """
         self.skipped = 0
+        self._reset_fact_accumulators()
         if cursor is None:
             profile = self._transport.get_json("profile", {})
             return [], str(profile.get("historyId", ""))
@@ -518,6 +1024,7 @@ class GmailConnector(Connector):
         configured query window, emitting body + attachment events per
         message. Per-message errors are skipped-and-counted, never fatal."""
         self.skipped = 0
+        self._reset_fact_accumulators()
         for message_ref in self._list_messages():
             mid = message_ref.get("id")
             if not mid:
@@ -566,6 +1073,16 @@ class GmailConnector(Connector):
         acl = map_participants(headers)
         entity_tags = list(acl.principals)  # participants ARE the entity links
         valid_from = parse_valid_from(headers, internal_date)
+
+        # Fact lane (additive): accumulate correspondence + org-domain evidence
+        # off the same headers. One malformed header must never corrupt the
+        # accumulator or abort the crawl, hence the skip-and-count guard.
+        try:
+            self._observe_correspondents(headers, internal_date)
+        except (ValueError, KeyError, TypeError) as exc:
+            # One malformed header must never corrupt the accumulator or abort
+            # the crawl — skip-and-count-and-log, same as the doc lane.
+            print(f"gmail: fact-observe skipped on {message_id}: {exc}", file=sys.stderr)
 
         subject = _header(headers, "Subject") or ""
         body_text = extract_body(payload)
@@ -710,6 +1227,311 @@ def build_document_request(
 
 
 # ---------------------------------------------------------------------------
+# Fact lane: selective org/person envelopes → POST /v1/ingest/debezium
+# ---------------------------------------------------------------------------
+#
+# ORG: one SINGLETON per surviving external registrable domain. The `after` has
+# only descriptive fields (domain/name/kind) — NONE named email/AccountId/
+# associatedcompanyid/*_id — so the resolver's producers see NO merge evidence
+# and the org materializes as its own canonical (fold.rs: a singleton is
+# implicitly its own canonical). No welding, no domain-star fan-out.
+#
+# PERSON: only addresses that clear the identity bar. The `after` carries a BARE
+# `email` field → EMAIL_FIELDS → the tier-1 email-within-namespace producer in
+# namespace customer_contact (source is "gmail", not "linear", and the field is
+# "email"). So this person can weld cross-source to a future CRM contact at the
+# same address WITHOUT welding to any internal actor (§4.4 fence) and WITHOUT
+# merging two freemail strangers (they never reach here — gate 1 drops them).
+
+
+def _title_case_label(label: str) -> str:
+    """A domain's leading label as a display name: `stripe` → `Stripe`,
+    `redis-labs` → `Redis Labs`. Display-only; NEVER a merge key."""
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", label) if part) or label
+
+
+def build_org_envelope(
+    domain: str, name: str, owner_token: int | None, ts_ms: int | None
+) -> dict | None:
+    """One Debezium ORG envelope (a singleton canonical). Returns None when the
+    owner principal did not resolve (fail closed: no resolvable visibility →
+    no fact). `verity_acl` is a TOP-LEVEL sibling of op/source/after."""
+    if owner_token is None:
+        return None
+    source: dict[str, Any] = {"connector": SOURCE_NAME, "db": "accounts", "table": "org"}
+    if ts_ms is not None:
+        source["ts_ms"] = ts_ms
+    return {
+        "op": "c",
+        "source": source,
+        # Descriptive-only: no field named email/AccountId/associatedcompanyid/
+        # *_id → no merge evidence → singleton → its own canonical.
+        "after": {"id": domain, "domain": domain, "name": name, "kind": "organization"},
+        "verity_acl": {"visibility": [owner_token], "confidentiality": "internal"},
+    }
+
+
+def build_person_envelope(
+    email: str,
+    name: str | None,
+    domain: str | None,
+    correspondence: str,
+    owner_token: int | None,
+    ts_ms: int | None,
+) -> dict | None:
+    """One Debezium PERSON envelope (welds cross-source by `email` within the
+    customer_contact namespace). Returns None when the owner principal did not
+    resolve (fail closed). `verity_acl` is a TOP-LEVEL sibling."""
+    if owner_token is None:
+        return None
+    source: dict[str, Any] = {"connector": SOURCE_NAME, "db": "contacts", "table": "person"}
+    if ts_ms is not None:
+        source["ts_ms"] = ts_ms
+    after: dict[str, Any] = {
+        "id": email,
+        # BARE `email` → EMAIL_FIELDS → tier-1 email-within-namespace producer.
+        "email": email,
+        "correspondence": correspondence,
+    }
+    if name:
+        after["name"] = name  # display/blocking only, never a lone merge key
+    if domain:
+        after["domain"] = domain  # descriptive; NOT re-emitted as a merge key
+    return {
+        "op": "c",
+        "source": source,
+        "after": after,
+        "verity_acl": {"visibility": [owner_token], "confidentiality": "internal"},
+    }
+
+
+def select_org_facts(
+    org_domains: Mapping[str, str],
+    org_first_seen: Mapping[str, int],
+    owner_token: int | None,
+    *,
+    owner_domain: str | None = None,
+) -> list[dict]:
+    """Build the deduped ORG envelopes (one per surviving external registrable
+    domain). Permissive on orgs — high value, near-zero noise:
+    - drop denylisted (free-mail / placeholder) domains;
+    - drop the owner's own registrable domain;
+    - role-local-ness does NOT disqualify (notifications@github.com still proves
+      github.com is an org we deal with).
+    Empty list when the owner token is unresolvable (fail closed)."""
+    if owner_token is None:
+        return []
+    owner_reg = _registrable_domain(owner_domain) if owner_domain else None
+    envelopes: list[dict] = []
+    for domain in sorted(org_domains):
+        if _is_denylisted_domain(domain):
+            continue
+        if owner_reg and domain == owner_reg:
+            continue
+        name = org_domains[domain] or _title_case_label(domain.split(".", 1)[0])
+        env = build_org_envelope(domain, name, owner_token, org_first_seen.get(domain))
+        if env is not None:
+            envelopes.append(env)
+    return envelopes
+
+
+def select_person_facts(
+    corr: Mapping[str, _CorrespondentStat],
+    owner_token: int | None,
+    *,
+    strict: bool = True,
+) -> list[dict]:
+    """Build the PERSON envelopes for addresses that clear the identity bar.
+
+    ALL of 1-3, then 4a OR (when ``strict`` is False) 4b:
+      1. canonicalizes (kills every free-mail / placeholder / role-local — the
+         "127 bots" case);
+      2. is not the owner (owner is never accumulated as a correspondent);
+      3. is not a list/ESP/bot address;
+      4a. TWO-WAY (default): both inbound and outbound → correspondence
+          "two_way"; OR
+      4b. NAMED-SINGLE-DIRECTION (only when ``strict`` is False): exactly one
+          direction AND a real display name AND a non-freemail business domain
+          → "inbound_named" / "outbound_named".
+    Empty list when the owner token is unresolvable (fail closed)."""
+    if owner_token is None:
+        return []
+    envelopes: list[dict] = []
+    for addr in sorted(corr):
+        stat = corr[addr]
+        # addr is already the canonical key (gate 1 ran during accumulation),
+        # but re-assert the bar so a caller-built stat can't smuggle one past.
+        canon = _canonicalize_email(addr)
+        if canon is None or canon != addr:
+            continue
+        if _looks_like_list(addr):
+            continue
+        two_way = stat.inbound and stat.outbound
+        if two_way:
+            # A real correspondent, not an automation address the owner merely
+            # reply-all'd or CC'd a bot on. Two-way is necessary but NOT
+            # sufficient: require a real human display name (mirrors the
+            # single-direction branch below). This rejects CI/ticketing/list
+            # bots on ordinary hosts (ci_activity@noreply.github.com,
+            # tickets@zendesk-corp.io, jenkins@ci.internal-corp.com, …) that
+            # evade _looks_like_list because their local-part is not a known
+            # list-local and their host is not a known ESP domain.
+            if not any(_is_person_display(n, addr) for n in stat.display_names):
+                continue
+            correspondence = "two_way"
+        elif not strict and (stat.inbound ^ stat.outbound):
+            reg = _registrable_domain(addr.split("@", 1)[1])
+            if reg is None or reg in _FREEMAIL_DOMAINS:
+                continue
+            if not stat.display_names:
+                continue
+            correspondence = "inbound_named" if stat.inbound else "outbound_named"
+        else:
+            continue
+        name = _best_display_name(stat.display_names, addr)
+        domain = _registrable_domain(addr.split("@", 1)[1])
+        env = build_person_envelope(
+            addr, name, domain, correspondence, owner_token, stat.first_seen_ms
+        )
+        if env is not None:
+            envelopes.append(env)
+    return envelopes
+
+
+def _best_display_name(names: set[str], address: str) -> str | None:
+    """Pick the longest real display name seen for an address (already filtered
+    to real names by the accumulator), or None."""
+    real = sorted((n for n in names if _is_person_display(n, address)), key=len, reverse=True)
+    return real[0] if real else None
+
+
+class FactSink(Protocol):
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None: ...
+
+
+class VerityFactSink:
+    """POSTs a JSON ARRAY of Debezium envelopes to ``{base}/v1/ingest/debezium``.
+
+    Same httpx.Client + Bearer auth as VerityDocumentSink. The inline
+    ``verity_acl`` block on each envelope supplies visibility — there is NO
+    ``visibility=`` query param (that would be a bound-policy fallback, which the
+    fact lane forbids). ``tenant_id`` + ``pk`` are query params. The response's
+    ``facts_refused_no_acl`` count is surfaced for a fail-VISIBLE post-run
+    assertion — a mis-shaped ACL shows up as a refusal, never a silent leak."""
+
+    def __init__(
+        self,
+        base_url: str,
+        tenant_id: str,
+        client: httpx.Client | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._client = client or httpx.Client(timeout=120.0, headers=headers)
+        self._base_url = base_url.rstrip("/")
+        self._tenant_id = tenant_id
+        self.refused = 0
+
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None:
+        if not envelopes:
+            return
+        response = self._client.post(
+            f"{self._base_url}{DEBEZIUM_PATH}",
+            params={"tenant_id": self._tenant_id, "pk": pk},
+            json=envelopes,
+        )
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        refused = body.get("facts_refused_no_acl")
+        if isinstance(refused, int):
+            self.refused += refused
+
+
+class DryRunFactSink:
+    """Collects and prints the would-be Debezium envelopes instead of POSTing.
+
+    Person locals are REDACTED to ``•••@domain`` (domains are org identity, not
+    PII, so they print in clear); org domains print whole. No full addresses,
+    names, tokens, or bodies ever reach the output."""
+
+    def __init__(self, stream: Any = None) -> None:
+        self.envelopes: list[dict] = []
+        self.refused = 0
+        self._stream = stream if stream is not None else sys.stdout
+
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None:
+        self.envelopes.extend(envelopes)
+        for env in envelopes:
+            print(f"[dry-run] POST {DEBEZIUM_PATH}\n{_redact_envelope(env)}", file=self._stream)
+
+
+def _redact_local(email: str) -> str:
+    """`jane@supabase.io` → `•••@supabase.io`. Domain in clear (org identity)."""
+    domain = email.split("@", 1)[1] if "@" in email else "?"
+    return f"•••@{domain}"
+
+
+def _redact_envelope(env: Mapping[str, Any]) -> str:
+    """A PII-free one-line shape of an envelope for dry-run output."""
+    after = env.get("after") or {}
+    table = (env.get("source") or {}).get("table")
+    acl = env.get("verity_acl") or {}
+    vis_present = bool(acl.get("visibility"))
+    if table == "person":
+        ident = _redact_local(str(after.get("id", "")))
+        extra = f" correspondence={after.get('correspondence')}"
+    else:
+        ident = str(after.get("id", ""))  # a domain — org identity, not PII
+        extra = f" name={after.get('name')!r}"
+    return (
+        f"  op={env.get('op')} table={table} id={ident}{extra} "
+        f"acl.visibility={'set' if vis_present else 'MISSING'}"
+    )
+
+
+def deliver_facts(
+    connector: GmailConnector,
+    registry: PrincipalRegistry,
+    fact_sink: FactSink,
+) -> tuple[int, int]:
+    """Drain the crawl-scoped fact accumulators into the fact sink and return
+    ``(orgs, persons)`` emitted. Call AFTER the message loop.
+
+    Fail closed: resolve the owner principal ONCE; if it does not resolve to an
+    int token, the fact lane is DISABLED for this run — NO org and NO person
+    envelopes are built or posted (a count-only line is logged). The document
+    lane is unaffected."""
+    if not connector.config.emit_facts:
+        return (0, 0)
+    owner = connector._owner
+    owner_token: int | None = None
+    if owner:
+        principal = f"user:{owner}"
+        owner_token = registry.resolve([principal]).get(principal)
+    if owner_token is None:
+        print("gmail: fact lane disabled — owner principal did not resolve")
+        return (0, 0)
+
+    owner_domain = owner.rsplit("@", 1)[1] if "@" in owner else None
+    org_envelopes = select_org_facts(
+        connector._org_domains,
+        connector._org_first_seen,
+        owner_token,
+        owner_domain=owner_domain if connector.config.exclude_owner_domain else None,
+    )
+    person_envelopes: list[dict] = []
+    if connector.config.emit_people:
+        person_envelopes = select_person_facts(
+            connector._corr, owner_token, strict=connector.config.strict_people
+        )
+    fact_sink.deliver([*org_envelopes, *person_envelopes], pk="id")
+    return (len(org_envelopes), len(person_envelopes))
+
+
+# ---------------------------------------------------------------------------
 # Runner: python -m verity_ingest.connectors.gmail --once [--dry-run]
 # ---------------------------------------------------------------------------
 
@@ -730,10 +1552,16 @@ def run_once(
     registry: PrincipalRegistry,
     sink: DocumentSink,
     state_file: Path,
+    fact_sink: FactSink | None = None,
 ) -> int:
     """One poll cycle: load cursor, poll, deliver, checkpoint. Returns the
     number of delivered requests. The cursor is checkpointed only after
-    delivery, so a crash replays the window (at-least-once)."""
+    delivery, so a crash replays the window (at-least-once).
+
+    When ``fact_sink`` is given, the selective org/person facts accumulated over
+    this poll batch are delivered AFTER the documents (an additive second lane;
+    a contact that reaches two-way only across polls lands on the poll where the
+    second direction arrives, or on the next backfill)."""
     cursor = _load_cursor(state_file)
     events, next_cursor = asyncio.run(connector.poll(cursor))
     delivered = 0
@@ -751,6 +1579,10 @@ def run_once(
     skipped += connector.skipped
     if skipped:
         print(f"gmail: skipped {skipped} item(s) (unresolvable ACL, oversized, or fetch error)")
+    if fact_sink is not None:
+        orgs, persons = deliver_facts(connector, registry, fact_sink)
+        if orgs or persons:
+            print(f"gmail: emitted {orgs} org, {persons} person fact(s)")
     _save_cursor(state_file, next_cursor)
     heartbeat = getattr(sink, "heartbeat", None)
     if heartbeat is not None:
@@ -765,6 +1597,7 @@ def run_backfill(
     reporter: BackfillReporter | None = None,
     *,
     flush_every: int = 20,
+    fact_sink: FactSink | None = None,
 ) -> int:
     """§5a reconciliation backfill: drive :meth:`GmailConnector.full_crawl`
     (``messages.list`` over the query window) into the sink, reporting
@@ -822,6 +1655,17 @@ def run_backfill(
             f"{connector.skipped} message/attachment(s) (fetch/parse error or "
             f"oversized), {failed} ingest failure(s)"
         )
+    # Fact lane (additive): after the whole crawl has drained, resolve the owner
+    # token once and deliver the deduped org/person envelopes. A delivery
+    # failure here must not fail the (already-delivered) document backfill.
+    if fact_sink is not None:
+        try:
+            orgs, persons = deliver_facts(connector, registry, fact_sink)
+        except httpx.HTTPError as exc:
+            print(f"gmail: fact delivery failed ({exc}); document backfill unaffected")
+        else:
+            if orgs or persons:
+                print(f"gmail: emitted {orgs} org, {persons} person fact(s)")
     return delivered
 
 
@@ -877,11 +1721,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--interval", type=float, default=300.0, help="poll interval in seconds (without --once)"
     )
+    # Fact lane toggles (document lane always on and unchanged).
+    parser.add_argument(
+        "--facts",
+        dest="facts",
+        action="store_true",
+        default=True,
+        help="emit selective org/person entity facts (default on)",
+    )
+    parser.add_argument(
+        "--no-facts", dest="facts", action="store_false", help="disable the fact lane entirely"
+    )
+    parser.add_argument(
+        "--emit-people",
+        dest="emit_people",
+        action="store_true",
+        default=True,
+        help="emit person facts for real correspondents (default on; orgs-only with --no-people)",
+    )
+    parser.add_argument("--no-people", dest="emit_people", action="store_false")
+    parser.add_argument(
+        "--strict-people",
+        dest="strict_people",
+        action="store_true",
+        default=True,
+        help="require two-way correspondence for a person fact (default on)",
+    )
+    parser.add_argument(
+        "--no-strict-people",
+        dest="strict_people",
+        action="store_false",
+        help="also admit a NAMED single-direction business human (relaxed)",
+    )
     args = parser.parse_args(argv)
 
     query = args.query or f"newer_than:{args.newer_than}"
     config = GmailConfig(
-        tenant_id=args.tenant_id, delegated_subject=args.subject, query=query
+        tenant_id=args.tenant_id,
+        delegated_subject=args.subject,
+        query=query,
+        emit_facts=args.facts,
+        emit_people=args.emit_people,
+        strict_people=args.strict_people,
     )
     credentials = load_gmail_credentials(config.delegated_subject)
     connector = GmailConnector(HttpGmailTransport(credentials), config)
@@ -895,6 +1776,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     sink: DocumentSink = (
         DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
     )
+    fact_sink: FactSink | None = None
+    if config.emit_facts:
+        fact_sink = (
+            DryRunFactSink()
+            if args.dry_run
+            else VerityFactSink(args.verity_url, config.tenant_id, api_key=api_key)
+        )
 
     if args.backfill:
         # A backfill is a one-shot job, not a loop. Dry runs have no server to
@@ -906,12 +1794,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.verity_url, config.tenant_id, connector.name, api_key=api_key
             )
         )
-        delivered = run_backfill(connector, registry, sink, reporter)
+        delivered = run_backfill(connector, registry, sink, reporter, fact_sink=fact_sink)
         print(f"gmail: backfill delivered {delivered} request(s)")
         return 0
 
     while True:
-        delivered = run_once(connector, registry, sink, args.state_file)
+        delivered = run_once(connector, registry, sink, args.state_file, fact_sink=fact_sink)
         print(f"gmail: delivered {delivered} request(s); cursor -> {args.state_file}")
         if args.once:
             return 0
