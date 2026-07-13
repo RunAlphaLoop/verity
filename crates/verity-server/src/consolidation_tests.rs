@@ -56,6 +56,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         media_store: None,
         resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
+        folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
     });
     Some((state, tenant))
 }
@@ -82,6 +83,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
         auto_tag,
         knowledge_auto_merge,
         watch,
+        folder_watchers,
         ..
     } = Arc::try_unwrap(state).ok()?;
     Some((
@@ -100,6 +102,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             media_store: None,
             resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
             watch,
+            folder_watchers,
         }),
         tenant,
     ))

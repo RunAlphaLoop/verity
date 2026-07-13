@@ -543,34 +543,49 @@
         "</div>" +
         '<div class="err" id="wz-seed-err"></div><div id="wz-seed-out"></div>';
     } else {
-      // NOT DONE: a guided choice — one RECOMMENDED primary, one quiet alternative.
+      // NOT DONE: the "get data in" fork — TWO equal, clear paths, neither
+      // pre-selected (the logical first-run home). Left: watch a folder and
+      // drop real files in. Right: seed the sample cast. A quiet third link
+      // opens the ingest panel for writing one memory by hand.
       s4body =
         '<div class="dc-sides">' +
+          /* --- Path 1: watch a local folder --- */
           '<div class="dc-side">' +
-            '<div class="dc-name">Explore with sample data ' + V.badge("recommended — fastest to the proof", "b-kind") + "</div>" +
-            '<div class="dc-src" style="margin-top:6px">Meet <b>Acme Logistics (sample)</b> — three people, two teams, ' +
-              "two connected systems (a CRM and billing), and fourteen memories carrying real sharing rules: some org-visible, some team-only, one " +
-              "restricted, one field that got superseded, and one item that lands in <b>quarantine on purpose</b>. " +
-              "Everything is labeled " + V.badge("sample data", "b-kind") + " and removable in one click, using the same " +
-              "erasure pipeline you’d use for a real deletion request.</div>" +
+            '<div class="dc-name">Watch a local folder ' + V.badge("your own files", "b-kind") + "</div>" +
+            '<div class="dc-src" style="margin-top:6px">Point Verity at a folder on this machine and <b>drop files in — ' +
+              "each one becomes memory you can query.</b> Verity runs right here, so it can watch a folder on this computer " +
+              "directly (your browser can’t). Word docs, spreadsheets, slide decks, PDFs and plain text are read " +
+              "automatically. Default folder: <span class=\"ref\">./verity-inbox</span> — Verity makes it for you if it " +
+              "doesn’t exist, so you can drop a file in straight away.</div>" +
+            whatsThis("You choose <b>who can see</b> the files when you set the folder up — there is no default. " +
+              "Leave it empty and Verity refuses to watch: a folder whose files nobody could ever read is refused, not " +
+              "silently created. Same fail-closed rule the proof step demonstrates.") +
+            '<div class="dc-actions">' +
+              '<button class="primary" id="wz-folder"' + (info.tenant ? "" : " disabled") + ">Set up a watched folder</button>" +
+            "</div>" +
+            (info.tenant ? "" :
+              '<div class="asof" style="margin-top:6px">create your space first (step 1)</div>') +
+          "</div>" +
+          /* --- Path 2: seed sample data --- */
+          '<div class="dc-side">' +
+            '<div class="dc-name">Seed sample data ' + V.badge("fastest to the proof", "b-kind") + "</div>" +
+            '<div class="dc-src" style="margin-top:6px">No files of your own handy? Meet <b>Acme Logistics (sample)</b> — ' +
+              "three people, two teams, two connected systems (a CRM and billing), and fourteen memories carrying real " +
+              "sharing rules: some org-visible, some team-only, one restricted, one field that got superseded, and one " +
+              "item that lands in <b>quarantine on purpose</b>. Everything is labeled " + V.badge("sample data", "b-kind") +
+              " and removable in one click, using the same erasure pipeline you’d use for a real deletion request.</div>" +
             '<div class="dc-actions">' +
               '<button class="primary" id="wz-seed"' + (sampleReady && info.tenant ? "" : " disabled") + ">Seed the sample org</button>" +
             "</div>" +
             (sampleReady ? "" :
-              '<div class="asof" style="margin-top:6px">the sample seeder<span class="api-crumb"> · sample_cast.js</span> isn’t in this build yet — this button stays honestly disabled; “Start clean” works today</div>') +
+              '<div class="asof" style="margin-top:6px">the sample seeder<span class="api-crumb"> · sample_cast.js</span> isn’t in this build yet — this button stays honestly disabled; watching a folder works today</div>') +
             '<div class="err" id="wz-seed-err"></div><div id="wz-seed-out"></div>' +
           "</div>" +
-          '<div class="dc-side">' +
-            '<div class="dc-name" style="color:var(--dim)">…or start clean — add your first memory</div>' +
-            '<div class="dc-src" style="margin-top:6px">Write one memory yourself. You’ll be asked <b>who can see ' +
-              "it</b> before anything else, because Verity never guesses: <b>leave visibility empty and nobody can see " +
-              "it, ever.</b></div>" +
-            whatsThis("<b>Visibility</b> is the set of keys a memory is shared with, decided at write time. There is no " +
-              "default and no “public unless said otherwise” — omission refuses. This is the same fail-closed rule " +
-              "the proof step demonstrates.") +
-            '<div class="dc-actions"><button id="wz-goingest">Open the ingest panel</button></div>' +
-          "</div>" +
-        "</div>";
+        "</div>" +
+        /* --- quiet third path: write one memory by hand --- */
+        '<div class="note" style="margin-top:12px">Prefer to write one memory yourself? ' +
+          '<button id="wz-goingest" style="padding:2px 10px">Open the ingest panel</button> ' +
+          "— you’ll be asked <b>who can see it</b> before anything else; leave visibility empty and nobody can see it, ever.</div>";
     }
     html += stepShell(4, "Put memory in", items[3], s4body, V.esc(items[3].evidence));
 
@@ -808,6 +823,11 @@
     };
     var goIngest = el("wz-goingest");
     if (goIngest) goIngest.onclick = function () { V.show("ingest"); };
+
+    /* step 4 fork — watch a local folder: hand off to Sources & freshness (the
+       folder watch's home) with a nav param that opens the add-folder dialog. */
+    var goFolder = el("wz-folder");
+    if (goFolder) goFolder.onclick = function () { V.show("sources", { view: "folder" }); };
 
     /* step 4 done → single forward CTA to the proof */
     var cont5 = el("wz-continue5");

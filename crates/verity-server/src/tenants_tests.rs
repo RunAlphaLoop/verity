@@ -44,6 +44,7 @@ async fn test_state(admin: AdminAuth) -> Option<Arc<AppState>> {
         rebac: None,
         revocations: RevocationPlane::new(300),
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
+        folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
         allow_restricted_without_rebac: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,

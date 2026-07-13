@@ -45,6 +45,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         rebac: None,
         revocations: RevocationPlane::new(300),
         watch: std::sync::Arc::new(crate::rebac_watch::WatchStatus::new()),
+        folder_watchers: std::sync::Arc::new(crate::folder_watch::WatcherRegistry::new()),
         allow_restricted_without_rebac: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,

@@ -19,6 +19,7 @@ mod entity_resolution_tests;
 mod extract;
 #[cfg(test)]
 mod extract_tests;
+mod folder_watch;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
@@ -183,6 +184,11 @@ pub(crate) struct AppState {
     /// can report `enabled: false`; the consumer only ADDS revocation
     /// tombstones — the read path never consults it.
     pub(crate) watch: Arc<rebac_watch::WatchStatus>,
+    /// Live local-folder watchers (folder_watch.rs). Holds the OS-level watch
+    /// handles keyed by watch id so add/stop can arm/disarm them at runtime;
+    /// re-populated from the `folder_watches` table on boot. Ingest is
+    /// write-path only — read-path purity is untouched.
+    pub(crate) folder_watchers: Arc<folder_watch::WatcherRegistry>,
 }
 
 impl AppState {
@@ -311,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         // default 900s, 0 disables). See scheduler.rs.
         resolution: scheduler::ResolutionScheduler::from_env(),
         watch: Arc::new(rebac_watch::WatchStatus::new()),
+        folder_watchers: Arc::new(folder_watch::WatcherRegistry::new()),
     });
 
     let app = Router::new()
@@ -388,6 +395,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connector-status",
             post(connectors::post_status).get(connectors::get_status),
+        )
+        .route(
+            "/v1/admin/folders",
+            post(folder_watch::add_folder_watch).get(folder_watch::list_folder_watches),
+        )
+        .route(
+            "/v1/admin/folders/{id}",
+            axum::routing::delete(folder_watch::stop_folder_watch),
         )
         .route(
             "/v1/admin/backfill",
@@ -485,6 +500,12 @@ async fn main() -> anyhow::Result<()> {
             "spicedb watch disabled (set VERITY_SPICEDB_WATCH=1 with VERITY_SPICEDB_URL to accelerate out-of-band revocation propagation)"
         );
     }
+
+    // Re-establish persisted local-folder watches (folder_watch.rs): re-scan
+    // each active folder for files changed while the server was down, then
+    // re-arm the live OS watch. Best-effort — a folder that has gone missing is
+    // logged and skipped, never a boot failure.
+    folder_watch::reestablish_on_boot(Arc::clone(&state)).await;
 
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     // FTUE §2.3: unconditional stdout on bind, independent of any log filter.
@@ -1722,9 +1743,6 @@ async fn ingest_documents(
     headers: HeaderMap,
     Json(req): Json<IngestDocumentsRequest>,
 ) -> HandlerResult<Json<serde_json::Value>> {
-    // Freshness SLO (task 21): receipt time, not `valid_from` — a connector
-    // backfilling last year's documents is not "a year behind on ingest".
-    let received_at = Utc::now();
     state.admin.check(&headers)?;
     if req.acl_provenance == AclProvenance::Quarantined {
         return Err((
@@ -1732,8 +1750,6 @@ async fn ingest_documents(
             "acl_provenance must be mirrored, approximated, or admin-assigned".into(),
         ));
     }
-    let valid_from = req.valid_from.unwrap_or_else(Utc::now);
-
     // Resolve what (if anything) gets indexed. Three delivery shapes:
     //   * `content`         — pre-extracted text, indexed as before;
     //   * `content_base64`  — raw bytes; the server runs Tier-1 extraction
@@ -1748,20 +1764,120 @@ async fn ingest_documents(
             "send content OR content_base64, not both".into(),
         ));
     }
-    let mut extraction_receipt: Option<serde_json::Value> = None;
-    let text: Option<String> = match (&req.content, &req.content_base64) {
-        (Some(c), None) => Some(c.clone()),
+    let delivered = match (req.content, req.content_base64) {
+        (Some(c), None) => DeliveredContent::Text(c),
         (None, Some(b64)) => {
             use base64::Engine as _;
             let raw = base64::engine::general_purpose::STANDARD
-                .decode(b64)
+                .decode(&b64)
                 .map_err(|e| {
                     (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         format!("content_base64 is not valid base64: {e}"),
                     )
                 })?;
-            match extract::extract(&raw, req.filename.as_deref()) {
+            // Keep the delivered base64 for the idempotency hash (see
+            // DocumentIngest::content_hash): what was DELIVERED, not extracted.
+            DeliveredContent::Bytes {
+                raw,
+                hash_over: b64,
+            }
+        }
+        _ => DeliveredContent::None,
+    };
+
+    let outcome = ingest_document(
+        &state,
+        DocumentIngest {
+            tenant_id: req.tenant_id,
+            source: req.source,
+            document_id: req.document_id,
+            filename: req.filename,
+            entities: req.entities,
+            visibility: req.visibility,
+            confidentiality: Confidentiality::Internal,
+            acl_provenance: req.acl_provenance,
+            valid_from: req.valid_from,
+            delivered,
+        },
+    )
+    .await?;
+
+    let mut resp = serde_json::json!({
+        "episode_id": outcome.episode_id,
+        "chunks_indexed": outcome.chunks_indexed,
+    });
+    if let Some(x) = outcome.extraction_receipt {
+        resp["extraction"] = x;
+    }
+    Ok(Json(resp))
+}
+
+/// What a document delivery carried. Both the HTTP handler and the folder
+/// watcher build one of these, so extraction/chunking/idempotency live in ONE
+/// place ([`ingest_document`]) — the watcher never self-HTTPs or duplicates
+/// extract.rs.
+pub(crate) enum DeliveredContent {
+    /// Pre-extracted text, indexed as-is.
+    Text(String),
+    /// Raw file bytes for server-side Tier-1 extraction (extract.rs). `hash_over`
+    /// is the string the idempotency hash is taken over (the base64 for the HTTP
+    /// path, the raw UTF-8 for the watcher) — what was DELIVERED, so a changed
+    /// file re-ingests even if extraction failed both times.
+    Bytes { raw: Vec<u8>, hash_over: String },
+    /// Declared metadata-only: an episode is recorded, nothing is indexed.
+    None,
+}
+
+/// One document version to ingest under a resolved visibility policy. The
+/// shared shape behind POST /v1/ingest/documents and the folder watcher.
+pub(crate) struct DocumentIngest {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) source: String,
+    pub(crate) document_id: String,
+    pub(crate) filename: Option<String>,
+    pub(crate) entities: Vec<String>,
+    /// Materialized principal tokens (SPEC §5e); empty = invisible, never
+    /// permissive. The caller resolves these at the write-time ACL choke point.
+    pub(crate) visibility: Vec<PrincipalToken>,
+    pub(crate) confidentiality: Confidentiality,
+    pub(crate) acl_provenance: AclProvenance,
+    /// Event time (when true in the world); receipt time when absent.
+    pub(crate) valid_from: Option<DateTime<Utc>>,
+    pub(crate) delivered: DeliveredContent,
+}
+
+pub(crate) struct DocumentIngestOutcome {
+    pub(crate) episode_id: EpisodeId,
+    pub(crate) chunks_indexed: usize,
+    pub(crate) extraction_receipt: Option<serde_json::Value>,
+}
+
+/// Shared document-ingest choke point: one document version in → one L0
+/// episode + deterministic paragraph chunks out, under the caller-resolved
+/// visibility + ACL provenance. This is the SINGLE place that runs Tier-1
+/// extraction, chunking, idempotency, the auto-resolve trigger, and the
+/// freshness sample — both the HTTP handler and the folder watcher route
+/// through here so neither reimplements extraction or self-HTTPs.
+pub(crate) async fn ingest_document(
+    state: &AppState,
+    req: DocumentIngest,
+) -> HandlerResult<DocumentIngestOutcome> {
+    // Freshness SLO (task 21): receipt time, not `valid_from` — a connector
+    // backfilling last year's documents is not "a year behind on ingest".
+    let received_at = Utc::now();
+    let valid_from = req.valid_from.unwrap_or(received_at);
+
+    // Run extraction (bytes) or pass text through; a typed failure lands
+    // metadata-only with the reason disclosed (fail-visible, never silent).
+    let mut extraction_receipt: Option<serde_json::Value> = None;
+    let (text, hash_over): (Option<String>, String) = match req.delivered {
+        DeliveredContent::Text(c) => {
+            let hash = c.clone();
+            (Some(c), hash)
+        }
+        DeliveredContent::Bytes { raw, hash_over } => {
+            let text = match extract::extract(&raw, req.filename.as_deref()) {
                 extract::ExtractOutcome::Extracted(ex) => {
                     extraction_receipt = Some(serde_json::json!({
                         "method": ex.method, "truncated": ex.truncated,
@@ -1780,20 +1896,14 @@ async fn ingest_documents(
                     }));
                     None
                 }
-            }
+            };
+            (text, hash_over)
         }
-        _ => None,
+        DeliveredContent::None => (None, String::new()),
     };
 
-    // Idempotency hash covers what was DELIVERED (text or raw base64), not
-    // what extraction produced — a changed file re-ingests even if extraction
-    // failed both times.
-    let delivered = req
-        .content
-        .as_deref()
-        .or(req.content_base64.as_deref())
-        .unwrap_or("");
-    let content_hash = format!("{:x}", md5ish(delivered));
+    // Idempotency hash covers what was DELIVERED, not what extraction produced.
+    let content_hash = format!("{:x}", md5ish(&hash_over));
     let mut episode_payload = serde_json::json!({
         "document_id": req.document_id,
         "content_hash": content_hash,
@@ -1838,7 +1948,7 @@ async fn ingest_documents(
             embedding,
             visibility: req.visibility.clone(),
             entity_tags: req.entities.clone(),
-            confidentiality: Confidentiality::Internal,
+            confidentiality: req.confidentiality,
             trust_tier: TrustTier::Authoritative,
             valid_from,
             provenance: episode_id,
@@ -1854,14 +1964,11 @@ async fn ingest_documents(
     // (new entity_tags/aliases can feed resolution). Never affects the response.
     state.resolution.mark_dirty(req.tenant_id);
     slo::record_sample(state.pool(), req.tenant_id, &req.source, received_at).await;
-    let mut resp = serde_json::json!({
-        "episode_id": episode_id,
-        "chunks_indexed": chunks_indexed,
-    });
-    if let Some(x) = extraction_receipt {
-        resp["extraction"] = x;
-    }
-    Ok(Json(resp))
+    Ok(DocumentIngestOutcome {
+        episode_id,
+        chunks_indexed,
+        extraction_receipt,
+    })
 }
 
 // ---------- remember ----------

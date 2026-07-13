@@ -743,6 +743,7 @@ mod tests {
             media_store: None,
             resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
             watch: Arc::new(WatchStatus::new()),
+            folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
         });
         Some((state, tenant))
     }

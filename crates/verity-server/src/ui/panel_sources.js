@@ -38,9 +38,14 @@
     fresh: [],      // freshness percentiles
     backfill: [],   // latest catch-up run per source
     manifests: [],  // draft/active blueprints
+    folders: [],    // watched local folders (live status per watch)
     errs: [],       // per-read load failures (rendered, never hidden)
     loadedAt: 0,
   };
+  // The who-can-see-it picker inside the Watch-a-folder dialog. Reused across
+  // opens (destroyed/rebuilt each open so a stale tenant's names never linger).
+  var folderViewersPicker = null;
+  var pendingFolderStop = null; // { folder_id, source, path } for the stop dialog
   // Client-side only: sources minted this session that have not yet posted a
   // heartbeat or delivery. Labeled as client-side in the table — honest.
   var pendingLocal = [];
@@ -243,6 +248,7 @@ acl_policy:
           '<button id="src-refresh">Refresh</button>' +
           '<button id="src-revoke-open" title="DELETE /v1/webhooks/{id} — the URL stops resolving immediately">Shut off a source&hellip;</button>' +
           '<button id="src-manifest-open" title="POST /v1/manifests — installs as a DRAFT; a separate human approval activates it">Install a manifest&hellip;</button>' +
+          '<button id="src-folder-open" title="POST /v1/admin/folders — Verity watches a folder on this machine; files you drop in become memory">Watch a local folder&hellip;</button>' +
           '<button class="primary" id="src-connect-open" title="POST /v1/webhooks — mints a private URL any system can POST JSON to">Connect a source</button>' +
         "</div>" +
         '<div class="err" id="src-err"></div>' +
@@ -253,6 +259,16 @@ acl_policy:
         '<div class="card">' +
           '<h2>Your sources <span class="sub api-crumb">GET /v1/admin/connector-status · /v1/admin/backfill</span></h2>' +
           '<div id="src-health"></div>' +
+        "</div>" +
+
+        /* ---- watched folders ---- */
+        '<div class="card">' +
+          '<h2>Watch a local folder <span class="sub api-crumb">GET /v1/admin/folders</span></h2>' +
+          '<div class="note" style="margin-top:0"><b>Point Verity at a folder on this machine and drop files in — each one becomes memory you can query.</b> ' +
+            "Verity runs on this computer, so it can watch a folder here directly (your browser can&rsquo;t). " +
+            "Word docs, spreadsheets, slide decks, PDFs and plain text are read automatically; a file it can&rsquo;t read is still recorded, with the reason shown, never dropped silently. " +
+            "You choose <b>who can see</b> the files in a folder when you add it &mdash; there is no default: a folder nobody could ever read is refused, not silently created.</div>" +
+          '<div id="src-folders"></div>' +
         "</div>" +
 
         /* ---- manifests ---- */
@@ -361,6 +377,54 @@ acl_policy:
           "</div>" +
         "</div></div>" +
 
+        /* ---- watch a local folder ---- */
+        '<div class="dialog-backdrop" id="src-folder-dialog"><div class="dialog" style="max-width:640px">' +
+          "<h3>Watch a local folder</h3>" +
+          '<div class="note" style="margin-top:0">Verity watches this folder on the machine it runs on. ' +
+            "Every file you drop in is read and stored as memory, stamped with the visibility you choose below; " +
+            "edit a file and the new version replaces the old. Hidden and half-written files (names starting with a dot, <span class=\"ref\">.tmp</span>, <span class=\"ref\">.swp</span>, editor backups) are skipped, and very large files are skipped with a note &mdash; nothing is ever indexed without a visibility you set.</div>" +
+          '<div style="margin-top:12px"><label for="src-folder-path">folder on this machine <span style="font-weight:400">— an absolute path the server can reach</span></label>' +
+            '<input type="text" id="src-folder-path" value="./verity-inbox" placeholder="./verity-inbox" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="note" style="margin-top:6px">Not sure? Leave <span class="ref">./verity-inbox</span> &mdash; Verity creates it beside the server if it doesn&rsquo;t exist, and you can drop files straight in. ' +
+            "The path is where the server looks, not where your browser looks.</div>" +
+          '<div style="margin-top:12px"><label>who can see the files in this folder <span style="font-weight:400">— pick the keys; there is no default</span></label>' +
+            '<div id="src-folder-viewers" style="margin-top:6px"></div>' +
+            '<div class="note" style="margin-top:6px">Every file this folder ingests is shared with exactly these keys &mdash; nothing wider. ' +
+              'Leave it empty and Verity refuses to watch the folder, the same fail-closed rule every other write follows.<span class="api-crumb"> (GET /v1/admin/principals)</span></div>' +
+          "</div>" +
+          '<div class="row" style="margin-top:12px">' +
+            '<div class="tight" style="min-width:200px"><label for="src-folder-conf">most sensitive these files may be <span style="font-weight:400">— the ceiling for this folder</span></label>' +
+              '<select class="field" id="src-folder-conf">' +
+                '<option value="" selected disabled>choose…</option>' +
+                '<option value="Public">public</option>' +
+                '<option value="Internal">internal</option>' +
+                '<option value="Confidential">confidential</option>' +
+                '<option value="Restricted">restricted</option>' +
+              "</select></div>" +
+          "</div>" +
+          '<div class="err" id="src-folder-err"></div>' +
+          '<div id="src-folder-result"></div>' +
+          '<div class="actions">' +
+            '<button id="src-folder-cancel">Close</button>' +
+            '<button class="primary" id="src-folder-go">Start watching</button>' +
+          "</div>" +
+        "</div></div>" +
+
+        /* ---- stop watching a folder (typed confirm) ---- */
+        '<div class="dialog-backdrop" id="src-folder-stop-dialog"><div class="dialog" style="max-width:560px">' +
+          "<h3>Stop watching this folder</h3>" +
+          '<div id="src-folder-stop-summary"></div>' +
+          '<div class="note">Verity stops watching immediately &mdash; new files you drop in will no longer become memory. ' +
+            "Files already ingested stay searchable (history is invalidated elsewhere, never erased here).</div>" +
+          '<div style="margin-top:10px"><label for="src-folder-stop-word">type <b>STOP</b> to continue</label>' +
+            '<input type="text" id="src-folder-stop-word" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="err" id="src-folder-stop-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-folder-stop-cancel">Cancel</button>' +
+            '<button class="danger" id="src-folder-stop-go" disabled>Stop watching</button>' +
+          "</div>" +
+        "</div></div>" +
+
         /* ---- activate manifest (THE human gate) ---- */
         '<div class="dialog-backdrop" id="src-activate-dialog"><div class="dialog" style="max-width:600px">' +
           '<h3 id="src-activate-title">Approve &amp; activate</h3>' +
@@ -398,6 +462,13 @@ acl_policy:
         V.clearErr("src-manifest-err");
       };
 
+      el("src-folder-open").onclick = openFolderDialog;
+      el("src-folder-cancel").onclick = function () { V.dialog("src-folder-dialog").close(); };
+      el("src-folder-go").onclick = addFolder;
+      el("src-folder-stop-cancel").onclick = function () { V.dialog("src-folder-stop-dialog").close(); };
+      el("src-folder-stop-go").onclick = stopFolder;
+      el("src-folder-stop-word").oninput = reflectFolderStopTyped;
+
       el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
       el("src-activate-go").onclick = activateManifest;
       el("src-activate-word").oninput = reflectActivateTyped;
@@ -416,6 +487,7 @@ acl_policy:
     onShow: function () {
       var p = V.navParams();
       if (p && p.view === "connect" && V.tenant()) openMintDialog("");
+      if (p && p.view === "folder" && V.tenant()) openFolderDialog();
       if (!V.tenant()) renderNoTenant();
     },
   });
@@ -430,6 +502,7 @@ acl_policy:
         '<div class="et-body">Paste a space id in the session bar above, or mint a scope handle (the signed key an agent reads with) — the space fills in automatically and this screen loads itself.</div>' +
         '<div class="et-actions"><button class="primary" id="src-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
+    el("src-folders").innerHTML = "";
     el("src-manifests").innerHTML = "";
     el("src-fresh").innerHTML = "";
     el("src-back").innerHTML = "";
@@ -447,12 +520,20 @@ acl_policy:
       V.api("/v1/slo/freshness?" + q + "&window_hours=" + windowHours(), { admin: true }),
       V.api("/v1/admin/backfill?" + q, { admin: true }),
       V.api("/v1/manifests?" + q, { admin: true }),
+      V.api("/v1/admin/folders?" + q, { admin: true }),
     ]);
-    var keys = ["status", "fresh", "backfill", "manifests"];
+    var keys = ["status", "fresh", "backfill", "manifests", "folders"];
     data.errs = [];
     results.forEach(function (r, i) {
-      if (r.status === "fulfilled") data[keys[i]] = Array.isArray(r.value) ? r.value : [];
-      else { data[keys[i]] = []; data.errs.push(r.reason && r.reason.message ? r.reason.message : String(r.reason)); }
+      if (r.status === "fulfilled") {
+        // /v1/admin/folders returns { folders: [...] }; the rest return arrays.
+        var v = r.value;
+        if (keys[i] === "folders") data.folders = (v && Array.isArray(v.folders)) ? v.folders : (Array.isArray(v) ? v : []);
+        else data[keys[i]] = Array.isArray(v) ? v : [];
+      } else {
+        data[keys[i]] = keys[i] === "folders" ? [] : [];
+        data.errs.push(r.reason && r.reason.message ? r.reason.message : String(r.reason));
+      }
     });
     data.loadedAt = Date.now();
     renderAll();
@@ -460,18 +541,20 @@ acl_policy:
 
   function needsYou() {
     // The rail-pill count — derived from the SAME rows this panel renders:
-    // drafts awaiting the human gate + failed catch-up runs. (Threshold
-    // breaches are excluded on purpose: the threshold is a client-side knob.)
+    // drafts awaiting the human gate + failed catch-up runs + watched folders
+    // that reported a problem. (Threshold breaches are excluded on purpose:
+    // the threshold is a client-side knob.)
     var drafts = data.manifests.filter(function (m) { return m.status === "draft"; }).length;
     var failed = data.backfill.filter(function (b) { return String(b.state).toLowerCase() === "failed"; }).length;
-    return drafts + failed;
+    var folderProblems = data.folders.filter(function (f) { return !!f.last_error; }).length;
+    return drafts + failed + folderProblems;
   }
 
   function renderAll() {
     var needs = needsYou();
     V.setCount("sources", needs);
     var anything = data.status.length || data.fresh.length || data.backfill.length ||
-                   data.manifests.length || pendingLocal.length;
+                   data.manifests.length || data.folders.length || pendingLocal.length;
     if (data.errs.length) {
       el("src-state").innerHTML = V.stateChip("fail", "couldn't load");
       // Four reads failing the same way is ONE problem — dedupe before showing.
@@ -495,6 +578,7 @@ acl_policy:
     }
     el("src-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8);
     renderHealth();
+    renderFolders();
     renderManifests();
     renderFreshness();
     renderBackfill();
@@ -600,6 +684,206 @@ acl_policy:
       "</tr></thead><tbody>" + body + "</tbody></table></div>" +
       '<div class="note">Heartbeat rows carry no permission lane or tier — the heartbeat does not report one, and this screen never guesses ' +
         "(a mislabeled lane is worse than an admitted unknown). Lanes are real, and explained, on the manifests below.</div>";
+  }
+
+  /* =========================================================== folders */
+
+  // One plain-words liveness line for a watched folder. status is real server
+  // state ("running" | "stopped"); a folder that reported an error surfaces it
+  // verbatim (fail-visible), never a fake green.
+  function folderChip(f) {
+    if (f.last_error) return V.stateChip("fail", "problem");
+    var s = String(f.status || "").toLowerCase();
+    if (s === "stopped") return V.stateChip("off", "stopped");
+    if (s === "running") return V.stateChip("ok", "watching");
+    // Unknown/absent status: say so, never guess a green.
+    return V.stateChip("wait", s || "starting");
+  }
+
+  function renderFolders() {
+    var host = el("src-folders");
+    if (!host) return;
+    var rows = data.folders;
+    if (!rows.length) {
+      host.innerHTML =
+        '<div class="empty-teach sp-a">' +
+          '<div class="et-title">No folders watched yet</div>' +
+          '<div class="et-body">Pick a folder on this machine and Verity turns everything you drop in it into memory &mdash; ' +
+            "the fastest way to get your own files in. You choose who can see them when you add the folder; there is no default. " +
+            "An empty list is a real state, not an error.</div>" +
+          '<div class="et-actions"><button class="primary" id="src-folder-teach">Watch a local folder</button></div>' +
+        "</div>";
+      var b = el("src-folder-teach");
+      if (b) b.onclick = openFolderDialog;
+      return;
+    }
+
+    var body = rows.map(function (f, i) {
+      var evAge = ageMs(f.last_event_at);
+      var lastChange = evAge != null ? humanAge(evAge)
+        : '<span class="ref">no file yet</span>';
+      var files = f.files_ingested != null ? f.files_ingested
+        : (f.items_synced != null ? f.items_synced : null);
+      var notes = [];
+      var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+      if (f.last_error) {
+        notes.push(V.badge("problem", "b-conf-3") + ' <span class="note" style="margin-top:0">' + V.esc(f.last_error) + "</span>");
+      }
+      if (String(f.status || "").toLowerCase() === "running" && files === 0 && evAge == null) {
+        notes.push(proseRef + "watching &mdash; drop a file into this folder and it appears here on the next check</span>");
+      }
+      if (f.confidentiality) {
+        notes.push('<span class="ref">ceiling: ' + V.esc(String(f.confidentiality).toLowerCase()) + "</span>");
+      }
+      var stopBtn = String(f.status || "").toLowerCase() === "stopped"
+        ? '<span class="ref">stopped</span>'
+        : '<button class="danger src-folder-stop" data-i="' + i + '">Stop&hellip;</button>';
+      return "<tr>" +
+        '<td><b>' + V.esc(f.path || "(path not reported)") + "</b>" +
+          (f.source ? '<div class="ref">' + V.esc(f.source) + "</div>" : "") + "</td>" +
+        "<td>" + folderChip(f) + "</td>" +
+        '<td class="num">' + fmtCount(files) + "</td>" +
+        "<td>" + lastChange + "</td>" +
+        '<td style="overflow-wrap:break-word;word-break:normal;max-width:320px">' +
+          (notes.length ? notes.join("<br>") : '<span class="ref">&mdash;</span>') + "</td>" +
+        "<td>" + stopBtn + "</td>" +
+      "</tr>";
+    }).join("");
+
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>folder on this machine</th><th>state</th>" +
+        '<th class="num">files ingested</th><th>last change</th><th>notes</th><th></th>' +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+      '<div class="note">Each watched folder also appears in <b>Your sources</b> above as ' +
+        '<span class="ref">folder:&lt;name&gt;</span>, with the same freshness numbers as every other source &mdash; ' +
+        "so &ldquo;how fast a dropped file becomes searchable&rdquo; is measured, not asserted.</div>";
+
+    Array.prototype.forEach.call(host.querySelectorAll(".src-folder-stop"), function (btn) {
+      btn.onclick = function () { openFolderStopDialog(rows[Number(btn.getAttribute("data-i"))]); };
+    });
+  }
+
+  /* ================================================= watch-folder flow */
+
+  async function openFolderDialog() {
+    if (!tenantNow) { V.openMint(); return; }
+    V.clearErr("src-folder-err");
+    el("src-folder-result").innerHTML = "";
+    el("src-folder-go").disabled = false;
+    if (!el("src-folder-path").value.trim()) el("src-folder-path").value = "./verity-inbox";
+    el("src-folder-conf").value = "";
+    V.dialog("src-folder-dialog").open();
+
+    // Who-can-see-it: the SAME named picker the manifest wizard uses — pick
+    // keys from the directory, never raw tokens, never a default (LAW: fail
+    // closed). Rebuilt each open so a prior tenant's names never linger.
+    var mount = el("src-folder-viewers");
+    if (folderViewersPicker) { folderViewersPicker.destroy(); folderViewersPicker = null; }
+    folderViewersPicker = V.principalPicker(mount, {
+      tenantId: function () { return tenantNow || V.tenant(); },
+      placeholder: "filter people & groups",
+      emptyTitle: "No people or groups on record yet",
+      emptyBody: "Add people or groups to this space first, then pick who can see this folder's files.",
+      emptyAction: "Open People & groups",
+      onOpenDirectory: function () { V.show("principals"); },
+    });
+    folderViewersPicker.load(tenantNow);
+  }
+
+  async function addFolder() {
+    V.clearErr("src-folder-err");
+    el("src-folder-result").innerHTML = "";
+    var path = el("src-folder-path").value.trim();
+    if (!path) {
+      V.err("src-folder-err", new Error("give a folder path on this machine — e.g. ./verity-inbox"));
+      return;
+    }
+    // No client-side default: an empty pick is refused right here, mirroring
+    // the server's own fail-closed refusal (never a permissive default).
+    var viewers = folderViewersPicker ? folderViewersPicker.value() : [];
+    if (!viewers.length) {
+      V.err("src-folder-err", new Error(
+        "Pick who can see this folder's files — there is no default. " +
+        "A folder whose files nobody could ever read is refused, not silently watched."));
+      return;
+    }
+    var conf = el("src-folder-conf").value;
+    if (!conf) {
+      V.err("src-folder-err", new Error(
+        "Choose how sensitive these files may be — there is no default. " +
+        "It caps the visibility any file in this folder can carry."));
+      return;
+    }
+    var body = {
+      tenant_id: tenantNow,
+      path: path,
+      visibility: viewers.map(function (v) { return v.token; }),
+      confidentiality: conf,
+    };
+    var btn = el("src-folder-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api("/v1/admin/folders", { json: body, admin: true });
+      var viewerNames = viewers.map(function (v) { return v.principal; }).join(", ");
+      el("src-folder-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", "watching") +
+            '<span class="asof">' + V.esc(res.path || path) + "</span>" +
+          "</div>" +
+          '<div class="note" style="margin-top:8px"><b>Drop a file into this folder and it becomes memory.</b> ' +
+            "It will be shared with <b>" + V.esc(viewerNames) + "</b> and nobody wider. " +
+            "The folder appears in the list below &mdash; and in <b>Your sources</b> as " +
+            '<span class="ref">' + V.esc(res.source || "folder:…") + "</span> &mdash; the moment the first file lands." +
+            (res.created ? " Verity created the folder for you." : "") + "</div>" +
+        "</div>";
+      V.reload("sources");
+    } catch (e) {
+      // Server refusals (empty visibility, unreadable path) surface verbatim —
+      // the refusal is the product speaking, not an error to soften.
+      V.err("src-folder-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function openFolderStopDialog(f) {
+    pendingFolderStop = f;
+    V.clearErr("src-folder-stop-err");
+    el("src-folder-stop-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>Stop watching:</b> <b>' +
+        V.esc(f.path || "(folder)") + "</b>" +
+        (f.source ? '<div class="dc-meta" style="margin-top:6px">' + V.esc(f.source) + "</div>" : "") +
+      "</div>";
+    el("src-folder-stop-word").value = "";
+    el("src-folder-stop-go").disabled = true;
+    V.dialog("src-folder-stop-dialog").open();
+  }
+
+  function reflectFolderStopTyped() {
+    el("src-folder-stop-go").disabled = el("src-folder-stop-word").value.trim() !== "STOP";
+  }
+
+  async function stopFolder() {
+    if (!pendingFolderStop) return;
+    V.clearErr("src-folder-stop-err");
+    var id = pendingFolderStop.folder_id || pendingFolderStop.id;
+    var btn = el("src-folder-stop-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api("/v1/admin/folders/" + encodeURIComponent(id), { method: "DELETE", admin: true });
+      V.dialog("src-folder-stop-dialog").close();
+      if (res && (res.stopped || res.removed || res.deleted)) {
+        receipt("ok", "Stopped watching that folder — new files dropped in will no longer become memory. Files already ingested stay searchable (invalidate, never erase).");
+      } else {
+        receipt("attn", "Nothing was stopped — that folder is unknown or was already stopped. An honest no-op, not a failure.");
+      }
+      V.reload("sources");
+    } catch (e) {
+      V.err("src-folder-stop-err", e);
+      btn.disabled = false;
+    }
   }
 
   /* =========================================================== manifests */

@@ -1,0 +1,22 @@
+Acme Freight — renewal call notes
+Date: this quarter
+Attendees: Jordan (CSM, sales), Acme procurement + ops lead
+
+What happened on the call:
+- Acme pushed back on pricing. They asked for a multi-year discount and said
+  the revised $61k quote (up from $48k) was hard to justify to their finance team.
+- They mentioned they are "looking at other options" — consistent with the
+  rumored $52k competitor quote we heard about.
+- Ops lead was happy with the product: 120 trucks tracked, dispatch integration
+  has been live since March, on-time tracking events are running above the
+  95% success target from kickoff.
+
+Next steps agreed:
+- Jordan to send a revised quote by Friday.
+- Hold the annual number at or above the $58k deal-desk floor; bridge the gap
+  with a multi-year term instead of cutting the annual price.
+- Monthly ops review continues as the success-criteria checkpoint.
+
+Read of the room: renewal is winnable but genuinely at risk on price. The
+product value (dispatch integration + tracking SLA) is not in question — the
+number is. Emphasize switching cost, not discount.

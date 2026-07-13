@@ -66,3 +66,8 @@ quick-xml = "0.41"
 pdf-extract = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 schemars = { version = "1", features = ["chrono04"] }
+# Local-folder watching (folder_watch.rs): cross-platform FS events
+# (FSEvents/inotify/ReadDirectoryChangesW) with a settle-debouncer so editor
+# write bursts and mid-write partials fire once, after the file is quiescent.
+notify = "6"
+notify-debouncer-full = "0.3"

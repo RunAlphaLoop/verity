@@ -1,0 +1,10 @@
+account,entity_id,metric,value,unit,note
+Acme Freight Co,account:acme-freight,trucks_tracked,120,vehicles,fleet size at kickoff
+Acme Freight Co,account:acme-freight,dispatch_integration,live,status,live since March
+Acme Freight Co,account:acme-freight,on_time_tracking,96.4,percent,above the 95% success target
+Acme Freight Co,account:acme-freight,current_quote,61000,usd,revised from 48000 after pricing review
+Acme Freight Co,account:acme-freight,prior_quote,48000,usd,original renewal quote
+Acme Freight Co,account:acme-freight,competitor_quote,52000,usd,rumored competitor renewal quote
+Acme Freight Co,account:acme-freight,deal_desk_floor,58000,usd,do not commit below this annual number
+Acme Freight Co,account:acme-freight,renewal_stage,negotiation,stage,decision expected this quarter
+Acme Freight Co,account:acme-freight,renewal_risk,high,rating,price gap plus active competitor

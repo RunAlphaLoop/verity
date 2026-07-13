@@ -48,3 +48,6 @@ pdf-extract = { workspace = true }
 # SSE subscriptions (task 21): poll-loop event streams.
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# Local-folder watching (folder_watch.rs): server-side FS watcher + debounce.
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
