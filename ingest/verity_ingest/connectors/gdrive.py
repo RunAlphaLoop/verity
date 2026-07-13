@@ -272,7 +272,7 @@ class HttpRegistry:
         api_key: str | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self._client = client or httpx.Client(timeout=30.0, headers=headers)
+        self._client = client or httpx.Client(timeout=120.0, headers=headers)
         self._base_url = base_url.rstrip("/")
         self._tenant_id = tenant_id
 
@@ -503,7 +503,21 @@ class GDriveConnector(Connector):
 
     def _document_event(self, meta: Mapping[str, Any]) -> GDriveDocumentEvent:
         file_id = meta["id"]
-        acl = map_permissions(self._list_permissions(file_id), self.config.anyone_maps_to)
+        # Reading a file's full sharing list requires writer/owner on that
+        # file; a file shared TO us as a reader/commenter returns 403 (and a
+        # since-deleted file 404). We cannot mirror an ACL we cannot read, so
+        # the file quarantines fail-closed (§5a ACL-before-content, §5e.6) —
+        # its content is never pulled or indexed — and the crawl continues
+        # instead of dying on one unreadable file.
+        try:
+            raw_permissions = self._list_permissions(file_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (403, 404):
+                acl = AclEnvelope(resolvable=False)
+            else:
+                raise
+        else:
+            acl = map_permissions(raw_permissions, self.config.anyone_maps_to)
         mime_type = meta.get("mimeType", "")
         content = b""
         # ACL before content (§5a): never pull bytes for an item we already
@@ -629,7 +643,7 @@ class VerityDocumentSink:
         api_key: str | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self._client = client or httpx.Client(timeout=30.0, headers=headers)
+        self._client = client or httpx.Client(timeout=120.0, headers=headers)
         self._base_url = base_url.rstrip("/")
         # Heartbeat accumulators (task 28): what this sink delivered since the
         # last heartbeat() call — tenant/source come from the request bodies.
@@ -703,6 +717,20 @@ def _save_cursor(state_file: Path, cursor: str) -> None:
     state_file.write_text(json.dumps({"cursor": cursor}, indent=2) + "\n")
 
 
+def _is_indexable_body(body: Mapping[str, Any]) -> bool:
+    """Whether a document body is one the ``/v1/ingest/documents`` endpoint
+    accepts. A quarantine marker (an ACL we could not read or map — fail
+    closed, §5a/§5e.6) and a removal marker are NOT accepted there; they are
+    skipped so an unscopable or deleted file never aborts a whole-Drive crawl.
+    An unscopable file is simply not indexed — nothing leaks — and the skip is
+    counted and reported, never silent."""
+    if body.get("removed"):
+        return False
+    if body.get("acl_provenance") == "quarantined":
+        return False
+    return True
+
+
 def run_once(
     connector: GDriveConnector,
     registry: PrincipalRegistry,
@@ -715,10 +743,17 @@ def run_once(
     cursor = _load_cursor(state_file)
     events, next_cursor = asyncio.run(connector.poll(cursor))
     delivered = 0
+    skipped = 0
     for event in events:
         assert isinstance(event, GDriveDocumentEvent)
-        sink.deliver(build_document_request(event, registry, connector.config.tenant_id))
+        body = build_document_request(event, registry, connector.config.tenant_id)
+        if not _is_indexable_body(body):
+            skipped += 1
+            continue
+        sink.deliver(body)
         delivered += 1
+    if skipped:
+        print(f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or removed)")
     _save_cursor(state_file, next_cursor)
     # Best-effort connector heartbeat (task 28): sinks that support it
     # (VerityDocumentSink) report the batch; DryRunSink et al. just skip.
@@ -751,12 +786,31 @@ def run_backfill(
         reporter.start(total=None)
     delivered = 0
     pending = 0
+    skipped = 0
+    failed = 0
 
     async def _drive() -> None:
-        nonlocal delivered, pending
+        nonlocal delivered, pending, skipped, failed
         async for event in connector.full_crawl():
             assert isinstance(event, GDriveDocumentEvent)
-            sink.deliver(build_document_request(event, registry, connector.config.tenant_id))
+            body = build_document_request(event, registry, connector.config.tenant_id)
+            # Fail-closed skip: a file whose ACL we couldn't read/map, or that
+            # was removed, isn't sent to the index endpoint (it wouldn't be
+            # accepted and shouldn't be indexed) — counted, not fatal.
+            if not _is_indexable_body(body):
+                skipped += 1
+                continue
+            # One file's ingest failure never aborts a whole-Drive backfill:
+            # record it and press on, so a single malformed/oversized/rejected
+            # document can't cost the other 1,400.
+            try:
+                sink.deliver(body)
+            except httpx.HTTPError:
+                # HTTPError is the base class: status errors, timeouts, and
+                # transport failures all get skipped-and-counted so one slow or
+                # rejected document can't abort the whole-Drive backfill.
+                failed += 1
+                continue
             delivered += 1
             pending += 1
             if reporter is not None and pending >= flush_every:
@@ -775,6 +829,11 @@ def run_backfill(
         if pending:
             reporter.advance(pending)
         reporter.finish()
+    if skipped or failed:
+        print(
+            f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or "
+            f"removed), {failed} ingest failure(s)"
+        )
     return delivered
 
 

@@ -508,16 +508,16 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
     assert run_once(connector, registry, sink, state_file) == 0
     assert json.loads(state_file.read_text()) == {"cursor": "387"}
 
-    # Second run: polls from 387, delivers all six requests, advances to 412.
+    # Second run: polls from 387. Only the three SCOPABLE files are delivered
+    # to /v1/ingest/documents — the two removals (GONE_ID, TRASHED_ID) and the
+    # anyone-shared quarantine (PDF_ID) are skipped fail-closed: the server's
+    # documents endpoint accepts only mirrored/approximated/admin-assigned
+    # writes (it has no `removed` field and rejects `quarantined`), so
+    # delivering them would 422 and, worse, one such file would abort a whole
+    # crawl. Skipped files are counted and reported, never indexed. Cursor
+    # still advances to 412 (the whole window was processed).
     connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
     sink = DryRunSink(stream=io.StringIO())
-    assert run_once(connector, registry, sink, state_file) == 6
+    assert run_once(connector, registry, sink, state_file) == 3
     assert json.loads(state_file.read_text()) == {"cursor": "412"}
-    assert [r["document_id"] for r in sink.requests] == [
-        DOC_ID,
-        GONE_ID,
-        TXT_ID,
-        PDF_ID,
-        TRASHED_ID,
-        XLSX_ID,
-    ]
+    assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, XLSX_ID]
