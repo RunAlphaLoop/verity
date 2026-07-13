@@ -1063,12 +1063,30 @@ def run_once(
     our own crash-and-re-lease) counts as done — idempotent by design."""
     episodes = client.lease(tenant_id, limit=limit)
     completed = 0
+    skipped = 0
     for episode in episodes:
-        extraction = extractor.extract(episode)
-        if judge is not None and extraction.knowledge_candidates:
-            decide_merges(client, tenant_id, judge, extraction.knowledge_candidates)
+        try:
+            extraction = extractor.extract(episode)
+            if judge is not None and extraction.knowledge_candidates:
+                decide_merges(client, tenant_id, judge, extraction.knowledge_candidates)
+        except Exception as exc:  # noqa: BLE001
+            # One episode must never halt the whole worker. A deterministic
+            # failure (e.g. an oversized episode the model 400s on — a Drive
+            # CSV with thousands of chunks blowing the context) is completed
+            # with an EMPTY result so it's marked processed and not re-leased
+            # forever; the reason is logged, and the loop moves on.
+            print(
+                f"consolidation: skipped episode {episode.episode_id} — extraction "
+                f"failed ({type(exc).__name__}: {str(exc)[:200]})",
+                file=sys.stderr,
+            )
+            client.complete(tenant_id, episode.episode_id, Extraction())
+            skipped += 1
+            continue
         client.complete(tenant_id, episode.episode_id, extraction)
         completed += 1
+    if skipped:
+        print(f"consolidation: {skipped} episode(s) skipped this pass", file=sys.stderr)
     return completed
 
 
