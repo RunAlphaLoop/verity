@@ -23,75 +23,58 @@ const DEV_PRINCIPAL: &str = "user:dev";
 const SPICEDB_URL: &str = "http://localhost:8443";
 const SPICEDB_KEY: &str = "verity-dev-key";
 
-/// Where the Anthropic key lives (the same file the server reads via
-/// VERITY_ANTHROPIC_KEY_FILE). The knowledge worker needs it as ANTHROPIC_API_KEY.
-fn anthropic_key_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".verity-anthropic-key"))
+/// Ask the running server to start + own the knowledge consolidation worker
+/// (SPEC §2 L2). ONE OWNER: the server spawns and holds the child (the same
+/// recipe that used to live here as `spawn_knowledge_worker` now lives behind
+/// POST /v1/admin/planes/knowledge/start), so the console's "What's running"
+/// panel can show authoritative pid/status and offer a real Stop. This avoids
+/// the double-spawn (a CLI child + a console child both burning LLM calls on
+/// one space).
+///
+/// Fail-soft by design: a missing venv/key/repo comes back as the server's own
+/// 422/503 words and is surfaced verbatim as a non-fatal `knowledge` line — it
+/// never aborts `verity-cli dev`. Returns the started pid on success, or the
+/// server's disclosure string on a handled precondition failure.
+async fn start_knowledge_worker_via_server(ctx: &Ctx, tenant_id: &str) -> Result<KnowledgeStart> {
+    let mut req = ctx
+        .http
+        .post(format!("{}/v1/admin/planes/knowledge/start", ctx.url))
+        .json(&serde_json::json!({ "tenant_id": tenant_id }));
+    if let Some(token) = &ctx.config.admin_token {
+        req = req.bearer_auth(token);
+    }
+    let (status, body) = util::send(req, &ctx.url).await?;
+    if status.is_success() {
+        // { started, pid } on a fresh spawn; { started:false, pid, already_running:true }
+        // when the server already owns a live child (idempotent no-op).
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("the server answered {status} but not JSON: {body}"))?;
+        let pid = json["pid"].as_u64().map(|p| p as u32);
+        let already = json["already_running"].as_bool().unwrap_or(false);
+        Ok(KnowledgeStart::Started { pid, already })
+    } else {
+        // Predictable precondition (missing repo/venv/key) → the server returns
+        // 422/503 with the exact fix. Admin handlers answer in PLAIN TEXT
+        // (crate-wide (StatusCode, String) convention), so use the raw body as
+        // the disclosure — never JSON-parse it. Disclose, don't abort dev.
+        Ok(KnowledgeStart::Declined {
+            status,
+            disclosure: body.trim().to_string(),
+        })
+    }
 }
 
-/// Spawn the knowledge consolidation worker (SPEC §2 L2) as a managed dev
-/// plane: the Python `verity_ingest.consolidation` worker leased against the
-/// dev tenant, extracting knowledge into the review queue (auto-publish stays
-/// off). Detached + logged like the server; non-fatal — a missing venv or key
-/// is disclosed, never a hard stop. Returns the child pid on success.
-fn spawn_knowledge_worker(ctx: &Ctx, repo: &Path, tenant_id: &str) -> Result<u32> {
-    let py = repo.join("ingest/.venv/bin/python");
-    if !py.exists() {
-        bail!(
-            "no ingest virtualenv at {} — create it (cd ingest && python -m venv .venv && \
-             .venv/bin/pip install -e '.[gdrive]') then re-run with --knowledge",
-            py.display()
-        );
-    }
-    let key_path = anthropic_key_path().filter(|p| p.exists()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "knowledge extraction needs an Anthropic key at ~/.verity-anthropic-key \
-             (0600) — add it, then re-run with --knowledge"
-        )
-    })?;
-    let api_key = std::fs::read_to_string(&key_path)
-        .with_context(|| format!("reading {}", key_path.display()))?
-        .trim()
-        .to_string();
-
-    let log_path = ctx
-        .config_path
-        .parent()
-        .map(|d| d.join("consolidation.log"))
-        .unwrap_or_else(|| PathBuf::from("consolidation.log"));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("cannot open worker log {}", log_path.display()))?;
-
-    let mut cmd = Command::new(&py);
-    cmd.args(["-m", "verity_ingest.consolidation", "--base-url"])
-        .arg(&ctx.url)
-        .args(["--tenant-id"])
-        .arg(tenant_id)
-        // Live LLM extraction + judge (the whole reason to flip this on); the
-        // server still gates every candidate through the review queue.
-        .args([
-            "--extractor",
-            "anthropic",
-            "--judge",
-            "anthropic",
-            "--interval",
-            "30",
-        ])
-        .current_dir(repo.join("ingest"))
-        .env("ANTHROPIC_API_KEY", api_key)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().context("log handle clones")?)
-        .stderr(log);
-    if let Some(token) = &ctx.config.admin_token {
-        cmd.env("VERITY_ADMIN_TOKEN", token);
-    }
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("cannot start the knowledge worker ({})", py.display()))?;
-    Ok(child.id())
+/// Outcome of asking the server to start the worker.
+enum KnowledgeStart {
+    /// The server owns a live child. `pid` from the response; `already` true
+    /// when it was already running (idempotent no-op).
+    Started { pid: Option<u32>, already: bool },
+    /// The server refused for a known precondition (missing repo/venv/key);
+    /// `disclosure` is its verbatim fix. Non-fatal.
+    Declined {
+        status: reqwest::StatusCode,
+        disclosure: String,
+    },
 }
 
 pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>, knowledge: bool) -> Result<()> {
@@ -162,32 +145,49 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>, knowledge: bool) -> 
     // managed stack when flipped on with --knowledge; OFF by default because,
     // unlike the free deterministic planes, it makes LLM calls. Either way the
     // state is DISCLOSED here so it's never a silent mystery.
+    //
+    // ONE OWNER: we ask the SERVER to spawn + hold the worker child (POST
+    // …/knowledge/start) rather than spawning our own. The server owns the
+    // recipe (venv, key, --repo) and the child, so the console's What's-running
+    // panel shows authoritative pid/status and offers a real Stop — and there's
+    // never a second worker racing this one on the same space.
     if knowledge {
-        match repo.as_ref() {
-            Ok(repo_path) => match spawn_knowledge_worker(ctx, repo_path, &tenant_id) {
-                Ok(pid) => ui::step_ok(
+        match start_knowledge_worker_via_server(ctx, &tenant_id).await {
+            Ok(KnowledgeStart::Started { pid, already }) => {
+                let pid_note = pid
+                    .map(|p| format!("pid {p}"))
+                    .unwrap_or_else(|| "running".into());
+                let state = if already { "already running" } else { "up" };
+                ui::step_ok(
                     "knowledge",
                     &format!(
-                        "consolidation worker up (pid {pid}) — anthropic extractor + judge, \
-                         leasing every 30s into the review queue. Auto-publish stays OFF."
+                        "consolidation worker {state} ({pid_note}) — owned by the server; \
+                         anthropic extractor + judge, leasing every 30s into the review queue. \
+                         Auto-publish stays OFF. Stop it from the console's What's-running panel \
+                         or POST /v1/admin/planes/knowledge/stop."
                     ),
-                ),
-                Err(e) => println!(
-                    "  {} {}  --knowledge requested but the worker did not start: {e}",
-                    ui::yellow("…"),
-                    ui::pad("knowledge", 8)
-                ),
-            },
-            Err(_) => println!(
-                "  {} {}  --knowledge needs the repo path (pass --repo or set $VERITY_REPO)",
+                );
+            }
+            // 422/503: missing repo/venv/key — the server's own fix, verbatim.
+            // Non-fatal: dev completes, the summary still prints.
+            Ok(KnowledgeStart::Declined { status, disclosure }) => println!(
+                "  {} {}  --knowledge requested but the server ({status}) could not start it: \
+                 {disclosure}",
+                ui::yellow("…"),
+                ui::pad("knowledge", 8)
+            ),
+            // Transport-level failure only (the server was healthy moments ago).
+            // Still non-fatal — never abort dev over the opt-in worker.
+            Err(e) => println!(
+                "  {} {}  --knowledge requested but the start request failed: {e}",
                 ui::yellow("…"),
                 ui::pad("knowledge", 8)
             ),
         }
     } else {
         println!(
-            "  {} {}  off — flip on with `verity-cli dev --knowledge` (LLM extraction of \
-             facts/knowledge from your text, into the review queue)",
+            "  {} {}  off — flip on with `verity-cli dev --knowledge` (the server starts + owns \
+             the worker: LLM extraction of facts/knowledge from your text, into the review queue)",
             ui::dim("·"),
             ui::pad("knowledge", 8)
         );

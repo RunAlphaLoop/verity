@@ -23,6 +23,7 @@ mod folder_watch;
 #[cfg(test)]
 mod identity_tests;
 mod ingest;
+mod knowledge_worker;
 #[cfg(test)]
 mod manifest_tests;
 mod manifests;
@@ -43,6 +44,8 @@ mod slo;
 #[cfg(test)]
 mod sse_tests;
 mod subscribe;
+#[cfg(test)]
+mod system_tests;
 #[cfg(test)]
 mod tenants_tests;
 mod ui;
@@ -80,6 +83,24 @@ struct Cli {
     dsn: String,
     #[arg(long, default_value = "127.0.0.1:7717")]
     listen: String,
+    /// Repo root so the server can spawn the knowledge worker from
+    /// `<repo>/ingest/.venv`. Falls back to `VERITY_REPO` when the flag is
+    /// absent (see `Cli::repo_root`). Absent both → the knowledge plane reports
+    /// `startable:false` with the fix in its `start_hint`; it is NEVER a hard
+    /// boot failure (a server with no ingest checkout still runs every
+    /// read/write path).
+    #[arg(long)]
+    repo: Option<std::path::PathBuf>,
+}
+
+impl Cli {
+    /// Repo root from `--repo`, else `VERITY_REPO` (clap's `env` feature isn't
+    /// enabled in this workspace, so the fallback is resolved by hand).
+    fn repo_root(&self) -> Option<std::path::PathBuf> {
+        self.repo
+            .clone()
+            .or_else(|| std::env::var_os("VERITY_REPO").map(std::path::PathBuf::from))
+    }
 }
 
 /// Admin/ingest-plane bearer auth (roadmap task 3). When `VERITY_ADMIN_TOKEN`
@@ -189,6 +210,27 @@ pub(crate) struct AppState {
     /// re-populated from the `folder_watches` table on boot. Ingest is
     /// write-path only — read-path purity is untouched.
     pub(crate) folder_watchers: Arc<folder_watch::WatcherRegistry>,
+    /// Console/CLI-started knowledge consolidation worker (SPEC §2 L2). `Some` =
+    /// this server spawned + owns a live child → authoritative planes status
+    /// (pid, "started from this console") + a real Stop. `None` = not owned
+    /// here; the planes endpoint falls back to the `episode_processing`
+    /// activity proxy. ONE owner only — the CLI `--knowledge` flag routes
+    /// through `POST /v1/admin/planes/knowledge/start`, never a second child.
+    /// `tokio::sync::Mutex` (not std): the start/stop handlers `.await` while
+    /// holding the lock across the child `wait()`.
+    pub(crate) knowledge_worker: Arc<tokio::sync::Mutex<Option<knowledge_worker::KnowledgeWorker>>>,
+    /// Repo root (`--repo` / `VERITY_REPO`) so the server can find
+    /// `ingest/.venv` to spawn the knowledge worker. `None` → knowledge is not
+    /// startable here; the planes `start_hint` says to restart with `--repo`.
+    pub(crate) repo_root: Option<std::path::PathBuf>,
+    /// The `--listen` address, so a spawned knowledge worker can be pointed at
+    /// this server's own `--base-url` (`http://<listen>`).
+    pub(crate) listen: String,
+    /// The raw admin bearer (`VERITY_ADMIN_TOKEN`) when the server requires
+    /// one, passed to a spawned worker so it can reach the admin-gated
+    /// consolidation endpoints. `None` in dev mode (admin surfaces open). NEVER
+    /// logged or returned; distinct from `AdminAuth`'s one-way HMAC tag.
+    pub(crate) admin_token: Option<String>,
 }
 
 impl AppState {
@@ -251,6 +293,532 @@ pub(crate) fn resolve_entities(
             StatusCode::FORBIDDEN,
             "entities outside the scope's entity_scope".into(),
         ))
+    }
+}
+
+/// One row in the `GET /v1/admin/planes` report.
+///
+/// `class` governs the panel's affordance (the no-dead-button rule):
+/// - `"startable"` → a real Start/Stop button, but ONLY when `startable:true`;
+/// - `"command-only"` → NEVER a button, a copyable `start_hint` command;
+/// - `"config-only"` → NEVER a button, status + plain meaning, `start_hint:null`.
+///
+/// The UI keys off the machine-authoritative `startable`/`start_hint` fields
+/// and never re-derives `class`. `knowledge_worker` alone may also carry
+/// `authority`/`pid`/`started_at`/`stoppable` (merged in by the caller).
+fn plane_row(
+    name: &str,
+    label: &str,
+    class: &str,
+    status: &str,
+    detail: String,
+    startable: bool,
+    start_hint: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "label": label,
+        "class": class,
+        "status": status,
+        "detail": detail,
+        "startable": startable,
+        "start_hint": start_hint,
+    })
+}
+
+/// Command to bring the identity plane up (it is boot-time env, not
+/// click-startable): start SpiceDB, then restart the server with the URL set.
+const REBAC_START_HINT: &str = "docker compose -f deploy/docker-compose.yml up -d spicedb  \
+     — then restart the server with VERITY_SPICEDB_URL set";
+/// Command to bring the media object store up (Docker container, not
+/// click-startable).
+const MEDIA_START_HINT: &str = "docker compose -f deploy/docker-compose.yml up -d minio minio-init";
+
+/// Coarse, plain-words duration ("15 min", "1 h") for the debounce window.
+fn humanize_secs(s: u64) -> String {
+    if s >= 3600 && s.is_multiple_of(3600) {
+        format!("{} h", s / 3600)
+    } else if s >= 60 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
+}
+
+/// Coarse "how long ago" for an observed activity stamp — never fake-precise.
+fn humanize_ago(t: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - t).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Query for the "what's running" read: `tenant_id` is REQUIRED — the
+/// knowledge activity proxy and the start/stop symmetry are per-tenant.
+#[derive(Deserialize)]
+struct PlanesQuery {
+    tenant_id: uuid::Uuid,
+}
+
+/// Body for the knowledge Start/Stop endpoints. Per-tenant so start and the
+/// observed proxy line up on the same space.
+#[derive(Deserialize)]
+struct KnowledgeWorkerBody {
+    tenant_id: uuid::Uuid,
+}
+
+/// GET /v1/admin/planes?tenant_id=<uuid> (admin): the "what's running"
+/// infrastructure surface for the console. Reports each plane's OBSERVED state
+/// from what the running server actually knows — the planes AppState holds
+/// directly (permissions, media, encoder, auto-resolve, revocation watch) —
+/// plus the knowledge worker in two strict tiers: AUTHORITATIVE when this
+/// server owns a live child (pid, "started from this console", a real Stop),
+/// else an OBSERVED activity proxy from `episode_processing` (labeled
+/// "(observed)", no Stop). Every row carries `class`/`startable`/`start_hint`
+/// so the panel never renders a dead button: only `knowledge_worker` is ever
+/// startable, and only when the repo + venv + key all exist. Each plane probe
+/// is independent — a failing probe yields that row `unknown`, never a 500.
+async fn admin_planes(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<PlanesQuery>,
+    headers: HeaderMap,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut planes: Vec<serde_json::Value> = Vec::new();
+
+    // 1 · identity / ReBAC — files are permission-filtered live when on. Its
+    // affordance is command-only: it is boot-time env, so when off the panel
+    // teaches how to bring it up (never a dead button).
+    if state.rebac.is_some() {
+        planes.push(plane_row(
+            "rebac",
+            "Permissions engine",
+            "command-only",
+            "on",
+            "on — files are permission-filtered live against the identity graph".to_string(),
+            false,
+            None,
+        ));
+    } else if state.allow_restricted_without_rebac {
+        planes.push(plane_row(
+            "rebac",
+            "Permissions engine",
+            "command-only",
+            "degraded",
+            "off, and the fail-closed guard is overridden — the most sensitive \
+             (restricted) records index with no permissions engine to enforce them"
+                .to_string(),
+            false,
+            Some(REBAC_START_HINT),
+        ));
+    } else {
+        planes.push(plane_row(
+            "rebac",
+            "Permissions engine",
+            "command-only",
+            "off",
+            "off — dev mode: reader keys are trusted exactly as given, and the most \
+             sensitive (restricted) records are dropped rather than indexed unsafely"
+                .to_string(),
+            false,
+            Some(REBAC_START_HINT),
+        ));
+    }
+
+    // 2 · live access revocation (the SpiceDB Watch consumer). Config-only:
+    // on/off is boot-time (VERITY_SPICEDB_WATCH), reported, never a button.
+    let w = state.watch.snapshot();
+    let enabled = w["enabled"].as_bool().unwrap_or(false);
+    let connected = w["connected"].as_bool().unwrap_or(false);
+    let degraded = w["degraded"].as_bool().unwrap_or(false);
+    let (rev_status, rev_detail) = if !enabled {
+        (
+            "off",
+            "off — when someone loses access it takes effect the next time a reader \
+             mints a pass, not instantly (the live watch accelerates this)"
+                .to_string(),
+        )
+    } else if degraded {
+        (
+            "degraded",
+            "degraded — the live watch hit a gap; access removals still take effect, \
+             just on the periodic baseline rather than the very next read"
+                .to_string(),
+        )
+    } else if connected {
+        (
+            "on",
+            "on — when someone loses access it takes effect on their next read".to_string(),
+        )
+    } else {
+        (
+            "degraded",
+            "reconnecting — the live watch is enabled but not connected right now; \
+             the periodic baseline still applies access removals"
+                .to_string(),
+        )
+    };
+    planes.push(plane_row(
+        "revocation_watch",
+        "Live access revocation",
+        "config-only",
+        rev_status,
+        rev_detail,
+        false,
+        None,
+    ));
+
+    // 3 · media / object store. Command-only: a Docker container, so when off
+    // the panel offers the copyable `docker compose up` command, not a button.
+    if state.media_store.is_some() {
+        planes.push(plane_row(
+            "media_store",
+            "File & media storage",
+            "command-only",
+            "on",
+            "on — uploaded files and media are kept in the object store".to_string(),
+            false,
+            None,
+        ));
+    } else {
+        planes.push(plane_row(
+            "media_store",
+            "File & media storage",
+            "command-only",
+            "off",
+            "off — files and media fall back to the database (fine for dev, not for \
+             large files at scale)"
+                .to_string(),
+            false,
+            Some(MEDIA_START_HINT),
+        ));
+    }
+
+    // 4 · local query encoder — meaning-based recall when on. Config-only: the
+    // model either loaded at boot or it didn't; off is `degraded` (server up).
+    if state.encoder.is_some() {
+        planes.push(plane_row(
+            "encoder",
+            "Meaning-based search",
+            "config-only",
+            "on",
+            format!(
+                "on — searches match on meaning, not just exact keywords (model {})",
+                verity_encoder::MODEL_ID
+            ),
+            false,
+            None,
+        ));
+    } else {
+        planes.push(plane_row(
+            "encoder",
+            "Meaning-based search",
+            "config-only",
+            "off",
+            "off — keyword-only search (the meaning model didn't load, so dense recall \
+             is unavailable)"
+                .to_string(),
+            false,
+            None,
+        ));
+    }
+
+    // 5 · auto-resolve (entity resolution debounce). Config-only.
+    if let Some(d) = state.resolution.debounce() {
+        planes.push(plane_row(
+            "auto_resolve",
+            "Auto-merge of duplicate entities",
+            "config-only",
+            "on",
+            format!(
+                "on — records about the same thing are merged automatically about {} \
+                 after they arrive",
+                humanize_secs(d.as_secs())
+            ),
+            false,
+            None,
+        ));
+    } else {
+        planes.push(plane_row(
+            "auto_resolve",
+            "Auto-merge of duplicate entities",
+            "config-only",
+            "off",
+            "off — duplicate records are merged only when someone runs resolution by hand"
+                .to_string(),
+            false,
+            None,
+        ));
+    }
+
+    // 6 · knowledge consolidation worker (L2) — the ONE startable plane, in two
+    // strict tiers (§2). Tier 1 AUTHORITATIVE: this server owns a live child.
+    // Tier 2 OBSERVED: no owned child → fall back to the episode_processing
+    // activity proxy, tenant-scoped for start/stop symmetry.
+    planes.push(knowledge_plane_row(&state, q.tenant_id).await);
+
+    let up = planes.iter().filter(|p| p["status"] == "on").count();
+    Ok(Json(serde_json::json!({
+        "planes": planes,
+        "summary": { "up": up, "total": planes.len() },
+        "checked_at": Utc::now().to_rfc3339(),
+    })))
+}
+
+/// The `knowledge_worker` row: authoritative when this server owns a live
+/// child, else the tenant-scoped observed activity proxy. A dead owned child is
+/// reaped and the handle cleared before falling through — never a stale
+/// "running, pid N".
+/// The exact missing-prereq fix for a not-startable knowledge worker (repo /
+/// venv / key, in that resolution order). `None` when all prereqs are present.
+fn start_hint_for(repo: Option<&std::path::Path>, venv: bool, key: bool) -> Option<String> {
+    let Some(repo) = repo else {
+        return Some(
+            "start the server with --repo <path> (or VERITY_REPO) so it can find ingest/.venv"
+                .to_string(),
+        );
+    };
+    if !venv {
+        Some(format!(
+            "no ingest virtualenv at {}/ingest/.venv/bin/python — create it (cd ingest && \
+             python -m venv .venv && .venv/bin/pip install -e '.[gdrive]') then try again",
+            repo.display()
+        ))
+    } else if !key {
+        Some(
+            "knowledge extraction needs an Anthropic key at ~/.verity-anthropic-key (0600) — \
+             add it, then try again"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+async fn knowledge_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_json::Value {
+    const LABEL: &str = "Knowledge extraction worker";
+
+    // Tier 1 — AUTHORITATIVE (server-owned). Hold the lock only long enough to
+    // probe liveness / reap a dead child.
+    {
+        let mut guard = state.knowledge_worker.lock().await;
+        if let Some(worker) = guard.as_mut() {
+            match worker.child.try_wait() {
+                Ok(None) => {
+                    // Alive: the one authoritative "on" with pid + a real Stop.
+                    let pid = worker.pid;
+                    let started_at = worker.started_at;
+                    let worker_tenant = worker.tenant_id;
+                    let detail = format!(
+                        "running · pid {pid} · started from this console {} — anthropic \
+                         extractor + judge, leasing every 30s into the review queue. \
+                         Auto-publish stays off.",
+                        humanize_ago(started_at)
+                    );
+                    let mut row = plane_row(
+                        "knowledge_worker",
+                        LABEL,
+                        "startable",
+                        "on",
+                        detail,
+                        false,
+                        None,
+                    );
+                    let obj = row.as_object_mut().expect("plane_row is an object");
+                    obj.insert("authority".into(), serde_json::json!("server"));
+                    obj.insert("stoppable".into(), serde_json::json!(true));
+                    obj.insert("pid".into(), serde_json::json!(pid));
+                    obj.insert(
+                        "started_at".into(),
+                        serde_json::json!(started_at.to_rfc3339()),
+                    );
+                    // The space this owned child leases against (it serves one
+                    // tenant, fixed at spawn). Surfaced so the panel can note
+                    // if the live worker belongs to a different tenant.
+                    obj.insert(
+                        "worker_tenant_id".into(),
+                        serde_json::json!(worker_tenant.to_string()),
+                    );
+                    return row;
+                }
+                _ => {
+                    // Child died (Some(exit)) OR the wait errored: reap (already
+                    // waited) and clear the handle, then fall through to Tier 2.
+                    *guard = None;
+                }
+            }
+        }
+    }
+
+    // Tier 2 — OBSERVED PROXY. Same activity query as before, tenant-scoped.
+    let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT max(GREATEST(leased_until - make_interval(mins => 5), \
+                             COALESCE(processed_at, 'epoch'::timestamptz))) \
+         FROM episode_processing WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(state.pool())
+    .await
+    .ok()
+    .flatten();
+    // Startability depends ONLY on the prereqs + not owning a live child (this
+    // branch is reached only when the server owns none), NEVER on observed
+    // activity — otherwise stopping a worker leaves recent activity that would
+    // wrongly disable Start and dead-end the row (caught live 2026-07-13).
+    let repo = state.repo_root.as_deref();
+    let venv = knowledge_worker::venv_exists(repo);
+    let key = knowledge_worker::key_exists();
+    let startable = repo.is_some() && venv && key;
+
+    let recent = last.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(2));
+    if recent {
+        let t = last.expect("recent implies Some");
+        // Recent DB activity does NOT prove a worker is running now — it may
+        // have just finished or been stopped. Honest status is "unknown", not a
+        // false "on"; Start stays offered so a stopped worker isn't a dead-end.
+        let detail = format!(
+            "recently active — consolidation ran {}, but this console doesn't own a running \
+             worker (it may have just finished, or be running elsewhere). Start one here to \
+             own and stop it.",
+            humanize_ago(t)
+        );
+        let hint = start_hint_for(repo, venv, key);
+        let mut row = plane_row(
+            "knowledge_worker",
+            LABEL,
+            "startable",
+            "unknown",
+            detail,
+            startable,
+            hint.as_deref(),
+        );
+        let obj = row.as_object_mut().expect("plane_row is an object");
+        obj.insert("authority".into(), serde_json::json!("observed"));
+        obj.insert("stoppable".into(), serde_json::json!(false));
+        return row;
+    }
+    // `humanize_ago` already yields "…ago", so phrase around it (not "in the
+    // last 2h ago"); a never-run worker reads "has never run".
+    let recency = match last {
+        Some(t) => format!("last ran {}", humanize_ago(t)),
+        None => "has never run".to_string(),
+    };
+    let detail = format!(
+        "off — {recency}. New memories pile up unread until it runs."
+    );
+    // When not startable, start_hint carries the exact missing-prereq fix.
+    let hint = start_hint_for(repo, venv, key);
+    let mut row = plane_row(
+        "knowledge_worker",
+        LABEL,
+        "startable",
+        "off",
+        detail,
+        startable,
+        hint.as_deref(),
+    );
+    let obj = row.as_object_mut().expect("plane_row is an object");
+    obj.insert("authority".into(), serde_json::json!("observed"));
+    obj.insert("stoppable".into(), serde_json::json!(false));
+    row
+}
+
+/// The base-url the spawned worker should call back on, derived from `--listen`.
+fn worker_base_url(listen: &str) -> String {
+    format!("http://{listen}")
+}
+
+/// POST /v1/admin/planes/knowledge/start {tenant_id} (admin): spawn + track the
+/// consolidation worker for this tenant. Idempotent (an already-owned live
+/// child → 200 no-op). Missing repo/venv → 422, missing key / OS spawn failure
+/// → 503 — each with the exact fix in `error`, NEVER a 500. The Anthropic key
+/// is read from `~/.verity-anthropic-key` at spawn time, never embedded,
+/// logged, or returned.
+async fn admin_planes_knowledge_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.knowledge_worker.lock().await;
+
+    // ONE owner per server: if we already hold a LIVE child (any tenant), it's
+    // an idempotent no-op. A dead child is reaped and we proceed to respawn.
+    if let Some(worker) = guard.as_mut() {
+        match worker.child.try_wait() {
+            Ok(None) => {
+                return Ok(Json(serde_json::json!({
+                    "started": false,
+                    "pid": worker.pid,
+                    "already_running": true,
+                })));
+            }
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    let base_url = worker_base_url(&state.listen);
+    let admin_token = state.admin_token.as_deref();
+    match knowledge_worker::spawn(
+        state.repo_root.as_deref(),
+        &base_url,
+        body.tenant_id,
+        admin_token,
+    ) {
+        Ok(worker) => {
+            let pid = worker.pid;
+            *guard = Some(worker);
+            Ok(Json(serde_json::json!({ "started": true, "pid": pid })))
+        }
+        Err(knowledge_worker::SpawnError::NoRepo) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the server doesn't know its repo path — start it with --repo <path> or VERITY_REPO \
+             so it can find ingest/.venv"
+                .to_string(),
+        )),
+        Err(knowledge_worker::SpawnError::NoVenv(msg)) => {
+            Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+        }
+        Err(knowledge_worker::SpawnError::NoKey(msg)) => {
+            Err((StatusCode::SERVICE_UNAVAILABLE, msg))
+        }
+        Err(knowledge_worker::SpawnError::Os(msg)) => Err((StatusCode::SERVICE_UNAVAILABLE, msg)),
+    }
+}
+
+/// POST /v1/admin/planes/knowledge/stop {tenant_id} (admin): kill + reap the
+/// tracked child and clear the handle. Honest no-op when this console owns no
+/// worker (it may be running, started elsewhere — stop it there).
+async fn admin_planes_knowledge_stop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(_body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.knowledge_worker.lock().await;
+    match guard.take() {
+        Some(mut worker) => {
+            let pid = worker.pid;
+            // Kill then wait to reap — no zombie. Ignore a kill error on an
+            // already-exited child; the wait still reaps it.
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+            Ok(Json(serde_json::json!({ "stopped": true, "pid": pid })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "stopped": false,
+            "note": "nothing to stop — this console doesn't own a worker. If one is running it \
+                     was started outside this console (e.g. verity-cli dev --knowledge); stop it \
+                     there.",
+        }))),
     }
 }
 
@@ -318,6 +886,12 @@ async fn main() -> anyhow::Result<()> {
         resolution: scheduler::ResolutionScheduler::from_env(),
         watch: Arc::new(rebac_watch::WatchStatus::new()),
         folder_watchers: Arc::new(folder_watch::WatcherRegistry::new()),
+        knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
+        repo_root: cli.repo_root(),
+        listen: cli.listen.clone(),
+        admin_token: std::env::var("VERITY_ADMIN_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
     });
 
     let app = Router::new()
@@ -430,6 +1004,19 @@ async fn main() -> anyhow::Result<()> {
             post(admin_principals).get(admin_list_principals),
         )
         .route("/v1/admin/rebac-watch", get(rebac_watch::admin_status))
+        // "What's running" — observed infrastructure-plane status for the
+        // console System panel (admin-gated like every other /v1/admin read).
+        .route("/v1/admin/planes", get(admin_planes))
+        // The one real Start/Stop: spawn/kill the knowledge worker the server
+        // owns (SPEC §2 L2). Idempotent start, honest-no-op stop; admin-gated.
+        .route(
+            "/v1/admin/planes/knowledge/start",
+            post(admin_planes_knowledge_start),
+        )
+        .route(
+            "/v1/admin/planes/knowledge/stop",
+            post(admin_planes_knowledge_stop),
+        )
         .route(
             "/v1/admin/groups",
             post(admin_group_add).delete(admin_group_remove),

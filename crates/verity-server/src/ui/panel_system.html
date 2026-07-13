@@ -1,0 +1,35 @@
+<!-- ==========================================================================
+     panel_system.html — "What's running" (infrastructure status + control)
+     --------------------------------------------------------------------------
+     THE LAW (UI-ACTIONS §0): plain language first, every state labeled, the
+     empty/loading/error/starting/stopping states teach, no raw endpoint in
+     visible copy (kept to api-crumb only). One labeled row per infrastructure
+     plane with a plain-words status chip — so an operator can see, in ten
+     seconds, whether the permissions engine, media storage, meaning-based
+     search, live access revocation, auto-merge, and the knowledge extraction
+     worker are actually up. Every row says, in plain words, what being on or
+     off MEANS for them.
+
+     The founder's ask: "from that panel the user should be able to start those
+     workers." Exactly ONE plane is truly startable from a running server — the
+     knowledge extraction worker (an external Python process the server spawns,
+     tracks, and can stop). It gets a real Start/Stop button. Everything else
+     that is off is brought up by a copyable COMMAND (Docker / a server restart
+     with env), never a dead button that lies — the row shows the exact command
+     the server reports, so the panel teaches instead of pretending.
+
+     Honesty (from the server's `class` + `startable` fields, never re-derived
+     client-side): the knowledge worker's status is AUTHORITATIVE when this
+     server owns the child (pid, "started from this console", a real Stop), and
+     an OBSERVED proxy — labeled "(observed)", no Stop — when a worker is
+     running but was started outside this console. Starting it makes paid LLM
+     calls, so Start CONFIRMS the cost first and states that nothing auto-
+     publishes: every proposal lands in the Knowledge review queue.
+
+     Owns ONLY this file + panel_system.js. Same panel id (#panel-system) +
+     mount id (#system-mount) + Verity.register shape — wiring holds. -->
+<section class="panel" id="panel-system">
+  <h1>What&rsquo;s running</h1>
+  <div class="lede">The moving parts behind Verity, and whether each one is actually up right now &mdash; so you always know what&rsquo;s going on, not just when something breaks. Where a piece is off, this screen tells you exactly how to turn it on: the one worker the running server can start has a button; the rest show the command to bring them up.</div>
+  <div id="system-mount"></div>
+</section>

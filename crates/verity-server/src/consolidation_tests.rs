@@ -57,6 +57,10 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
         folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
+        knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
+        repo_root: None,
+        listen: "127.0.0.1:0".to_string(),
+        admin_token: None,
     });
     Some((state, tenant))
 }
@@ -103,6 +107,10 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
             watch,
             folder_watchers,
+            knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
+            repo_root: None,
+            listen: "127.0.0.1:0".to_string(),
+            admin_token: None,
         }),
         tenant,
     ))
