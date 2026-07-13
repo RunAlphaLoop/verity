@@ -437,6 +437,12 @@ async fn admin_planes(
     let enabled = w["enabled"].as_bool().unwrap_or(false);
     let connected = w["connected"].as_bool().unwrap_or(false);
     let degraded = w["degraded"].as_bool().unwrap_or(false);
+    // A watch that is open but has never received a frame reports connected=false
+    // BY DESIGN: SpiceDB sends nothing (not even headers) until the first access
+    // change, so a quiet system pends here — healthy, not failing. Only real
+    // churn (a prior reconnect or a recorded error) is genuinely reconnecting.
+    let churning =
+        w["reconnects"].as_u64().unwrap_or(0) > 0 || !w["last_error"].is_null();
     let (rev_status, rev_detail) = if !enabled {
         (
             "off",
@@ -456,11 +462,20 @@ async fn admin_planes(
             "on",
             "on — when someone loses access it takes effect on their next read".to_string(),
         )
-    } else {
+    } else if churning {
         (
             "degraded",
-            "reconnecting — the live watch is enabled but not connected right now; \
-             the periodic baseline still applies access removals"
+            "reconnecting — the live watch dropped and is retrying; access removals still \
+             apply on the periodic baseline until it's back"
+                .to_string(),
+        )
+    } else {
+        // Open, ready, nothing to stream yet on a quiet system — the healthy
+        // idle state, not degraded.
+        (
+            "on",
+            "on — connected and waiting; there's been no access change to stream yet, and a \
+             live removal is applied on the reader's next read the instant one happens"
                 .to_string(),
         )
     };
