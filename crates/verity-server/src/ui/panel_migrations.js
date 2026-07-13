@@ -1,30 +1,37 @@
 "use strict";
 /* ==========================================================================
-   panel_migrations.js — Search index upgrade (v2 rebuild)
+   panel_migrations.js — Search model upgrade
    --------------------------------------------------------------------------
-   THE LAW, applied:
-     • plain-language primaries — "Rebuild the search index", "Switch searches
-       to the new index", "Source history backfill", "Refresh entity
-       summaries"; re-embed / cutover / dense-route / embedding_v2 live ONLY
-       in .sub / mono .ref secondary text;
-     • one-sentence purpose on every operation; visible state chips + as-of;
-     • AUTOLOADS backfill progress once the tenant is known (no cold Load
-       button); no-tenant and empty states TEACH with working buttons;
-     • honesty kept verbatim: determinate bars only with a known total,
-       striped indeterminate otherwise, total==0 its own state, honest ETA,
-       the live-route "not known yet" seam (no GET exists), and
-       every count painted from a live server response — never fabricated;
-     • fail-closed kept: coverage-gated cutover (server 409), force only
-       behind an explicit acknowledgment (omission refuses client-side),
-       writes refuse when no scope is named rather than silently going global.
+   THE LAW (UI-ACTIONS §0), applied:
+     • whether-you-need-to-act-now is answered FIRST: a calm opening banner
+       ("you probably don't need to do anything here") shows before any
+       machinery, and the three-step flow stays collapsed behind an explicit
+       "Start a search-model upgrade" affordance;
+     • plain language first — "Build the new index", "Switch search to the new
+       index", "Refresh entity summaries"; every glossed term (embedding /
+       re-embed / cutover / coverage / vector / brief) is defined once in
+       visible copy, with the raw term / endpoint kept to api-crumb only;
+     • every number is labeled with what it counts ("X of Y text chunks
+       re-indexed (Z%)");
+     • empty / loading / error states TEACH; backfill autoloads once a space
+       is known;
+     • honesty kept verbatim: readiness is "not measured yet" until a rebuild
+       batch runs (no read-only coverage check), the live route is "not known
+       yet" unless THIS session switched it (no GET exists), determinate bars
+       only with a known total, total==0 its own state, honest ETA;
+     • fail-closed kept: coverage-gated cutover (server 409 rendered plain),
+       force only behind an explicit checkbox acknowledgment (omission refuses
+       client-side), writes refuse when no space is named rather than silently
+       going global; the "Switch to the new index" button is disabled until
+       readiness reads 100%, with the force path living only inside the dialog.
    Endpoints verified against crates/verity-server/src/{main,backfill}.rs.
    Zero LLM / zero live-ReBAC calls from this panel.
    ========================================================================== */
 (function () {
   var V = window.Verity;
 
-  // Default target model id for the new column; the server registers it on
-  // the first batch (idempotent). An honest non-empty default, overridable.
+  // Default target model id for the new index; the server registers it on the
+  // first batch (idempotent). An honest non-empty default, overridable.
   var DEFAULT_MODEL = "bge-small-en-v1.5";
 
   /* ------------------------------------------------------------- state */
@@ -32,6 +39,7 @@
   var lastCutover = null;   // { route, tenant, forced, at } — the only honest "live route" source
   var looping = false;
   var stopRequested = false;
+  var stepsRevealed = false; // the machinery starts collapsed; this flips true on "Start…"
 
   function el(id) { return V.$(id); }
   function nowStamp() { return new Date().toTimeString().slice(0, 8); }
@@ -42,6 +50,10 @@
     if (!cov || cov.total == null) return false;
     return cov.total <= 0 || (cov.covered != null && cov.covered >= cov.total);
   }
+  // "Measured" means a batch has actually run and returned a coverage total.
+  function coverageMeasured() {
+    return lastCoverage != null && lastCoverage.total != null;
+  }
 
   /* ------------------------------------------------------------ register */
   V.register({
@@ -49,111 +61,212 @@
     mount: function () {
       var host = el("migrations-mount");
       if (!host) return;
-      // The backfill chip + as-of live in the backfill card's header (see
-      // buildCards), NOT here — under the panel title they read as the state
-      // of the whole index upgrade.
       host.innerHTML =
-        '<div class="toolbar">' +
-          '<span class="spacer"></span>' +
-          '<button id="mig-refresh">Refresh</button>' +
-        "</div>" +
         '<div class="err" id="mig-err"></div>' +
-        '<div id="mig-cards"></div>';
-      buildCards(el("mig-cards"));
-      el("mig-refresh").onclick = function () {
-        var t = V.tenant();
-        if (t) refreshBackfill(t); else paintNoTenant();
-      };
+        buildBanner() +
+        '<div id="mig-steps" style="display:none"></div>' +
+        buildRelated();
+      wireBanner();
+      buildSteps(el("mig-steps"));
+      wireBackfillRefresh();
       if (!V.tenant()) paintNoTenant();
     },
-    // AUTOLOAD — the router runs this when the panel shows and a tenant is
-    // known (and again on tenant change): backfill progress is the loadable
-    // read here. Coverage and route stay honestly "unmeasured/unknown" until
-    // an operation runs — there is no read-only endpoint for either.
+    // AUTOLOAD — the router runs this when the panel shows and a space is known
+    // (and again on space change): the source-history catch-up list is the only
+    // loadable read here. Readiness and live route stay honestly
+    // "not measured / not known yet" until an operation runs — no read-only
+    // endpoint exists for either.
     load: function (_s, tenant) { return refreshBackfill(tenant); },
   });
 
-  /* ------------------------------------------------------------- cards */
-  function buildCards(host) {
+  /* ------------------------------------------------------ opening banner */
+  // Answered FIRST, before any machinery: do you need to act right now?
+  function buildBanner() {
+    return '' +
+      '<div class="card" id="mig-banner">' +
+        '<h2>You probably don&rsquo;t need to do anything here.</h2>' +
+        '<div class="note">This page is only for the rare job of upgrading the AI model that turns your ' +
+          'stored text into the numbers search uses — its <b>embedding model</b> ' +
+          '<span class="api-crumb">(embedding = the numeric fingerprint Verity makes of each piece of text ' +
+          'so search can match by meaning, not just keywords)</span>. Live search keeps working the whole ' +
+          'time, whether or not you ever use this page.</div>' +
+        '<div class="note" style="margin-top:10px">' +
+          '<b>You need this only if</b> the Verity team told you to move to a newer/better search model, or ' +
+          'you&rsquo;re switching off the built-in local model. ' +
+          '<b>You do NOT need this</b> to add data, connect a source, fix day-to-day search quality, or catch ' +
+          'a connector up on history.</div>' +
+        '<div class="note" style="margin-top:10px">' + V.stateChip("off", "one honest caveat") +
+          ' This console can only tell you an upgrade is <b>underway</b> if it was started from this browser ' +
+          'session &mdash; it can&rsquo;t yet read the live search index or rebuild progress from the server ' +
+          '<span class="api-crumb">(no read-only GET for the live route or coverage)</span>. So on a fresh ' +
+          'load it can&rsquo;t prove a migration is or isn&rsquo;t running elsewhere.</div>' +
+        '<div id="mig-session-state" style="margin-top:10px"></div>' +
+        '<div class="actions" style="justify-content:flex-start;margin-top:12px">' +
+          '<button class="primary" id="mig-start">Start a search-model upgrade</button>' +
+          '<button id="mig-what">What is this?</button>' +
+        '</div>' +
+        '<div class="note" id="mig-what-body" style="display:none;margin-top:12px">' +
+          '<b>The 1&mdash;2&mdash;3 of a search-model upgrade:</b><br>' +
+          '<b>1. Build the new index.</b> Re-encode every stored text chunk with the new model into a ' +
+          'separate, second index, in the background. Live search never changes while this runs.<br>' +
+          '<b>2. Switch search to the new index.</b> Point live searches at the new index &mdash; only ' +
+          'allowed once the new index covers 100% of your searchable memories, so nothing quietly drops out ' +
+          'of search.<br>' +
+          '<b>3. Refresh entity summaries.</b> Recompute the short auto-written blurbs Verity keeps for each ' +
+          'person/company, which a model change can leave out of date.<br>' +
+          '<span class="note">Re-encoding every chunk takes real compute, so this is usually a planned, ' +
+          'multi-hour, one-in-a-blue-moon job done with guidance. If nobody told you &ldquo;we&rsquo;re ' +
+          'upgrading the search model,&rdquo; you&rsquo;re probably not supposed to be here.</span>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function wireBanner() {
+    el("mig-start").onclick = function () { revealSteps(true); };
+    el("mig-what").onclick = function () {
+      var body = el("mig-what-body");
+      var open = body.style.display !== "none";
+      body.style.display = open ? "none" : "";
+      el("mig-what").textContent = open ? "What is this?" : "Hide";
+    };
+    paintSessionState();
+  }
+
+  // Surface remembered session state prominently on the banner: if THIS session
+  // started a rebuild or performed a switch, say so (and auto-reveal the steps
+  // so the operator can continue). Otherwise stay calm and collapsed.
+  function paintSessionState() {
+    var wrap = el("mig-session-state");
+    if (!wrap) return;
+    var bits = [];
+    if (lastCutover) {
+      var toNew = lastCutover.route === "v2";
+      bits.push(V.stateChip(toNew ? "attn" : "ok",
+        toNew ? "you switched search to the NEW index" : "you switched search back to the OLD index") +
+        ' <span class="note">at ' + V.esc(V.fmtTime(lastCutover.at)) + " this session" +
+        (lastCutover.forced ? " — <b>forced below 100%</b>" : "") +
+        (lastCutover.tenant ? " · space " + V.esc(lastCutover.tenant) : " · all spaces") +
+        "</span>");
+    }
+    if (coverageMeasured()) {
+      bits.push('<span class="note">A rebuild has run this session &mdash; readiness is measured below.</span>');
+    }
+    if (!bits.length) { wrap.innerHTML = ""; return; }
+    wrap.innerHTML = '<div class="note"><b>This session:</b><br>' + bits.join("<br>") + "</div>";
+  }
+
+  function revealSteps(scroll) {
+    stepsRevealed = true;
+    var steps = el("mig-steps");
+    if (steps) steps.style.display = "";
+    var start = el("mig-start");
+    if (start) start.textContent = "Steps shown below";
+    if (scroll && steps && steps.scrollIntoView) {
+      try { steps.scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) { /* ok */ }
+    }
+  }
+
+  /* ------------------------------------------------------------- steps */
+  function buildSteps(host) {
+    if (!host) return;
     host.innerHTML =
-      /* 1 · rebuild */
+      /* STEP 1 · build the new index */
       '<div class="card">' +
-        '<h2>1 · Rebuild the search index <span class="sub">re-embed<span class="api-crumb"> · POST /v1/admin/reembed/batch</span></span></h2>' +
-        '<div class="note">Re-encodes stored text into the new model’s index, in batches. Safe to stop at any ' +
-          "time — it resumes where it left off, and it <b>never re-fetches source data</b>. Needs the server’s " +
-          "built-in encoder: a keyword-search-only (sparse) server refuses, and the reason is shown as-is" +
+        '<h2>Step 1 &mdash; Build the new index ' +
+          '<span class="sub">creates a second, separate index<span class="api-crumb"> · re-embed every ' +
+          'stored text chunk with the new model → embedding_v2 · POST /v1/admin/reembed/batch</span></span> ' +
+          '<span id="mig-encoder-chip"></span></h2>' +
+        '<div class="note">Re-encodes your stored text with the new model in the background, into a ' +
+          '<b>brand-new index alongside the current one</b>. Live search keeps using the current index, so ' +
+          'search quality never dips while this runs. It re-reads the canonical text Verity already stored ' +
+          '&mdash; it <b>never re-downloads source data</b>. Safe to stop anytime: it picks up exactly where ' +
+          'it left off.</div>' +
+        '<div class="note" style="margin-top:8px">This only works if your Verity server was set up to make ' +
+          'its own text fingerprints. Some servers are keyword-search-only and can&rsquo;t &mdash; if so, ' +
+          '&ldquo;Rebuild&rdquo; stops and shows you the server&rsquo;s exact reason' +
           '<span class="api-crumb"> · 503</span>.</div>' +
-        '<div class="row" style="margin-top:8px">' +
-          '<div class="tight"><label for="mig-model">New model <span class="note">(target model id)</span></label> ' +
+        '<div class="row" style="margin-top:10px">' +
+          '<div class="tight"><label for="mig-model">The new model you&rsquo;re upgrading to ' +
+            '<span class="note">(the model id to build with)</span></label> ' +
             '<input type="text" id="mig-model" class="field" value="' + V.esc(DEFAULT_MODEL) + '" size="24" spellcheck="false"></div>' +
-          '<div class="tight"><label for="mig-batch">Text chunks per batch <span class="note">(1–10000)</span></label> ' +
+          '<div class="tight"><label for="mig-batch">Text chunks per batch ' +
+            '<span class="note">(1&ndash;10000 &mdash; bigger = faster but heavier load; leave at 512 if unsure)</span></label> ' +
             '<input type="number" id="mig-batch" class="field" min="1" max="10000" step="1" value="512"></div>' +
           '<div class="tight"><label style="display:flex;gap:8px;align-items:center;margin-top:18px">' +
             '<input type="checkbox" id="mig-global" style="width:auto;min-width:0">' +
-            '<span>All spaces <span class="note">(unchecked = the active space <span class="api-crumb">(tenant)</span> only)</span></span></label></div>' +
+            '<span>All spaces <span class="note">(unchecked = the active space only; a space is one tenant. ' +
+            'Ticking this re-indexes <b>every tenant&rsquo;s</b> data)</span><span class="api-crumb"> ' +
+            '· space = tenant</span></span></label></div>' +
         "</div>" +
-        '<div style="margin-top:12px"><b>How much is ready</b></div>' +
+        '<div class="note" style="margin-top:12px">The new model must produce the <b>same-size fingerprint</b> ' +
+          'as your current one (384 numbers per chunk today). A true change of fingerprint size is a much ' +
+          'bigger, separate operation<span class="api-crumb"> · dims must match (384-d today); a true dim ' +
+          'change needs docs/EMBEDDING_MIGRATION.md</span>.</div>' +
+        '<div style="margin-top:14px"><b>How much of your data has been re-indexed with the new model</b> ' +
+          '<span class="note">(this must reach 100% before you can safely switch in Step 2)</span></div>' +
         '<div id="mig-cov-bar" style="margin-top:6px"></div>' +
         '<div id="mig-cov-stat"></div>' +
         '<div class="actions" style="justify-content:flex-start;margin-top:12px">' +
-          '<button class="primary" id="mig-run" title="Loop batches until the server reports no pending items, repainting readiness after each batch.">Rebuild until done</button>' +
-          '<button id="mig-run-one" title="Fill exactly one batch, then stop — a careful step-through.">Do one batch</button>' +
-          '<button id="mig-run-stop" disabled title="Stop after the in-flight batch returns — never mid-write.">Stop</button>' +
+          '<button id="mig-run-one" class="primary" title="Encode exactly one batch, then stop — a careful step-through, and the only way to measure readiness.">Do one batch (also measures readiness)</button>' +
+          '<button id="mig-run" title="Keep running batches automatically until the server reports nothing left to encode.">Rebuild until done</button>' +
+          '<button id="mig-run-stop" disabled title="Stop after the batch currently in flight finishes — never mid-write.">Stop after this batch</button>' +
           '<span class="asof" id="mig-run-status"></span>' +
         "</div>" +
-        '<div class="dc-meta api-crumb-block">re-embed → embedding_v2 · model registered idempotently · dims must match (384-d today; a true dim change needs docs/EMBEDDING_MIGRATION.md)</div>' +
       "</div>" +
 
-      /* backfill (auto-loaded) — NOT a numbered step of the index upgrade */
+      /* STEP 2 · cutover */
       '<div class="card">' +
-        '<h2>Source history backfill — separate from the index upgrade ' +
-          '<span class="sub">latest run per source · auto-loaded<span class="api-crumb"> · GET /v1/admin/backfill</span></span> ' +
-          '<span id="mig-state"></span> <span class="asof" id="mig-asof"></span></h2>' +
-        '<div class="note">This watches connected sources pulling in their history. It is not a step of the ' +
-          "index switch — shown here so you can see data landing while you rebuild. Progress is posted " +
-          "best-effort by the ingest side — a <b>progress signal, not an audit ledger</b>; the authoritative " +
-          "rows live in the store. A bar is exact only when the source declared a total.</div>" +
-        '<div id="mig-bf-out" style="margin-top:8px"></div>' +
-      "</div>" +
-
-      /* 2 · cutover */
-      '<div class="card">' +
-        '<h2>2 · Switch searches to the new index <span class="sub">coverage-gated<span class="api-crumb"> · POST /v1/admin/reembed/cutover</span></span></h2>' +
-        '<div class="note">Flips recall queries to the rebuilt index. Below 100% readiness the server refuses ' +
-          "unless you explicitly force it" +
-          '<span class="api-crumb"> · 409</span>. Switching back to the old index is always safe — its data ' +
-          "still exists, so no gate applies.</div>" +
-        '<div id="mig-route-state" style="margin-top:8px"></div>' +
+        '<h2>Step 2 &mdash; Switch search to the new index ' +
+          '<span class="sub">only allowed once every memory is re-indexed<span class="api-crumb"> · the ' +
+          'coverage-gated cutover · POST /v1/admin/reembed/cutover</span></span></h2>' +
+        '<div class="note">Points live searches at the new index. Verity <b>refuses this until the new index ' +
+          'covers 100% of your searchable memories</b> &mdash; switching to a half-built index would quietly ' +
+          'drop the not-yet-rebuilt memories to keyword-only search, so search would silently get worse for ' +
+          'part of your data. That gate is a safety rail, not a bug' +
+          '<span class="api-crumb"> · server returns 409 below 100%</span>. Switching back to the old ' +
+          'index is always safe &mdash; the old index still exists, so no gate applies.</div>' +
+        '<div class="note" style="margin-top:8px">Forcing the switch below 100% <b>is</b> possible but ' +
+          'discouraged &mdash; it lives behind an explicit acknowledgment in the dialog below.</div>' +
+        '<div id="mig-route-state" style="margin-top:10px"></div>' +
         '<div class="actions" style="justify-content:flex-start;margin-top:12px">' +
-          '<button class="good" id="mig-cutover">Switch to the new index…</button>' +
-          '<button id="mig-rollback">Switch back to the old index…</button>' +
+          '<button class="good" id="mig-cutover" disabled>Switch to the new index&hellip;</button>' +
+          '<button id="mig-rollback" title="Always safe — the old index still exists.">Switch back to the old index&hellip;</button>' +
         "</div>" +
-        '<div class="dc-meta api-crumb-block">dense route v1→v2 cutover · embedding_route() has no GET — the live route is not readable over HTTP</div>' +
+        '<div class="note" id="mig-cutover-hint" style="margin-top:6px"></div>' +
       "</div>" +
 
-      /* 3 · briefs */
+      /* STEP 3 · briefs */
       '<div class="card">' +
-        '<h2>3 · Refresh entity summaries <span class="sub"><span class="api-crumb">POST /v1/admin/briefs/refresh?tenant=</span></span></h2>' +
-        '<div class="note">After a rebuild, re-computes every <b>stale</b> entity summary for the active space ' +
-          "so downstream reads stay fresh. Summaries that are already current are left alone.</div>" +
-        '<div class="row" style="margin-top:8px">' +
+        '<h2>Step 3 &mdash; Refresh entity summaries ' +
+          '<span class="sub">recompute the stale per-entity blurbs<span class="api-crumb"> · briefs = the ' +
+          'cached one-call &ldquo;current state of this entity&rdquo; summaries · ' +
+          'POST /v1/admin/briefs/refresh?tenant=</span></span></h2>' +
+        '<div class="note">Entity summaries are the short auto-written blurbs Verity keeps for each ' +
+          'person/company. After the model change, this recomputes only the ones that are now <b>out of ' +
+          'date</b>, for the active space &mdash; already-current summaries are left alone. It&rsquo;s a ' +
+          'nice-to-have cleanup after switching, not a step that blocks search.</div>' +
+        '<div class="row" style="margin-top:10px">' +
           '<div class="tight"><button id="mig-briefs">Refresh summaries</button></div>' +
         "</div>" +
         '<div id="mig-briefs-out"></div>' +
       "</div>" +
 
       /* cutover confirm dialog */
-      '<div class="dialog-backdrop" id="mig-cutover-dialog"><div class="dialog" style="max-width:600px">' +
+      '<div class="dialog-backdrop" id="mig-cutover-dialog"><div class="dialog" style="max-width:620px">' +
         '<h3 id="mig-cut-title">Switch the search index</h3>' +
         '<div class="note" id="mig-cut-stmt"></div>' +
         '<div class="card" id="mig-cut-force-card" style="margin-top:10px;display:none">' +
-          '<div class="note" style="margin-bottom:8px"><b>Readiness is below 100% (or unmeasured).</b> ' +
-            "The server refuses a plain switch<span class=\"api-crumb\"> · 409</span>. Forcing it flips anyway — items not yet rebuilt " +
-            "<b>fall back to keyword-only search</b> until the rebuild finishes. An explicit, acknowledged " +
-            "degradation, never a silent one.</div>" +
+          '<h3 style="margin-top:0">Force the switch below 100%?</h3>' +
+          '<div class="note" style="margin-bottom:8px">The new index isn&rsquo;t 100% built yet ' +
+            '<span id="mig-cut-force-pct"></span>, so the server refuses a plain switch' +
+            '<span class="api-crumb"> · 409</span>. If you force it anyway, then <b>until the rebuild ' +
+            'finishes, searches over the not-yet-rebuilt memories will be less accurate</b> &mdash; keyword ' +
+            'matching only, with no meaning-based match. This is a deliberate, acknowledged trade-off, never ' +
+            'a silent one.</div>' +
           '<label class="tight" style="display:flex;gap:8px;align-items:center">' +
             '<input type="checkbox" id="mig-cut-force" style="width:auto;min-width:0">' +
-            "<span>I understand some items will fall back to keyword-only search, and I want to force the switch.</span>" +
+            "<span>I understand some memories will fall back to keyword-only search until the rebuild " +
+            "finishes, and I want to force the switch.</span>" +
           "</label>" +
         "</div>" +
         '<div class="err" id="mig-cut-err"></div>' +
@@ -170,8 +283,38 @@
     paintRouteState();
   }
 
+  /* ------------------------------------------------ related: backfill */
+  // Fenced HARD below the three steps and OUTSIDE #mig-steps, so it can never
+  // read as "step 1.5". It is auto-loaded whether or not the steps are revealed
+  // (it's genuinely useful to watch data landing during a long rebuild), but it
+  // is verbally and visually quarantined and never numbered. The word
+  // "backfill" appears ONLY here, glossed, and never in the migration steps.
+  function buildRelated() {
+    return '' +
+      '<div class="card" id="mig-related">' +
+        '<h2>Source history catch-up &mdash; <b>not</b> part of the search-model upgrade ' +
+          '<span class="sub">latest connector run per source<span class="api-crumb"> · &ldquo;backfill&rdquo; ' +
+          '· GET /v1/admin/backfill</span></span> ' +
+          '<span id="mig-state"></span> <span class="asof" id="mig-asof"></span> ' +
+          '<button id="mig-refresh" style="margin-left:8px">Refresh catch-up status</button></h2>' +
+        '<div class="note">This shows connected data sources pulling in their <b>history</b> &mdash; ' +
+          'connectors catching a source up on its older records. It has <b>nothing to do</b> with the ' +
+          'search-model upgrade above; it&rsquo;s shown here only so you can watch data still landing during a ' +
+          'long rebuild. Progress is a <b>best-effort signal, not an exact ledger</b>; a bar is exact only ' +
+          'when the source declared a total.</div>' +
+        '<div id="mig-bf-out" style="margin-top:8px"></div>' +
+      "</div>";
+  }
+
+  function wireBackfillRefresh() {
+    el("mig-refresh").onclick = function () {
+      var t = V.tenant();
+      if (t) refreshBackfill(t); else paintNoTenant();
+    };
+  }
+
   /* -------------------------------------------------- scope for writes */
-  // Fail closed: with no active tenant and "all tenants" unchecked we REFUSE
+  // Fail closed: with no active space and "All spaces" unchecked we REFUSE
   // instead of silently widening a write to every tenant.
   function writeScope() {
     if (el("mig-global").checked) return { global: true };
@@ -180,35 +323,38 @@
     return null;
   }
   function scopeSentence(scope) {
-    return scope.global ? "<b>all spaces</b> (global)" : "space " + V.refSpan(scope.tenant);
+    return scope.global ? "<b>all spaces</b> (every tenant)" : "space " + V.refSpan(scope.tenant);
   }
   function noScopeError() {
     return new Error(
-      "no active space — set one in the session bar, or tick “All spaces” to run globally (this screen never widens a write silently)");
+      "no active space — set one in the session bar, or tick “All spaces” to run across every " +
+      "tenant (this screen never widens a write silently)");
   }
 
   /* ------------------------------------------------- coverage painting */
-  // Honest readiness only: determinate bar when the total is known; total==0
-  // is its own state ("nothing to rebuild"); unknown → striped, no number.
+  // Honest readiness only: determinate bar when the total is known; total==0 is
+  // its own state ("nothing to re-index"); not-yet-measured → striped, no
+  // number. Every painted number is labeled with what it counts.
   function paintCoverage(cov) {
     var barEl = el("mig-cov-bar"), statEl = el("mig-cov-stat");
     if (!barEl || !statEl) return;
     if (!cov) {
       barEl.innerHTML = '<div class="bar indet"></div>';
-      statEl.innerHTML = '<span class="note">unmeasured — readiness is only reported after a rebuild batch runs, ' +
-        "and running a batch does real rebuild work (there is no look-without-touching check). " +
-        "Use “Do one batch” to measure. No percentage is invented.</span>";
+      statEl.innerHTML = '<span class="note"><b>Not measured yet.</b> We can&rsquo;t check progress without ' +
+        "doing some rebuild work — there&rsquo;s no look-without-touching check — so this stays " +
+        "blank until you run at least one batch. Use “Do one batch” above to measure. " +
+        "No percentage is invented.</span>";
       return;
     }
     if (cov.total == null) {
       barEl.innerHTML = '<div class="bar indet"></div>';
-      statEl.innerHTML = '<span class="note">' + V.esc(cov.covered == null ? "?" : cov.covered) +
-        " text chunks rebuilt · total unknown — no percentage is invented</span>";
+      statEl.innerHTML = '<span class="note"><b>' + V.esc(cov.covered == null ? "?" : cov.covered) +
+        "</b> text chunks re-indexed so far · total unknown — no percentage is invented</span>";
       return;
     }
     if (cov.total <= 0) {
       barEl.innerHTML = '<div class="bar completed"><i style="width:100%"></i></div>';
-      statEl.innerHTML = V.stateChip("ok", "nothing to rebuild") +
+      statEl.innerHTML = V.stateChip("ok", "nothing to re-index") +
         ' <span class="note">no text chunks exist for this scope — complete by definition, not 0%</span>';
       return;
     }
@@ -217,10 +363,10 @@
     barEl.innerHTML = '<div class="bar' + (complete ? " completed" : "") +
       '"><i style="width:' + pct.toFixed(1) + '%"></i></div>';
     statEl.innerHTML =
-      "<b>" + V.esc(cov.covered) + "</b> of <b>" + V.esc(cov.total) + "</b> text chunks rebuilt (" +
-      pct.toFixed(1) + "%)" +
-      (complete ? " · " + V.stateChip("ok", "100% — ready to switch") : "") +
-      ' <span class="asof">as of the last server response</span>';
+      "<b>" + V.esc(cov.covered) + "</b> of <b>" + V.esc(cov.total) + "</b> text chunks re-indexed with the " +
+      "new model (" + pct.toFixed(1) + "%)" +
+      (complete ? " · " + V.stateChip("ok", "100% — ready to switch in Step 2") : "") +
+      ' <span class="asof">as of the last rebuild batch</span>';
   }
 
   /* ------------------------------------------------ route-state painting */
@@ -232,40 +378,72 @@
     if (lastCutover) {
       var isV2 = lastCutover.route === "v2";
       routeLine = "<dt>Live index now</dt><dd>" +
-        V.stateChip("ok", isV2 ? "new index" : "old index") + " " + V.refSpan(lastCutover.route) +
-        ' <span class="note">as flipped by this session at ' + V.esc(V.fmtTime(lastCutover.at)) +
+        V.stateChip(isV2 ? "ok" : "off", isV2 ? "new index" : "old index") +
+        ' <span class="note">as switched from this session at ' + V.esc(V.fmtTime(lastCutover.at)) +
         (lastCutover.forced ? " — <b>forced below 100%</b>" : "") +
         (lastCutover.tenant ? " · space " + V.esc(lastCutover.tenant) : " · all spaces") +
-        "</span></dd>";
+        "</span>" +
+        '<span class="api-crumb"> ' + V.refSpan("route=" + lastCutover.route) + "</span></dd>";
     } else {
       // The honest seam: no GET exists for the live route; we will not guess.
       routeLine = "<dt>Live index now</dt><dd>" + V.stateChip("off", "not known yet") +
-        ' <span class="note">the console only learns which index is live when you switch it from this ' +
-        "screen, and no switch has happened this session. A server that has never been switched serves " +
-        "the old index." +
+        ' <span class="note">this console only learns the live index when <b>you</b> switch it here, and no ' +
+        "switch has happened this session. It can&rsquo;t read the live index from the server. " +
+        "(A server that has never been switched serves the old index.)" +
         "</span>" + '<span class="api-crumb"> ' + V.refSpan("embedding_route() — storage-only, no HTTP GET") + "</span></dd>";
     }
 
     var covLine;
-    if (lastCoverage == null) {
-      covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("off", "unmeasured") +
-        ' <span class="note">run a rebuild batch first — the server refuses an unforced switch below 100%<span class="api-crumb"> · 409</span></span></dd>';
-    } else if (lastCoverage.total == null) {
-      covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("off", "total unknown") + "</dd>";
+    if (!coverageMeasured()) {
+      covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("off", "not measured yet") +
+        ' <span class="note">run a rebuild batch first (Step 1) — the server refuses an unforced switch ' +
+        'below 100%<span class="api-crumb"> · 409</span></span></dd>';
     } else if (coverageComplete(lastCoverage)) {
-      covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("ok", "open — 100% ready") +
+      covLine = "<dt>Readiness gate</dt><dd>" + V.stateChip("ok", "100% — ready to switch") +
         (lastCoverage.total <= 0
-          ? ' <span class="note">nothing to rebuild — the gate is satisfied by definition</span>'
-          : ' <span class="note">' + V.esc(lastCoverage.covered) + " / " + V.esc(lastCoverage.total) + "</span>") +
+          ? ' <span class="note">nothing to re-index — the gate is satisfied by definition</span>'
+          : ' <span class="note"><b>' + V.esc(lastCoverage.covered) + "</b> of <b>" + V.esc(lastCoverage.total) +
+            "</b> text chunks covered</span>") +
         "</dd>";
     } else {
       var pct = Math.max(0, Math.min(100, (lastCoverage.covered / lastCoverage.total) * 100));
       covLine = "<dt>Readiness gate</dt><dd>" +
-        V.stateChip("attn", pct.toFixed(1) + "% — server refuses without force") +
-        ' <span class="note">' + V.esc(lastCoverage.covered) + " / " + V.esc(lastCoverage.total) + "</span></dd>";
+        V.stateChip("attn", pct.toFixed(1) + "% built — server refuses until 100%") +
+        ' <span class="note"><b>' + V.esc(lastCoverage.covered) + "</b> of <b>" + V.esc(lastCoverage.total) +
+        "</b> text chunks re-indexed</span></dd>";
     }
 
     wrap.innerHTML = '<dl class="kv">' + routeLine + covLine + "</dl>";
+
+    // Gate the "Switch to the new index" button on measured 100% readiness;
+    // the force path lives ONLY inside the dialog (reached via rollback? no —
+    // via a still-enabled switch button? no). We keep switch disabled until
+    // ready, and expose forcing through a small "force anyway" affordance in the
+    // hint so it isn't a surprise but also isn't the default.
+    var cutBtn = el("mig-cutover");
+    var hint = el("mig-cutover-hint");
+    if (cutBtn) {
+      var ready = coverageMeasured() && coverageComplete(lastCoverage);
+      cutBtn.disabled = !ready;
+      cutBtn.title = ready
+        ? "The new index covers 100% of your memories — safe to switch."
+        : "Available once the rebuild reaches 100% (Step 1).";
+      if (hint) {
+        if (ready) {
+          hint.innerHTML = "";
+        } else if (!coverageMeasured()) {
+          hint.innerHTML = '<span class="note">&ldquo;Switch to the new index&rdquo; unlocks once a rebuild ' +
+            'batch has measured readiness at 100%. Not measured yet — run Step 1 first. ' +
+            '<a href="#" id="mig-force-open">Force the switch anyway&hellip;</a> (discouraged).</span>';
+        } else {
+          hint.innerHTML = '<span class="note">&ldquo;Switch to the new index&rdquo; unlocks at 100% ' +
+            're-indexed. <a href="#" id="mig-force-open">Force the switch below 100%&hellip;</a> ' +
+            '(discouraged — uncovered memories fall back to keyword-only search).</span>';
+        }
+        var fo = el("mig-force-open");
+        if (fo) fo.onclick = function (e) { e.preventDefault(); openCutoverV2(); };
+      }
+    }
   }
 
   /* --------------------------------------------------- rebuild (batches) */
@@ -291,6 +469,7 @@
         lastCoverage = res.coverage;
         paintCoverage(res.coverage);
         paintRouteState();
+        paintSessionState();
       }
       return res;
     }
@@ -312,20 +491,20 @@
           scanned += (res && res.scanned) || 0;
           el("mig-run-status").textContent =
             batches + " batch" + (batches === 1 ? "" : "es") + " · " +
-            written + " rebuilt · " + scanned + " scanned";
+            written + " chunks re-indexed · " + scanned + " scanned";
           // `done` = the server found no pending items this batch — the honest
           // terminal signal, not a client-side % guess.
           if (!res || res.done) {
-            el("mig-run-status").textContent += " · done (no pending items)";
+            el("mig-run-status").textContent += " · done (nothing left to re-index)";
             break;
           }
           if (stopRequested) {
-            el("mig-run-status").textContent += " · stopped by operator";
+            el("mig-run-status").textContent += " · stopped after this batch";
             break;
           }
         }
       } catch (e) {
-        V.err("mig-err", e); // incl. the verbatim 503 on a sparse-only server
+        V.err("mig-err", e); // incl. the verbatim 503 on a keyword-only server
       } finally {
         looping = false;
         stopRequested = false;
@@ -350,9 +529,9 @@
       try {
         var res = await runOneBatch(scope);
         el("mig-run-status").textContent =
-          "one batch · " + ((res && res.written) || 0) + " rebuilt · " +
+          "one batch · " + ((res && res.written) || 0) + " chunks re-indexed · " +
           ((res && res.scanned) || 0) + " scanned" +
-          (res && res.done ? " · done (no pending items)" : "");
+          (res && res.done ? " · done (nothing left to re-index)" : "");
       } catch (e) {
         V.err("mig-err", e);
       } finally {
@@ -377,11 +556,11 @@
       var pct = Math.max(0, Math.min(100, (processed / total) * 100));
       var cls = (state === "completed" || state === "failed" || state === "paused") ? " " + state : "";
       return '<div class="bar' + cls + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
-        '<span class="note">' + pct.toFixed(1) + "% · " + V.esc(processed) + " / " + V.esc(total) + "</span>";
+        '<span class="note">' + pct.toFixed(1) + "% · " + V.esc(processed) + " of " + V.esc(total) + " records</span>";
     }
     // No declared total → striped track, never a fabricated percentage.
     return '<div class="bar indet"></div>' +
-      '<span class="note">' + V.esc(processed) + " processed · total unknown</span>";
+      '<span class="note">' + V.esc(processed) + " records processed · total not declared by this source</span>";
   }
 
   // Time-left only for a running job with a known total and forward progress.
@@ -406,10 +585,10 @@
     el("mig-asof").textContent = "";
     out.innerHTML =
       '<div class="empty-teach sp-a">' +
-        '<div class="et-title">Pick a space</div>' +
-        '<div class="et-body">Backfill progress and summary refresh are per-space. Paste a space id in the ' +
-          "session bar, or mint a scope handle to adopt one. (The rebuild and switch above can still run " +
-          "globally via “All spaces”.)</div>" +
+        '<div class="et-title">Pick a space to see catch-up progress</div>' +
+        '<div class="et-body">Source-history catch-up and summary refresh (Step 3) are per-space (a space is ' +
+          "one tenant). Paste a space id in the session bar, or mint a scope handle to adopt one. " +
+          "The rebuild and switch above can still run across all spaces via “All spaces”.</div>" +
         '<div class="et-actions"><button class="primary" id="mig-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("mig-mint").onclick = function () { V.openMint(); };
@@ -432,17 +611,18 @@
       });
       el("mig-state").innerHTML =
         failed ? V.stateChip("fail", failed + " source" + (failed === 1 ? "" : "s") + " failed")
-        : running ? V.stateChip("wait", running + " backfill" + (running === 1 ? "" : "s") + " running")
-        : runs.length ? V.stateChip("ok", "all backfills settled")
-        : V.stateChip("ok", "no backfill activity");
+        : running ? V.stateChip("wait", running + " catch-up" + (running === 1 ? "" : "s") + " running")
+        : runs.length ? V.stateChip("ok", "all caught up")
+        : V.stateChip("ok", "no catch-up activity");
       el("mig-asof").textContent = "checked " + nowStamp();
 
       if (!runs.length) {
         out.innerHTML =
           '<div class="empty-teach sp-a">' +
-            '<div class="et-title">No backfill activity yet</div>' +
-            '<div class="et-body">A source appears here once its ingest side posts progress — an empty list ' +
-              "is not an error. Connect a source to start pulling in history.</div>" +
+            '<div class="et-title">No source catch-up activity yet</div>' +
+            '<div class="et-body">A source appears here once its connector posts catch-up progress — an ' +
+              "empty list is not an error. Connect a source to start pulling in history. " +
+              "(Reminder: this panel is unrelated to the search-model upgrade above.)</div>" +
             '<div class="et-actions"><button class="primary" id="mig-open-sources">Open Sources &amp; freshness</button></div>' +
           "</div>";
         el("mig-open-sources").onclick = function () { V.show("sources"); };
@@ -464,13 +644,16 @@
           "<th>source</th><th>state</th><th>progress</th><th>time left</th><th>last error</th><th>updated</th>" +
         "</tr></thead><tbody>" + rows + "</tbody></table></div>";
     } catch (e) {
-      // Label the failure: only the backfill check failed, not the upgrade.
-      el("mig-state").innerHTML = V.stateChip("fail", "backfill check failed");
+      // Label the failure: only the catch-up check failed, not the upgrade.
+      el("mig-state").innerHTML = V.stateChip("fail", "catch-up check failed");
       V.err("mig-err", e);
     }
   }
 
   /* --------------------------------------------------------- cutover */
+  var _openCutover = null; // exposed so the "force anyway" hint link can open it
+  function openCutoverV2() { if (_openCutover) _openCutover("v2"); }
+
   function wireCutover() {
     var cutDlg = V.dialog("mig-cutover-dialog");
     var pendingRoute = "v2";
@@ -489,20 +672,34 @@
 
       if (toV2) {
         el("mig-cut-stmt").innerHTML =
-          "Point search queries at the <b>new index</b> for " + scopeSentence(scope) + "." +
+          "Point live searches at the <b>new index</b> for " + scopeSentence(scope) + ". Once switched, " +
+          "search finds things by meaning using the new model." +
           '<span class="api-crumb"> ' + V.refSpan("route=v2 · recall/brief read embedding_v2") + "</span>";
         // The force acknowledgment appears ONLY when readiness is sub-100% or
         // unmeasured — when the server is the authority and would 409.
-        var measured = lastCoverage != null && lastCoverage.total != null;
-        forceCard.style.display = (measured && coverageComplete(lastCoverage)) ? "none" : "";
+        var ready = coverageMeasured() && coverageComplete(lastCoverage);
+        forceCard.style.display = ready ? "none" : "";
+        var pctEl = el("mig-cut-force-pct");
+        if (pctEl) {
+          if (!coverageMeasured()) {
+            pctEl.textContent = "(readiness not measured yet — run a rebuild batch to measure)";
+          } else if (lastCoverage.total > 0) {
+            var pct = Math.max(0, Math.min(100, (lastCoverage.covered / lastCoverage.total) * 100));
+            pctEl.textContent = "(" + pct.toFixed(1) + "% of your memories re-indexed so far)";
+          } else {
+            pctEl.textContent = "";
+          }
+        }
       } else {
         forceCard.style.display = "none";
         el("mig-cut-stmt").innerHTML =
-          "Point search queries back at the <b>old index</b> for " + scopeSentence(scope) + ". " +
-          "Always safe — the old index still exists, so no gate applies." + '<span class="api-crumb"> ' + V.refSpan("route=v1 · un-gated rollback") + "</span>";
+          "Point live searches back at the <b>old index</b> for " + scopeSentence(scope) + ". " +
+          "Always safe — the old index still exists, so no gate applies." +
+          '<span class="api-crumb"> ' + V.refSpan("route=v1 · un-gated rollback") + "</span>";
       }
       cutDlg.open();
     }
+    _openCutover = openCutover;
 
     el("mig-cutover").onclick = function () { openCutover("v2"); };
     el("mig-rollback").onclick = function () { openCutover("v1"); };
@@ -519,7 +716,8 @@
       // refuse client-side instead of firing a POST the server will 409.
       if (toV2 && forceShown && !force) {
         V.err("mig-cut-err", new Error(
-          "readiness is below 100% (or unmeasured) — tick the acknowledgment to force the switch, or Cancel and finish the rebuild first"));
+          "the new index isn’t ready — tick the acknowledgment to force the switch below 100%, or " +
+          "Cancel and finish the rebuild first"));
         return;
       }
       var body = { route: pendingRoute, force: force };
@@ -537,14 +735,33 @@
         };
         if (res && res.coverage) { lastCoverage = res.coverage; paintCoverage(res.coverage); }
         paintRouteState();
+        paintSessionState();
         cutDlg.close();
       } catch (e) {
-        // A 409 here is the readiness gate doing its job — surfaced verbatim.
-        V.err("mig-cut-err", e);
+        // A 409 here is the readiness gate doing its job. Render it plain.
+        V.err("mig-cut-err", plainCutoverError(e));
       } finally {
         btn.disabled = false;
       }
     };
+  }
+
+  // Turn a raw 409 (or any cutover failure) into the plain-language message
+  // the LAW asks for, while still surfacing the server's own reason.
+  function plainCutoverError(e) {
+    var msg = (e && e.message) || String(e);
+    if (/\b409\b/.test(msg) || /coverage|not ready|incomplete/i.test(msg)) {
+      var suffix = "";
+      if (coverageMeasured() && lastCoverage.total > 0) {
+        var pct = Math.max(0, Math.min(100, (lastCoverage.covered / lastCoverage.total) * 100));
+        suffix = " — " + pct.toFixed(1) + "% of memories re-indexed so far";
+      }
+      return new Error("The new index isn’t ready" + suffix +
+        ". The server refused the switch so search can’t silently miss the not-yet-rebuilt memories. " +
+        "Finish the rebuild, or tick the force acknowledgment above to switch anyway. (Server said: " +
+        msg + ")");
+    }
+    return e;
   }
 
   /* ---------------------------------------------------------- briefs */
@@ -554,9 +771,10 @@
       out.innerHTML = "";
       var tenant = V.tenant() || "";
       if (!tenant) {
-        // briefs/refresh REQUIRES a tenant (AdminTenantParam) — fail closed
-        // with the reason instead of firing a doomed POST.
-        out.innerHTML = '<div class="err on">summary refresh needs a space — set one in the session bar</div>';
+        // briefs/refresh REQUIRES a tenant (AdminTenantParam) — fail closed with
+        // the reason instead of firing a doomed POST.
+        out.innerHTML = '<div class="err on">Refreshing summaries needs a space — set one in the ' +
+          "session bar (a space is one tenant).</div>";
         return;
       }
       var btn = el("mig-briefs");
@@ -567,12 +785,12 @@
           { admin: true, json: {} });
         var n = res && typeof res.refreshed === "number" ? res.refreshed : null;
         out.innerHTML =
-          '<div class="note" style="margin-top:8px">' + V.stateChip("ok", "refreshed") + " " +
+          '<div class="note" style="margin-top:8px">' + V.stateChip("ok", "done") + " " +
           (n == null
             ? "summary refresh requested"
             : n === 0
               ? "nothing was stale — 0 summaries needed refreshing"
-              : "<b>" + V.esc(n) + "</b> stale summar" + (n === 1 ? "y" : "ies") + " refreshed") +
+              : "refreshed <b>" + V.esc(n) + "</b> summar" + (n === 1 ? "y" : "ies")) +
           ' <span class="asof">' + nowStamp() + "</span></div>";
       } catch (e) {
         out.innerHTML = '<div class="err on">' + V.esc((e && e.message) || String(e)) + "</div>";
