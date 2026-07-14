@@ -22,6 +22,7 @@ from verity_ingest.connector import AclEnvelope
 from verity_ingest.connectors.gdrive import (
     DOCUMENTS_PATH,
     PRINCIPALS_PATH,
+    DryRunFactSink,
     DryRunSink,
     GDriveConfig,
     GDriveConnector,
@@ -30,6 +31,7 @@ from verity_ingest.connectors.gdrive import (
     StaticRegistry,
     VerityDocumentSink,
     build_document_request,
+    deliver_facts,
     is_binary_extractable,
     map_permissions,
     run_once,
@@ -521,3 +523,311 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
     assert run_once(connector, registry, sink, state_file) == 3
     assert json.loads(state_file.read_text()) == {"cursor": "412"}
     assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, XLSX_ID]
+
+
+# ---------------------------------------------------------------------------
+# Fact lane: selective identity-keyed org/person envelopes (§4.2, the weld)
+# ---------------------------------------------------------------------------
+#
+# These drive the accumulator directly via _observe_permissions (no new
+# fixtures needed) and then deliver_facts into a DryRunFactSink, asserting
+# selectivity (only real users become people; groups/domain/anyone/service-
+# accounts/freemail/role-locals do not), the weld shape (bare `email` under
+# source gdrive:contacts.person), owner-only visibility, and fail-closed.
+
+ALICE = "alice@corp.example"  # file owner in perms_doc/perms_pipeline
+ALICE_TOKEN = 101
+
+# A modifiedTime the accumulator can parse to epoch-millis for ts_ms.
+_TS = "2026-07-09T10:00:00.000Z"
+
+
+def _person_envelopes(envelopes):
+    return [e for e in envelopes if (e.get("source") or {}).get("table") == "person"]
+
+
+def _org_envelopes(envelopes):
+    return [e for e in envelopes if (e.get("source") or {}).get("table") == "org"]
+
+
+def test_person_facts_weld_shape():
+    """A sharer (bob, writer) becomes a person fact with the BARE `email` weld
+    key under source gdrive:contacts.person and owner-only visibility. The file
+    owner (== the crawl subject alice) is excluded (self is not a correspondent);
+    a type=group grant never becomes a person; and alice's OWN domain is excluded
+    from the org lane when exclude_owner_domain is on."""
+    connector = GDriveConnector(
+        FixtureTransport(), GDriveConfig(delegated_subject=ALICE, tenant_id=TENANT)
+    )
+    # perms_pricing: bob@corp.example (writer). perms_doc: alice owner + group.
+    connector._observe_permissions(_load("perms_pricing.json")["permissions"], _TS)
+    connector._observe_permissions(_load("perms_doc.json")["permissions"], _TS)
+
+    registry = StaticRegistry({f"user:{ALICE}": ALICE_TOKEN})
+    sink = DryRunFactSink(stream=io.StringIO())
+    orgs, persons = deliver_facts(connector, registry, sink)
+
+    people = _person_envelopes(sink.envelopes)
+    assert persons == len(people) == 1
+    bob = people[0]
+    assert bob["after"]["email"] == "bob@corp.example"  # bare email == weld key
+    assert bob["after"]["id"] == "bob@corp.example"
+    assert bob["after"]["correspondence"] == "shared_with"
+    # ts_ms is optional; assert the identity triple that names the weld source.
+    assert bob["source"]["connector"] == "gdrive"
+    assert bob["source"]["db"] == "contacts"
+    assert bob["source"]["table"] == "person"
+    assert bob["verity_acl"]["visibility"] == [ALICE_TOKEN]
+    assert bob["op"] == "c"
+
+    # alice (owner == subject) is not a person; eng-leads group is not a person.
+    person_emails = {e["after"]["email"] for e in people}
+    assert ALICE not in person_emails
+    assert "eng-leads@corp.example" not in person_emails
+
+    # corp.example is alice's OWN domain → excluded from the org lane.
+    org_domains = {e["after"]["domain"] for e in _org_envelopes(sink.envelopes)}
+    assert "corp.example" not in org_domains
+    assert orgs == 0
+
+
+def test_person_facts_owner_role_marks_correspondence_owner():
+    """When the crawl subject is a DIFFERENT user, the file owner (alice) does
+    survive as a person with correspondence=='owner' (role=owner)."""
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    connector._observe_permissions(_load("perms_doc.json")["permissions"], _TS)
+    registry = StaticRegistry({"user:ops@ourco.com": 501})
+    sink = DryRunFactSink(stream=io.StringIO())
+    deliver_facts(connector, registry, sink)
+    people = {e["after"]["email"]: e for e in _person_envelopes(sink.envelopes)}
+    assert ALICE in people
+    assert people[ALICE]["after"]["correspondence"] == "owner"
+
+
+def test_service_account_and_denylist_excluded():
+    """A service account never becomes a person OR an org; a role-local user
+    email drops from the person lane but its domain STILL proves the org; a real
+    external user survives as a shared_with person."""
+    perms = [
+        {"type": "user", "emailAddress": "svc-123@my-proj.iam.gserviceaccount.com", "role": "owner"},
+        {"type": "user", "emailAddress": "no-reply@acme.com", "role": "writer"},
+        {"type": "user", "emailAddress": "jane@vendor.io", "role": "reader"},
+    ]
+    # Owner at a DIFFERENT domain so exclude_owner_domain doesn't eat acme/vendor.
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    connector._observe_permissions(perms, _TS)
+    registry = StaticRegistry({"user:ops@ourco.com": 501})
+    sink = DryRunFactSink(stream=io.StringIO())
+    deliver_facts(connector, registry, sink)
+
+    person_emails = {e["after"]["email"] for e in _person_envelopes(sink.envelopes)}
+    assert person_emails == {"jane@vendor.io"}
+    jane = next(e for e in _person_envelopes(sink.envelopes) if e["after"]["email"] == "jane@vendor.io")
+    assert jane["after"]["correspondence"] == "shared_with"
+
+    org_domains = {e["after"]["domain"] for e in _org_envelopes(sink.envelopes)}
+    assert "acme.com" in org_domains  # role-local user email still proves the org
+    assert "vendor.io" in org_domains
+    assert not any(d.endswith("gserviceaccount.com") for d in org_domains)
+    # Service account never leaked as a person either.
+    assert not any(p.endswith("gserviceaccount.com") for p in person_emails)
+
+
+def test_group_domain_anyone_never_produce_person_facts():
+    """type=group, type=domain, and type=anyone contribute NO person facts.
+    type=domain seeds an org; group/anyone contribute nothing at all."""
+    perms = [
+        {"type": "group", "emailAddress": "eng-leads@corp.example", "role": "reader"},
+        {"type": "domain", "domain": "partner.io", "role": "reader"},
+        {"type": "anyone", "role": "reader"},
+    ]
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    connector._observe_permissions(perms, _TS)
+    registry = StaticRegistry({"user:ops@ourco.com": 501})
+    sink = DryRunFactSink(stream=io.StringIO())
+    orgs, persons = deliver_facts(connector, registry, sink)
+    assert persons == 0
+    assert _person_envelopes(sink.envelopes) == []
+    org_domains = {e["after"]["domain"] for e in _org_envelopes(sink.envelopes)}
+    assert org_domains == {"partner.io"}  # domain-perm seeds org; group/anyone do not
+
+
+def test_fact_lane_fail_closed_when_owner_unresolvable():
+    """Subject set but the owner principal resolves to nothing → (0,0), ZERO
+    envelopes. And no delegated subject at all (shared-drive) → (0,0), zero
+    envelopes — the document lane is untouched either way."""
+    perms = _load("perms_pricing.json")["permissions"]
+
+    # (a) owner set, registry returns nothing for it.
+    connector = GDriveConnector(
+        FixtureTransport(), GDriveConfig(delegated_subject=ALICE, tenant_id=TENANT)
+    )
+    connector._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    assert deliver_facts(connector, StaticRegistry({}), sink) == (0, 0)
+    assert sink.envelopes == []
+
+    # (b) no delegated subject → owner empty → fail closed.
+    connector = GDriveConnector(
+        FixtureTransport(), GDriveConfig(delegated_subject=None, tenant_id=TENANT)
+    )
+    connector._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    # Even a registry that COULD resolve someone yields nothing: no owner token.
+    assert deliver_facts(connector, StaticRegistry({f"user:{ALICE}": ALICE_TOKEN}), sink) == (0, 0)
+    assert sink.envelopes == []
+
+
+def test_emit_flags():
+    """emit_facts=False → (0,0) regardless of accumulated state. emit_people=
+    False → orgs still emitted, zero person envelopes."""
+    perms = [
+        {"type": "user", "emailAddress": "jane@vendor.io", "role": "reader"},
+    ]
+    registry = StaticRegistry({"user:ops@ourco.com": 501})
+
+    off = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT, emit_facts=False),
+    )
+    off._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    assert deliver_facts(off, registry, sink) == (0, 0)
+    assert sink.envelopes == []
+
+    no_people = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT, emit_people=False),
+    )
+    no_people._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    orgs, persons = deliver_facts(no_people, registry, sink)
+    assert persons == 0
+    assert _person_envelopes(sink.envelopes) == []
+    assert orgs >= 1
+    assert "vendor.io" in {e["after"]["domain"] for e in _org_envelopes(sink.envelopes)}
+
+
+def test_every_emitted_fact_carries_owner_only_visibility():
+    """Belt-and-suspenders: EVERY delivered envelope (org and person) carries
+    verity_acl.visibility == [owner_token] — never empty, never missing."""
+    perms = [
+        {"type": "user", "emailAddress": "jane@vendor.io", "role": "reader"},
+        {"type": "user", "emailAddress": "ops@ourco.com", "role": "owner"},
+    ]
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    connector._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    orgs, persons = deliver_facts(connector, StaticRegistry({"user:ops@ourco.com": 501}), sink)
+    assert orgs + persons == len(sink.envelopes) >= 1
+    for env in sink.envelopes:
+        assert env["verity_acl"]["visibility"] == [501]
+
+
+def test_freemail_sharer_never_becomes_person_or_org():
+    """A gmail.com sharer is freemail: never a person (no weld between two
+    strangers at gmail.com) and never an org."""
+    perms = [{"type": "user", "emailAddress": "randomdude@gmail.com", "role": "writer"}]
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    connector._observe_permissions(perms, _TS)
+    sink = DryRunFactSink(stream=io.StringIO())
+    orgs, persons = deliver_facts(connector, StaticRegistry({"user:ops@ourco.com": 501}), sink)
+    assert (orgs, persons) == (0, 0)
+    assert sink.envelopes == []
+
+
+def test_document_lane_unchanged_by_fact_lane():
+    """After wiring the observe side-effect, the document request bodies are
+    byte-identical to test_sink_request_bodies_exact — proving the additive fact
+    lane touched nothing in the doc/chunk/ACL lane (no _FILE_FIELDS change)."""
+    assert _delivered_requests() == [
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": DOC_ID,
+            "content": (FIXTURES / "doc_export.txt").read_text(),
+            "entities": [],
+            "valid_from": "2026-07-09T09:59:31.000Z",
+            "visibility": [101, 202],
+            "acl_provenance": "mirrored",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": GONE_ID,
+            "removed": True,
+            "valid_from": "2026-07-09T10:02:41.000Z",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": TXT_ID,
+            "content": (FIXTURES / "oncall_notes.txt").read_text(),
+            "entities": [],
+            "valid_from": "2026-07-09T10:04:58.000Z",
+            "visibility": [101, 303],
+            "acl_provenance": "mirrored",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": PDF_ID,
+            "content": None,
+            "entities": [],
+            "valid_from": "2026-07-09T10:07:02.000Z",
+            "acl_provenance": "quarantined",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": TRASHED_ID,
+            "removed": True,
+            "valid_from": "2026-07-09T10:09:01.000Z",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "document_id": XLSX_ID,
+            "content_base64": base64.b64encode(XLSX_BYTES).decode("ascii"),
+            "filename": "q3-pipeline.xlsx",
+            "entities": [],
+            "valid_from": "2026-07-09T10:11:12.000Z",
+            "visibility": [101, 202],
+            "acl_provenance": "mirrored",
+        },
+    ]
+
+
+def test_poll_side_effect_accumulates_then_delivers_person_and_org():
+    """End-to-end through poll(): the document pass fills the fact accumulators
+    as a side-effect; a subject at a foreign domain yields bob (corp.example) as
+    a person and corp.example as an org (foreign to the subject)."""
+    connector = GDriveConnector(
+        FixtureTransport(),
+        GDriveConfig(delegated_subject="ops@ourco.com", tenant_id=TENANT),
+    )
+    asyncio.run(connector.poll("387"))
+    sink = DryRunFactSink(stream=io.StringIO())
+    deliver_facts(connector, StaticRegistry({"user:ops@ourco.com": 501}), sink)
+    person_emails = {e["after"]["email"] for e in _person_envelopes(sink.envelopes)}
+    org_domains = {e["after"]["domain"] for e in _org_envelopes(sink.envelopes)}
+    # alice (owner) + bob (writer) appear; the group/domain/anyone do not.
+    assert "alice@corp.example" in person_emails
+    assert "bob@corp.example" in person_emails
+    assert "eng-leads@corp.example" not in person_emails
+    assert "corp.example" in org_domains  # foreign to ops@ourco.com

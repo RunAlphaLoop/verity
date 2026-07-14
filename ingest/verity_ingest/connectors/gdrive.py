@@ -93,9 +93,11 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Mapping, Protocol, Sequence
 
@@ -113,6 +115,11 @@ DOC_EXPORT_MIME = "text/plain"
 PRINCIPALS_PATH = "/v1/admin/principals"
 DOCUMENTS_PATH = "/v1/ingest/documents"
 CONNECTOR_STATUS_PATH = "/v1/admin/connector-status"
+
+# The fact lane (selective identity-keyed org/person records) posts here, NOT
+# to /v1/ingest/documents. Debezium-shaped envelopes; verity_acl is a TOP-LEVEL
+# sibling of op/source/after (verity-server ingest.rs::parse_inline_acl).
+DEBEZIUM_PATH = "/v1/ingest/debezium"
 
 # Field masks: ask Google for exactly what we consume, nothing more.
 _CHANGES_FIELDS = "kind,nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId)"
@@ -137,6 +144,12 @@ class GDriveConfig:
     # service account can also be granted access directly on shared drives.
     delegated_subject: str | None = None
     page_size: int = 100
+    # Fact lane toggles (the document lane is always on and unchanged).
+    emit_facts: bool = True  # --facts/--no-facts
+    emit_people: bool = True  # --emit-people/--no-people (orgs-only when False)
+    # Exclude the crawl owner's own registrable domain from the ORG lane
+    # (default ON — the owner's employer is not an "org we deal with").
+    exclude_owner_domain: bool = True
 
 
 @dataclass
@@ -179,6 +192,293 @@ def is_extractable(mime_type: str) -> bool:
 def is_binary_extractable(mime_type: str) -> bool:
     """Mimetypes delivered as raw bytes for SERVER-side Tier-1 extraction."""
     return mime_type in BINARY_EXTRACTABLE_MIMES
+
+
+# ---------------------------------------------------------------------------
+# Selective fact emission: the identity bar (§4.2 denylist parity + heuristics)
+# ---------------------------------------------------------------------------
+#
+# The document lane above emits participant tags + mirrored visibility on every
+# file (per-person retrieval + ACL — correct, unchanged). This SECOND lane ADDS
+# selective identity-keyed facts so entity RESOLUTION has something to fold:
+# every external corporate DOMAIN that shares a file becomes an organization
+# entity (high value, near-zero noise), and ONLY type=user permissions whose
+# address clears the identity bar become person entities. Groups, domain-wide,
+# anyone, service accounts, no-reply/role mailboxes never become entities — no
+# "127 bots", no merge-review flood. The PERSON `after.email` is the weld key:
+# a Drive sharer and a Gmail correspondent at the SAME address resolve to ONE
+# canonical (gdrive:contacts.person + gmail:contacts.person share the
+# customer_contact namespace in canon.rs — the resolver welds them for free).
+#
+# NOTE: gmail.py imports gdrive.py at module load, so gdrive.py MUST NOT import
+# from gmail.py (circular import). The denylist tables + canonicalization below
+# are therefore MIRRORED VERBATIM from gmail.py (which in turn mirrors
+# crates/verity-storage/src/resolve/canon.rs) so the identity bar is provably
+# identical across both connectors and the Rust resolver.
+
+# canon.rs:110 — free-mail / consumer domains (a shared gmail.com is NOT shared
+# identity). Two strangers at gmail.com therefore never become entities and so
+# CAN NEVER weld — the freemail trap is avoided by construction.
+_FREEMAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "ymail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "msn.com",
+        "aol.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "proton.me",
+        "protonmail.com",
+        "gmx.com",
+        "mail.com",
+        "zoho.com",
+        "yandex.com",
+        "pm.me",
+    }
+)
+
+# canon.rs:134 — placeholder / reserved domains (RFC 2606 + common test values).
+_PLACEHOLDER_DOMAINS = frozenset(
+    {
+        "example.com",
+        "example.org",
+        "example.net",
+        "example.edu",
+        "test.com",
+        "localhost",
+        "invalid",
+        "none.com",
+        "noemail.com",
+        "no-reply.com",
+        "noreply.com",
+    }
+)
+
+# canon.rs:150 — role-based / shared-mailbox local-parts (a mailbox, not a
+# person). info@/sales@/no-reply@/notifications@… never form a person edge.
+_ROLE_LOCALS = frozenset(
+    {
+        "info",
+        "sales",
+        "support",
+        "admin",
+        "administrator",
+        "contact",
+        "hello",
+        "help",
+        "office",
+        "team",
+        "marketing",
+        "billing",
+        "accounts",
+        "accounting",
+        "finance",
+        "hr",
+        "jobs",
+        "careers",
+        "press",
+        "media",
+        "legal",
+        "privacy",
+        "security",
+        "abuse",
+        "postmaster",
+        "webmaster",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "mailer-daemon",
+        "notifications",
+        "notification",
+        "newsletter",
+        "enquiries",
+        "inquiries",
+        "service",
+        "customerservice",
+        "orders",
+        "hi",
+    }
+)
+
+# The eTLD+1 multi-part public-suffix table, mirrored (minimally) from canon.rs
+# registrable_domain's MULTI_PART_SUFFIXES so a `mail.acme.co.uk` collapses to
+# `acme.co.uk`, not `co.uk`. A plain last-two-labels fallback covers the rest.
+_MULTI_PART_SUFFIXES = frozenset(
+    {
+        "co.uk",
+        "org.uk",
+        "me.uk",
+        "ltd.uk",
+        "plc.uk",
+        "net.uk",
+        "sch.uk",
+        "ac.uk",
+        "gov.uk",
+        "com.au",
+        "net.au",
+        "org.au",
+        "edu.au",
+        "gov.au",
+        "asn.au",
+        "id.au",
+        "co.nz",
+        "net.nz",
+        "org.nz",
+        "govt.nz",
+        "ac.nz",
+        "school.nz",
+        "co.jp",
+        "or.jp",
+        "ne.jp",
+        "ac.jp",
+        "go.jp",
+        "com.br",
+        "net.br",
+        "org.br",
+        "gov.br",
+        "co.in",
+        "net.in",
+        "org.in",
+        "gen.in",
+        "firm.in",
+        "ind.in",
+        "co.za",
+        "net.za",
+        "org.za",
+        "gov.za",
+        "com.mx",
+        "com.sg",
+        "com.hk",
+        "com.cn",
+        "com.tr",
+        "com.ar",
+        "com.tw",
+        "com.my",
+        "co.kr",
+        "co.il",
+        "co.id",
+        "co.th",
+        "com.pl",
+        "com.ua",
+        "com.ph",
+        "com.vn",
+    }
+)
+
+# Connector-side EXTRA selectivity (NOT in canon.rs — pure NARROWING, never
+# widening): Google service-account domains are machines, not people. A file
+# shared to / owned by a service account (e.g. a pipeline robot) must never
+# become a person OR an org entity. Applied to both lanes below.
+_SERVICE_ACCOUNT_DOMAINS = frozenset({"gserviceaccount.com"})
+
+
+def _is_denylisted_domain(domain: str) -> bool:
+    """canon.rs is_denied_domain: free-mail or placeholder → never an org, never
+    a person's org."""
+    return domain in _FREEMAIL_DOMAINS or domain in _PLACEHOLDER_DOMAINS
+
+
+def _is_denylisted_email(local: str, domain: str) -> bool:
+    """canon.rs is_denylisted(Email): role-based local (after +tag strip) OR a
+    denylisted domain. Fail closed."""
+    local_base = local.split("+", 1)[0]
+    return local_base in _ROLE_LOCALS or _is_denylisted_domain(domain)
+
+
+def _canonicalize_email(raw: str | None) -> str | None:
+    """Port of canon.rs::canonicalize_email (identity bar parity).
+
+    trim; lowercase; strip a leading ``mailto:``; split on a SINGLE ``@``
+    (None if 0 or >1); strip the ``+tag`` sub-address (None if the local then
+    empties); trim ``.`` off the domain; require the domain to contain ``.`` and
+    no space; drop if denylisted (free-mail / placeholder / role-local). Returns
+    the canonical ``local@domain`` or None. Fail closed on anything malformed."""
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    if s.startswith("mailto:"):
+        s = s[len("mailto:") :].strip()
+    if s.count("@") != 1:
+        return None
+    local_raw, domain_raw = s.split("@", 1)
+    if not local_raw or not domain_raw:
+        return None
+    local = local_raw.split("+", 1)[0] if "+" in local_raw else local_raw
+    if not local:
+        return None
+    domain = domain_raw.strip(".")
+    if "." not in domain or " " in domain:
+        return None
+    if _is_denylisted_email(local, domain):
+        return None
+    return f"{local}@{domain}"
+
+
+def _registrable_domain(host: str | None) -> str | None:
+    """Port of canon.rs::registrable_domain (eTLD+1) over a bare host or a URL.
+
+    Strip scheme/path/query/fragment/port/userinfo down to the bare host, drop a
+    leading ``www.``, then reduce to the registrable domain using the multi-part
+    suffix table (``mail.acme.co.uk`` → ``acme.co.uk``), else the last two
+    labels. None on empty / single-label."""
+    if not host:
+        return None
+    s = host.strip().lower()
+    if not s:
+        return None
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    elif s.startswith("mailto:"):
+        s = s[len("mailto:") :]
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    for sep in ("/", "?", "#"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    if ":" in s:
+        head, _, port = s.rpartition(":")
+        if head and port.isdigit():
+            s = head
+    if s.startswith("www."):
+        s = s[len("www.") :]
+    s = s.strip(".")
+    if not s or "." not in s or " " in s:
+        return None
+    labels = [label for label in s.split(".") if label]
+    if len(labels) < 2:
+        return None
+    last_two = f"{labels[-2]}.{labels[-1]}"
+    if last_two in _MULTI_PART_SUFFIXES and len(labels) >= 3:
+        return f"{labels[-3]}.{last_two}"
+    return last_two
+
+
+def _title_case_label(label: str) -> str:
+    """A domain's leading label as a display name: `stripe` → `Stripe`,
+    `redis-labs` → `Redis Labs`. Display-only; NEVER a merge key."""
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", label) if part) or label
+
+
+def _modified_time_to_ms(modified_time: str) -> int | None:
+    """Parse an RFC3339 ``modifiedTime`` to epoch-millis, or None if unparseable.
+    ts_ms is optional in the Debezium envelopes, so a malformed timestamp simply
+    omits the field rather than aborting anything."""
+    if not modified_time:
+        return None
+    try:
+        dt = datetime.fromisoformat(modified_time.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +701,102 @@ class GDriveConnector(Connector):
     def __init__(self, transport: DriveTransport, config: GDriveConfig | None = None) -> None:
         self._transport = transport
         self.config = config or GDriveConfig()
+        # Fact lane (§4.2) accumulators — crawl/batch-scoped, filled as a SIDE
+        # EFFECT of the document pass, drained by the runner AFTER the file
+        # loop. The document lane (map_permissions → mirrored visibility) is
+        # unchanged; this is a strictly additive second lane.
+        self._owner = (self.config.delegated_subject or "").strip().lower()
+        # canonical_email -> {"is_owner": bool, "domain": str|None, "first_seen_ms": int|None}
+        self._corr: dict[str, dict] = {}
+        self._org_domains: dict[str, str] = {}  # registrable_domain -> display name
+        self._org_first_seen: dict[str, int] = {}
+
+    def _reset_fact_accumulators(self) -> None:
+        self._owner = (self.config.delegated_subject or "").strip().lower()
+        self._corr = {}
+        self._org_domains = {}
+        self._org_first_seen = {}
+
+    def _observe_permissions(
+        self, permissions: Iterable[Mapping[str, Any]], modified_time: str
+    ) -> None:
+        """Accumulate person + org-domain evidence from one file's permission
+        list. Wrapped by the caller's skip-and-count so a single malformed
+        permission never corrupts the accumulator or aborts the crawl. The file
+        owner (self) is never recorded as a correspondent.
+
+        Signal (permissions-only — Drive has no display-name / direction data):
+        - PERSON lane: type=user with a canonicalizable, non-denylisted,
+          non-service-account email that is not the owner. role=owner →
+          ``correspondence="owner"``; sharers → ``"shared_with"``.
+        - ORG lane: the registrable domain of any type=user email (even a
+          role-local one — notifications@github.com still proves github.com) and
+          any type=domain permission, minus freemail/placeholder/service-account.
+        - type=group / anyone contribute NOTHING (shared mailboxes / public
+          links are not identities we deal with — the more selective choice)."""
+        ts_ms = _modified_time_to_ms(modified_time)
+        for perm in permissions:
+            if perm.get("deleted"):
+                continue  # tombstoned grant confers nothing (matches map_permissions)
+            ptype = perm.get("type")
+            if ptype == "user":
+                email_raw = perm.get("emailAddress")
+                if not email_raw:
+                    continue
+                # ORG lane runs off the RAW user-email domain, even when the
+                # address itself fails the person bar for role-local reasons
+                # (parity with gmail: notifications@github.com still proves the
+                # org github.com). Service accounts are machines — never an org.
+                reg_raw = _registrable_domain(str(email_raw).rsplit("@", 1)[1]) if "@" in str(
+                    email_raw
+                ) else None
+                if (
+                    reg_raw is not None
+                    and reg_raw not in _SERVICE_ACCOUNT_DOMAINS
+                    and not _is_denylisted_domain(reg_raw)
+                ):
+                    self._org_domains.setdefault(
+                        reg_raw, _title_case_label(reg_raw.split(".", 1)[0])
+                    )
+                    if ts_ms is not None:
+                        prev = self._org_first_seen.get(reg_raw)
+                        if prev is None or ts_ms < prev:
+                            self._org_first_seen[reg_raw] = ts_ms
+
+                # PERSON lane: strict canonical gate.
+                canon = _canonicalize_email(email_raw)
+                if canon is None:
+                    continue  # freemail / placeholder / role-local drops here
+                if canon == self._owner:
+                    continue  # self is not a correspondent
+                reg = _registrable_domain(canon.rsplit("@", 1)[1])
+                if reg is not None and reg in _SERVICE_ACCOUNT_DOMAINS:
+                    continue  # service accounts are machines, not people
+                stat = self._corr.setdefault(
+                    canon, {"is_owner": False, "domain": reg, "first_seen_ms": None}
+                )
+                if perm.get("role") == "owner":
+                    stat["is_owner"] = True
+                if ts_ms is not None:
+                    prev_ms = stat["first_seen_ms"]
+                    if prev_ms is None or ts_ms < prev_ms:
+                        stat["first_seen_ms"] = ts_ms
+            elif ptype == "domain":
+                dom = perm.get("domain")
+                if not dom:
+                    continue
+                reg = _registrable_domain(dom)
+                if (
+                    reg is not None
+                    and reg not in _SERVICE_ACCOUNT_DOMAINS
+                    and not _is_denylisted_domain(reg)
+                ):
+                    self._org_domains.setdefault(reg, _title_case_label(reg.split(".", 1)[0]))
+                    if ts_ms is not None:
+                        prev = self._org_first_seen.get(reg)
+                        if prev is None or ts_ms < prev:
+                            self._org_first_seen[reg] = ts_ms
+            # type=group / anyone: contribute nothing (design choice above).
 
     # -- push lane ----------------------------------------------------------
 
@@ -421,6 +817,7 @@ class GDriveConnector(Connector):
         no events — history before the token is the job of `full_crawl`
         (backfill protocol, §5a), not the change feed.
         """
+        self._reset_fact_accumulators()
         if cursor is None:
             data = self._transport.get_json("changes/startPageToken", {"supportsAllDrives": "true"})
             return [], data["startPageToken"]
@@ -453,6 +850,7 @@ class GDriveConnector(Connector):
         """Reconciliation crawl over files.list: content + ACL for every
         non-trashed file (permission drift shows up as re-emitted envelopes;
         the server diffs). Deletions are reconciled by the change feed."""
+        self._reset_fact_accumulators()
         page_token: str | None = None
         while True:
             params: dict[str, str] = {
@@ -518,6 +916,15 @@ class GDriveConnector(Connector):
                 raise
         else:
             acl = map_permissions(raw_permissions, self.config.anyone_maps_to)
+            # Fact lane (additive): accumulate person + org-domain evidence off
+            # the SAME permissions we just read. Only here — the 403/404
+            # quarantine path has nothing to observe. One malformed permission
+            # must never corrupt the accumulator or abort the crawl, hence the
+            # skip-and-count-and-log guard (mirrors gmail's _observe_*).
+            try:
+                self._observe_permissions(raw_permissions, meta.get("modifiedTime", ""))
+            except (ValueError, KeyError, TypeError) as exc:
+                print(f"gdrive: fact-observe skipped on {file_id}: {exc}", file=sys.stderr)
         mime_type = meta.get("mimeType", "")
         content = b""
         # ACL before content (§5a): never pull bytes for an item we already
@@ -702,6 +1109,268 @@ class DryRunSink:
 
 
 # ---------------------------------------------------------------------------
+# Fact lane: selective org/person envelopes → POST /v1/ingest/debezium
+# ---------------------------------------------------------------------------
+#
+# ORG: one SINGLETON per surviving external registrable domain. The `after` has
+# only descriptive fields (domain/name/kind) — NONE named email/AccountId/*_id —
+# so the resolver's producers see NO merge evidence and the org materializes as
+# its own canonical (fold.rs: a singleton is implicitly its own canonical). No
+# welding, no domain-star fan-out.
+#
+# PERSON: only type=user addresses that clear the identity bar. The `after`
+# carries a BARE `email` field → EMAIL_FIELDS → the tier-1 email-within-
+# namespace producer in namespace customer_contact (source "gdrive", field
+# "email"). So a Drive sharer welds cross-source to a Gmail correspondent at the
+# same address (gmail:contacts.person, same namespace) WITHOUT welding to any
+# internal actor (§4.4 fence) and WITHOUT merging two freemail strangers (they
+# never reach here — the freemail gate drops them).
+#
+# NOTE: connector must be hard-coded "gdrive" here (NOT the module `name`); these
+# functions are gdrive-local and must never import gmail (circular import).
+
+
+def build_org_envelope(
+    domain: str, name: str, owner_token: int | None, ts_ms: int | None
+) -> dict | None:
+    """One Debezium ORG envelope (a singleton canonical). Returns None when the
+    owner principal did not resolve (fail closed: no resolvable visibility →
+    no fact). `verity_acl` is a TOP-LEVEL sibling of op/source/after."""
+    if owner_token is None:
+        return None
+    source: dict[str, Any] = {"connector": "gdrive", "db": "accounts", "table": "org"}
+    if ts_ms is not None:
+        source["ts_ms"] = ts_ms
+    return {
+        "op": "c",
+        "source": source,
+        # Descriptive-only: no field named email/AccountId/*_id → no merge
+        # evidence → singleton → its own canonical.
+        "after": {"id": domain, "domain": domain, "name": name, "kind": "organization"},
+        "verity_acl": {"visibility": [owner_token], "confidentiality": "internal"},
+    }
+
+
+def build_person_envelope(
+    email: str,
+    name: str | None,
+    domain: str | None,
+    correspondence: str,
+    owner_token: int | None,
+    ts_ms: int | None,
+) -> dict | None:
+    """One Debezium PERSON envelope (welds cross-source by `email` within the
+    customer_contact namespace). Returns None when the owner principal did not
+    resolve (fail closed). `verity_acl` is a TOP-LEVEL sibling."""
+    if owner_token is None:
+        return None
+    source: dict[str, Any] = {"connector": "gdrive", "db": "contacts", "table": "person"}
+    if ts_ms is not None:
+        source["ts_ms"] = ts_ms
+    after: dict[str, Any] = {
+        "id": email,
+        # BARE `email` → EMAIL_FIELDS → tier-1 email-within-namespace producer.
+        # This is the weld key: a gmail:contacts.person of the same email folds
+        # to the same canonical.
+        "email": email,
+        "correspondence": correspondence,
+    }
+    if name:
+        after["name"] = name  # display/blocking only, never a lone merge key
+    if domain:
+        after["domain"] = domain  # descriptive; NOT re-emitted as a merge key
+    return {
+        "op": "c",
+        "source": source,
+        "after": after,
+        "verity_acl": {"visibility": [owner_token], "confidentiality": "internal"},
+    }
+
+
+def select_org_facts(
+    org_domains: Mapping[str, str],
+    org_first_seen: Mapping[str, int],
+    owner_token: int | None,
+    *,
+    owner_domain: str | None = None,
+) -> list[dict]:
+    """Build the deduped ORG envelopes (one per surviving external registrable
+    domain). Permissive on orgs — high value, near-zero noise:
+    - drop denylisted (free-mail / placeholder) domains;
+    - drop the owner's own registrable domain;
+    - role-local-ness does NOT disqualify (notifications@github.com still proves
+      github.com is an org we deal with).
+    Empty list when the owner token is unresolvable (fail closed)."""
+    if owner_token is None:
+        return []
+    owner_reg = _registrable_domain(owner_domain) if owner_domain else None
+    envelopes: list[dict] = []
+    for domain in sorted(org_domains):
+        if _is_denylisted_domain(domain):
+            continue
+        if owner_reg and domain == owner_reg:
+            continue
+        name = org_domains[domain] or _title_case_label(domain.split(".", 1)[0])
+        env = build_org_envelope(domain, name, owner_token, org_first_seen.get(domain))
+        if env is not None:
+            envelopes.append(env)
+    return envelopes
+
+
+def select_person_facts(corr: Mapping[str, dict], owner_token: int | None) -> list[dict]:
+    """Build the PERSON envelopes for accumulated Drive correspondents.
+
+    Permissions-only: no display name, no direction logic — the accumulator has
+    already applied the identity bar (canonicalize → drop freemail/placeholder/
+    role-local; drop the owner; drop service accounts). Re-assert the canonical
+    gate belt-and-suspenders so a caller-built stat can't smuggle one past.
+    ``correspondence`` is ``"owner"`` (the file owner) or ``"shared_with"`` (a
+    sharer). Empty list when the owner token is unresolvable (fail closed)."""
+    if owner_token is None:
+        return []
+    envelopes: list[dict] = []
+    for email in sorted(corr):
+        canon = _canonicalize_email(email)
+        if canon is None or canon != email:
+            continue
+        stat = corr[email]
+        correspondence = "owner" if stat.get("is_owner") else "shared_with"
+        name = None  # permissions-only: no display name; the bare email welds fine
+        domain = stat.get("domain") or _registrable_domain(email.split("@", 1)[1])
+        env = build_person_envelope(
+            email, name, domain, correspondence, owner_token, stat.get("first_seen_ms")
+        )
+        if env is not None:
+            envelopes.append(env)
+    return envelopes
+
+
+class FactSink(Protocol):
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None: ...
+
+
+class VerityFactSink:
+    """POSTs a JSON ARRAY of Debezium envelopes to ``{base}/v1/ingest/debezium``.
+
+    Same httpx.Client + Bearer auth as VerityDocumentSink. The inline
+    ``verity_acl`` block on each envelope supplies visibility — there is NO
+    ``visibility=`` query param (that would be a bound-policy fallback, which the
+    fact lane forbids). ``tenant_id`` + ``pk`` are query params. The response's
+    ``facts_refused_no_acl`` count is surfaced for a fail-VISIBLE post-run
+    assertion — a mis-shaped ACL shows up as a refusal, never a silent leak."""
+
+    def __init__(
+        self,
+        base_url: str,
+        tenant_id: str,
+        client: httpx.Client | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._client = client or httpx.Client(timeout=120.0, headers=headers)
+        self._base_url = base_url.rstrip("/")
+        self._tenant_id = tenant_id
+        self.refused = 0
+
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None:
+        if not envelopes:
+            return
+        response = self._client.post(
+            f"{self._base_url}{DEBEZIUM_PATH}",
+            params={"tenant_id": self._tenant_id, "pk": pk},
+            json=envelopes,
+        )
+        response.raise_for_status()
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        refused = body.get("facts_refused_no_acl")
+        if isinstance(refused, int):
+            self.refused += refused
+
+
+class DryRunFactSink:
+    """Collects and prints the would-be Debezium envelopes instead of POSTing.
+
+    Person locals are REDACTED to ``•••@domain`` (domains are org identity, not
+    PII, so they print in clear); org domains print whole. No full addresses,
+    names, tokens, or bodies ever reach the output."""
+
+    def __init__(self, stream: Any = None) -> None:
+        self.envelopes: list[dict] = []
+        self.refused = 0
+        self._stream = stream if stream is not None else sys.stdout
+
+    def deliver(self, envelopes: list[dict], *, pk: str = "id") -> None:
+        self.envelopes.extend(envelopes)
+        for env in envelopes:
+            print(f"[dry-run] POST {DEBEZIUM_PATH}\n{_redact_envelope(env)}", file=self._stream)
+
+
+def _redact_local(email: str) -> str:
+    """`jane@vendor.io` → `•••@vendor.io`. Domain in clear (org identity)."""
+    domain = email.split("@", 1)[1] if "@" in email else "?"
+    return f"•••@{domain}"
+
+
+def _redact_envelope(env: Mapping[str, Any]) -> str:
+    """A PII-free one-line shape of an envelope for dry-run output."""
+    after = env.get("after") or {}
+    table = (env.get("source") or {}).get("table")
+    acl = env.get("verity_acl") or {}
+    vis_present = bool(acl.get("visibility"))
+    if table == "person":
+        ident = _redact_local(str(after.get("id", "")))
+        extra = f" correspondence={after.get('correspondence')}"
+    else:
+        ident = str(after.get("id", ""))  # a domain — org identity, not PII
+        extra = f" name={after.get('name')!r}"
+    return (
+        f"  op={env.get('op')} table={table} id={ident}{extra} "
+        f"acl.visibility={'set' if vis_present else 'MISSING'}"
+    )
+
+
+def deliver_facts(
+    connector: GDriveConnector,
+    registry: PrincipalRegistry,
+    fact_sink: FactSink,
+) -> tuple[int, int]:
+    """Drain the crawl-scoped fact accumulators into the fact sink and return
+    ``(orgs, persons)`` emitted. Call AFTER the document loop.
+
+    Fail closed: resolve the owner principal ONCE; if it does not resolve to an
+    int token (or there is no delegated subject at all — a shared-drive crawl),
+    the fact lane is DISABLED for this run — NO org and NO person envelopes are
+    built or posted (a count-only line is logged). The document lane is
+    unaffected."""
+    if not connector.config.emit_facts:
+        return (0, 0)
+    owner = connector._owner
+    owner_token: int | None = None
+    if owner:
+        principal = f"user:{owner}"
+        owner_token = registry.resolve([principal]).get(principal)
+    if owner_token is None:
+        print("gdrive: fact lane disabled — owner principal did not resolve")
+        return (0, 0)
+
+    owner_domain = owner.rsplit("@", 1)[1] if "@" in owner else None
+    org_envelopes = select_org_facts(
+        connector._org_domains,
+        connector._org_first_seen,
+        owner_token,
+        owner_domain=owner_domain if connector.config.exclude_owner_domain else None,
+    )
+    person_envelopes: list[dict] = []
+    if connector.config.emit_people:
+        person_envelopes = select_person_facts(connector._corr, owner_token)
+    fact_sink.deliver([*org_envelopes, *person_envelopes], pk="id")
+    return (len(org_envelopes), len(person_envelopes))
+
+
+# ---------------------------------------------------------------------------
 # Runner: python -m verity_ingest.connectors.gdrive --once [--dry-run]
 # ---------------------------------------------------------------------------
 
@@ -736,10 +1405,15 @@ def run_once(
     registry: PrincipalRegistry,
     sink: DocumentSink,
     state_file: Path,
+    fact_sink: FactSink | None = None,
 ) -> int:
     """One poll cycle: load cursor, poll, deliver, checkpoint. Returns the
     number of delivered requests. The cursor is checkpointed only after
-    delivery succeeds, so a crash replays the window (at-least-once)."""
+    delivery succeeds, so a crash replays the window (at-least-once).
+
+    When ``fact_sink`` is given, the selective org/person facts accumulated over
+    this poll batch (a side-effect of the document pass) are delivered AFTER the
+    documents — an additive second lane that never affects the document count."""
     cursor = _load_cursor(state_file)
     events, next_cursor = asyncio.run(connector.poll(cursor))
     delivered = 0
@@ -754,6 +1428,10 @@ def run_once(
         delivered += 1
     if skipped:
         print(f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or removed)")
+    if fact_sink is not None:
+        orgs, persons = deliver_facts(connector, registry, fact_sink)
+        if orgs or persons:
+            print(f"gdrive: emitted {orgs} org, {persons} person fact(s)")
     _save_cursor(state_file, next_cursor)
     # Best-effort connector heartbeat (task 28): sinks that support it
     # (VerityDocumentSink) report the batch; DryRunSink et al. just skip.
@@ -770,6 +1448,7 @@ def run_backfill(
     reporter: BackfillReporter | None = None,
     *,
     flush_every: int = 20,
+    fact_sink: FactSink | None = None,
 ) -> int:
     """§5a reconciliation backfill: drive :meth:`GDriveConnector.full_crawl`
     (``files.list`` over every non-trashed file) into the sink, reporting
@@ -834,6 +1513,17 @@ def run_backfill(
             f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or "
             f"removed), {failed} ingest failure(s)"
         )
+    # Fact lane (additive): after the whole crawl has drained, resolve the owner
+    # token once and deliver the deduped org/person envelopes. A delivery
+    # failure here must not fail the (already-delivered) document backfill.
+    if fact_sink is not None:
+        try:
+            orgs, persons = deliver_facts(connector, registry, fact_sink)
+        except httpx.HTTPError as exc:
+            print(f"gdrive: fact delivery failed ({exc}); document backfill unaffected")
+        else:
+            if orgs or persons:
+                print(f"gdrive: emitted {orgs} org, {persons} person fact(s)")
     return delivered
 
 
@@ -884,12 +1574,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--interval", type=float, default=300.0, help="poll interval in seconds (without --once)"
     )
+    # Fact lane toggles (document lane always on and unchanged).
+    parser.add_argument(
+        "--facts",
+        dest="facts",
+        action="store_true",
+        default=True,
+        help="emit selective org/person entity facts (default on)",
+    )
+    parser.add_argument(
+        "--no-facts", dest="facts", action="store_false", help="disable the fact lane entirely"
+    )
+    parser.add_argument(
+        "--emit-people",
+        dest="emit_people",
+        action="store_true",
+        default=True,
+        help="emit person facts for real sharers (default on; orgs-only with --no-people)",
+    )
+    parser.add_argument("--no-people", dest="emit_people", action="store_false")
     args = parser.parse_args(argv)
 
     config = GDriveConfig(
         tenant_id=args.tenant_id,
         anyone_maps_to=args.anyone_maps_to,
         delegated_subject=args.subject,
+        emit_facts=args.facts,
+        emit_people=args.emit_people,
     )
     credentials = load_service_account_credentials(delegated_subject=config.delegated_subject)
     connector = GDriveConnector(HttpDriveTransport(credentials), config)
@@ -903,6 +1614,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     sink: DocumentSink = (
         DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
     )
+    fact_sink: FactSink | None = None
+    if config.emit_facts:
+        fact_sink = (
+            DryRunFactSink()
+            if args.dry_run
+            else VerityFactSink(args.verity_url, config.tenant_id, api_key=api_key)
+        )
 
     if args.backfill:
         # A backfill is a one-shot job, not a loop. Dry runs have no server to
@@ -914,12 +1632,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.verity_url, config.tenant_id, connector.name, api_key=api_key
             )
         )
-        delivered = run_backfill(connector, registry, sink, reporter)
+        delivered = run_backfill(connector, registry, sink, reporter, fact_sink=fact_sink)
         print(f"gdrive: backfill delivered {delivered} request(s)")
         return 0
 
     while True:
-        delivered = run_once(connector, registry, sink, args.state_file)
+        delivered = run_once(connector, registry, sink, args.state_file, fact_sink=fact_sink)
         print(f"gdrive: delivered {delivered} request(s); cursor -> {args.state_file}")
         if args.once:
             return 0
