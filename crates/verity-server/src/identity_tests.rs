@@ -466,3 +466,179 @@ async fn restricted_recheck_follows_live_membership() {
         "revoked member loses restricted hits on the live handle: {docs:?}"
     );
 }
+
+// ---- §6c conformance locks (mirror ingest/tests/test_gdirectory.py) ----
+
+/// DSN + SpiceDB: a THREE-level nest (`all ⊃ eng ⊃ eng-leads ⊃ alice`) —
+/// deeper than `identity_resolution_end_to_end`'s two levels — resolves so the
+/// bottom user reaches a doc shared only with the TOP group. Server-side proof
+/// that `rebac.user_groups` returns the full transitive closure.
+#[tokio::test]
+async fn nested_three_level_closure_resolves() {
+    let Some(rebac) = Rebac::from_env() else {
+        eprintln!("VERITY_SPICEDB_URL not set; skipping");
+        return;
+    };
+    rebac.ensure_schema().await.expect("schema");
+    let Some((state, tenant)) = test_state(Some(rebac), false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+
+    group_change(&state, tenant, "group:all", "group:eng", true)
+        .await
+        .expect("all <- eng");
+    group_change(&state, tenant, "group:eng", "group:eng-leads", true)
+        .await
+        .expect("eng <- eng-leads");
+    group_change(
+        &state,
+        tenant,
+        "group:eng-leads",
+        "user:alice@corp.example",
+        true,
+    )
+    .await
+    .expect("eng-leads <- alice");
+
+    // A doc visible ONLY to the top group's token, three levels above alice.
+    let all_token =
+        crate::upsert_principal_tokens(state.pool(), tenant, &["group:all".to_string()])
+            .await
+            .expect("token")[0]
+            .1;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-top",
+        "the platinum falcon dossier",
+        vec![all_token],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    let handle = mint_with_subject(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("mint");
+    let payload = state.minter.verify(&handle).expect("verifies");
+    assert_eq!(
+        payload.principals.len(),
+        4,
+        "user + 3 nested groups: {payload:?}"
+    );
+    let docs = recall_docs(&state, &handle, "falcon")
+        .await
+        .expect("recall");
+    assert!(
+        docs.contains(&"doc-top".to_string()),
+        "the nested member reaches the top-group doc: {docs:?}"
+    );
+}
+
+/// DSN + SpiceDB: a membership CYCLE (`loop-a ⊃ loop-b ⊃ loop-a`) must
+/// TERMINATE — SpiceDB owns cycle-safety, and a subject-mint over a member of
+/// the cycle returns instead of hanging.
+#[tokio::test]
+async fn membership_cycle_terminates() {
+    let Some(rebac) = Rebac::from_env() else {
+        eprintln!("VERITY_SPICEDB_URL not set; skipping");
+        return;
+    };
+    rebac.ensure_schema().await.expect("schema");
+    let Some((state, tenant)) = test_state(Some(rebac), false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+
+    group_change(&state, tenant, "group:loop-a", "group:loop-b", true)
+        .await
+        .expect("loop-a <- loop-b");
+    group_change(&state, tenant, "group:loop-b", "group:loop-a", true)
+        .await
+        .expect("loop-b <- loop-a");
+    group_change(
+        &state,
+        tenant,
+        "group:loop-a",
+        "user:cyril@corp.example",
+        true,
+    )
+    .await
+    .expect("loop-a <- cyril");
+
+    // A true membership cycle is infinite-depth for ReBAC resolution, so
+    // SpiceDB's max-depth guard makes `user_groups` ERROR rather than hang. The
+    // invariant that matters for §6c: the server TERMINATES (returns promptly,
+    // never loops) and FAILS CLOSED — `open_scope` surfaces the resolution error
+    // so the caller gets NO scope (denied), never a partial or looping grant,
+    // never a leak. (Real Google directories reject cyclic nesting, so this is
+    // a defensive edge; if a malformed sync ever produced one, we deny.)
+    let result = mint_with_subject(&state, tenant, "user:cyril@corp.example").await;
+    assert!(
+        result.is_err(),
+        "a membership cycle must fail closed (no scope minted), not resolve to a \
+         grant and not hang: {result:?}"
+    );
+}
+
+/// DSN + SpiceDB: an email-only / unmapped subject (never added to any group)
+/// resolves to just itself and sees nothing group-shared — the §6c "email-only
+/// user denied when mapping is off" case, at the server.
+#[tokio::test]
+async fn email_only_subject_confers_nothing() {
+    let Some(rebac) = Rebac::from_env() else {
+        eprintln!("VERITY_SPICEDB_URL not set; skipping");
+        return;
+    };
+    rebac.ensure_schema().await.expect("schema");
+    let Some((state, tenant)) = test_state(Some(rebac), false).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+
+    group_change(
+        &state,
+        tenant,
+        "group:staff",
+        "user:insider@corp.example",
+        true,
+    )
+    .await
+    .expect("add insider");
+    let staff_token =
+        crate::upsert_principal_tokens(state.pool(), tenant, &["group:staff".to_string()])
+            .await
+            .expect("token")[0]
+            .1;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-staff",
+        "the tangerine offsite agenda",
+        vec![staff_token],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // The insider sees it; the email-only outsider does not.
+    let insider = mint_with_subject(&state, tenant, "user:insider@corp.example")
+        .await
+        .expect("mint");
+    assert!(
+        recall_docs(&state, &insider, "tangerine")
+            .await
+            .expect("recall")
+            .contains(&"doc-staff".to_string()),
+        "a real member sees the group doc"
+    );
+    let outsider = mint_with_subject(&state, tenant, "user:partner@outside.example")
+        .await
+        .expect("mint");
+    assert!(
+        recall_docs(&state, &outsider, "tangerine")
+            .await
+            .expect("recall")
+            .is_empty(),
+        "an email-only non-member sees nothing"
+    );
+}
