@@ -370,6 +370,35 @@ def test_run_once_first_cycle_applies_all_then_second_cycle_deletes_one(tmp_path
     assert [ENG, BOB] not in state["snapshot"]["memberships"]
 
 
+def test_dry_run_does_not_persist_snapshot(tmp_path):
+    """A dry run (persist=False) must NOT advance the snapshot: it delivered
+    nothing, so the NEXT real sync must still apply every op instead of diffing
+    against un-applied state and no-opping to zero (the poisoning we hit live)."""
+    state_file = tmp_path / "gdirectory_snapshot.json"
+    config = _config()
+
+    # Dry run: the full op set is still computed, but no snapshot is written.
+    applied = run_once(
+        GDirectoryConnector(_sync1_transport(), config),
+        DryRunAdminSink(stream=io.StringIO()),
+        state_file,
+        now="2026-07-11T08:00:00Z",
+        persist=False,
+    )
+    assert applied == 1 + len(SYNC1_MEMBERSHIPS)
+    assert not state_file.exists(), "a dry run must leave no snapshot behind"
+
+    # The following REAL sync starts clean and applies EVERYTHING, not zero.
+    applied_real = run_once(
+        GDirectoryConnector(_sync1_transport(), config),
+        DryRunAdminSink(stream=io.StringIO()),
+        state_file,
+        now="2026-07-11T08:01:00Z",
+    )
+    assert applied_real == 1 + len(SYNC1_MEMBERSHIPS), "real sync after a dry run must not no-op"
+    assert state_file.exists(), "a real sync persists the snapshot"
+
+
 def test_run_once_reconverges_after_no_change():
     """A cycle with no directory change applies zero ops (idempotent diff)."""
     import tempfile
