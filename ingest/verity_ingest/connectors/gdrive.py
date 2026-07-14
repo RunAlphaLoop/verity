@@ -38,6 +38,21 @@ ACL mapping (fail-closed, §5e.6 / §6b):
   operator explicitly sets ``anyone_maps_to`` (e.g. ``org:everyone``)
 - unknown/unmappable entries → ``AclEnvelope(resolvable=False)``
 
+Folder ACL inheritance (§6c ACL-mapping conformance) — deliberately NOT a
+parent-walk. Drive's ``permissions.list`` on a file already returns the
+EFFECTIVE ACL, inheritance included: **My Drive** copies a shared folder's
+grants down onto every descendant (each file carries its own direct grant),
+and **Shared Drives** list inherited grants on the item (``permissionDetails``
+flags which are inherited). So the fetched ``parents`` field is intentionally
+unused: walking it to re-fetch and merge ancestor ACLs would be redundant, and
+worse — because a file whose ancestor folder ACL is unreadable would then
+fail-closed-quarantine even though its own ``permissions.list`` is already
+complete, i.e. it would OVER-hide files that index correctly today. Empirically
+verified 2026-07-14 against this workspace (137 folders scanned, 0 shared beyond
+the owner — no copy-down/inherited case to observe). Residual: the Shared-Drive
+inherited-listing behavior could not be exercised here (no shared drive present);
+revisit with a Shared-Drive corpus before claiming Shared-Drive conformance.
+
 Deletions and trashed files emit a removal marker event
 (``GDriveDocumentEvent(removed=True)``); the sink posts it with
 ``{"removed": true}``. TODO(server): wire to the server-side retire path —
