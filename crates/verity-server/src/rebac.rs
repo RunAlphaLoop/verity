@@ -185,6 +185,17 @@ pub(crate) enum RebacError {
 
 type RebacResult<T> = std::result::Result<T, RebacError>;
 
+impl RebacError {
+    /// True iff this is SpiceDB's `MAXIMUM_DEPTH_EXCEEDED` — a membership CYCLE
+    /// (or a pathologically deep nest) that is infinite-depth to resolve.
+    /// Distinguished so identity resolution can degrade fail-closed (deny the
+    /// unresolvable groups, keep the user's own principal) instead of failing
+    /// the whole scope mint — while a genuine outage still surfaces as an error.
+    pub(crate) fn is_max_depth(&self) -> bool {
+        matches!(self, RebacError::Api { body, .. } if body.contains("MAXIMUM_DEPTH_EXCEEDED"))
+    }
+}
+
 /// SpiceDB client over the HTTP gateway. Present iff `VERITY_SPICEDB_URL` is
 /// set; absent = ReBAC disabled (dev mode, caller-supplied principals).
 pub(crate) struct Rebac {
@@ -606,6 +617,25 @@ impl Rebac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_max_depth_detects_the_cycle_error_only() {
+        // SpiceDB surfaces a membership cycle as an in-stream error → Api{body}
+        // carrying the MAXIMUM_DEPTH_EXCEEDED reason. Only that degrades identity
+        // resolution; transport/malformed/other-Api errors stay hard failures.
+        let cycle = RebacError::Api {
+            status: 200,
+            body: r#"{"code":9,"reason":"ERROR_REASON_MAXIMUM_DEPTH_EXCEEDED","message":"max depth exceeded"}"#.into(),
+        };
+        assert!(cycle.is_max_depth());
+        assert!(!RebacError::Api {
+            status: 502,
+            body: "upstream connect error".into(),
+        }
+        .is_max_depth());
+        assert!(!RebacError::Transport("connection refused".into()).is_max_depth());
+        assert!(!RebacError::Malformed("bad json".into()).is_max_depth());
+    }
 
     #[test]
     fn principal_parsing_is_strict() {

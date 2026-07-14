@@ -593,19 +593,26 @@ def run_once(
     state_file: Path,
     *,
     now: str | None = None,
+    persist: bool = True,
 ) -> int:
     """One reconcile cycle: load previous snapshot, full reconcile, diff,
     apply ops in order, checkpoint. Returns the number of applied ops. The
     snapshot is checkpointed only after every op delivers, so a crash replays
     the cycle (at-least-once; every op is idempotent — removals re-tombstone,
-    which over-hides, never under-hides)."""
+    which over-hides, never under-hides).
+
+    ``persist=False`` (a DRY RUN) skips the snapshot checkpoint: a dry run
+    delivers nothing, so it must NOT advance the snapshot — otherwise the next
+    REAL sync diffs against a state that was never applied and no-ops (0 ops),
+    silently skipping the real work."""
     previous = _load_snapshot(state_file)
     desired = connector.reconcile()
     ops = build_admin_ops(diff_snapshots(previous, desired), connector.config.tenant_id)
     for op in ops:
         sink.apply(op)
     reconciled_at = now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _save_snapshot(state_file, desired, reconciled_at)
+    if persist:
+        _save_snapshot(state_file, desired, reconciled_at)
     heartbeat = getattr(sink, "heartbeat", None)
     if heartbeat is not None:
         heartbeat(cursor=reconciled_at)
@@ -665,8 +672,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     while True:
-        applied = run_once(connector, sink, args.state_file)
-        print(f"gdirectory: applied {applied} admin op(s); snapshot -> {args.state_file}")
+        # A dry run must not advance the snapshot (it delivered nothing), else
+        # the next real sync would diff against un-applied state and no-op.
+        applied = run_once(connector, sink, args.state_file, persist=not args.dry_run)
+        dest = "(dry-run, snapshot unchanged)" if args.dry_run else f"snapshot -> {args.state_file}"
+        print(f"gdirectory: applied {applied} admin op(s); {dest}")
         if args.once:
             return 0
         time.sleep(args.interval)

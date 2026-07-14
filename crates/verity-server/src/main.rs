@@ -1495,12 +1495,33 @@ async fn open_scope(
                 ));
             };
             // Fail closed: an unresolvable subject mints nothing.
-            let groups = rebac.user_groups(req.tenant_id, name).await.map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("identity resolution failed: {e}"),
-                )
-            })?;
+            let groups = match rebac.user_groups(req.tenant_id, name).await {
+                Ok(groups) => groups,
+                // A membership CYCLE is infinite-depth for ReBAC, so SpiceDB
+                // returns MAXIMUM_DEPTH_EXCEEDED. That's a directory DATA problem
+                // for this one user — not a system outage — so don't lock them
+                // out of their OWN direct access. Degrade fail-closed to just the
+                // user's own principal (the unresolvable groups are DENIED, never
+                // granted) and log loudly for an admin to fix the cycle. Any
+                // OTHER rebac error (SpiceDB down/timeout) still 502s: a real
+                // outage must fail loudly, not silently reduce everyone's access.
+                Err(e) if e.is_max_depth() => {
+                    tracing::warn!(
+                        tenant = %req.tenant_id,
+                        subject = %name,
+                        "identity resolution hit a membership cycle (max depth) — degrading to \
+                         the user's own principal; group access denied until the directory cycle \
+                         is fixed"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("identity resolution failed: {e}"),
+                    ));
+                }
+            };
             let mut principal_strings = vec![subject.clone()];
             principal_strings.extend(groups);
             let tokens: Vec<PrincipalToken> =
