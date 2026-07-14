@@ -55,6 +55,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
         folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
+        directory: crate::directory_worker::DirectoryPlane::disabled(),
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,

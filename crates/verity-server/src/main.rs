@@ -14,6 +14,7 @@ mod console_later_tests;
 mod consolidation;
 #[cfg(test)]
 mod consolidation_tests;
+mod directory_worker;
 #[cfg(test)]
 mod entity_resolution_tests;
 mod extract;
@@ -231,6 +232,11 @@ pub(crate) struct AppState {
     /// consolidation endpoints. `None` in dev mode (admin surfaces open). NEVER
     /// logged or returned; distinct from `AdminAuth`'s one-way HMAC tag.
     pub(crate) admin_token: Option<String>,
+    /// Console/CLI-started Google directory-sync plane (Identity Plane §6a): the
+    /// server-owned child (if any) + the spawn config. ONE owner only — the CLI
+    /// `--directory` flag routes through the server start endpoint, never a
+    /// second child. See directory_worker::DirectoryPlane.
+    pub(crate) directory: directory_worker::DirectoryPlane,
 }
 
 impl AppState {
@@ -577,6 +583,11 @@ async fn admin_planes(
     // activity proxy, tenant-scoped for start/stop symmetry.
     planes.push(knowledge_plane_row(&state, q.tenant_id).await);
 
+    // 7 · directory-sync worker (Identity Plane §6a) — same two-tier treatment:
+    // authoritative when this server owns a live child, else the connector-status
+    // heartbeat proxy. The reconcile interval is the group-membership ACL SLO.
+    planes.push(directory_plane_row(&state, q.tenant_id).await);
+
     let up = planes.iter().filter(|p| p["status"] == "on").count();
     Ok(Json(serde_json::json!({
         "planes": planes,
@@ -746,6 +757,143 @@ fn worker_base_url(listen: &str) -> String {
     format!("http://{listen}")
 }
 
+/// The exact missing-prereq fix for a not-startable directory worker (repo /
+/// venv / config, in that resolution order). `None` when all prereqs exist.
+fn directory_start_hint(
+    repo: Option<&std::path::Path>,
+    venv: bool,
+    config: bool,
+) -> Option<String> {
+    let Some(repo) = repo else {
+        return Some(
+            "start the server with --repo <path> (or VERITY_REPO) so it can find ingest/.venv"
+                .to_string(),
+        );
+    };
+    if !venv {
+        Some(format!(
+            "no ingest virtualenv at {}/ingest/.venv/bin/python — create it (cd ingest && \
+             python -m venv .venv && .venv/bin/pip install -e '.[gdrive]') then try again",
+            repo.display()
+        ))
+    } else if !config {
+        Some(
+            "directory sync needs a service-account key (GOOGLE_APPLICATION_CREDENTIALS) and a \
+             DWD subject (VERITY_GDIRECTORY_SUBJECT) — set both on the server, then try again"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// The `directory_worker` row: authoritative when this server owns a live child,
+/// else the tenant-scoped `connector_status` heartbeat proxy. A dead owned child
+/// is reaped and the handle cleared before falling through — never a stale
+/// "running, pid N".
+async fn directory_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_json::Value {
+    const LABEL: &str = "Directory sync worker";
+
+    // Tier 1 — AUTHORITATIVE (server-owned). Hold the lock only to probe/reap.
+    {
+        let mut guard = state.directory.worker.lock().await;
+        if let Some(worker) = guard.as_mut() {
+            match worker.child.try_wait() {
+                Ok(None) => {
+                    let pid = worker.pid;
+                    let started_at = worker.started_at;
+                    let worker_tenant = worker.tenant_id;
+                    let detail = format!(
+                        "running · pid {pid} · started from this console {} — reconciling Google \
+                         users + groups (nested membership) into SpiceDB every {}s; that interval \
+                         is the ACL-freshness bound.",
+                        humanize_ago(started_at),
+                        state.directory.interval_secs,
+                    );
+                    let mut row = plane_row(
+                        "directory_worker",
+                        LABEL,
+                        "startable",
+                        "on",
+                        detail,
+                        false,
+                        None,
+                    );
+                    let obj = row.as_object_mut().expect("plane_row is an object");
+                    obj.insert("authority".into(), serde_json::json!("server"));
+                    obj.insert("stoppable".into(), serde_json::json!(true));
+                    obj.insert("pid".into(), serde_json::json!(pid));
+                    obj.insert(
+                        "started_at".into(),
+                        serde_json::json!(started_at.to_rfc3339()),
+                    );
+                    obj.insert(
+                        "worker_tenant_id".into(),
+                        serde_json::json!(worker_tenant.to_string()),
+                    );
+                    return row;
+                }
+                _ => {
+                    *guard = None;
+                }
+            }
+        }
+    }
+
+    // Tier 2 — OBSERVED PROXY: the gdirectory connector-status heartbeat.
+    let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT updated_at FROM connector_status WHERE tenant_id = $1 AND source = 'gdirectory'",
+    )
+    .bind(tenant_id)
+    .fetch_optional(state.pool())
+    .await
+    .ok()
+    .flatten();
+
+    // Startability depends ONLY on prereqs + not owning a live child, never on
+    // observed activity (so a stopped worker isn't a dead-end).
+    let repo = state.repo_root.as_deref();
+    let venv = directory_worker::venv_exists(repo);
+    let config = state.directory.config_ready();
+    let startable = repo.is_some() && venv && config;
+    let hint = directory_start_hint(repo, venv, config);
+
+    let recent = last.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(2));
+    let (status, detail) = if recent {
+        let t = last.expect("recent implies Some");
+        (
+            "unknown",
+            format!(
+                "recently reconciled {}, but this console doesn't own a running worker (it may \
+                 have just finished, or be running elsewhere). Start one here to own and stop it.",
+                humanize_ago(t)
+            ),
+        )
+    } else {
+        let recency = match last {
+            Some(t) => format!("last reconciled {}", humanize_ago(t)),
+            None => "has never run".to_string(),
+        };
+        (
+            "off",
+            format!("off — {recency}. Group-membership ACLs go stale until it runs."),
+        )
+    };
+    let mut row = plane_row(
+        "directory_worker",
+        LABEL,
+        "startable",
+        status,
+        detail,
+        startable,
+        hint.as_deref(),
+    );
+    let obj = row.as_object_mut().expect("plane_row is an object");
+    obj.insert("authority".into(), serde_json::json!("observed"));
+    obj.insert("stoppable".into(), serde_json::json!(false));
+    row
+}
+
 /// POST /v1/admin/planes/knowledge/start {tenant_id} (admin): spawn + track the
 /// consolidation worker for this tenant. Idempotent (an already-owned live
 /// child → 200 no-op). Missing repo/venv → 422, missing key / OS spawn failure
@@ -834,6 +982,93 @@ async fn admin_planes_knowledge_stop(
     }
 }
 
+/// POST /v1/admin/planes/directory/start {tenant_id} (admin): spawn + track the
+/// directory-sync worker for this tenant. Idempotent (an already-owned live
+/// child → 200 no-op). Missing repo/venv → 422; missing SA key / subject / OS
+/// spawn failure → 503 — each with the exact fix, NEVER a 500. The SA key path
+/// is passed to the child; the server never reads the key contents.
+async fn admin_planes_directory_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.directory.worker.lock().await;
+
+    // ONE owner per server: a LIVE child (any tenant) → idempotent no-op; a dead
+    // child is reaped and we respawn.
+    if let Some(worker) = guard.as_mut() {
+        match worker.child.try_wait() {
+            Ok(None) => {
+                return Ok(Json(serde_json::json!({
+                    "started": false,
+                    "pid": worker.pid,
+                    "already_running": true,
+                })));
+            }
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    let base_url = worker_base_url(&state.listen);
+    match directory_worker::spawn(
+        state.repo_root.as_deref(),
+        &base_url,
+        body.tenant_id,
+        state.admin_token.as_deref(),
+        state.directory.sa_key.as_deref(),
+        state.directory.subject.as_deref(),
+        state.directory.domain.as_deref(),
+        state.directory.interval_secs,
+    ) {
+        Ok(worker) => {
+            let pid = worker.pid;
+            *guard = Some(worker);
+            Ok(Json(serde_json::json!({ "started": true, "pid": pid })))
+        }
+        Err(directory_worker::SpawnError::NoRepo) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the server doesn't know its repo path — start it with --repo <path> or VERITY_REPO \
+             so it can find ingest/.venv"
+                .to_string(),
+        )),
+        Err(directory_worker::SpawnError::NoVenv(msg)) => {
+            Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+        }
+        Err(directory_worker::SpawnError::NoConfig(msg)) => {
+            Err((StatusCode::SERVICE_UNAVAILABLE, msg))
+        }
+        Err(directory_worker::SpawnError::Os(msg)) => Err((StatusCode::SERVICE_UNAVAILABLE, msg)),
+    }
+}
+
+/// POST /v1/admin/planes/directory/stop {tenant_id} (admin): kill + reap the
+/// tracked child. Honest no-op when this console owns no directory worker.
+async fn admin_planes_directory_stop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(_body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.directory.worker.lock().await;
+    match guard.take() {
+        Some(mut worker) => {
+            let pid = worker.pid;
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+            Ok(Json(serde_json::json!({ "stopped": true, "pid": pid })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "stopped": false,
+            "note": "nothing to stop — this console doesn't own a directory worker. If one is \
+                     running it was started outside this console (e.g. verity-cli dev --directory); \
+                     stop it there.",
+        }))),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // FTUE §2.3: when RUST_LOG is unset, default to `info` — a bare `./verity`
@@ -904,6 +1139,7 @@ async fn main() -> anyhow::Result<()> {
         admin_token: std::env::var("VERITY_ADMIN_TOKEN")
             .ok()
             .filter(|t| !t.is_empty()),
+        directory: directory_worker::DirectoryPlane::from_env(),
     });
 
     let app = Router::new()
@@ -1028,6 +1264,16 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/planes/knowledge/stop",
             post(admin_planes_knowledge_stop),
+        )
+        // The directory-sync worker's Start/Stop (Identity Plane §6a) — same
+        // server-owned, single-owner, idempotent-start / honest-no-op-stop shape.
+        .route(
+            "/v1/admin/planes/directory/start",
+            post(admin_planes_directory_start),
+        )
+        .route(
+            "/v1/admin/planes/directory/stop",
+            post(admin_planes_directory_stop),
         )
         .route(
             "/v1/admin/groups",

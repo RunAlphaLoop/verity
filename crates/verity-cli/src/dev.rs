@@ -64,6 +64,31 @@ async fn start_knowledge_worker_via_server(ctx: &Ctx, tenant_id: &str) -> Result
     }
 }
 
+/// Ask the running server to start + own the directory-sync worker. Mirrors
+/// `start_knowledge_worker_via_server`; reuses `KnowledgeStart` (Started/Declined).
+async fn start_directory_worker_via_server(ctx: &Ctx, tenant_id: &str) -> Result<KnowledgeStart> {
+    let mut req = ctx
+        .http
+        .post(format!("{}/v1/admin/planes/directory/start", ctx.url))
+        .json(&serde_json::json!({ "tenant_id": tenant_id }));
+    if let Some(token) = &ctx.config.admin_token {
+        req = req.bearer_auth(token);
+    }
+    let (status, body) = util::send(req, &ctx.url).await?;
+    if status.is_success() {
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("the server answered {status} but not JSON: {body}"))?;
+        let pid = json["pid"].as_u64().map(|p| p as u32);
+        let already = json["already_running"].as_bool().unwrap_or(false);
+        Ok(KnowledgeStart::Started { pid, already })
+    } else {
+        Ok(KnowledgeStart::Declined {
+            status,
+            disclosure: body.trim().to_string(),
+        })
+    }
+}
+
 /// Outcome of asking the server to start the worker.
 enum KnowledgeStart {
     /// The server owns a live child. `pid` from the response; `already` true
@@ -77,7 +102,12 @@ enum KnowledgeStart {
     },
 }
 
-pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>, knowledge: bool) -> Result<()> {
+pub async fn run(
+    ctx: &mut Ctx,
+    repo_flag: Option<PathBuf>,
+    knowledge: bool,
+    directory: bool,
+) -> Result<()> {
     ui::banner("verity dev — local memory plane, five minutes");
     println!();
 
@@ -190,6 +220,45 @@ pub async fn run(ctx: &mut Ctx, repo_flag: Option<PathBuf>, knowledge: bool) -> 
              the worker: LLM extraction of facts/knowledge from your text, into the review queue)",
             ui::dim("·"),
             ui::pad("knowledge", 8)
+        );
+    }
+
+    if directory {
+        match start_directory_worker_via_server(ctx, &tenant_id).await {
+            Ok(KnowledgeStart::Started { pid, already }) => {
+                let pid_note = pid
+                    .map(|p| format!("pid {p}"))
+                    .unwrap_or_else(|| "running".into());
+                let state = if already { "already running" } else { "up" };
+                ui::step_ok(
+                    "directory",
+                    &format!(
+                        "directory-sync worker {state} ({pid_note}) — owned by the server; \
+                         reconciling Google Workspace users + groups (nested membership) into \
+                         SpiceDB, so group-based ACL inheritance stays fresh. Stop it from the \
+                         What's-running panel or POST /v1/admin/planes/directory/stop."
+                    ),
+                );
+            }
+            // 422/503: missing repo/venv/config (SA key + subject) — verbatim fix.
+            Ok(KnowledgeStart::Declined { status, disclosure }) => println!(
+                "  {} {}  --directory requested but the server ({status}) could not start it: \
+                 {disclosure}",
+                ui::yellow("…"),
+                ui::pad("directory", 8)
+            ),
+            Err(e) => println!(
+                "  {} {}  --directory requested but the start request failed: {e}",
+                ui::yellow("…"),
+                ui::pad("directory", 8)
+            ),
+        }
+    } else {
+        println!(
+            "  {} {}  off — flip on with `verity-cli dev --directory` (the server starts + owns \
+             the worker: Google users/groups → SpiceDB, keeping group-based ACL inheritance fresh)",
+            ui::dim("·"),
+            ui::pad("directory", 8)
         );
     }
 
