@@ -229,6 +229,188 @@ async fn identity_membership_flows_into_subject_minted_handle() {
     );
 }
 
+// ================================================================
+// [inheritance] §6c: a doc shared with a group reaches a NESTED member,
+// and NO ONE else. The never-before-proven end-to-end ACL claim.
+// ================================================================
+
+/// Build a 3-level nested group (`all ⊃ eng ⊃ eng-leads ⊃ alice`) plus a
+/// membership CYCLE (`loop-a ⊃ loop-b ⊃ loop-a`, must terminate), ingest docs
+/// shared with the TOP group, a domain principal, and a direct user; then prove
+/// by subject-mint + recall:
+/// - alice (nested member, three levels down) SEES the group-shared doc, because
+///   `open_scope` resolves `alice → eng-leads → eng → all` and the token lines
+///   up — the whole ACL-inheritance claim, finally end-to-end;
+/// - alice does NOT see the domain-only or direct-to-bob docs;
+/// - mallory (deprovisioned, no membership) and partner@outside (email-only, no
+///   membership) see NOTHING.
+/// Also locks the gdrive↔gdirectory string contract: the `group:` string the
+/// Drive connector would emit resolves to the SAME token the directory allocated
+/// — a casing/format drift there would silently break inheritance.
+#[tokio::test]
+async fn inheritance_group_shared_doc_reaches_nested_member_only() {
+    let Some(s) = live_stack("inheritance").await else {
+        return;
+    };
+    if spicedb_env("inheritance").is_none() {
+        return;
+    }
+
+    // The exact `group:<email.lower()>` / `user:...` strings the connectors emit.
+    let g_all = "group:all@corp.example";
+    let g_eng = "group:eng@corp.example";
+    let g_leads = "group:eng-leads@corp.example";
+    let u_alice = "user:alice@corp.example";
+
+    // Build the nested directory through the admin plane (production shape).
+    s.admin_post(
+        "/v1/admin/groups",
+        json!({ "tenant_id": s.tenant, "group": g_all, "member": g_eng }),
+    )
+    .await;
+    s.admin_post(
+        "/v1/admin/groups",
+        json!({ "tenant_id": s.tenant, "group": g_eng, "member": g_leads }),
+    )
+    .await;
+    let leads_write = s
+        .admin_post(
+            "/v1/admin/groups",
+            json!({ "tenant_id": s.tenant, "group": g_leads, "member": u_alice }),
+        )
+        .await;
+    let leads_token = leads_write["tokens"][g_leads]
+        .as_i64()
+        .expect("eng-leads token");
+
+    // A membership cycle: closure must terminate, never hang.
+    s.admin_post(
+        "/v1/admin/groups",
+        json!({ "tenant_id": s.tenant, "group": "group:loop-a@corp.example", "member": "group:loop-b@corp.example" }),
+    )
+    .await;
+    s.admin_post(
+        "/v1/admin/groups",
+        json!({ "tenant_id": s.tenant, "group": "group:loop-b@corp.example", "member": "group:loop-a@corp.example" }),
+    )
+    .await;
+
+    // Allocate the visibility tokens the way a content connector does: the
+    // `group:all` string (the doc's ACL target), a domain principal, a direct
+    // user. `/v1/admin/principals` is idempotent, so re-allocating `group:all`
+    // returns the SAME token the group write minted.
+    let alloc = |principal: &'static str| {
+        let s = &s;
+        async move {
+            s.admin_post(
+                "/v1/admin/principals",
+                json!({ "tenant_id": s.tenant, "principals": [principal] }),
+            )
+            .await["mappings"][principal]
+                .as_i64()
+                .unwrap_or_else(|| panic!("token for {principal}"))
+        }
+    };
+    let all_token = alloc(g_all).await;
+    let dom_token = alloc("domain:corp.example").await;
+    let bob_token = alloc("user:bob@corp.example").await;
+
+    // String-contract lock: the `group:eng-leads@corp.example` string gdrive's
+    // map_permissions emits resolves to the SAME token gdirectory allocated.
+    let gdrive_leads_token = alloc(g_leads).await;
+    assert_eq!(
+        gdrive_leads_token, leads_token,
+        "the group string gdrive emits must resolve to the SAME token the directory \
+         allocated — a casing/format drift here silently breaks ACL inheritance"
+    );
+
+    // Ingest three docs, each carrying a globally-unique marker term so the
+    // negative assertions are exact even when a shared word co-matches.
+    let ingest = |doc: &'static str, marker: &'static str, vis: i64| {
+        let s = &s;
+        async move {
+            s.admin_post(
+                "/v1/ingest/documents",
+                json!({
+                    "tenant_id": s.tenant,
+                    "source": "e2e-inherit",
+                    "document_id": doc,
+                    "content": format!("The {marker} roadmap is shared with one audience only."),
+                    "visibility": [vis],
+                    "acl_provenance": "mirrored",
+                }),
+            )
+            .await;
+        }
+    };
+    ingest("doc-group", "peregrine", all_token).await;
+    ingest("doc-domain", "zzqxancorp", dom_token).await;
+    ingest("doc-direct", "wombatxqz", bob_token).await;
+
+    // Does any recall hit's payload carry the marker? (Precise: a co-matched
+    // visible doc never carries another doc's unique marker.)
+    fn carries(hits: &[Value], marker: &str) -> bool {
+        hits.iter().any(|h| h.to_string().contains(marker))
+    }
+
+    // Alice — nested member three levels down.
+    let alice = s
+        .mint(json!({
+            "tenant_id": s.tenant, "subject": u_alice,
+            "actor_sub": u_alice, "actor_azp": "test:dev-stack-e2e", "ttl_seconds": 300,
+        }))
+        .await;
+    let aprincipals: Vec<i64> = decode_handle(&alice)["principals"]
+        .as_array()
+        .expect("principals array")
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert!(
+        aprincipals.contains(&all_token) && aprincipals.contains(&leads_token),
+        "alice's closure must resolve the TOP group (all={all_token}, three levels up) \
+         AND eng-leads ({leads_token}); got {aprincipals:?}"
+    );
+    assert!(
+        carries(&s.recall(&alice, "peregrine roadmap").await, "peregrine"),
+        "alice MUST see the group-shared doc — shared with `all`, she is a nested member"
+    );
+    assert!(
+        !carries(&s.recall(&alice, "zzqxancorp roadmap").await, "zzqxancorp"),
+        "alice must NOT see the domain-only doc (she is in groups, not the domain principal)"
+    );
+    assert!(
+        !carries(&s.recall(&alice, "wombatxqz roadmap").await, "wombatxqz"),
+        "alice must NOT see the direct-to-bob doc"
+    );
+
+    // Mallory — deprovisioned, no membership → sees nothing.
+    let mallory = "user:mallory@corp.example";
+    let mh = s
+        .mint(json!({
+            "tenant_id": s.tenant, "subject": mallory,
+            "actor_sub": mallory, "actor_azp": "test:dev-stack-e2e", "ttl_seconds": 300,
+        }))
+        .await;
+    assert!(
+        !carries(&s.recall(&mh, "peregrine roadmap").await, "peregrine"),
+        "a deprovisioned user with no membership must see NOTHING group-shared"
+    );
+
+    // partner@outside — email-only, unmapped, no membership → sees nothing.
+    let partner = "user:partner@outside.example";
+    let ph = s
+        .mint(json!({
+            "tenant_id": s.tenant, "subject": partner,
+            "actor_sub": partner, "actor_azp": "test:dev-stack-e2e", "ttl_seconds": 300,
+        }))
+        .await;
+    assert!(
+        !carries(&s.recall(&ph, "peregrine roadmap").await, "peregrine"),
+        "an email-only non-member must see NOTHING group-shared"
+    );
+}
+
 // =====================================================================
 // [watch] out-of-band SpiceDB delete revokes WITHOUT the window elapsing
 // =====================================================================
