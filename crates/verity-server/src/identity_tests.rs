@@ -567,18 +567,46 @@ async fn membership_cycle_terminates() {
     .await
     .expect("loop-a <- cyril");
 
-    // A true membership cycle is infinite-depth for ReBAC resolution, so
-    // SpiceDB's max-depth guard makes `user_groups` ERROR rather than hang. The
-    // invariant that matters for §6c: the server TERMINATES (returns promptly,
-    // never loops) and FAILS CLOSED — `open_scope` surfaces the resolution error
-    // so the caller gets NO scope (denied), never a partial or looping grant,
-    // never a leak. (Real Google directories reject cyclic nesting, so this is
-    // a defensive edge; if a malformed sync ever produced one, we deny.)
-    let result = mint_with_subject(&state, tenant, "user:cyril@corp.example").await;
+    // A doc visible only to the cyclic group.
+    let loop_a_token =
+        crate::upsert_principal_tokens(state.pool(), tenant, &["group:loop-a".to_string()])
+            .await
+            .expect("token")[0]
+            .1;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-loop",
+        "the cyclic zucchini memo",
+        vec![loop_a_token],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // A true membership cycle is infinite-depth for ReBAC, so SpiceDB's max-depth
+    // guard makes `user_groups` ERROR rather than hang. The invariant for §6c:
+    // the server TERMINATES (returns promptly, never loops) and degrades
+    // FAIL-CLOSED but GRACEFULLY — `open_scope` doesn't lock cyril out of ALL
+    // access with a 502; it mints a scope carrying only his OWN principal, and
+    // the unresolvable cyclic groups are DENIED (never a partial or looping
+    // grant, never a leak). Real Google directories reject cyclic nesting, so
+    // this is a defensive edge; the point is a malformed sync can't lock a user
+    // out of their direct content.
+    let handle = mint_with_subject(&state, tenant, "user:cyril@corp.example")
+        .await
+        .expect("a cycle degrades to a minted scope, never a lockout/502");
+    let payload = state.minter.verify(&handle).expect("verifies");
+    assert_eq!(
+        payload.principals.len(),
+        1,
+        "degraded to cyril's own principal only (cyclic groups denied): {payload:?}"
+    );
+    let docs = recall_docs(&state, &handle, "zucchini")
+        .await
+        .expect("recall");
     assert!(
-        result.is_err(),
-        "a membership cycle must fail closed (no scope minted), not resolve to a \
-         grant and not hang: {result:?}"
+        docs.is_empty(),
+        "the unresolvable cyclic group is denied — cyril cannot see its doc: {docs:?}"
     );
 }
 
