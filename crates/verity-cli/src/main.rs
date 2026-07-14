@@ -67,6 +67,14 @@ enum Command {
         /// extracts knowledge into the review queue, never straight to memory.
         #[arg(long)]
         knowledge: bool,
+        /// Bring up the Google directory-sync worker with the stack (Identity
+        /// Plane §6a). OFF by default — needs the Workspace service-account key
+        /// (GOOGLE_APPLICATION_CREDENTIALS) + a DWD subject
+        /// (VERITY_GDIRECTORY_SUBJECT) on the server. Reconciles users + groups
+        /// (nested membership) into SpiceDB so group-based ACL inheritance stays
+        /// fresh; the reconcile interval is the membership-freshness bound.
+        #[arg(long)]
+        directory: bool,
     },
     /// Ingest a file, a directory (recursive, text-like files), an http(s)
     /// URL, or stdin ('-') into memory — under an explicit visibility.
@@ -331,7 +339,11 @@ async fn run() -> Result<()> {
     };
 
     match cli.command {
-        Command::Dev { repo, knowledge } => dev::run(&mut ctx, repo, knowledge).await,
+        Command::Dev {
+            repo,
+            knowledge,
+            directory,
+        } => dev::run(&mut ctx, repo, knowledge, directory).await,
         Command::Add {
             target,
             visibility,
