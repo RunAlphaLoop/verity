@@ -33,3 +33,16 @@ what powers it holds:
 
 No principal token is ever handed to an agent. Exit code `0` = the boundary
 held. Idempotent — safe to re-run.
+
+## `backup_restore_drill.sh` — "if I put real data in, can I get it back?"
+
+```
+./demo/backup_restore_drill.sh
+```
+
+The disaster-recovery answer, proven on demand. Runs the real `verity-cli
+backup`, restores the dump into a **throwaway** database (never the live one),
+and asserts every table's row count matches the source exactly — then confirms
+the CLI's `pg_restore --clean --if-exists` path exits clean. Only READS the live
+DB, so it's safe against a running dev stack. Exit `0` = round-trips
+byte-identical. See `docs/OPERATIONS.md` for the SPEC §11b restore ordering.
