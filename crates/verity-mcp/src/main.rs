@@ -63,13 +63,16 @@ struct Cli {
     tenant_id: Uuid,
     /// Materialized principal tokens for this agent's identity
     /// (comma-separated ints). Empty set = everything invisible (fail closed).
-    #[arg(
-        long,
-        env = "VERITY_PRINCIPALS",
-        value_delimiter = ',',
-        required = true
-    )]
+    /// Mutually exclusive with --subject: with a subject, the SERVER resolves
+    /// the principal set (the user + its transitive group closure) itself.
+    #[arg(long, env = "VERITY_PRINCIPALS", value_delimiter = ',')]
     principals: Vec<i32>,
+    /// Identity-resolved mode (SPEC §6/§9a — the production shape): a
+    /// `user:<id>` subject the server resolves to its principal set (the user
+    /// plus its transitive group closure) via ReBAC. Mutually exclusive with
+    /// --principals — the agent names WHO it is, never what powers it holds.
+    #[arg(long, env = "VERITY_SUBJECT")]
+    subject: Option<String>,
     /// Stable subject identifier (`sub`) stamped on writes.
     #[arg(long, env = "VERITY_ACTOR_SUB")]
     actor_sub: Option<String>,
@@ -534,7 +537,12 @@ impl VerityMcp {
         #[derive(Serialize)]
         struct Body<'a> {
             tenant_id: Uuid,
-            principals: &'a [i32],
+            // Exactly one of subject / principals is sent — the server rejects
+            // both (self-assertion) and resolves a subject to its group closure.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            subject: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            principals: Option<&'a [i32]>,
             entity_scope: Vec<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             actor_sub: &'a Option<String>,
@@ -543,9 +551,16 @@ impl VerityMcp {
             #[serde(skip_serializing_if = "Option::is_none")]
             ttl_seconds: Option<i64>,
         }
+        // Identity-resolved mode when a subject is configured; else the
+        // materialized-token mode (unchanged). main() guarantees not-both.
+        let (subject, principals) = match &self.config.subject {
+            Some(s) => (Some(s), None),
+            None => (None, Some(self.config.principals.as_slice())),
+        };
         let body = Body {
             tenant_id: self.config.tenant_id,
-            principals: &self.config.principals,
+            subject,
+            principals,
             entity_scope: p.entity_scope.unwrap_or_default(),
             actor_sub: &self.config.actor_sub,
             actor_azp: &self.config.actor_azp,
@@ -911,6 +926,8 @@ impl VerityMcp {
         let info = serde_json::json!({
             "url": self.config.url,
             "tenant_id": self.config.tenant_id,
+            "mode": if self.config.subject.is_some() { "subject-resolved" } else { "materialized-tokens" },
+            "subject": self.config.subject,
             "principals": self.config.principals,
             "actor_sub": self.config.actor_sub,
             "actor_azp": self.config.actor_azp,
@@ -949,7 +966,21 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    tracing::info!(url = %cli.url, tenant = %cli.tenant_id, "verity-mcp serving on stdio");
+    // Exactly one identity mode: a subject (server-resolved) OR materialized
+    // tokens — never both (that is self-assertion; the server 422s it). An empty
+    // principal set with no subject is the legitimate fail-closed "see nothing".
+    if cli.subject.is_some() && !cli.principals.is_empty() {
+        anyhow::bail!(
+            "set VERITY_SUBJECT or VERITY_PRINCIPALS, not both — with a subject the server \
+             resolves the principal set (user + transitive groups) itself"
+        );
+    }
+    tracing::info!(
+        url = %cli.url,
+        tenant = %cli.tenant_id,
+        mode = if cli.subject.is_some() { "subject-resolved" } else { "materialized-tokens" },
+        "verity-mcp serving on stdio"
+    );
     let service = VerityMcp::new(cli).serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

@@ -110,6 +110,24 @@ verity-cli restore <file>
   the dump is permanently unreadable. That property is also the point:
   see crypto-shredding below.
 
+### Verify a backup without touching production — the DR drill
+
+```
+./demo/backup_restore_drill.sh
+```
+
+Runs the real `verity-cli backup`, restores the dump into a **throwaway**
+database (never the live one — it only READS the live DB), and asserts every
+table's row count matches the source exactly, then confirms the CLI's
+`pg_restore --clean --if-exists` path exits clean. This is the
+restore-to-a-new-instance drill you should prefer over `--clean`-ing your live
+DB: restore to a fresh instance, verify, then cut over. Verified 2026-07-15
+against a 115,643-chunk / ~300 MB corpus — every table round-tripped
+byte-identical. (Note: a restore into a *fresh* database emits 3 harmless
+`schema … already exists` notices for `paradedb`/`tiger`/`topology`, which ship
+with the ParadeDB image; data restores fully. The CLI's `--clean --if-exists`
+into an existing DB does not emit them.)
+
 ## Envelope encryption & the KEK (SPEC §8a, v0)
 
 - `VERITY_KEK` = 64 hex chars (32 bytes). Generate:
