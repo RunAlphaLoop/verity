@@ -935,6 +935,25 @@ fn print_summary(
         ui::cyan(&console_link)
     );
     println!();
+    // `cargo run -p verity-cli -- dev` does NOT put `verity-cli` on PATH, so the
+    // commands below would be "command not found" for a fresh user. Detect it
+    // and, if missing, say exactly how to make them runnable — the cold-start
+    // dead end otherwise (audited 2026-07-15).
+    if !verity_cli_on_path() {
+        let onpath = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.display().to_string()))
+            .map(|d| format!("export PATH=\"{d}:$PATH\""))
+            .unwrap_or_else(|| "add target/release to your PATH".into());
+        println!(
+            "    {}",
+            ui::dim(&format!(
+                "first, put verity-cli on your PATH — `cargo install --path crates/verity-cli` \
+                 (or `{onpath}`) — otherwise the commands below say \"command not found\".",
+            ))
+        );
+        println!();
+    }
     let step = |n: u32, what: &str, cmd: &str| {
         println!("    {n}. {}  {}", ui::pad(what, 18), ui::cyan(cmd));
     };
@@ -954,4 +973,14 @@ fn print_summary(
         "    {}",
         ui::dim("every write needs --visibility: Verity never guesses who may see a memory.",)
     );
+}
+
+/// Whether a bare `verity-cli` resolves on the user's PATH — so the "Next steps"
+/// commands actually run. `cargo run -p verity-cli -- dev` does not install to
+/// PATH, so a fresh user needs to be told where the binary is.
+fn verity_cli_on_path() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join("verity-cli").is_file())
 }
