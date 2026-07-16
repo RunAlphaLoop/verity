@@ -72,17 +72,142 @@ pub fn load(path: &Path) -> Result<Config> {
 
 pub fn save(path: &Path, config: &Config) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
+        create_private_dir(dir)
             .with_context(|| format!("cannot create config directory {}", dir.display()))?;
     }
     let body = toml::to_string_pretty(config).context("config serializes")?;
-    std::fs::write(path, body)
+    // The file may carry an admin token. Create it owner-only FROM THE START
+    // (mode at creation, not a chmod-after race that leaves a world-readable
+    // window) and via a temp file + atomic rename, so a concurrent reader never
+    // catches a partial or briefly-permissive file. A permission failure is
+    // propagated, never swallowed — a token must never be left world-readable
+    // silently.
+    write_private(path, body.as_bytes())
         .with_context(|| format!("cannot write config file {}", path.display()))?;
-    // The file may carry an admin token: owner-only.
+    Ok(())
+}
+
+/// Create a directory (recursively) that may hold a secret, owner-only. On
+/// unix the 0700 mode is applied to directories THIS call creates; a
+/// pre-existing directory is left as the operator set it.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Write `bytes` to `path` owner-only and atomically: a temp file created at
+/// mode 0600 (so the token is never world-readable, even for an instant),
+/// fsync'd, then renamed over the target (rename preserves the 0600 mode). Any
+/// permission error propagates rather than leaving the secret exposed.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config");
+        let tmp = parent.join(format!(".{stem}.{}.tmp", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Rename is atomic within a filesystem and keeps the 0600 temp mode.
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn save_writes_owner_only_file_and_dir() {
+        let base =
+            std::env::temp_dir().join(format!("verity-cfg-{}-{}", std::process::id(), "save"));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join(".verity");
+        let path = dir.join("config.toml");
+
+        let cfg = Config {
+            admin_token: Some("super-secret-admin-token".into()),
+            ..Config::default()
+        };
+        save(&path, &cfg).unwrap();
+
+        // The token file is owner-only — never the 0644 the old write-then-chmod
+        // left in the race window (or permanently on a swallowed chmod error).
+        assert_eq!(mode_of(&path), 0o600, "config with a token must be 0600");
+        // The directory we created is owner-only too.
+        assert_eq!(mode_of(&dir), 0o700, "a secret-bearing dir must be 0700");
+        // Round-trips.
+        assert_eq!(
+            load(&path).unwrap().admin_token.as_deref(),
+            Some("super-secret-admin-token")
+        );
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "atomic write must leave no .tmp file");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_overwrites_existing_config_keeping_owner_only() {
+        let base =
+            std::env::temp_dir().join(format!("verity-cfg-{}-{}", std::process::id(), "over"));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join(".verity").join("config.toml");
+        save(&path, &Config::default()).unwrap();
+        save(
+            &path,
+            &Config {
+                url: Some("http://127.0.0.1:7717".into()),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(
+            load(&path).unwrap().url.as_deref(),
+            Some("http://127.0.0.1:7717")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
