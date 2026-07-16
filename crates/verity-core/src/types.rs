@@ -7,6 +7,43 @@ pub type EpisodeId = Uuid;
 pub type FactId = Uuid;
 pub type ChunkId = Uuid;
 
+/// The kind of a stored connector credential (SPEC §5e, Phase-2 secret intake).
+/// `Bearer` is a tier-C static token stored AES-256-GCM encrypted-at-rest under
+/// the tenant DEK; `Path` is a tier-A Google service-account key FILE PATH (not
+/// a secret). Serialized lowercase to match the `kind` text column and the
+/// connector-readiness UI states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorCredentialKind {
+    /// Encrypted-at-rest bearer token (HubSpot / Salesforce).
+    Bearer,
+    /// Google SA-key file path (gdrive / gmail / gdirectory).
+    Path,
+}
+
+impl ConnectorCredentialKind {
+    /// The `kind` text-column spelling (`"bearer"` / `"path"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConnectorCredentialKind::Bearer => "bearer",
+            ConnectorCredentialKind::Path => "path",
+        }
+    }
+}
+
+/// Non-secret status of a stored connector credential (SPEC §5e, Phase-2). The
+/// only thing a read ever discloses about a stored credential: its kind, its
+/// salted-HMAC `fingerprint` prefix, and when it was last written — NEVER the
+/// secret or the path plaintext (a bearer's ciphertext is not surfaced; a path
+/// is only fingerprinted here, not echoed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorCredentialStatus {
+    pub kind: ConnectorCredentialKind,
+    /// Salted-HMAC prefix of the secret/path (VERITY_SCOPE_KEY) — safe to echo.
+    pub fingerprint: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A materialized principal token: the unit of visibility. Every chunk carries
 /// the set of tokens allowed to see it; the caller's principal set is resolved
 /// once per session and intersected in the index. Empty set = invisible.

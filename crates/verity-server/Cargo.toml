@@ -29,6 +29,9 @@ thiserror = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+# Secret-intake redaction (Phase 2, Secret newtype): zeroize the pasted secret
+# on drop; Debug/Display print `***` so a secret can never leak via a log line.
+zeroize = { workspace = true }
 rand_core = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

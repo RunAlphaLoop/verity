@@ -361,6 +361,195 @@ impl PostgresAdapter {
         }
     }
 
+    // ---- Connector credential intake (SPEC §5e, Phase-2 secret intake) ----
+    //
+    // All crypto is in-crate: these methods call the pub(crate) crypto helpers
+    // and `self.tenant_dek`, and hand callers only a fingerprint or a
+    // decrypted-on-demand value. The trait forwards to them (below).
+
+    /// The tenant DEK for a WRITE that must be genuinely protected: unlike
+    /// `tenant_dek` (which tolerates a plaintext-provenance DEK for the L0
+    /// dev path), this HARD-REFUSES unless a KEK is configured AND the stored
+    /// DEK is actually KEK-wrapped (raw length > 32). A DEK minted plaintext
+    /// before a KEK was set stays plaintext even after `VERITY_KEK` is added
+    /// (unwrap_dek keys off length), so a secret written against it would sit
+    /// unprotected — refuse. Provisions the DEK first (via `tenant_dek`) so a
+    /// brand-new tenant with a KEK set gets a properly wrapped DEK, then
+    /// re-reads the raw row to check provenance.
+    async fn tenant_dek_for_secret(
+        &self,
+        tenant: TenantId,
+    ) -> Result<[u8; crate::crypto::DEK_BYTES]> {
+        if self.kek.is_none() {
+            return Err(StorageError::InvalidInput(
+                "refusing to store a connector secret: VERITY_KEK is not set \
+                 (encrypt-at-rest is mandatory for tier-C bearer tokens)"
+                    .into(),
+            ));
+        }
+        // Ensure the DEK exists and is unwrappable (also fails closed on a
+        // wrapped-DEK/no-KEK mismatch, though we already required a KEK).
+        let dek = self.tenant_dek(tenant).await?;
+        // Provenance check on the RAW stored bytes: length <= 32 = plaintext.
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT dek FROM tenant_deks WHERE tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+        if stored.len() <= crate::crypto::DEK_BYTES {
+            return Err(StorageError::InvalidInput(
+                "refusing to store a connector secret: the tenant DEK is \
+                 plaintext-provenance (minted before VERITY_KEK was set) — \
+                 rotate the tenant DEK under the KEK before storing secrets"
+                    .into(),
+            ));
+        }
+        Ok(dek)
+    }
+
+    /// Store a tier-C bearer token encrypted-at-rest; returns its fingerprint.
+    /// See [`StorageAdapter::store_connector_bearer`].
+    pub async fn store_connector_bearer_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        plaintext: &[u8],
+    ) -> Result<String> {
+        let dek = self.tenant_dek_for_secret(tenant).await?;
+        let ciphertext = crate::crypto::encrypt(&dek, plaintext)?;
+        let fingerprint = crate::crypto::credential_fingerprint(plaintext);
+        sqlx::query(
+            "INSERT INTO connector_credentials
+                 (tenant_id, source, kind, ciphertext, path, fingerprint, updated_at)
+             VALUES ($1, $2, 'bearer', $3, NULL, $4, now())
+             ON CONFLICT (tenant_id, source) DO UPDATE
+                 SET kind = 'bearer', ciphertext = EXCLUDED.ciphertext,
+                     path = NULL, fingerprint = EXCLUDED.fingerprint,
+                     updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(&ciphertext)
+        .bind(&fingerprint)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(fingerprint)
+    }
+
+    /// Store a Google SA-key file PATH (no crypto); returns its fingerprint.
+    /// See [`StorageAdapter::store_connector_path`].
+    pub async fn store_connector_path_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        path: &str,
+    ) -> Result<String> {
+        let fingerprint = crate::crypto::credential_fingerprint(path.as_bytes());
+        sqlx::query(
+            "INSERT INTO connector_credentials
+                 (tenant_id, source, kind, ciphertext, path, fingerprint, updated_at)
+             VALUES ($1, $2, 'path', NULL, $3, $4, now())
+             ON CONFLICT (tenant_id, source) DO UPDATE
+                 SET kind = 'path', ciphertext = NULL,
+                     path = EXCLUDED.path, fingerprint = EXCLUDED.fingerprint,
+                     updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(path)
+        .bind(&fingerprint)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(fingerprint)
+    }
+
+    /// Non-secret status of a stored credential.
+    /// See [`StorageAdapter::get_connector_credential_status`].
+    pub async fn get_connector_credential_status_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorCredentialStatus>> {
+        let row = sqlx::query(
+            "SELECT kind, fingerprint, updated_at FROM connector_credentials
+             WHERE tenant_id = $1 AND source = $2",
+        )
+        .bind(tenant)
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let kind_str: String = row.try_get("kind").map_err(db_err)?;
+        let kind = match kind_str.as_str() {
+            "bearer" => ConnectorCredentialKind::Bearer,
+            "path" => ConnectorCredentialKind::Path,
+            other => {
+                return Err(StorageError::Database(format!(
+                    "connector_credentials.kind has an unknown value {other:?}"
+                )))
+            }
+        };
+        Ok(Some(ConnectorCredentialStatus {
+            kind,
+            fingerprint: row.try_get("fingerprint").map_err(db_err)?,
+            updated_at: row.try_get("updated_at").map_err(db_err)?,
+        }))
+    }
+
+    /// Decrypt-on-demand read of a stored bearer secret.
+    /// See [`StorageAdapter::materialize_connector_bearer`].
+    pub async fn materialize_connector_bearer_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            "SELECT kind, ciphertext FROM connector_credentials
+             WHERE tenant_id = $1 AND source = $2",
+        )
+        .bind(tenant)
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let kind: String = row.try_get("kind").map_err(db_err)?;
+        if kind != "bearer" {
+            return Err(StorageError::InvalidInput(format!(
+                "connector credential for source {source:?} is a {kind} credential, \
+                 not a bearer — nothing to materialize"
+            )));
+        }
+        let ciphertext: Vec<u8> = row.try_get("ciphertext").map_err(db_err)?;
+        // Decrypt-on-demand under the tenant DEK. This inherits the KEK-unset
+        // hard-refuse for free: tenant_dek → unwrap_dek fails closed when a
+        // wrapped-provenance DEK meets a missing KEK.
+        let dek = self.tenant_dek(tenant).await?;
+        let plain = crate::crypto::decrypt(&dek, &ciphertext)?;
+        Ok(Some(plain))
+    }
+
+    /// Revoke (delete) a stored credential row.
+    /// See [`StorageAdapter::revoke_connector_credential`].
+    pub async fn revoke_connector_credential_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<bool> {
+        let done =
+            sqlx::query("DELETE FROM connector_credentials WHERE tenant_id = $1 AND source = $2")
+                .bind(tenant)
+                .bind(source)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Run pending migrations and return how many were applied, so boot can
     /// print `applied N migrations` (FTUE §2.3 — a bare `./verity` on a fresh
     /// database must say what it did). The count-before read is best-effort:
@@ -3848,6 +4037,49 @@ impl StorageAdapter for PostgresAdapter {
         // bookkeeping — the same rationale as `CachedAdapter::flush_facts`.
         self.routes.invalidate_all();
         Ok(())
+    }
+
+    // ---- Connector credential intake (SPEC §5e, Phase-2) ----
+    // Thin forwarders to the inherent `*_impl` methods where the crypto lives.
+
+    async fn store_connector_bearer(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        plaintext: &[u8],
+    ) -> Result<String> {
+        self.store_connector_bearer_impl(tenant, source, plaintext)
+            .await
+    }
+
+    async fn store_connector_path(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        path: &str,
+    ) -> Result<String> {
+        self.store_connector_path_impl(tenant, source, path).await
+    }
+
+    async fn get_connector_credential_status(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorCredentialStatus>> {
+        self.get_connector_credential_status_impl(tenant, source)
+            .await
+    }
+
+    async fn materialize_connector_bearer(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.materialize_connector_bearer_impl(tenant, source).await
+    }
+
+    async fn revoke_connector_credential(&self, tenant: TenantId, source: &str) -> Result<bool> {
+        self.revoke_connector_credential_impl(tenant, source).await
     }
 }
 

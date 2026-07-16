@@ -25,7 +25,11 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::{connectors, directory_worker, internal, AppState, HandlerResult};
+use crate::{
+    connectors, directory_worker, internal, AppState, HandlerResult, Secret, SecretIntakeAuth,
+};
+use verity_core::adapter::StorageAdapter;
+use verity_core::types::{ConnectorCredentialKind, ConnectorCredentialStatus, StorageError};
 
 // ---------------------------------------------------------------------------
 // Source registry — the six source families Phase 1 lists.
@@ -79,6 +83,192 @@ pub(crate) const SOURCES: [SourceSpec; 6] = [
 /// (→ 404, fail closed — never a fabricated row).
 pub(crate) fn source_spec(source: &str) -> Option<&'static SourceSpec> {
     SOURCES.iter().find(|s| s.source == source)
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2 credential intake — the pure classification / validation / precedence
+// layer. Everything here is a total function over injected values so the
+// honesty rules (tier split, fail-closed empty visibility, env-vs-UI
+// precedence, Google subject requirement) are pinned by hermetic tests below,
+// with zero DB / FS / env access.
+// ---------------------------------------------------------------------------
+
+/// Which credential shape a source takes. `TierC` sources (HubSpot/Salesforce)
+/// paste an encrypted-at-rest bearer + a REQUIRED visibility set; `Google`
+/// sources register a SA-key PATH (+ subject for the impersonating ones).
+/// `folder` is zero-credential and refuses secret intake entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialClass {
+    /// hubspot / salesforce — a pasted bearer, encrypted under the tenant DEK.
+    TierC,
+    /// gdrive / gmail / gdirectory — a SA-key path; gmail/gdirectory also need
+    /// a `subject` (domain-wide-delegation impersonation).
+    Google { subject_required: bool },
+    /// folder — no credential is ever stored (fail closed: secret intake 422s).
+    None,
+}
+
+/// Classify a source for credential intake. `None` for the local watch plane,
+/// and — fail closed — for any unknown source (never a fabricated tier).
+pub(crate) fn credential_class(source: &str) -> CredentialClass {
+    match source {
+        "hubspot" | "salesforce" => CredentialClass::TierC,
+        "gdrive" => CredentialClass::Google {
+            subject_required: false,
+        },
+        "gmail" | "gdirectory" => CredentialClass::Google {
+            subject_required: true,
+        },
+        _ => CredentialClass::None,
+    }
+}
+
+/// The server env var(s) that already supply a credential for this source. If
+/// ANY is set (non-empty) at request time, a UI store REFUSES (409) rather than
+/// silently shadowing/overriding the operator's env-provided credential
+/// (env-vs-UI precedence — never a silent double-source-of-truth). Returned as
+/// a static slice so the handler can name the offending var in the 409.
+pub(crate) fn env_precedence_vars(source: &str) -> &'static [&'static str] {
+    match source {
+        "hubspot" => &["HUBSPOT_SERVICE_KEY", "HUBSPOT_PRIVATE_APP_TOKEN"],
+        "salesforce" => &["SF_CLIENT_ID", "SF_CLIENT_SECRET"],
+        "gdrive" | "gmail" | "gdirectory" => &["GOOGLE_APPLICATION_CREDENTIALS"],
+        _ => &[],
+    }
+}
+
+/// The first env-precedence var that is actually set (non-empty) for this
+/// source, if any. `lookup` is injected so this is testable without touching
+/// process env. `Some(var)` => a UI store must 409 and name `var`.
+pub(crate) fn env_precedence_hit<'a>(
+    source: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<&'a str> {
+    env_precedence_vars(source)
+        .iter()
+        .copied()
+        .find(|var| lookup(var).is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// Validated tier-C intake: a non-empty bearer and a non-empty visibility set.
+/// The token stays inside `Secret` (never copied to a plain String here) and
+/// `expose()` is the single read point the caller hands to the encryptor.
+#[derive(Debug)]
+pub(crate) struct TierCIntake {
+    pub(crate) token: Secret,
+    pub(crate) visibility: Vec<i32>,
+}
+
+/// The tier-C request body: `{ token: Secret, visibility: [int] }`. The token
+/// is a `Secret` so it auto-redacts in Debug/Display and zeroizes on drop; it
+/// is never logged, never echoed. `visibility` is REQUIRED (no `serde(default)`)
+/// — a missing field is a 422 at deserialization, and an empty list is a 422 in
+/// validation (fail closed: memory nobody can read is never a permissive
+/// default at the credential boundary).
+#[derive(Deserialize)]
+pub(crate) struct TierCCredentialBody {
+    pub(crate) token: Secret,
+    pub(crate) visibility: Vec<i32>,
+}
+
+/// Validate a tier-C body: the pasted token must be non-empty (after trim) and
+/// the visibility set must be non-empty. Returns the (422, message) fail-closed
+/// error verbatim so the handler stays a thin wrapper. Never formats the token.
+pub(crate) fn validate_tier_c(body: TierCCredentialBody) -> Result<TierCIntake, String> {
+    if body.token.expose().trim().is_empty() {
+        return Err("token must not be empty".to_string());
+    }
+    if body.visibility.is_empty() {
+        return Err(
+            "visibility must be a non-empty set of principal tokens (fail-closed: an empty \
+             visibility would store a credential no reader can act under)"
+                .to_string(),
+        );
+    }
+    Ok(TierCIntake {
+        token: body.token,
+        visibility: body.visibility,
+    })
+}
+
+/// The Google request body: `{ path: String, subject: Option<String> }`. No
+/// `Secret` — a SA-key PATH is not itself a secret (the key file it names is,
+/// and that never enters the server). `subject` is required for gmail/gdirectory
+/// (domain-wide-delegation impersonation) and ignored for gdrive.
+#[derive(Deserialize)]
+pub(crate) struct GoogleCredentialBody {
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+}
+
+/// A validated Google SA-key path (canonicalized) plus optional subject.
+#[derive(Debug)]
+pub(crate) struct GoogleIntake {
+    /// The canonicalized, usable path string that gets stored.
+    pub(crate) path: String,
+    pub(crate) subject: Option<String>,
+}
+
+/// Validate a Google intake WITHOUT reading the key file's contents. Enforces:
+/// non-empty path; `subject` present + non-empty when `subject_required`;
+/// canonicalize + a coarse usable-or-not check via the injected `canonicalize`
+/// probe (real handler passes `std::fs::canonicalize` composed with an
+/// is-file check) — never an arbitrary-path exists oracle: the only signal
+/// surfaced is "the path you gave is not a readable file", identical for a
+/// missing path and a directory. On success returns the canonical path string.
+pub(crate) fn validate_google(
+    body: GoogleCredentialBody,
+    subject_required: bool,
+    canonicalize: impl Fn(&str) -> Option<String>,
+) -> Result<GoogleIntake, String> {
+    let raw = body.path.trim();
+    if raw.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let subject = match (subject_required, body.subject) {
+        (true, Some(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        (true, _) => {
+            return Err(
+                "subject is required for this source (domain-wide-delegation impersonation \
+                 subject — a Workspace admin address)"
+                    .to_string(),
+            )
+        }
+        (false, s) => s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+    };
+    let Some(canonical) = canonicalize(raw) else {
+        return Err(
+            "path is not a readable service-account key file on the server (contents are \
+             never read — this checks only that the path resolves to a readable file)"
+                .to_string(),
+        );
+    };
+    Ok(GoogleIntake {
+        path: canonical,
+        subject,
+    })
+}
+
+/// The structural (NOT live-auth) SA-JSON check for the Google test probe. Given
+/// the raw file bytes, `Ok(())` iff it parses as JSON with non-empty
+/// `client_email` and `private_key` fields — honestly labeled by the caller as a
+/// structural check, not proof the key authenticates. Never logs the bytes.
+pub(crate) fn structural_sa_json_check(bytes: &[u8]) -> Result<(), String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| "service-account key file is not valid JSON".to_string())?;
+    let has = |k: &str| {
+        json.get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    };
+    if !has("client_email") {
+        return Err("service-account key JSON is missing a non-empty client_email".to_string());
+    }
+    if !has("private_key") {
+        return Err("service-account key JSON is missing a non-empty private_key".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -288,14 +478,38 @@ pub(crate) fn backfill_hint(source: &str) -> &'static str {
     }
 }
 
+/// The `credential` field of a connector row. When a credential is stored for
+/// this (tenant, source) — Phase 2's new state — it reports `"tracked"` with the
+/// non-secret `{ kind, fingerprint }` from `get_connector_credential_status`,
+/// flipping the Phase-1 `"untracked"`. Otherwise it is the Phase-1 truthful
+/// no-stored-credential state from `credential_for` (`not-required` / `unset` /
+/// `path-missing` / `path-configured` / `untracked`). The secret is NEVER here.
+pub(crate) fn credential_field(
+    source: &str,
+    p: &ProbeSnapshot,
+    stored: Option<&ConnectorCredentialStatus>,
+) -> serde_json::Value {
+    match stored {
+        Some(s) => serde_json::json!({
+            "state": "tracked",
+            "kind": s.kind.as_str(),
+            "fingerprint": s.fingerprint,
+            "updated_at": s.updated_at,
+        }),
+        None => serde_json::json!({ "state": credential_for(source, p) }),
+    }
+}
+
 /// Assemble one connector row from the pure pieces. `prereqs_ok` is derived
 /// from the SAME probe rows the response carries, so the summary flag and the
-/// detail list can never disagree.
+/// detail list can never disagree. `stored` flips `credential` from the Phase-1
+/// observed state to the tracked `{ kind, fingerprint }` when Phase 2 holds one.
 pub(crate) fn connector_row(
     spec: &SourceSpec,
     p: &ProbeSnapshot,
     worker: (&str, &str),
     last_heartbeat: Option<DateTime<Utc>>,
+    stored: Option<&ConnectorCredentialStatus>,
 ) -> serde_json::Value {
     let prereqs = prereqs_for(spec.source, p);
     let prereqs_ok = prereqs.iter().all(|q| q["ok"] == true);
@@ -303,7 +517,7 @@ pub(crate) fn connector_row(
         "source": spec.source,
         "label": spec.label,
         "kind": spec.kind,
-        "credential": credential_for(spec.source, p),
+        "credential": credential_field(spec.source, p, stored),
         "worker": { "status": worker.0, "authority": worker.1 },
         "last_heartbeat": last_heartbeat,
         "backfill": { "available": false, "hint": backfill_hint(spec.source) },
@@ -378,6 +592,22 @@ pub(crate) async fn list_connectors(
     let gdirectory_owned =
         gdirectory_owned_for(state.directory.owned_live().await.as_ref(), q.tenant_id);
 
+    // Phase-2 credential state: the non-secret stored status per source, so a
+    // source with a stored credential reports `tracked { kind, fingerprint }`
+    // instead of the Phase-1 `untracked`. One status lookup per source; folder
+    // is zero-credential and never stores one, so it is skipped.
+    let mut stored: HashMap<&'static str, ConnectorCredentialStatus> = HashMap::new();
+    for spec in SOURCES.iter().filter(|s| s.source != "folder") {
+        if let Some(status) = state
+            .storage
+            .get_connector_credential_status(q.tenant_id, spec.source)
+            .await
+            .map_err(internal)?
+        {
+            stored.insert(spec.source, status);
+        }
+    }
+
     let now = Utc::now();
     let connectors_json: Vec<serde_json::Value> = SOURCES
         .iter()
@@ -392,7 +622,7 @@ pub(crate) async fn list_connectors(
                     )
                 }
             };
-            connector_row(spec, &probes, verdict, hb)
+            connector_row(spec, &probes, verdict, hb, stored.get(spec.source))
         })
         .collect();
 
@@ -415,7 +645,6 @@ pub(crate) async fn source_prereqs(
     axum::extract::Query(q): axum::extract::Query<ListParams>,
 ) -> HandlerResult<Json<serde_json::Value>> {
     state.admin.check(&headers)?;
-    let _ = q.tenant_id;
     let Some(spec) = source_spec(&source) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -428,14 +657,404 @@ pub(crate) async fn source_prereqs(
     let probes = ProbeSnapshot::capture(&state);
     let prereqs = prereqs_for(spec.source, &probes);
     let prereqs_ok = prereqs.iter().all(|p| p["ok"] == true);
+    // Phase-2: the stored credential status (never the secret) so this detail
+    // read also flips `untracked` → `tracked { kind, fingerprint }`. folder is
+    // zero-credential and never stores one.
+    let stored = if spec.source == "folder" {
+        None
+    } else {
+        state
+            .storage
+            .get_connector_credential_status(q.tenant_id, spec.source)
+            .await
+            .map_err(internal)?
+    };
     Ok(Json(serde_json::json!({
         "source": spec.source,
         "label": spec.label,
         "kind": spec.kind,
+        "credential": credential_field(spec.source, &probes, stored.as_ref()),
         "prereqs_ok": prereqs_ok,
         "prereqs": prereqs,
         "checked_at": Utc::now().to_rfc3339(),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2 secret-intake handlers — POST credential, POST credential/test,
+// DELETE credential. All three are gated by `SecretIntakeAuth` (Origin/CSRF +
+// bearer with NO dev-open branch): the extractor argument makes the gate
+// compiler-enforced and it runs BEFORE the JSON body is read.
+// ---------------------------------------------------------------------------
+
+/// Map the storage layer's write errors to HTTP. The KEK-unset /
+/// plaintext-provenance DEK hard-refusals surface as `InvalidInput` → 422
+/// (fail closed, honest message); an unknown tenant → 404; a genuine DB fault →
+/// 500. Never leaks a secret (the storage layer never formats one).
+fn credential_status(e: StorageError) -> (StatusCode, String) {
+    match e {
+        StorageError::UnknownTenant(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+        StorageError::Database(_) => internal(e),
+    }
+}
+
+/// Canonicalize + coarse usable check for a Google SA-key path: `Some(canonical)`
+/// iff the path resolves to a readable regular file, else `None`. Deliberately
+/// NOT an arbitrary-path exists oracle — a missing path and a directory both
+/// return `None` with the identical caller-side message; the key file's CONTENTS
+/// are never read here.
+fn canonicalize_readable_file(raw: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(raw).ok()?;
+    let meta = std::fs::metadata(&canonical).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    // Confirm readability without reading contents into a lasting buffer.
+    std::fs::File::open(&canonical).ok()?;
+    Some(canonical.to_string_lossy().into_owned())
+}
+
+/// The one shared HTTP client for the tier-C live test probe (short timeout so a
+/// hung upstream can't wedge the admin surface).
+fn probe_http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client construction cannot fail with these options")
+    })
+}
+
+/// The request body of the credential POST, source-branched at the handler. A
+/// tier-C body deserializes to `TierCCredentialBody` (token is a `Secret`); a
+/// Google body to `GoogleCredentialBody`. We take the raw JSON and dispatch on
+/// the source's class so ONE route serves both shapes.
+///
+/// POST /v1/admin/connectors/{source}/credential — store a credential for one
+/// source. Gated by `SecretIntakeAuth` (401 when `VERITY_ADMIN_TOKEN` unset —
+/// no dev exception — + Origin/CSRF). Returns ONLY `{ fingerprint, kind }`,
+/// never the token. 409 when a server env var already provides this source's
+/// credential (env-vs-UI precedence). 404 for an unknown source; 422 for a
+/// zero-credential source (folder), an empty visibility set, a missing subject,
+/// or a KEK-unset/plaintext-DEK refusal.
+pub(crate) async fn store_credential(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(source): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ListParams>,
+    _auth: SecretIntakeAuth,
+    Json(body): Json<serde_json::Value>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let Some(spec) = source_spec(&source) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown source '{source}' — expected one of gdrive, gmail, gdirectory, \
+                 hubspot, salesforce (folder is zero-credential)"
+            ),
+        ));
+    };
+    // Unknown tenant → clean 404 (UnknownTenant), never a raw foreign-key
+    // violation surfacing as a 500 from the credential INSERT. This mirrors
+    // every other admin write handler.
+    state
+        .storage
+        .inner()
+        .ensure_tenant(q.tenant_id)
+        .await
+        .map_err(credential_status)?;
+    // ENV-VS-UI precedence: refuse (409) if the server already supplies this
+    // source's credential via env — never silently shadow the operator's config.
+    if let Some(var) = env_precedence_hit(spec.source, |k| std::env::var(k).ok()) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{var} already provides the {source} credential on this server — refusing to \
+                 store a UI credential that would shadow it; unset {var} first, or revoke the \
+                 env credential, to manage it here"
+            ),
+        ));
+    }
+
+    let (fingerprint, kind) = match credential_class(spec.source) {
+        CredentialClass::None => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{source} is zero-credential — nothing to store"),
+            ));
+        }
+        CredentialClass::TierC => {
+            let body: TierCCredentialBody = serde_json::from_value(body).map_err(|e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid tier-C credential body: {e}"),
+                )
+            })?;
+            let intake =
+                validate_tier_c(body).map_err(|msg| (StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+            // The visibility set is validated here (fail-closed: empty refused)
+            // as a forward-compat gate, but Phase 2 does NOT persist or enforce
+            // it — the contract wires spawn scoping in Phase 3, which will
+            // collect visibility at spawn time. It is intentionally NOT stored:
+            // there is no visibility column on connector_credentials yet, and
+            // asserting a sharing scope was applied when nothing is persisted
+            // would be a false enforcement claim. The bearer is exposed EXACTLY
+            // once, here, to the encryptor — never logged, never formatted.
+            let _ = &intake.visibility;
+            let fingerprint = state
+                .storage
+                .store_connector_bearer(q.tenant_id, spec.source, intake.token.expose().as_bytes())
+                .await
+                .map_err(credential_status)?;
+            (fingerprint, ConnectorCredentialKind::Bearer)
+        }
+        CredentialClass::Google { subject_required } => {
+            let body: GoogleCredentialBody = serde_json::from_value(body).map_err(|e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid Google credential body: {e}"),
+                )
+            })?;
+            let intake = validate_google(body, subject_required, canonicalize_readable_file)
+                .map_err(|msg| (StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+            let _ = &intake.subject;
+            let fingerprint = state
+                .storage
+                .store_connector_path(q.tenant_id, spec.source, &intake.path)
+                .await
+                .map_err(credential_status)?;
+            (fingerprint, ConnectorCredentialKind::Path)
+        }
+    };
+
+    // Append-only audit: actor = admin surface, source + fingerprint only, NEVER
+    // the secret. Reuses the shared audit-insert path.
+    crate::audit::spawn_credential_audit(
+        &state,
+        q.tenant_id,
+        "credential.create",
+        spec.source,
+        &fingerprint,
+    );
+
+    Ok(Json(serde_json::json!({
+        "fingerprint": fingerprint,
+        "kind": kind.as_str(),
+    })))
+}
+
+/// POST /v1/admin/connectors/{source}/credential/test — probe a source's
+/// credential. Gated by `SecretIntakeAuth`. tier-C: materialize the stored
+/// bearer (or accept a just-typed `token` in the body) and do a LIVE HTTP GET to
+/// HubSpot `/crm/v3/owners`, surfacing 401/403 inline as `{ ok:false, detail }`.
+/// Google: a STRUCTURAL SA-JSON check of the stored/typed path (client_email +
+/// private_key present) — honestly labeled NOT a live-auth test. Never logs the
+/// secret. `{ ok, detail, kind }` where `kind` is `"live"` or `"structural"`.
+pub(crate) async fn test_credential(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(source): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ListParams>,
+    _auth: SecretIntakeAuth,
+    body: Option<Json<serde_json::Value>>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let Some(spec) = source_spec(&source) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown source '{source}' — expected one of gdrive, gmail, gdirectory, \
+                 hubspot, salesforce (folder is zero-credential)"
+            ),
+        ));
+    };
+    let body = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
+
+    match credential_class(spec.source) {
+        CredentialClass::None => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{source} is zero-credential — nothing to test"),
+        )),
+        CredentialClass::TierC => {
+            // The live probe hits ONE vendor's API, so it is only correct for
+            // the source whose token that endpoint accepts. HubSpot is the only
+            // wired live probe; salesforce is fixtures-only, so NEVER transmit a
+            // Salesforce token to HubSpot's servers — return an honest
+            // not-yet-supported response instead (no secret materialized, no
+            // credential-misdirection leak to an unrelated third party).
+            if spec.source != "hubspot" {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "kind": "unsupported",
+                    "detail": "no live credential test is wired for this source yet — the \
+                               connector is fixtures-only, and the token is never sent to \
+                               another vendor's API to probe it",
+                })));
+            }
+            // Prefer a just-typed token (wrapped in Secret so it redacts); else
+            // materialize the stored bearer. Nothing to test if neither exists.
+            let typed: Option<Secret> = body
+                .get("token")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Secret::new(s.to_string()));
+            let token_bytes: Vec<u8> = if let Some(typed) = &typed {
+                typed.expose().as_bytes().to_vec()
+            } else {
+                match state
+                    .storage
+                    .materialize_connector_bearer(q.tenant_id, spec.source)
+                    .await
+                    .map_err(credential_status)?
+                {
+                    Some(b) => b,
+                    None => {
+                        return Ok(Json(serde_json::json!({
+                            "ok": false,
+                            "kind": "live",
+                            "detail": "no stored bearer for this source and none supplied to test",
+                        })))
+                    }
+                }
+            };
+            // The bearer is exposed ONLY as an Authorization header value here.
+            let bearer = String::from_utf8_lossy(&token_bytes).into_owned();
+            let resp = probe_http_client()
+                .get("https://api.hubapi.com/crm/v3/owners")
+                .bearer_auth(&bearer)
+                .send()
+                .await;
+            let out = match resp {
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    let ok = r.status().is_success();
+                    let detail = match code {
+                        401 => "HubSpot rejected the bearer (401 unauthorized)".to_string(),
+                        403 => "HubSpot accepted the bearer but it lacks scope (403 forbidden)"
+                            .to_string(),
+                        c if (200..300).contains(&c) => {
+                            "HubSpot accepted the bearer (owners endpoint reachable)".to_string()
+                        }
+                        c => format!("HubSpot returned HTTP {c}"),
+                    };
+                    serde_json::json!({ "ok": ok, "kind": "live", "status": code, "detail": detail })
+                }
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "kind": "live",
+                    // reqwest's Display never includes the bearer; still, keep it terse.
+                    "detail": format!("could not reach HubSpot: {}", e),
+                }),
+            };
+            Ok(Json(out))
+        }
+        CredentialClass::Google { .. } => {
+            // Resolve the path to check: a just-typed `path` in the body, else
+            // the stored path status. We only have the STATUS (fingerprint), not
+            // the stored path plaintext, so a structural check requires a typed
+            // path OR the server's configured SA key path for gdirectory.
+            let typed_path = body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let path = match typed_path {
+                Some(p) => Some(p),
+                None => {
+                    // Fall back to the server-configured SA key path (the one
+                    // source whose path the server itself holds).
+                    state
+                        .directory
+                        .sa_key
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                }
+            };
+            let Some(path) = path else {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "kind": "structural",
+                    "detail": "no SA-key path supplied to test (pass {\"path\": ...}); the stored \
+                               path plaintext is never echoed back to test against",
+                })));
+            };
+            let Some(canonical) = canonicalize_readable_file(&path) else {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "kind": "structural",
+                    "detail": "path is not a readable file on the server",
+                })));
+            };
+            let bytes = match std::fs::read(&canonical) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Ok(Json(serde_json::json!({
+                        "ok": false,
+                        "kind": "structural",
+                        "detail": "could not read the SA-key file",
+                    })))
+                }
+            };
+            let out = match structural_sa_json_check(&bytes) {
+                Ok(()) => serde_json::json!({
+                    "ok": true,
+                    "kind": "structural",
+                    "detail": "SA-key JSON is structurally valid (client_email + private_key \
+                               present) — this is NOT a live-auth test",
+                }),
+                Err(msg) => {
+                    serde_json::json!({ "ok": false, "kind": "structural", "detail": msg })
+                }
+            };
+            Ok(Json(out))
+        }
+    }
+}
+
+/// DELETE /v1/admin/connectors/{source}/credential — revoke a stored credential.
+/// Gated by `SecretIntakeAuth`. Deletes the (tenant, source) row (credentials are
+/// operator config, not memory — a hard delete does not violate
+/// invalidate-don't-delete). `{ revoked: bool }`; `revoked:false` is the honest
+/// no-op when nothing was stored. Audited (`credential.revoke`) only when a row
+/// was actually removed. 404 for an unknown source.
+pub(crate) async fn revoke_credential(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(source): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ListParams>,
+    _auth: SecretIntakeAuth,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let Some(spec) = source_spec(&source) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown source '{source}' — expected one of gdrive, gmail, gdirectory, \
+                 hubspot, salesforce (folder is zero-credential)"
+            ),
+        ));
+    };
+    // Unknown tenant → clean 404, for parity with the store path (a revoke
+    // against a nonexistent tenant is a 404, not a 500).
+    state
+        .storage
+        .inner()
+        .ensure_tenant(q.tenant_id)
+        .await
+        .map_err(credential_status)?;
+    let revoked = state
+        .storage
+        .revoke_connector_credential(q.tenant_id, spec.source)
+        .await
+        .map_err(credential_status)?;
+    if revoked {
+        crate::audit::spawn_credential_audit(
+            &state,
+            q.tenant_id,
+            "credential.revoke",
+            spec.source,
+            "revoked",
+        );
+    }
+    Ok(Json(serde_json::json!({ "revoked": revoked })))
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +1193,7 @@ mod tests {
         // Rust-native and zero-credential even on a bare server: an empty
         // probe list, so `connector_row` derives prereqs_ok = true.
         assert!(prereqs_for("folder", &bare()).is_empty());
-        let row = connector_row(&SOURCES[0], &bare(), ("off", "server"), None);
+        let row = connector_row(&SOURCES[0], &bare(), ("off", "server"), None, None);
         assert_eq!(row["prereqs_ok"], true);
     }
 
@@ -664,7 +1283,7 @@ mod tests {
     fn row_shape_and_the_honest_backfill_notes() {
         let now = Utc::now();
         for spec in SOURCES.iter() {
-            let row = connector_row(spec, &full(), ("off", "none"), None);
+            let row = connector_row(spec, &full(), ("off", "none"), None, None);
             // The full Phase-1 row contract, per source.
             for key in [
                 "source",
@@ -684,13 +1303,13 @@ mod tests {
             assert!(!row["backfill"]["hint"].as_str().expect("hint").is_empty());
         }
         // Salesforce carries the honest awaiting-test-org note.
-        let sf = connector_row(&SOURCES[5], &full(), ("off", "none"), None);
+        let sf = connector_row(&SOURCES[5], &full(), ("off", "none"), None, None);
         assert!(sf["backfill"]["hint"]
             .as_str()
             .expect("hint")
             .contains("awaiting a Salesforce test org"));
         // Heartbeat round-trips as rfc3339, null when never seen.
-        let hb = connector_row(&SOURCES[4], &full(), ("off", "observed"), Some(now));
+        let hb = connector_row(&SOURCES[4], &full(), ("off", "observed"), Some(now), None);
         assert_eq!(
             serde_json::from_value::<DateTime<Utc>>(hb["last_heartbeat"].clone())
                 .expect("timestamp")
@@ -698,14 +1317,15 @@ mod tests {
             now.timestamp_millis()
         );
         assert!(
-            connector_row(&SOURCES[4], &full(), ("off", "none"), None)["last_heartbeat"].is_null()
+            connector_row(&SOURCES[4], &full(), ("off", "none"), None, None)["last_heartbeat"]
+                .is_null()
         );
     }
 
     #[test]
     fn prereqs_ok_derives_from_the_same_rows_the_response_carries() {
         // gdirectory on a bare server: every probe fails ⇒ prereqs_ok false.
-        let row = connector_row(&SOURCES[3], &bare(), ("off", "none"), None);
+        let row = connector_row(&SOURCES[3], &bare(), ("off", "none"), None, None);
         assert_eq!(row["prereqs_ok"], false);
         assert!(row["prereqs"]
             .as_array()
@@ -713,7 +1333,218 @@ mod tests {
             .iter()
             .all(|q| q["ok"] == false));
         // ...and fully-provisioned: all ok ⇒ prereqs_ok true.
-        let row = connector_row(&SOURCES[3], &full(), ("off", "none"), None);
+        let row = connector_row(&SOURCES[3], &full(), ("off", "none"), None, None);
         assert_eq!(row["prereqs_ok"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase-2 secret-intake: the pure classification / validation / precedence
+    // layer, pinned without any DB / FS / env / HTTP.
+    // -----------------------------------------------------------------------
+
+    /// Deserialize a tier-C body from JSON exactly as the handler does — so the
+    /// REQUIRED-field contract (a missing `visibility` is a deser error, not a
+    /// silent default) is exercised through serde, and the token lands in Secret.
+    fn tier_c_body(json: serde_json::Value) -> Result<TierCCredentialBody, String> {
+        serde_json::from_value(json).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn credential_class_splits_tiers_and_fails_closed_on_unknown() {
+        assert_eq!(credential_class("hubspot"), CredentialClass::TierC);
+        assert_eq!(credential_class("salesforce"), CredentialClass::TierC);
+        assert_eq!(
+            credential_class("gdrive"),
+            CredentialClass::Google {
+                subject_required: false
+            }
+        );
+        for s in ["gmail", "gdirectory"] {
+            assert_eq!(
+                credential_class(s),
+                CredentialClass::Google {
+                    subject_required: true
+                }
+            );
+        }
+        // folder + any unknown source classify as None (no secret intake).
+        assert_eq!(credential_class("folder"), CredentialClass::None);
+        assert_eq!(credential_class("notion"), CredentialClass::None);
+    }
+
+    #[test]
+    fn env_precedence_hit_names_the_offending_var() {
+        // No env → no hit; a UI store is allowed.
+        assert_eq!(env_precedence_hit("hubspot", |_| None), None);
+        // HUBSPOT_SERVICE_KEY set → 409 naming it.
+        assert_eq!(
+            env_precedence_hit("hubspot", |k| (k == "HUBSPOT_SERVICE_KEY")
+                .then(|| "sk".to_string())),
+            Some("HUBSPOT_SERVICE_KEY")
+        );
+        // The legacy token also trips it.
+        assert_eq!(
+            env_precedence_hit("hubspot", |k| (k == "HUBSPOT_PRIVATE_APP_TOKEN")
+                .then(|| "t".to_string())),
+            Some("HUBSPOT_PRIVATE_APP_TOKEN")
+        );
+        // An empty/whitespace env value is NOT a credential — no precedence hit.
+        assert_eq!(
+            env_precedence_hit("hubspot", |k| (k == "HUBSPOT_SERVICE_KEY")
+                .then(|| "   ".to_string())),
+            None
+        );
+        // Google sources are gated by GOOGLE_APPLICATION_CREDENTIALS.
+        for s in ["gdrive", "gmail", "gdirectory"] {
+            assert_eq!(
+                env_precedence_hit(s, |k| (k == "GOOGLE_APPLICATION_CREDENTIALS")
+                    .then(|| "/k.json".to_string())),
+                Some("GOOGLE_APPLICATION_CREDENTIALS")
+            );
+        }
+        // Salesforce OAuth client vars.
+        assert_eq!(
+            env_precedence_hit("salesforce", |k| (k == "SF_CLIENT_ID")
+                .then(|| "id".to_string())),
+            Some("SF_CLIENT_ID")
+        );
+        // folder has no env credential at all.
+        assert_eq!(
+            env_precedence_hit("folder", |_| Some("anything".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn tier_c_visibility_is_required_and_empty_fails_closed() {
+        // Missing visibility entirely → deserialization error (REQUIRED field).
+        assert!(tier_c_body(serde_json::json!({ "token": "sk-abc" })).is_err());
+        // Empty visibility parses but validation refuses it (fail closed).
+        let body = tier_c_body(serde_json::json!({ "token": "sk-abc", "visibility": [] }))
+            .expect("parses");
+        let err = validate_tier_c(body).expect_err("empty visibility must refuse");
+        assert!(err.contains("non-empty"));
+        // Empty token → refused too.
+        let body =
+            tier_c_body(serde_json::json!({ "token": "  ", "visibility": [7] })).expect("parses");
+        assert!(validate_tier_c(body).is_err());
+        // A well-formed body validates, preserving the visibility set; the token
+        // is carried in Secret (redacts when formatted — never the raw value).
+        let body = tier_c_body(serde_json::json!({ "token": "sk-abc", "visibility": [3, 9] }))
+            .expect("parses");
+        let intake = validate_tier_c(body).expect("valid");
+        assert_eq!(intake.visibility, vec![3, 9]);
+        assert_eq!(format!("{}", intake.token), "***");
+        assert_eq!(format!("{:?}", intake.token), "Secret(***)");
+        assert_eq!(intake.token.expose(), "sk-abc");
+    }
+
+    #[test]
+    fn google_subject_required_only_for_gmail_and_directory() {
+        // A canonicalize probe that always reports the path usable, so we test
+        // ONLY the subject/path validation branches (no real FS).
+        let ok_path = |p: &str| Some(format!("/canon{p}"));
+
+        // gdrive: no subject required; a missing subject is fine.
+        let intake = validate_google(
+            GoogleCredentialBody {
+                path: "/k.json".to_string(),
+                subject: None,
+            },
+            false,
+            ok_path,
+        )
+        .expect("gdrive needs no subject");
+        assert_eq!(intake.path, "/canon/k.json");
+        assert_eq!(intake.subject, None);
+
+        // gmail/gdirectory: a missing (or blank) subject is a hard refuse.
+        for subject in [None, Some("   ".to_string())] {
+            let err = validate_google(
+                GoogleCredentialBody {
+                    path: "/k.json".to_string(),
+                    subject,
+                },
+                true,
+                ok_path,
+            )
+            .expect_err("subject required");
+            assert!(err.contains("subject is required"));
+        }
+        // ...and present subject is trimmed and carried.
+        let intake = validate_google(
+            GoogleCredentialBody {
+                path: "/k.json".to_string(),
+                subject: Some("  admin@corp.com ".to_string()),
+            },
+            true,
+            ok_path,
+        )
+        .expect("valid");
+        assert_eq!(intake.subject.as_deref(), Some("admin@corp.com"));
+    }
+
+    #[test]
+    fn google_path_check_is_not_an_arbitrary_exists_oracle() {
+        // Empty path → refused before any FS probe.
+        assert!(validate_google(
+            GoogleCredentialBody {
+                path: "   ".to_string(),
+                subject: None,
+            },
+            false,
+            |_| Some("x".to_string()),
+        )
+        .is_err());
+        // An unusable path (probe returns None) → the identical coarse message,
+        // whether it is missing, a directory, or unreadable — never disclosing
+        // which. The message never claims the KEY is valid.
+        let err = validate_google(
+            GoogleCredentialBody {
+                path: "/nope".to_string(),
+                subject: None,
+            },
+            false,
+            |_| None,
+        )
+        .expect_err("unusable path refused");
+        assert!(err.contains("not a readable"));
+        assert!(err.contains("never read"));
+    }
+
+    #[test]
+    fn structural_sa_json_check_wants_client_email_and_private_key() {
+        let good = br#"{"client_email":"svc@p.iam","private_key":"-----BEGIN-----"}"#;
+        assert!(structural_sa_json_check(good).is_ok());
+        // Not JSON at all.
+        assert!(structural_sa_json_check(b"not json").is_err());
+        // Missing / empty each required field.
+        assert!(structural_sa_json_check(br#"{"private_key":"k"}"#).is_err());
+        assert!(structural_sa_json_check(br#"{"client_email":"e","private_key":""}"#).is_err());
+        assert!(
+            structural_sa_json_check(br#"{"client_email":"","private_key":"k"}"#).is_err(),
+            "empty client_email is not present"
+        );
+    }
+
+    #[test]
+    fn credential_field_flips_untracked_to_tracked_when_stored() {
+        // No stored credential → the Phase-1 observed state under `state`.
+        let f = credential_field("hubspot", &bare(), None);
+        assert_eq!(f["state"], "untracked");
+        // A stored credential → tracked { kind, fingerprint } (never a secret).
+        let status = ConnectorCredentialStatus {
+            kind: ConnectorCredentialKind::Bearer,
+            fingerprint: "abcd1234".to_string(),
+            updated_at: Utc::now(),
+        };
+        let f = credential_field("hubspot", &bare(), Some(&status));
+        assert_eq!(f["state"], "tracked");
+        assert_eq!(f["kind"], "bearer");
+        assert_eq!(f["fingerprint"], "abcd1234");
+        // And it appears in the assembled row, replacing the observed state.
+        let row = connector_row(&SOURCES[4], &bare(), ("off", "none"), None, Some(&status));
+        assert_eq!(row["credential"]["state"], "tracked");
+        assert_eq!(row["credential"]["fingerprint"], "abcd1234");
     }
 }

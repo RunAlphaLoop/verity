@@ -112,6 +112,17 @@ impl Cli {
 pub(crate) struct AdminAuth {
     key: [u8; 32],
     expected_tag: Option<Vec<u8>>,
+    // Read only by `SecretIntakeAuth::from_request_parts` via `check_origin`,
+    // which gates the Phase-2 credential POST/DELETE/test handlers.
+    /// `VERITY_ALLOWED_ORIGIN` — the one browser origin (scheme://host[:port])
+    /// permitted to POST a secret to the secret-intake surface. Phase 2 CSRF
+    /// defense: a cross-site form can set neither this `Origin` nor a bearer it
+    /// cannot read, so a request whose `Origin` is present and ≠ this value is
+    /// refused (`SecretIntakeAuth`). `None` = no browser origin is allowed; only
+    /// server-to-server callers (no `Origin` header at all) may reach the
+    /// surface, still under bearer auth. Never consulted by `check`/`require`;
+    /// origin enforcement lives only on `SecretIntakeAuth`.
+    allowed_origin: Option<String>,
 }
 
 impl AdminAuth {
@@ -126,7 +137,31 @@ impl AdminAuth {
                 None
             }
         };
-        Self { key, expected_tag }
+        let allowed_origin = std::env::var("VERITY_ALLOWED_ORIGIN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        Self {
+            key,
+            expected_tag,
+            allowed_origin,
+        }
+    }
+
+    /// Hermetic constructor for tests: build an `AdminAuth` with an explicit
+    /// token (or `None` for the dev-open / no-token state) and an explicit
+    /// allowed origin, without touching process env.
+    #[cfg(test)]
+    fn for_test(token: Option<&str>, allowed_origin: Option<&str>) -> Self {
+        let mut key = [0u8; 32];
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(&mut key);
+        let expected_tag = token.map(|t| Self::tag(&key, t.trim()));
+        Self {
+            key,
+            expected_tag,
+            allowed_origin: allowed_origin.map(|s| s.to_string()),
+        }
     }
 
     fn tag(key: &[u8; 32], token: &str) -> Vec<u8> {
@@ -140,6 +175,31 @@ impl AdminAuth {
         let Some(expected) = &self.expected_tag else {
             return Ok(()); // dev mode
         };
+        self.verify_bearer(headers, expected)
+    }
+
+    /// Like `check`, but with NO dev-open branch: when `VERITY_ADMIN_TOKEN` is
+    /// unset/empty (`expected_tag` is `None`) this returns 401 instead of
+    /// `Ok(())`. Backs `SecretIntakeAuth` — the secret-intake surface must never
+    /// be reachable unauthenticated, unlike every other admin surface which is
+    /// dev-open via `check`. The constant-time HMAC path is shared with `check`
+    /// (`verify_bearer`); only the missing-token disposition differs.
+    // Consumed by `SecretIntakeAuth`, which gates the Phase-2 credential handlers.
+    pub(crate) fn require(&self, headers: &HeaderMap) -> HandlerResult<()> {
+        let Some(expected) = &self.expected_tag else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "secret intake requires VERITY_ADMIN_TOKEN (no dev-open path)".to_string(),
+            ));
+        };
+        self.verify_bearer(headers, expected)
+    }
+
+    /// Constant-time bearer verification shared by `check`/`require`. Reads the
+    /// bearer ONLY from `Authorization: Bearer <token>`, never a cookie (a
+    /// cookie would let a cross-site form ride the browser's ambient
+    /// credential — the exact CSRF vector `SecretIntakeAuth` also guards).
+    fn verify_bearer(&self, headers: &HeaderMap, expected: &[u8]) -> HandlerResult<()> {
         let provided = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -156,6 +216,128 @@ impl AdminAuth {
         mac.verify_slice(expected)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid admin token".to_string()))
     }
+
+    /// CSRF/same-origin gate for `SecretIntakeAuth`. A browser attaches an
+    /// `Origin` header it cannot forge cross-site; a server-to-server client
+    /// sends none. Rules (fail-closed):
+    ///   - `Origin` present and == `VERITY_ALLOWED_ORIGIN`  → allow.
+    ///   - `Origin` present and no `VERITY_ALLOWED_ORIGIN` configured → 403
+    ///     (a browser request with no allowlist is refused, never defaulted).
+    ///   - `Origin` present and != the configured value → 403.
+    ///   - `Origin` absent (non-browser caller) → allow; bearer already gates.
+    ///
+    /// A valid bearer alone is therefore insufficient for a cross-site browser
+    /// POST — the `Origin` must also match.
+    // Consumed by `SecretIntakeAuth`, which gates the Phase-2 credential handlers.
+    fn check_origin(&self, headers: &HeaderMap) -> HandlerResult<()> {
+        let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+            return Ok(()); // no Origin → server-to-server; bearer suffices.
+        };
+        match &self.allowed_origin {
+            Some(allowed) if origin == allowed => Ok(()),
+            _ => Err((
+                StatusCode::FORBIDDEN,
+                "cross-origin secret intake refused (set VERITY_ALLOWED_ORIGIN to the console origin)".to_string(),
+            )),
+        }
+    }
+}
+
+/// A distinct axum extractor for the secret-intake surface (Phase-2 §AUTH +
+/// §CSRF). Unlike `AdminAuth::check`, it has NO dev-open branch: an unset
+/// `VERITY_ADMIN_TOKEN` yields 401, so the compiler-applied `SecretIntakeAuth`
+/// argument can never reuse the dev-open admin path. It also enforces a
+/// same-origin/`Origin` check so a valid bearer alone is insufficient against a
+/// cross-site browser POST. Handlers opt in by taking a `_auth: SecretIntakeAuth`
+/// argument; because `FromRequestParts` runs before any body extractor, place it
+/// BEFORE any `Json<…>` argument.
+// Wired to the Phase-2 credential POST/DELETE/test handlers
+// (connectors_admin.rs) — the extractor argument makes the gate
+// compiler-enforced and runs before any body extractor.
+pub(crate) struct SecretIntakeAuth;
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for SecretIntakeAuth {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        // Order: origin first (cheap, no bearer oracle), then bearer with NO
+        // dev-open branch. Both must pass.
+        state.admin.check_origin(&parts.headers)?;
+        state.admin.require(&parts.headers)?;
+        Ok(SecretIntakeAuth)
+    }
+}
+
+/// A redacting, zeroize-on-drop wrapper for a pasted secret in memory. `Debug`
+/// and `Display` print `***` so a secret can never leak through a log line or a
+/// formatted error; the inner bytes are wiped on drop so freed memory does not
+/// retain key material. Use it for ANY pasted secret from the moment of intake
+/// (contrast `SlackConnector`, which derived `Debug` over a bare `String`
+/// token — the failure mode this type exists to prevent).
+// Wraps the pasted bearer at the Phase-2 credential intake handler
+// (connectors_admin.rs); deserialize + format-redaction + zeroize are proven by
+// unit tests. `expose()` is handed to the encryptor / test-probe ONLY.
+pub(crate) struct Secret(zeroize::Zeroizing<String>);
+
+impl Secret {
+    pub(crate) fn new(raw: String) -> Self {
+        Secret(zeroize::Zeroizing::new(raw))
+    }
+
+    /// The plaintext, for the single choke point that encrypts/probes it. Never
+    /// log or format the return value — only `Secret` itself is safe to format.
+    pub(crate) fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Secret {
+    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialize into the Zeroizing<String> directly so the intermediate
+        // never sits in a plain String that outlives this call unwiped.
+        Ok(Secret(zeroize::Zeroizing::new(String::deserialize(de)?)))
+    }
+}
+
+/// Bind-time gate decision (Phase-2 §TRANSPORT, D1). Given the parsed `--listen`
+/// address and whether the two required env vars are set, decide whether the
+/// server may bind. Loopback (127.0.0.0/8, ::1) binds unconditionally. A
+/// non-loopback bind (including the unspecified `0.0.0.0`/`::`, which exposes
+/// every interface and is NOT loopback) REFUSES unless BOTH `VERITY_ADMIN_TOKEN`
+/// and `VERITY_KEK` are set. Pure + hermetic so it can be unit-tested without a
+/// socket or process env.
+fn bind_gate_decision(
+    addr: std::net::SocketAddr,
+    admin_set: bool,
+    kek_set: bool,
+) -> std::result::Result<(), String> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    if admin_set && kek_set {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind non-loopback address {addr}: set VERITY_ADMIN_TOKEN and VERITY_KEK (or bind a loopback address)"
+    ))
 }
 
 pub(crate) struct AppState {
@@ -1071,6 +1253,39 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
+    // Bind-time gate (Phase-2 §TRANSPORT, D1): a non-loopback bind exposes the
+    // whole surface, so it REFUSES TO START unless both VERITY_ADMIN_TOKEN and
+    // VERITY_KEK are set. Loopback (the default 127.0.0.1:7717) is unaffected.
+    // Fail-closed on a --listen that is not a literal host:port SocketAddr
+    // (e.g. `localhost:7717`): treat it as non-loopback and require the secrets
+    // rather than binding it unguarded. Reuses the anyhow::bail! "refusing to
+    // start" idiom (crypto.rs / VERITY_SPICEDB_WATCH gate).
+    {
+        let admin_set = std::env::var("VERITY_ADMIN_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let kek_set = std::env::var("VERITY_KEK")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        match cli.listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                if let Err(msg) = bind_gate_decision(addr, admin_set, kek_set) {
+                    anyhow::bail!("{msg}");
+                }
+            }
+            Err(_) => {
+                // Unparseable as a literal SocketAddr (hostname form). Fail
+                // closed: require the secrets unless we can prove loopback.
+                if !(admin_set && kek_set) {
+                    anyhow::bail!(
+                        "refusing to bind {:?}: not a literal loopback host:port and VERITY_ADMIN_TOKEN + VERITY_KEK are not both set (use 127.0.0.1:<port> for an unguarded dev bind)",
+                        cli.listen
+                    );
+                }
+            }
+        }
+    }
+
     let pg = PostgresAdapter::connect(&cli.dsn).await?;
     let applied = pg.migrate().await?;
     if applied > 0 {
@@ -1218,6 +1433,20 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connectors/{source}/prereqs",
             get(connectors_admin::source_prereqs),
+        )
+        // Connect-a-source Phase 2 secret-intake plane (connectors_admin.rs):
+        // store / test / revoke a per-source credential. All three are gated by
+        // `SecretIntakeAuth` (Origin/CSRF + bearer with NO dev-open branch), so
+        // an unset VERITY_ADMIN_TOKEN hard-refuses (401) here even though the
+        // Phase-1 GETs above are dev-open. The token is never logged, never
+        // echoed — a successful store returns only { fingerprint, kind }.
+        .route(
+            "/v1/admin/connectors/{source}/credential",
+            post(connectors_admin::store_credential).delete(connectors_admin::revoke_credential),
+        )
+        .route(
+            "/v1/admin/connectors/{source}/credential/test",
+            post(connectors_admin::test_credential),
         )
         .route(
             "/v1/admin/folders",
@@ -2532,6 +2761,174 @@ mod ingest_visibility_param_tests {
         // Fail closed: never silently drop a malformed token and bind a
         // narrower-than-intended policy.
         assert!(visibility_of(Some("1,notatoken,3")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod secret_intake_auth_tests {
+    //! Hermetic locks for the Phase-2 secret-intake auth + CSRF gate, the
+    //! `Secret` redacting newtype, and the bind-time transport gate. All pure —
+    //! no socket, no DB, no process env — so they run in CI without fixtures.
+    use super::{bind_gate_decision, AdminAuth, Secret};
+    use axum::http::{header, HeaderMap, StatusCode};
+
+    fn headers(pairs: &[(axum::http::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(k.clone(), v.parse().unwrap());
+        }
+        h
+    }
+
+    // --- SecretIntakeAuth: no dev-open branch (require) --------------------
+
+    #[test]
+    fn require_refuses_when_no_admin_token_configured() {
+        // The whole point of SecretIntakeAuth: an unset VERITY_ADMIN_TOKEN must
+        // 401, NOT dev-open like AdminAuth::check.
+        let auth = AdminAuth::for_test(None, None);
+        let err = auth
+            .require(&headers(&[(header::AUTHORIZATION, "Bearer whatever")]))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn check_is_dev_open_but_require_is_not_for_the_same_state() {
+        // Same no-token AdminAuth: check() passes (dev mode), require() refuses.
+        let auth = AdminAuth::for_test(None, None);
+        let h = headers(&[]);
+        assert!(auth.check(&h).is_ok());
+        assert!(auth.require(&h).is_err());
+    }
+
+    #[test]
+    fn require_rejects_missing_bearer() {
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        let err = auth.require(&headers(&[])).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_rejects_wrong_bearer() {
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        let err = auth
+            .require(&headers(&[(header::AUTHORIZATION, "Bearer wrong")]))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_accepts_correct_bearer() {
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        assert!(auth
+            .require(&headers(&[(header::AUTHORIZATION, "Bearer s3cret")]))
+            .is_ok());
+    }
+
+    #[test]
+    fn require_never_reads_bearer_from_cookie() {
+        // A cookie-borne token is the CSRF vector; only Authorization counts.
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        let err = auth
+            .require(&headers(&[(header::COOKIE, "Authorization=Bearer s3cret")]))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // --- SecretIntakeAuth: Origin / same-origin CSRF gate ------------------
+
+    #[test]
+    fn origin_absent_is_allowed_server_to_server() {
+        let auth = AdminAuth::for_test(Some("s3cret"), Some("https://console.example"));
+        assert!(auth.check_origin(&headers(&[])).is_ok());
+    }
+
+    #[test]
+    fn origin_matching_allowlist_is_allowed() {
+        let auth = AdminAuth::for_test(Some("s3cret"), Some("https://console.example"));
+        assert!(auth
+            .check_origin(&headers(&[(header::ORIGIN, "https://console.example")]))
+            .is_ok());
+    }
+
+    #[test]
+    fn cross_origin_is_refused_even_with_valid_bearer() {
+        // A valid bearer alone is insufficient: a mismatched Origin still 403s.
+        let auth = AdminAuth::for_test(Some("s3cret"), Some("https://console.example"));
+        let err = auth
+            .check_origin(&headers(&[(header::ORIGIN, "https://evil.example")]))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn browser_origin_with_no_allowlist_is_refused() {
+        // Fail closed: a browser Origin with no VERITY_ALLOWED_ORIGIN configured
+        // is refused, never defaulted-permissive.
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        let err = auth
+            .check_origin(&headers(&[(header::ORIGIN, "https://console.example")]))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    // --- Secret redacting newtype -----------------------------------------
+
+    #[test]
+    fn secret_debug_and_display_are_redacted() {
+        let s = Secret::new("hush-abcd1234".to_string());
+        assert_eq!(format!("{s}"), "***");
+        assert_eq!(format!("{s:?}"), "Secret(***)");
+        assert!(!format!("{s} {s:?}").contains("abcd1234"));
+    }
+
+    #[test]
+    fn secret_exposes_plaintext_for_the_crypto_choke_point() {
+        let s = Secret::new("hush-abcd1234".to_string());
+        assert_eq!(s.expose(), "hush-abcd1234");
+    }
+
+    #[test]
+    fn secret_deserializes_from_a_json_string() {
+        let s: Secret = serde_json::from_value(serde_json::json!("tok-xyz")).unwrap();
+        assert_eq!(s.expose(), "tok-xyz");
+        // And even after deserialize it stays redacted when formatted.
+        assert_eq!(format!("{s:?}"), "Secret(***)");
+    }
+
+    // --- Bind-time gate decision ------------------------------------------
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_binds_without_any_env() {
+        assert!(bind_gate_decision(sa("127.0.0.1:7717"), false, false).is_ok());
+        assert!(bind_gate_decision(sa("[::1]:7717"), false, false).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_missing_env_refuses() {
+        let err = bind_gate_decision(sa("10.0.0.5:7717"), false, false).unwrap_err();
+        assert!(err.contains("refusing to bind"));
+        // Either one missing is still a refusal.
+        assert!(bind_gate_decision(sa("10.0.0.5:7717"), true, false).is_err());
+        assert!(bind_gate_decision(sa("10.0.0.5:7717"), false, true).is_err());
+    }
+
+    #[test]
+    fn non_loopback_with_both_env_binds() {
+        assert!(bind_gate_decision(sa("10.0.0.5:7717"), true, true).is_ok());
+    }
+
+    #[test]
+    fn unspecified_address_is_treated_as_non_loopback() {
+        // 0.0.0.0 / :: expose every interface and are NOT loopback → gated.
+        assert!(bind_gate_decision(sa("0.0.0.0:7717"), false, false).is_err());
+        assert!(bind_gate_decision(sa("[::]:7717"), false, false).is_err());
+        assert!(bind_gate_decision(sa("0.0.0.0:7717"), true, true).is_ok());
     }
 }
 

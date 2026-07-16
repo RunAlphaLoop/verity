@@ -63,6 +63,7 @@ fn dev_admin() -> AdminAuth {
     AdminAuth {
         key: [0u8; 32],
         expected_tag: None, // dev mode: admin surfaces open
+        allowed_origin: None,
     }
 }
 
@@ -109,6 +110,7 @@ async fn tenant_by_id_is_admin_gated() {
     let key = [9u8; 32];
     let admin = AdminAuth {
         expected_tag: Some(AdminAuth::tag(&key, "sekrit")),
+        allowed_origin: None,
         key,
     };
     let Some(state) = test_state(admin).await else {
@@ -214,6 +216,7 @@ async fn tenant_directory_is_admin_gated() {
     let key = [7u8; 32];
     let admin = AdminAuth {
         expected_tag: Some(AdminAuth::tag(&key, "sekrit")),
+        allowed_origin: None,
         key,
     };
     let Some(state) = test_state(admin).await else {

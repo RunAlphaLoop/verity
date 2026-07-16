@@ -593,6 +593,12 @@ Verity is bi-temporal: *valid time* (`valid_from`/`valid_to`, when a value was t
 
 This is the one deliberate divergence from strict append-only, and it is the same reasoning the revocation-tombstone path already uses: corrections-take-effect-immediately for a fail-closed system.
 
+### 5e.6c Secret-intake auth is fail-closed, no dev-mode exception (Phase 2)
+
+**Rule (SECRET-INTAKE fails closed on authentication).** Every admin surface in the OSS core is dev-open — unset `VERITY_ADMIN_TOKEN` warns and passes — but the connector-credential write endpoint is the one exception that is **never** dev-open: with `VERITY_ADMIN_TOKEN` unset or empty it returns **401**, refusing rather than warn-and-pass, so a pasted tier-C bearer or SA-key path can never land under an unauthenticated request. This is enforced by a **distinct** guard (`SecretIntakeAuth`, a real extractor with no `Ok(())` dev branch) that shares the constant-time HMAC path but can never reach `AdminAuth`'s dev-open early-return; the compiler applies it wherever a secret is written. The same request also requires a passing **Origin / same-origin (CSRF) check** — a valid bearer alone is insufficient, a browser-origin that fails the allowlist is refused (403), and the bearer is never accepted via cookie. This rule scopes to **authentication only**: wire confidentiality is the reverse-proxy TLS plus the bind-time transport gate below, and at-rest protection is env-KEK (`VERITY_KEK`) envelope encryption inside `verity-storage` — not this guard. **Out of scope here:** per-subject crypto-shredding is the §8 pipeline, not a secret-intake concern. *(Full secret-write contract — encrypt-at-rest under the per-tenant DEK, KEK-unset hard-refuse, redaction/no-oracle, env-vs-UI precedence, honest test-probe — lives with the Phase-2 connector-credential store; this subsection anchors only its authentication invariant.)*
+
+A **non-loopback bind refuses to start** without both `VERITY_ADMIN_TOKEN` and `VERITY_KEK`: if `--listen` resolves to anything but a loopback address the server bails at boot (reusing the existing "refusing to start" idiom), so exposing the surface off localhost cannot happen without an admin token and a KEK present. Loopback stays the default.
+
 ---
 
 ### 5e.7 Build order and honest costs

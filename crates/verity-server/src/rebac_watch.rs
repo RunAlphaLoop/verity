@@ -733,6 +733,7 @@ mod tests {
             admin: crate::AdminAuth {
                 key: [0u8; 32],
                 expected_tag: None,
+                allowed_origin: None,
             },
             rebac: Some(rebac),
             revocations: crate::revocation::RevocationPlane::new(300),

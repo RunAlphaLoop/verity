@@ -15,13 +15,21 @@
      failure never blanks the screen. GET /v1/admin/principals feeds the
      who-can-see picker in the connect dialog (names, not bare ints).
 
-   Connect section (Phase 1): ZERO secret-handling and ZERO backfill
-   triggering — no credential inputs, no new POSTs. The one live action is
-   the zero-credential local-folder watch (the existing POST /v1/admin/folders
-   dialog, promoted as the fastest start). Every per-source action cell is
-   keyed off the server's own prereqs / backfill.hint: an unwired flow shows
-   the server's honest phase note verbatim, never a button that would 404,
-   and CRM credential state is reported "untracked" — never guessed.
+   Connect section (Phase 2): the zero-credential local-folder watch stays the
+   fastest start, and each eligible source row now carries an "Add / rotate
+   credential" control (POST /v1/admin/connectors/{source}/credential, gated by
+   SecretIntakeAuth — bearer via Authorization header + same-origin Origin/CSRF,
+   NEVER a cookie, 401 with no dev-open branch when VERITY_ADMIN_TOKEN is unset).
+   The dialog is source-branched: tier-C (HubSpot/Salesforce) takes a masked
+   bearer + the MANDATORY visibility picker (empty refused client-side AND by
+   the server) + a live Test (HubSpot /crm/v3/owners); Google (Drive/Gmail/
+   Directory) takes an SA-key PATH + subject (required gmail/gdirectory) + a
+   STRUCTURAL SA-JSON Test (honestly labeled not-a-live-auth-test). The pasted
+   token is NEVER echoed, NEVER kept in the DOM/JS after the request resolves,
+   and the response echoes ONLY the salted-HMAC fingerprint. Backfill triggering
+   is still Phase 3 — the per-source hint stays honest, never a button that 404s.
+   The connectors row credential field flips from the Phase-1 observed state to
+   tracked { kind, fingerprint } once a credential is stored.
 
    Fail-closed gates kept: empty visibility on mint → the server's own 422
    refusal, surfaced verbatim (no client-side permissive default); the raw
@@ -67,6 +75,12 @@
   // in the console — a webhook's entity limit binds standing infrastructure
   // that cannot be listed or edited afterward; only revoked and re-minted.
   var mintEntPicker = null;
+  // Phase-2 credential dialog: the source being credentialed this open, its
+  // credential class ("tierc" | "google"), whether a credential is already
+  // stored (=> the flow is a rotate, not a first add), and the who-can-see
+  // picker for tier-C (rebuilt each open so a stale tenant never lingers).
+  var pendingCred = null; // { source, label, kind, cls, subjectRequired, rotate }
+  var credViewersPicker = null;
 
   function el(id) { return V.$(id); }
 
@@ -281,7 +295,8 @@ acl_policy:
           '<h2>Connect a source <span class="sub api-crumb">GET /v1/admin/connectors</span></h2>' +
           '<div class="note" style="margin-top:0"><b>Every source family Verity can ingest from, with exactly what this server can truthfully see about each.</b> ' +
             "Prerequisite checks are probed, never guessed; a worker chip is <b>server-authoritative</b> only when this server owns the process, otherwise it is <b>observed</b> from heartbeats. " +
-            "The console handles no secrets in this phase &mdash; credentials stay outside it: in the connector CLI&rsquo;s environment for Drive/Gmail/CRM, and (for directory sync only) as a key-file path in the <b>server&rsquo;s</b> environment &mdash; either way this console never reads or stores one. Backfills aren&rsquo;t triggered from here yet. " +
+            "You can now <b>add or rotate a credential</b> per source: CRM bearers are <b>encrypted at rest</b> under this space&rsquo;s key and the console keeps only a fingerprint &mdash; never the token; Google connectors store only the <b>path</b> to a service-account key file, never its contents. " +
+            "Secret entry needs an admin token (it is refused unauthenticated); backfills still aren&rsquo;t triggered from here yet. " +
             "The one zero-credential path is the local folder above.</div>" +
           '<div id="src-connect"></div>' +
         "</div>" +
@@ -446,6 +461,54 @@ acl_policy:
           "</div>" +
         "</div></div>" +
 
+        /* ---- add / rotate a credential (Phase 2, source-branched) ---- */
+        '<div class="dialog-backdrop" id="src-cred-dialog"><div class="dialog" style="max-width:640px">' +
+          '<h3 id="src-cred-title">Add a credential</h3>' +
+          '<div id="src-cred-summary"></div>' +
+          // DEV teaching banner: shown only after a 401 proves the secret-write
+          // surface is unauthenticated on this deployment (VERITY_ADMIN_TOKEN unset).
+          '<div class="note" id="src-cred-dev" style="display:none;margin-top:10px"></div>' +
+
+          /* ---- tier-C branch: HubSpot / Salesforce ---- */
+          '<div id="src-cred-tierc" style="display:none">' +
+            '<div class="note" style="margin-top:0">Paste the API bearer token for this CRM. ' +
+              "It is <b>encrypted at rest</b> under this space&rsquo;s key the moment it is stored &mdash; the server keeps only a <b>fingerprint</b>, " +
+              "never the token, and this console clears it from the page as soon as the request resolves. " +
+              "You must also choose <b>who can see</b> the records this credential ingests: there is no default &mdash; an empty pick is refused here and by the server.</div>" +
+            '<div style="margin-top:12px"><label for="src-cred-token">API token <span style="font-weight:400">— masked; never echoed back, never kept after Save</span></label>' +
+              '<input type="password" id="src-cred-token" placeholder="paste the bearer token" autocomplete="off" spellcheck="false"></div>' +
+            '<div style="margin-top:10px"><label>who can see what this credential ingests <span style="font-weight:400">— pick the keys; there is no default</span></label>' +
+              '<div id="src-cred-viewers" style="margin-top:6px"></div>' +
+              '<div class="note" style="margin-top:6px">These are the keys the records this credential ingests will be shared with once ingestion runs. ' +
+                "It is required and checked now (an empty pick is refused, here and by the server), but connector ingestion isn&rsquo;t wired to it yet &mdash; that lands in a later phase, so nothing is ingested under it today. " +
+                'Leave it empty and the store is refused, the same fail-closed rule every other write follows.<span class="api-crumb"> (GET /v1/admin/principals)</span></div>' +
+            "</div>" +
+          "</div>" +
+
+          /* ---- Google branch: Drive / Gmail / Directory ---- */
+          '<div id="src-cred-google" style="display:none">' +
+            '<div class="note" style="margin-top:0">Google connectors authenticate with a <b>service-account key file</b>. ' +
+              "This console stores only the <b>path</b> to that file on the machine the connector runs on &mdash; never the key contents. " +
+              "The path is checked structurally (is it a readable SA-JSON with a client_email and private_key); that is <b>not a live auth test</b>.</div>" +
+            '<div style="margin-top:12px"><label for="src-cred-path">service-account key path <span style="font-weight:400">— an absolute path the connector can read</span></label>' +
+              '<input type="text" id="src-cred-path" placeholder="/etc/verity/sa-key.json" autocomplete="off" spellcheck="false"></div>' +
+            '<div id="src-cred-subject-wrap" style="margin-top:10px;display:none"><label for="src-cred-subject">impersonation subject <span style="font-weight:400">— a Workspace admin address for domain-wide delegation</span></label>' +
+              '<input type="text" id="src-cred-subject" placeholder="admin@corp.example" autocomplete="off" spellcheck="false">' +
+              '<div class="note" style="margin-top:6px">Gmail and the directory read as a specific user &mdash; this subject is who. Required for these two; the server refuses without it.</div>' +
+            "</div>" +
+          "</div>" +
+
+          '<div class="err" id="src-cred-err"></div>' +
+          '<div id="src-cred-test-result"></div>' +
+          '<div id="src-cred-result"></div>' +
+          '<div class="actions">' +
+            '<button id="src-cred-cancel">Close</button>' +
+            '<button class="danger" id="src-cred-revoke" style="display:none">Remove credential</button>' +
+            '<button id="src-cred-test">Test credential</button>' +
+            '<button class="primary" id="src-cred-go">Save</button>' +
+          "</div>" +
+        "</div></div>" +
+
         /* ---- activate manifest (THE human gate) ---- */
         '<div class="dialog-backdrop" id="src-activate-dialog"><div class="dialog" style="max-width:600px">' +
           '<h3 id="src-activate-title">Approve &amp; activate</h3>' +
@@ -489,6 +552,11 @@ acl_policy:
       el("src-folder-stop-cancel").onclick = function () { V.dialog("src-folder-stop-dialog").close(); };
       el("src-folder-stop-go").onclick = stopFolder;
       el("src-folder-stop-word").oninput = reflectFolderStopTyped;
+
+      el("src-cred-cancel").onclick = closeCredDialog;
+      el("src-cred-test").onclick = testCredential;
+      el("src-cred-go").onclick = saveCredential;
+      el("src-cred-revoke").onclick = revokeCredential;
 
       el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
       el("src-activate-go").onclick = activateManifest;
@@ -579,7 +647,7 @@ acl_policy:
     // Connect readiness: only a configured-then-broken credential path counts
     // (the one attn chip that table renders); a never-configured source is a
     // setup state, not an incident.
-    var credBroken = data.connectors.filter(function (c) { return c.credential === "path-missing"; }).length;
+    var credBroken = data.connectors.filter(function (c) { return credState(c).state === "path-missing"; }).length;
     return drafts + failed + folderProblems + credBroken;
   }
 
@@ -804,13 +872,42 @@ acl_policy:
   // server never reads credential contents, so no chip here ever claims
   // "valid" — and CRM/Drive/Gmail credentials live in the connector CLI's
   // env, invisible to the server: reported "untracked", never guessed.
+  // Normalize the credential field across Phase-1 (a bare string) and Phase-2
+  // (an object: {state:"tracked",kind,fingerprint,updated_at} when a credential
+  // is stored, else {state:<phase-1 word>}). Returns {state, kind, fingerprint,
+  // updated_at} so every reader speaks one shape.
+  function credState(c) {
+    var cr = c.credential;
+    if (cr && typeof cr === "object") {
+      return {
+        state: String(cr.state || ""),
+        kind: cr.kind || null,
+        fingerprint: cr.fingerprint || null,
+        updated_at: cr.updated_at || null,
+      };
+    }
+    return { state: String(cr || ""), kind: null, fingerprint: null, updated_at: null };
+  }
+
   function connCredCell(c) {
-    var v = String(c.credential || "");
+    var cs = credState(c);
+    var v = cs.state;
     var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+    if (v === "tracked") {
+      // A credential is stored: show its kind + the salted-HMAC fingerprint —
+      // NEVER a raw last-4 and never the secret. The token itself is unknowable
+      // here (the server never returns it), so no chip claims "valid".
+      return V.stateChip("ok", "stored") +
+        '<div class="ref" style="word-break:normal;overflow-wrap:break-word">' +
+          (cs.kind === "path" ? "SA-key path" : "bearer") +
+          (cs.fingerprint ? " · " + V.esc(cs.fingerprint) : "") +
+          (cs.updated_at ? " · " + V.esc(V.fmtTime(cs.updated_at)) : "") +
+        "</div>";
+    }
     if (v === "not-required") return V.stateChip("ok", "none needed");
     if (v === "untracked") {
-      return V.stateChip("off", "untracked") +
-        "<div>" + proseRef + "lives in the connector CLI&rsquo;s env &mdash; this server can&rsquo;t see it</span></div>";
+      return V.stateChip("off", "none stored") +
+        "<div>" + proseRef + "no credential stored here yet &mdash; add one with the button, or leave it in the connector CLI&rsquo;s env</span></div>";
     }
     if (v === "path-configured") {
       return V.stateChip("ok", "key path present") +
@@ -843,20 +940,36 @@ acl_policy:
   // the zero-credential folder watch (the existing dialog). Everything else
   // renders the server's own words — a failing prereq's fix hint verbatim,
   // or the honest Phase-1 backfill note — never a button that would 404.
+  // Which sources take a UI-entered credential (Phase 2). folder is
+  // zero-credential; everything else in the registry does. Mirrors the server's
+  // credential_class (folder => None, the rest => TierC/Google).
+  function credEligible(source) { return source !== "folder"; }
+
   function connActionCell(c) {
     var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
     if (c.source === "folder") {
       return '<button class="primary src-conn-folder" title="POST /v1/admin/folders — the same watch-a-folder dialog as the card above">Watch a folder&hellip;</button>';
     }
+    var parts = [];
     var failing = (c.prereqs || []).filter(function (q) { return !q.ok; });
     if (failing.length) {
-      return failing.map(function (q) {
+      parts.push(failing.map(function (q) {
         return V.badge("missing: " + String(q.name || ""), "b-conf-3") +
           "<br>" + proseRef + V.esc(String(q.hint || "")) + "</span>";
-      }).join("<br>");
+      }).join("<br>"));
+    } else {
+      var hint = c.backfill && c.backfill.hint;
+      if (hint) parts.push(proseRef + V.esc(hint) + "</span>");
     }
-    var hint = c.backfill && c.backfill.hint;
-    return hint ? proseRef + V.esc(hint) + "</span>" : '<span class="ref">—</span>';
+    // Phase-2 credential control: add if none stored, rotate if one is. Rows
+    // carry the source in data-src so the handler re-reads the fresh row.
+    if (credEligible(c.source)) {
+      var rotate = credState(c).state === "tracked";
+      parts.push('<button class="src-conn-cred" data-src="' + V.esc(c.source) + '" ' +
+        'title="POST /v1/admin/connectors/' + V.esc(c.source) + '/credential — encrypted at rest; the server keeps only a fingerprint">' +
+        (rotate ? "Rotate credential&hellip;" : "Add credential&hellip;") + "</button>");
+    }
+    return parts.length ? parts.join("<br>") : '<span class="ref">—</span>';
   }
 
   function renderConnectors() {
@@ -895,6 +1008,13 @@ acl_policy:
         "so &ldquo;present&rdquo; never means &ldquo;valid&rdquo;.</div>";
     Array.prototype.forEach.call(host.querySelectorAll(".src-conn-folder"), function (btn) {
       btn.onclick = openFolderDialog;
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-cred"), function (btn) {
+      btn.onclick = function () {
+        var src = btn.getAttribute("data-src");
+        var row = data.connectors.filter(function (x) { return x.source === src; })[0];
+        if (row) openCredDialog(row);
+      };
     });
   }
 
@@ -1016,6 +1136,319 @@ acl_policy:
       V.reload("sources");
     } catch (e) {
       V.err("src-folder-stop-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  /* ============================================ credential (Phase 2) flow */
+
+  // The secret-write surface is SecretIntakeAuth-gated: an unset
+  // VERITY_ADMIN_TOKEN => 401 with NO dev-open branch (unlike the dev-open admin
+  // GETs). This exact message is the honest capability signal.
+  var SECRET_401 = /VERITY_ADMIN_TOKEN|secret intake requires|no dev-open/i;
+  var DEV_TEACH =
+    "set VERITY_ADMIN_TOKEN — secret entry is refused unauthenticated; " +
+    "Google path-only and the local-folder card need no token.";
+
+  function credClassOf(source) {
+    if (source === "hubspot" || source === "salesforce") return "tierc";
+    if (source === "gdrive" || source === "gmail" || source === "gdirectory") return "google";
+    return "none";
+  }
+  function credSubjectRequired(source) { return source === "gmail" || source === "gdirectory"; }
+
+  // Wipe every trace of the pasted secret from the DOM + JS state. Called after
+  // a resolved save AND on close/cancel — the token must never linger.
+  function clearCredSecrets() {
+    var t = el("src-cred-token");
+    if (t) t.value = "";
+    var p = el("src-cred-path");
+    if (p) p.value = "";
+    var s = el("src-cred-subject");
+    if (s) s.value = "";
+  }
+
+  function closeCredDialog() {
+    clearCredSecrets();
+    if (credViewersPicker) { credViewersPicker.destroy(); credViewersPicker = null; }
+    pendingCred = null;
+    V.dialog("src-cred-dialog").close();
+  }
+
+  function setCredDevBlocked(blocked) {
+    var box = el("src-cred-dev");
+    var tokenField = el("src-cred-token");
+    if (blocked) {
+      box.style.display = "";
+      box.innerHTML = "<em>" + V.esc(DEV_TEACH) + "</em>";
+      // tier-C token paste is the one field that ALWAYS needs the token — 401s
+      // unauthenticated. Disable it and the Save so no secret is typed in vain.
+      if (tokenField) { tokenField.disabled = true; tokenField.value = ""; tokenField.placeholder = "disabled — secret entry is refused unauthenticated"; }
+      if (pendingCred && pendingCred.cls === "tierc") el("src-cred-go").disabled = true;
+    } else {
+      box.style.display = "none";
+      box.innerHTML = "";
+      if (tokenField) { tokenField.disabled = false; tokenField.placeholder = "paste the bearer token"; }
+      el("src-cred-go").disabled = false;
+    }
+  }
+
+  async function openCredDialog(row) {
+    if (!tenantNow) { V.openMint(); return; }
+    var source = row.source;
+    var cls = credClassOf(source);
+    if (cls === "none") return; // folder / unknown — never eligible
+    var rotate = credState(row).state === "tracked";
+    pendingCred = {
+      source: source,
+      label: row.label || source,
+      kind: row.kind || null,
+      cls: cls,
+      subjectRequired: credSubjectRequired(source),
+      rotate: rotate,
+    };
+
+    V.clearErr("src-cred-err");
+    el("src-cred-test-result").innerHTML = "";
+    el("src-cred-result").innerHTML = "";
+    clearCredSecrets();
+    setCredDevBlocked(false);
+    el("src-cred-go").disabled = false;
+
+    el("src-cred-title").textContent =
+      (rotate ? "Rotate the credential for " : "Add a credential for ") + pendingCred.label;
+    el("src-cred-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>' + V.esc(pendingCred.label) + "</b>" +
+        '<div class="dc-meta" style="margin-top:6px">' + V.esc(source) +
+        (pendingCred.kind ? " · " + V.esc(pendingCred.kind) : "") +
+        (rotate ? " · a credential is already stored — saving replaces it (rotate)" : "") +
+        "</div></div>";
+
+    // Remove is offered only when a credential is already stored (rotate mode);
+    // there is nothing to revoke on a first add.
+    el("src-cred-revoke").style.display = rotate ? "" : "none";
+
+    // Branch the body. Only one of the two panels is ever visible.
+    el("src-cred-tierc").style.display = cls === "tierc" ? "" : "none";
+    el("src-cred-google").style.display = cls === "google" ? "" : "none";
+    el("src-cred-subject-wrap").style.display =
+      (cls === "google" && pendingCred.subjectRequired) ? "" : "none";
+
+    V.dialog("src-cred-dialog").open();
+
+    // tier-C: the MANDATORY visibility picker — the same named directory picker
+    // every other write uses. Rebuilt each open (fail-closed: no default, empty
+    // refused here and by the server).
+    if (cls === "tierc") {
+      if (credViewersPicker) { credViewersPicker.destroy(); credViewersPicker = null; }
+      credViewersPicker = V.principalPicker(el("src-cred-viewers"), {
+        tenantId: function () { return tenantNow || V.tenant(); },
+        placeholder: "filter people & groups",
+        emptyTitle: "No people or groups on record yet",
+        emptyBody: "Add people or groups to this space first, then pick who can see this connector's records.",
+        emptyAction: "Open People & groups",
+        onOpenDirectory: function () { V.show("principals"); },
+      });
+      credViewersPicker.load(tenantNow);
+    } else if (credViewersPicker) {
+      credViewersPicker.destroy();
+      credViewersPicker = null;
+    }
+
+    // Capability probe: the credential/test surface is SecretIntakeAuth-gated
+    // with NO side effects (it never stores). A 401 here proves the server has
+    // no VERITY_ADMIN_TOKEN — disable the token paste + teach, gracefully.
+    try {
+      await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) +
+          "/credential/test?tenant_id=" + encodeURIComponent(tenantNow),
+        { json: {}, admin: true });
+    } catch (e) {
+      var m = (e && e.message) || "";
+      if (/HTTP 401/.test(m) && SECRET_401.test(m)) setCredDevBlocked(true);
+      // Any other error (403 Origin, 404, network) is surfaced by the real
+      // Test/Save actions, not pre-emptively here.
+    }
+  }
+
+  // Build the source-branched request body, enforcing the fail-closed
+  // client-side gates (empty visibility / token / path / subject refused here,
+  // mirroring the server's own 422). Returns { body } or throws a teaching Error.
+  function buildCredBody(includeToken) {
+    if (!pendingCred) throw new Error("no source selected");
+    if (pendingCred.cls === "tierc") {
+      var body = {};
+      if (includeToken) {
+        var token = el("src-cred-token").value;
+        if (!token.trim()) {
+          throw new Error("paste the API token — it is encrypted at rest and never echoed back.");
+        }
+        body.token = token;
+      }
+      // The MANDATORY visibility set: no default, empty refused client-side.
+      var viewers = credViewersPicker ? credViewersPicker.value() : [];
+      if (includeToken && !viewers.length) {
+        throw new Error(
+          "Pick who can see what this credential ingests — there is no default. " +
+          "An empty visibility set is refused here and by the server (fail closed).");
+      }
+      if (viewers.length) body.visibility = viewers.map(function (v) { return v.token; });
+      return { body: body, viewers: viewers };
+    }
+    // Google
+    var gbody = {};
+    var path = el("src-cred-path").value.trim();
+    if (!path) throw new Error("give the service-account key path — an absolute path the connector can read.");
+    gbody.path = path;
+    if (pendingCred.subjectRequired) {
+      var subject = el("src-cred-subject").value.trim();
+      if (!subject) {
+        throw new Error(
+          "give the impersonation subject — Gmail and the directory read as a specific " +
+          "Workspace user, and the server refuses without it.");
+      }
+      gbody.subject = subject;
+    } else {
+      var optSub = el("src-cred-subject").value.trim();
+      if (optSub) gbody.subject = optSub;
+    }
+    return { body: gbody, viewers: [] };
+  }
+
+  async function testCredential() {
+    if (!pendingCred) return;
+    V.clearErr("src-cred-err");
+    el("src-cred-test-result").innerHTML = "";
+    // Test does NOT require the visibility set — only the secret material to
+    // probe with (tier-C token / Google path). Build with includeToken but
+    // tolerate a missing visibility (the store gate, not the test gate).
+    var body;
+    try {
+      if (pendingCred.cls === "tierc") {
+        var token = el("src-cred-token").value;
+        if (!token.trim()) {
+          throw new Error("paste the API token to test it against the live provider.");
+        }
+        body = { token: token };
+      } else {
+        var path = el("src-cred-path").value.trim();
+        if (!path) throw new Error("give the service-account key path to check it structurally.");
+        body = { path: path };
+      }
+    } catch (e) {
+      V.err("src-cred-err", e);
+      return;
+    }
+    var btn = el("src-cred-test");
+    btn.disabled = true;
+    try {
+      var res = await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(pendingCred.source) +
+          "/credential/test?tenant_id=" + encodeURIComponent(tenantNow),
+        { json: body, admin: true });
+      var ok = !!(res && res.ok);
+      var kind = (res && res.kind) || (pendingCred.cls === "tierc" ? "live" : "structural");
+      var status = res && res.status != null ? " · HTTP " + V.esc(res.status) : "";
+      var label = kind === "live" ? "live check" : "structural check — not a live auth test";
+      el("src-cred-test-result").innerHTML =
+        '<div class="card" style="margin-top:10px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            (ok ? V.stateChip("ok", "reachable") : V.stateChip("attn", "not usable")) +
+            '<span class="asof">' + V.esc(label) + status + "</span>" +
+          "</div>" +
+          '<div class="note" style="margin-top:8px">' + V.esc((res && res.detail) || "no detail returned") + "</div>" +
+        "</div>";
+    } catch (e) {
+      var m = (e && e.message) || "";
+      if (/HTTP 401/.test(m) && SECRET_401.test(m)) setCredDevBlocked(true);
+      V.err("src-cred-err", e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function saveCredential() {
+    if (!pendingCred) return;
+    V.clearErr("src-cred-err");
+    el("src-cred-result").innerHTML = "";
+    var built;
+    try {
+      built = buildCredBody(true);
+    } catch (e) {
+      V.err("src-cred-err", e);
+      return;
+    }
+    var source = pendingCred.source;
+    var rotate = pendingCred.rotate;
+    var viewerNames = (built.viewers || []).map(function (v) { return v.principal; }).join(", ");
+    var btn = el("src-cred-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) + "/credential",
+        { json: built.body, admin: true });
+      // NEVER keep the token: clear the input the instant the request resolves,
+      // and show ONLY the returned fingerprint (no last-4, no raw hash oracle).
+      clearCredSecrets();
+      el("src-cred-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            V.stateChip("ok", rotate ? "credential rotated" : "credential stored") +
+            '<span class="asof">the token is never kept — this console holds only the fingerprint below</span>' +
+          "</div>" +
+          '<div class="note" style="margin-top:8px">' +
+            (res && res.kind === "path" ? "SA-key path recorded" : "bearer stored, encrypted at rest") +
+            (res && res.fingerprint ? " · fingerprint " + V.refSpan(res.fingerprint) : "") +
+            (viewerNames ? ". You picked <b>" + V.esc(viewerNames) + "</b> as who should see records it ingests; that scope was validated but connector ingestion isn&rsquo;t wired to it yet (a later phase), so nothing is ingested or shared under it today." : "") +
+          "</div>" +
+        "</div>";
+      V.reload("sources");
+    } catch (e) {
+      // Server refusals surface verbatim: 401 (VERITY_ADMIN_TOKEN unset), 403
+      // (cross-origin), 409 (env-vs-UI precedence), 422 (empty/KEK-refuse).
+      var m = (e && e.message) || "";
+      if (/HTTP 401/.test(m) && SECRET_401.test(m)) setCredDevBlocked(true);
+      V.err("src-cred-err", e);
+    } finally {
+      // Re-enable Save unless the dev block already latched it off for tier-C
+      // (an unauthenticated token paste can never succeed — keep it disabled).
+      var devLatched = pendingCred && pendingCred.cls === "tierc" &&
+        el("src-cred-token").disabled;
+      if (!devLatched) btn.disabled = false;
+    }
+  }
+
+  async function revokeCredential() {
+    if (!pendingCred) return;
+    V.clearErr("src-cred-err");
+    el("src-cred-result").innerHTML = "";
+    var source = pendingCred.source;
+    var btn = el("src-cred-revoke");
+    btn.disabled = true;
+    try {
+      var res = await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) + "/credential",
+        { method: "DELETE", admin: true });
+      var removed = !!(res && res.revoked);
+      el("src-cred-result").innerHTML =
+        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+            (removed ? V.stateChip("ok", "credential removed") : V.stateChip("attn", "nothing to remove")) +
+            '<span class="asof">' +
+              (removed
+                ? "the stored credential was deleted &mdash; the row falls back to its observed state"
+                : "no credential was stored for this source &mdash; an honest no-op, not a failure") +
+            "</span>" +
+          "</div></div>";
+      // The row's chip is refreshed from the connectors endpoint on reload.
+      V.reload("sources");
+      // A removed credential means the next open is an add, not a rotate.
+      if (removed && pendingCred) { pendingCred.rotate = false; el("src-cred-revoke").style.display = "none"; }
+    } catch (e) {
+      var m = (e && e.message) || "";
+      if (/HTTP 401/.test(m) && SECRET_401.test(m)) setCredDevBlocked(true);
+      V.err("src-cred-err", e);
+    } finally {
       btn.disabled = false;
     }
   }

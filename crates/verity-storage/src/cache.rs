@@ -254,4 +254,53 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
     ) -> Result<()> {
         self.inner.set_embedding_route(tenant, route).await
     }
+
+    // Phase-2 connector-credential intake: pure pass-through to the inner
+    // adapter (no L1 caching — these are operator config, not the fact hot
+    // path). Without these delegations the trait defaults would return
+    // `unsupported`, silently killing the secret-intake surface behind the
+    // cache the live server actually uses.
+    async fn store_connector_bearer(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        plaintext: &[u8],
+    ) -> Result<String> {
+        self.inner
+            .store_connector_bearer(tenant, source, plaintext)
+            .await
+    }
+
+    async fn store_connector_path(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        path: &str,
+    ) -> Result<String> {
+        self.inner.store_connector_path(tenant, source, path).await
+    }
+
+    async fn get_connector_credential_status(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorCredentialStatus>> {
+        self.inner
+            .get_connector_credential_status(tenant, source)
+            .await
+    }
+
+    async fn materialize_connector_bearer(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.inner
+            .materialize_connector_bearer(tenant, source)
+            .await
+    }
+
+    async fn revoke_connector_credential(&self, tenant: TenantId, source: &str) -> Result<bool> {
+        self.inner.revoke_connector_credential(tenant, source).await
+    }
 }
