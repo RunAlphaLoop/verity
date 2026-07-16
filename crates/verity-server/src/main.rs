@@ -9,6 +9,7 @@ mod audit;
 mod backfill;
 mod compliance;
 mod connectors;
+mod connectors_admin;
 #[cfg(test)]
 mod console_later_tests;
 mod consolidation;
@@ -794,50 +795,39 @@ fn directory_start_hint(
 async fn directory_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_json::Value {
     const LABEL: &str = "Directory sync worker";
 
-    // Tier 1 — AUTHORITATIVE (server-owned). Hold the lock only to probe/reap.
-    {
-        let mut guard = state.directory.worker.lock().await;
-        if let Some(worker) = guard.as_mut() {
-            match worker.child.try_wait() {
-                Ok(None) => {
-                    let pid = worker.pid;
-                    let started_at = worker.started_at;
-                    let worker_tenant = worker.tenant_id;
-                    let detail = format!(
-                        "running · pid {pid} · started from this console {} — reconciling Google \
-                         users + groups (nested membership) into SpiceDB every {}s; that interval \
-                         is the ACL-freshness bound.",
-                        humanize_ago(started_at),
-                        state.directory.interval_secs,
-                    );
-                    let mut row = plane_row(
-                        "directory_worker",
-                        LABEL,
-                        "startable",
-                        "on",
-                        detail,
-                        false,
-                        None,
-                    );
-                    let obj = row.as_object_mut().expect("plane_row is an object");
-                    obj.insert("authority".into(), serde_json::json!("server"));
-                    obj.insert("stoppable".into(), serde_json::json!(true));
-                    obj.insert("pid".into(), serde_json::json!(pid));
-                    obj.insert(
-                        "started_at".into(),
-                        serde_json::json!(started_at.to_rfc3339()),
-                    );
-                    obj.insert(
-                        "worker_tenant_id".into(),
-                        serde_json::json!(worker_tenant.to_string()),
-                    );
-                    return row;
-                }
-                _ => {
-                    *guard = None;
-                }
-            }
-        }
+    // Tier 1 — AUTHORITATIVE (server-owned). Shared probe/reap discipline
+    // (`owned_live`) with the connectors read, so the two can never drift.
+    if let Some(worker) = state.directory.owned_live().await {
+        let detail = format!(
+            "running · pid {} · started from this console {} — reconciling Google \
+             users + groups (nested membership) into SpiceDB every {}s; that interval \
+             is the ACL-freshness bound.",
+            worker.pid,
+            humanize_ago(worker.started_at),
+            state.directory.interval_secs,
+        );
+        let mut row = plane_row(
+            "directory_worker",
+            LABEL,
+            "startable",
+            "on",
+            detail,
+            false,
+            None,
+        );
+        let obj = row.as_object_mut().expect("plane_row is an object");
+        obj.insert("authority".into(), serde_json::json!("server"));
+        obj.insert("stoppable".into(), serde_json::json!(true));
+        obj.insert("pid".into(), serde_json::json!(worker.pid));
+        obj.insert(
+            "started_at".into(),
+            serde_json::json!(worker.started_at.to_rfc3339()),
+        );
+        obj.insert(
+            "worker_tenant_id".into(),
+            serde_json::json!(worker.tenant_id.to_string()),
+        );
+        return row;
     }
 
     // Tier 2 — OBSERVED PROXY: the gdirectory connector-status heartbeat.
@@ -1217,6 +1207,17 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connector-status",
             post(connectors::post_status).get(connectors::get_status),
+        )
+        // Connect-a-source Phase 1 read plane (connectors_admin.rs): one
+        // honest row per source family from what the server can truthfully
+        // observe. Read-only — no secrets, no backfill trigger.
+        .route(
+            "/v1/admin/connectors",
+            get(connectors_admin::list_connectors),
+        )
+        .route(
+            "/v1/admin/connectors/{source}/prereqs",
+            get(connectors_admin::source_prereqs),
         )
         .route(
             "/v1/admin/folders",
