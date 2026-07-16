@@ -455,3 +455,42 @@ cutover; same rationale as `CachedAdapter::flush_facts`).
 `chunks_embedding_v2_missing_idx` (7 MB partial btree) and the 88 kB `chunks_embedding_v2_idx`
 are off the exact-scan path and cost ~0 ms on reads; dropping/keeping them is a migration
 decision for the v2 cutover, not a latency fix. No migration, no schema change made.
+
+---
+
+## 2026-07-14 — the served path: HTTP + encoder + release build, on a real 115k-chunk workspace
+
+**Setup:** the number every earlier entry flagged as owed — *"a served deployment adds HTTP,
+encoder, and concurrency."* Measured end-to-end over `POST /v1/recall` against the **running
+release-build server** on a **real 115,643-chunk workspace** (live Gmail + Drive, real ACL
+cardinality — 762 principals), owner scope (sees ~all chunks — the broad, expensive case),
+single-threaded warm client. Apple M3 Pro, ParadeDB pg17 in Docker.
+
+| Case (115k real chunks, served over HTTP) | p50 | p95 | p99 |
+|---|---|---|---|
+| recall, broad scope (owner, ~115k visible) — encoder + HTTP | ~72ms | **~105ms** | ~167ms |
+| recall, narrow scope (~1k visible) — encoder + HTTP | ~70ms | ~111ms | ~246ms |
+| L1 point read (`get`) over HTTP | 0.4ms | **1.4ms** | 2.0ms |
+| local query encode (release ONNX) | 11ms | 23ms | 32ms |
+
+**QPS under load** (closed loop, N=4/16/64): end-to-end HTTP recall saturates at **~50 QPS**;
+the in-process serving core (100k synthetic) saturates at **~120 QPS** — the encoder's single
+ONNX session is the served ceiling, Postgres the core ceiling.
+
+**Findings:**
+
+1. **Release ≈ dev for recall — because recall is Postgres-bound, not Rust-bound.** The heavy
+   lifting is pgvector ANN + pg_search BM25 inside Postgres; a release compile barely moves it.
+   The lever is Postgres tuning, not the binary.
+2. **The `get` path holds its claim end-to-end**: 1.4ms p95 over HTTP, comfortably under the
+   <5ms budget — the correct inner-loop hot path.
+3. **Latency is flat across a 112× selectivity change** (broad ~115k vs narrow ~1k visible,
+   both ~70ms p50): filtered-ANN + ACL cardinality is *not* the bottleneck — the ACORN risk,
+   retired on real data. The cost is the encoder (~12–23ms) plus the Postgres hybrid query;
+   the HTTP hop is small.
+4. **The served path exceeds the 50ms envelope.** The in-process encode+ANN number (~37–48ms
+   p95, prior entries) holds, but a real HTTP request adds the served round-trip to ~105ms p95
+   on this laptop stack. Honest reading: **~20ms p95 scoped hybrid recall in the serving core;
+   ~105ms end-to-end served on a laptop; sub-ms permissioned `get`; QPS saturates ~50–120 on a
+   single untuned Postgres container.** The ≥300 QPS / server-hardware numbers remain unproven
+   — gated on Postgres tuning and encoder pooling, not the Rust build.
