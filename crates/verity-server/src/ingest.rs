@@ -26,8 +26,11 @@ pub struct ResolvedAcl {
     pub visibility: Vec<PrincipalToken>,
     pub confidentiality: Confidentiality,
     /// How the tokens were obtained, for the fact's `acl_provenance` label and
-    /// the audit trail. `Mirrored` = the envelope declared them; `AdminAssigned`
-    /// = the connector-bound static policy supplied them.
+    /// the audit trail. Set from the inline block's `acl_provenance` (a
+    /// connector's honest self-label: `Mirrored` for a literal source ACL,
+    /// `Approximated` for an owner/team/container approximation), defaulting to
+    /// `Mirrored`; or `AdminAssigned` when the connector-bound static policy
+    /// supplied them.
     pub provenance: verity_core::AclProvenance,
 }
 
@@ -164,7 +167,8 @@ pub fn parse_envelope(
 
 /// Read an inline `verity_acl` extension block off the payload, when a pipeline
 /// has been configured to carry source ACLs alongside the row image:
-/// `"verity_acl": {"visibility": [3,7], "confidentiality": "confidential"}`.
+/// `"verity_acl": {"visibility": [3,7], "confidentiality": "confidential",
+/// "acl_provenance": "approximated"}`.
 /// Absent or malformed => `None` (fall back to the bound policy, then refuse) —
 /// a malformed ACL is NEVER read as permissive.
 fn parse_inline_acl(payload: &Value) -> Option<ResolvedAcl> {
@@ -181,10 +185,22 @@ fn parse_inline_acl(payload: &Value) -> Option<ResolvedAcl> {
         None => Confidentiality::Internal,
         Some(v) => serde_json::from_value(v.clone()).ok()?,
     };
+    // Provenance is the connector's honest self-label of HOW it derived this
+    // ACL (the same contract POST /v1/ingest/documents already honors): a
+    // literal source ACL is `mirrored`; a container/owner/team approximation
+    // (HubSpot owner+team — no per-record ACL, no visibility into per-user
+    // permission levels) is `approximated`. Omitted defaults to `mirrored` for
+    // backward compatibility with the content connectors that predate this
+    // field. A present-but-unrecognized value is malformed => refuse the whole
+    // ACL (never silently downgrade to a permissive-looking default).
+    let provenance = match block.get("acl_provenance") {
+        None => verity_core::AclProvenance::Mirrored,
+        Some(v) => serde_json::from_value(v.clone()).ok()?,
+    };
     Some(ResolvedAcl {
         visibility,
         confidentiality,
-        provenance: verity_core::AclProvenance::Mirrored,
+        provenance,
     })
 }
 
@@ -321,6 +337,45 @@ mod tests {
         // absent), so the fact resolves to None and is refused.
         let mut env = wrapped_update();
         env["payload"]["verity_acl"] = json!({"visibility": "everyone"});
+        let ev = parse_envelope(&env, "id", None).unwrap();
+        assert!(ev.acl.is_none());
+    }
+
+    #[test]
+    fn inline_acl_provenance_label_is_honored() {
+        // A tier-B connector (HubSpot owner+team) declares `approximated`; the
+        // fact must carry that label, not the `mirrored` default — the audit
+        // trail has to say the ACL is a container approximation, not a literal
+        // source ACL.
+        let mut env = wrapped_update();
+        env["payload"]["verity_acl"] = json!({"visibility": [5], "acl_provenance": "approximated"});
+        let ev = parse_envelope(&env, "id", None).unwrap();
+        let acl = ev.acl.expect("inline ACL should materialize");
+        assert_eq!(acl.visibility, vec![5]);
+        assert_eq!(acl.provenance, verity_core::AclProvenance::Approximated);
+    }
+
+    #[test]
+    fn inline_acl_provenance_defaults_to_mirrored_when_omitted() {
+        // Back-compat: the content connectors (gdrive/gmail) predate the label
+        // and emit no `acl_provenance` — those facts stay `mirrored`.
+        let mut env = wrapped_update();
+        env["payload"]["verity_acl"] = json!({"visibility": [5]});
+        let ev = parse_envelope(&env, "id", None).unwrap();
+        assert_eq!(
+            ev.acl.unwrap().provenance,
+            verity_core::AclProvenance::Mirrored
+        );
+    }
+
+    #[test]
+    fn unrecognized_provenance_label_refuses_the_acl() {
+        // An unknown label is malformed — never silently downgraded to a
+        // permissive-looking default. Falls through to bound policy (absent
+        // here) => refused.
+        let mut env = wrapped_update();
+        env["payload"]["verity_acl"] =
+            json!({"visibility": [5], "acl_provenance": "everyone-can-see"});
         let ev = parse_envelope(&env, "id", None).unwrap();
         assert!(ev.acl.is_none());
     }

@@ -1,0 +1,44 @@
+{
+  "total": 3,
+  "results": [
+    {
+      "id": "401",
+      "properties": {
+        "email": "owned@acme.test",
+        "firstname": "Owned",
+        "hs_object_id": "401",
+        "hubspot_owner_id": "77",
+        "lastmodifieddate": "2026-07-10T12:00:00.000Z",
+        "lastname": "Record"
+      },
+      "updatedAt": "2026-07-10T12:00:00.000Z",
+      "archived": false
+    },
+    {
+      "id": "402",
+      "properties": {
+        "email": "solo@acme.test",
+        "firstname": "Solo",
+        "hs_object_id": "402",
+        "hubspot_owner_id": "88",
+        "lastmodifieddate": "2026-07-10T13:00:00.000Z",
+        "lastname": "Owner"
+      },
+      "updatedAt": "2026-07-10T13:00:00.000Z",
+      "archived": false
+    },
+    {
+      "id": "403",
+      "properties": {
+        "email": "unowned@acme.test",
+        "firstname": "Unowned",
+        "hs_object_id": "403",
+        "hubspot_owner_id": null,
+        "lastmodifieddate": "2026-07-10T14:00:00.000Z",
+        "lastname": "Record"
+      },
+      "updatedAt": "2026-07-10T14:00:00.000Z",
+      "archived": false
+    }
+  ]
+}

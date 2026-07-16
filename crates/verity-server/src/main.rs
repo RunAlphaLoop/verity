@@ -2508,7 +2508,10 @@ mod ingest_visibility_param_tests {
 
     #[test]
     fn whitespace_around_tokens_is_trimmed() {
-        assert_eq!(visibility_of(Some(" 1 , 2 ,3 ")).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            visibility_of(Some(" 1 , 2 ,3 ")).unwrap(),
+            Some(vec![1, 2, 3])
+        );
     }
 
     #[test]
