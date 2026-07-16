@@ -417,11 +417,22 @@ def test_visibility_policy_is_required() -> None:
 
 
 def test_token_comes_from_env_and_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Neither credential set → fail closed, naming both env vars.
+    monkeypatch.delenv("HUBSPOT_SERVICE_KEY", raising=False)
     monkeypatch.delenv("HUBSPOT_PRIVATE_APP_TOKEN", raising=False)
-    with pytest.raises(RuntimeError, match="HUBSPOT_PRIVATE_APP_TOKEN"):
+    with pytest.raises(RuntimeError, match="HUBSPOT_SERVICE_KEY"):
         HubSpotConnector(POLICY)
 
-    monkeypatch.setenv("HUBSPOT_PRIVATE_APP_TOKEN", "pat-na1-from-env")
+    # A Service Key (the current path) is used as a bearer token.
+    monkeypatch.setenv("HUBSPOT_SERVICE_KEY", "pat-na1-service-key")
     connector = HubSpotConnector(POLICY)
-    assert connector._client.headers["Authorization"] == "Bearer pat-na1-from-env"
+    assert connector._client.headers["Authorization"] == "Bearer pat-na1-service-key"
     asyncio.run(connector.aclose())
+
+    # The legacy private-app token still works (backward compat); the Service
+    # Key wins when both are set.
+    monkeypatch.delenv("HUBSPOT_SERVICE_KEY", raising=False)
+    monkeypatch.setenv("HUBSPOT_PRIVATE_APP_TOKEN", "pat-na1-from-env")
+    legacy = HubSpotConnector(POLICY)
+    assert legacy._client.headers["Authorization"] == "Bearer pat-na1-from-env"
+    asyncio.run(legacy.aclose())

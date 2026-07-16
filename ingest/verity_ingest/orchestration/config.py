@@ -18,7 +18,7 @@ Everything is environment-first so the worker container needs no config file:
   stays fully manual via ``POST /v1/admin/entity-resolution/run``).
 
 Connector credentials/policies ride on the connectors' own env contract
-(``HUBSPOT_PRIVATE_APP_TOKEN``, ``SF_*``, ``GOOGLE_APPLICATION_CREDENTIALS``,
+(``HUBSPOT_SERVICE_KEY``, ``SF_*``, ``GOOGLE_APPLICATION_CREDENTIALS``,
 ``VERITY_TENANT_ID`` …); see :mod:`.runners`.
 """
 

@@ -1,8 +1,12 @@
 """HubSpot native flagship connector (SPEC.md §5, §5e.2).
 
-Auth is bring-your-own-token (BYOT doctrine): a private-app token created in
-the customer's own portal (~2 min), read from env ``HUBSPOT_PRIVATE_APP_TOKEN``.
-Never a vendor-hosted OAuth app — that is strictly a cloud-edition concern.
+Auth is bring-your-own-token (BYOT doctrine): a **Service Key** created in the
+customer's own portal (Development → Keys → Service keys, ~2 min), read from env
+``HUBSPOT_SERVICE_KEY``. HubSpot deprecated private apps in 2026 in favour of
+Service Keys; a legacy private-app token (``HUBSPOT_PRIVATE_APP_TOKEN``) is still
+accepted for backward compat — both are used identically as
+``Authorization: Bearer <key>`` at the v3 CRM endpoints. Never a vendor-hosted
+OAuth app — that is strictly a cloud-edition concern.
 
 HubSpot is **ACL tier C** (SPEC.md §5e.2): the CRM exposes no per-record ACL
 API, so nothing here can mint a faithful AclEnvelope. Instead the constructor
@@ -49,6 +53,12 @@ from verity_ingest.credentials import StaticKey
 
 SOURCE = "hubspot"
 BASE_URL = "https://api.hubapi.com"
+#: Preferred credential env var. A HubSpot **Service Key** (Development → Keys →
+#: Service keys) is the current single-account credential; HubSpot deprecated
+#: private apps in 2026. Both are used identically as `Authorization: Bearer
+#: <key>` at the same v3 CRM endpoints, so either drops in unchanged.
+SERVICE_KEY_ENV = "HUBSPOT_SERVICE_KEY"
+#: Legacy fallback: a private-app token. Still accepted for backward compat.
 TOKEN_ENV = "HUBSPOT_PRIVATE_APP_TOKEN"
 PAGE_SIZE = 100  # search API maximum
 MAX_RETRIES = 5
@@ -108,7 +118,8 @@ class HubSpotConnector(Connector):
     """Truth-lane polling connector for HubSpot CRM objects.
 
     ``visibility_policy`` is required and has no default (tier C, fail
-    closed). The token defaults to env ``HUBSPOT_PRIVATE_APP_TOKEN``.
+    closed). The credential defaults to env ``HUBSPOT_SERVICE_KEY`` (a Service
+    Key), falling back to the legacy ``HUBSPOT_PRIVATE_APP_TOKEN``.
     """
 
     name = SOURCE
@@ -129,11 +140,16 @@ class HubSpotConnector(Connector):
         # (a 401 means "rotate the token", never "retry"), and no published
         # expiry — pass a `credential` with `expiry` set to get the 7-day
         # expiry-telemetry warning if your org rotates tokens on a schedule.
+        # Service Keys (the current path) and legacy private-app tokens are both
+        # bearer credentials against the same v3 CRM API — either drops in
+        # unchanged. Prefer HUBSPOT_SERVICE_KEY; fall back to the legacy env var.
+        resolved = token or os.environ.get(SERVICE_KEY_ENV) or os.environ.get(TOKEN_ENV)
         self.credential = credential or StaticKey(
-            TOKEN_ENV,
-            value=token,
-            missing_hint="a private-app token (BYOT — create it in your own "
-            "portal, Settings → Integrations → Private Apps)",
+            SERVICE_KEY_ENV,
+            value=resolved,
+            missing_hint="a HubSpot Service Key (Development → Keys → Service "
+            "keys — the current path) or a legacy private-app token; set "
+            "HUBSPOT_SERVICE_KEY or HUBSPOT_PRIVATE_APP_TOKEN. Both are bearer tokens",
         )
         self.visibility_policy = list(visibility_policy)
         self.properties = dict(DEFAULT_PROPERTIES, **(properties or {}))
