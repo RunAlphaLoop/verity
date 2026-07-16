@@ -1,0 +1,34 @@
+{
+  "results": [
+    {
+      "id": "77",
+      "email": "Rep.One@acme.test",
+      "type": "PERSON",
+      "firstName": "Rep",
+      "lastName": "One",
+      "teams": [
+        {"id": "10", "name": "Enterprise", "primary": true},
+        {"id": "20", "name": "West", "primary": false}
+      ],
+      "archived": false
+    },
+    {
+      "id": "88",
+      "email": "rep.two@acme.test",
+      "type": "PERSON",
+      "firstName": "Rep",
+      "lastName": "Two",
+      "teams": [
+        {"id": "10", "name": "Enterprise", "primary": true}
+      ],
+      "archived": false
+    },
+    {
+      "id": "99",
+      "email": "",
+      "type": "QUEUE",
+      "teams": [],
+      "archived": false
+    }
+  ]
+}

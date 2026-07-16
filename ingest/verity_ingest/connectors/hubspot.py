@@ -8,12 +8,22 @@ accepted for backward compat — both are used identically as
 ``Authorization: Bearer <key>`` at the v3 CRM endpoints. Never a vendor-hosted
 OAuth app — that is strictly a cloud-edition concern.
 
-HubSpot is **ACL tier C** (SPEC.md §5e.2): the CRM exposes no per-record ACL
-API, so nothing here can mint a faithful AclEnvelope. Instead the constructor
-requires an admin-assigned ``visibility_policy`` (materialized principal
-tokens, SPEC §7b) with **no default**, and every emitted event carries it —
-the fail-closed alternative to permissive indexing. Provenance tag:
-``admin-assigned``.
+**Access model (SPEC.md §5e.2).** HubSpot record access is driven by the
+record's **owner** (``hubspot_owner_id``) and the owner's **team(s)**. The
+connector mirrors this: each owned record's facts carry an inline
+owner+team ACL (``user:<owner>`` + ``group:hubspot-team-<id>``) with provenance
+``approximated`` — it is a container/owner approximation, not a literal source
+ACL, because two access inputs are NOT visible from the record side: each
+user's permission level ("Everything" sees all records) and manual per-record
+shares. The mirror therefore deliberately UNDER-grants (over-hides — fail
+closed). Team **hierarchy** (a parent team seeing child-team records) is also
+not modeled — HubSpot's public API does not expose parent/child team ids.
+
+Owner/team resolution needs the ``crm.objects.owners.read`` scope on the key;
+without it (or for an unowned record, or the webhook lane) facts fall back to
+an **admin-assigned** ``visibility_policy`` (materialized principal tokens,
+SPEC §7b) — required on the constructor with **no default**, the fail-closed
+alternative to permissive indexing.
 
 Two lanes:
 
@@ -44,7 +54,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Mapping
 
 import httpx
 
@@ -62,6 +72,18 @@ SERVICE_KEY_ENV = "HUBSPOT_SERVICE_KEY"
 TOKEN_ENV = "HUBSPOT_PRIVATE_APP_TOKEN"
 PAGE_SIZE = 100  # search API maximum
 MAX_RETRIES = 5
+#: Owners API — read-only roster of CRM owners (users who can own records).
+#: Each owner carries `id` (matches a record's `hubspot_owner_id`), `email`,
+#: and a `teams` array (`id`, `name`, `primary`). Requires the
+#: `crm.objects.owners.read` scope on the Service Key.
+OWNERS_PATH = "/crm/v3/owners"
+#: The record property naming the owner. Drives HubSpot record-level access:
+#: a record is reachable by its owner and (per each user's permission level)
+#: the owner's team(s). We mirror owner + team; per-user "Everything" access and
+#: manual per-record shares are NOT visible from the record side, so the mirror
+#: deliberately UNDER-grants (over-hides — fail closed) and is labeled
+#: `approximated`, never `mirrored`.
+OWNER_ID_PROPERTY = "hubspot_owner_id"
 
 #: Object type → last-modified property used for the incremental filter and
 #: for ``valid_from``. Contacts are the documented exception: they expose
@@ -72,8 +94,8 @@ LAST_MODIFIED_PROPERTY = {
     "deals": "hs_lastmodifieddate",
 }
 
-#: Default properties requested per object type (the last-modified property is
-#: always added). Override via the ``properties`` constructor arg.
+#: Default properties requested per object type (the last-modified property AND
+#: the owner property are always added). Override via the ``properties`` arg.
 DEFAULT_PROPERTIES = {
     "contacts": ["email", "firstname", "lastname", "lifecyclestage"],
     "companies": ["name", "domain", "industry"],
@@ -87,18 +109,68 @@ WEBHOOK_OBJECT_TYPES = {
     "deal": "deals",
 }
 
-#: Properties never emitted as facts: the pk mirror, and the last-modified
-#: metadata properties (they become ``valid_from``, not L1 fields).
-_METADATA_PROPERTIES = {"hs_object_id", "lastmodifieddate", "hs_lastmodifieddate"}
+#: Properties never emitted as facts: the pk mirror, the last-modified metadata
+#: properties (they become ``valid_from``, not L1 fields), and the owner id
+#: (it is ACL plumbing — it drives per-record visibility, not a content fact).
+_METADATA_PROPERTIES = {
+    "hs_object_id",
+    "lastmodifieddate",
+    "hs_lastmodifieddate",
+    OWNER_ID_PROPERTY,
+}
+
+
+@dataclass(frozen=True)
+class OwnerInfo:
+    """One CRM owner as the Owners API returns it, reduced to what access
+    mirroring needs: the (lowercased) login email and the ids of every team the
+    owner belongs to (primary + secondary — HubSpot grants team access on both).
+    """
+
+    email: str
+    team_ids: tuple[str, ...]
+
+
+def owner_principal(email: str) -> str:
+    """The record-owner principal. Lowercased ``user:<email>`` so it is the SAME
+    SpiceDB object a Gmail/Drive subject resolves to — a person owning a HubSpot
+    deal and appearing in Drive/Gmail is ONE identity across sources."""
+    return f"user:{email.lower()}"
+
+
+def team_principal(team_id: str) -> str:
+    """The team-visibility principal, a SpiceDB group. Members are attached via
+    ``POST /v1/admin/groups`` (``group:hubspot-team-<id> ⊃ user:<member>``), so
+    a subject resolves through their team membership exactly like a Google
+    Group. Team hierarchy (parent teams seeing child records) is NOT modeled:
+    HubSpot's public API does not expose parent/child team ids, so a manager who
+    can see a child team's records only through the hierarchy is under-granted
+    here (over-hides — fail closed), never over-granted."""
+    return f"group:hubspot-team-{team_id}"
 
 
 @dataclass
 class HubSpotFactEvent(FactEvent):
-    """A FactEvent plus what tier-C ingestion requires: the CRM object type
-    (→ Debezium ``source.table``) and the admin-assigned visibility policy."""
+    """A FactEvent plus what CRM ingestion requires: the object type (→ Debezium
+    ``source.table``) and the resolved visibility for this record.
+
+    Visibility precedence, per record:
+    - ``record_principals`` — the owner+team principal STRINGS this record's
+      access mirrors (``user:<owner>`` + ``group:hubspot-team-<id>``), or
+      ``None`` when the record is unowned. Computed at map time from the owner
+      roster; source of truth for the SpiceDB team edges too.
+    - ``record_visibility`` — those strings resolved to int tokens (filled by
+      the runner via ``/v1/admin/principals``). When set, the envelope carries
+      an inline ``verity_acl`` with ``acl_provenance: approximated``.
+    - ``visibility_policy`` — the admin-assigned fallback (``--visibility``).
+      Used for unowned records (and the webhook lane, which has no owner
+      context): delivered as the connector-bound policy, ``admin-assigned``.
+    """
 
     object_type: str
     visibility_policy: list[int]
+    record_principals: list[str] | None = None
+    record_visibility: list[int] | None = None
 
 
 def _parse_hs_timestamp(value: str) -> datetime:
@@ -117,9 +189,11 @@ def _ms_to_datetime(ms: int) -> datetime:
 class HubSpotConnector(Connector):
     """Truth-lane polling connector for HubSpot CRM objects.
 
-    ``visibility_policy`` is required and has no default (tier C, fail
-    closed). The credential defaults to env ``HUBSPOT_SERVICE_KEY`` (a Service
-    Key), falling back to the legacy ``HUBSPOT_PRIVATE_APP_TOKEN``.
+    Owned records mirror their owner+team access (``approximated``); unowned
+    records (and any record when the owners scope is absent) fall back to the
+    admin-assigned ``visibility_policy``, which is required and has no default
+    (fail closed). The credential defaults to env ``HUBSPOT_SERVICE_KEY`` (a
+    Service Key), falling back to the legacy ``HUBSPOT_PRIVATE_APP_TOKEN``.
     """
 
     name = SOURCE
@@ -153,6 +227,12 @@ class HubSpotConnector(Connector):
         )
         self.visibility_policy = list(visibility_policy)
         self.properties = dict(DEFAULT_PROPERTIES, **(properties or {}))
+        #: Filled by :meth:`poll` from the Owners API. ``team_members`` maps each
+        #: ``group:hubspot-team-<id>`` to the set of ``user:<email>`` members —
+        #: the SpiceDB edges the runner syncs so a subject resolves through team
+        #: membership. Empty when the owners scope is absent (fail-closed to the
+        #: admin-assigned fallback).
+        self.team_members: dict[str, set[str]] = {}
         self._client = client or httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {self.credential.value}"},
@@ -161,21 +241,54 @@ class HubSpotConnector(Connector):
 
     # ---------- deterministic mapping (pure; exercised by conformance tests) ----------
 
+    @staticmethod
+    def record_principals(
+        record: dict, owner_map: Mapping[str, OwnerInfo] | None
+    ) -> list[str] | None:
+        """The owner+team principal strings this record's access mirrors, or
+        ``None`` when the record is unowned or its owner is unknown (→ the
+        admin-assigned fallback applies; never a permissive default).
+
+        ``user:<owner>`` first (deterministic), then one ``group:hubspot-team-``
+        per team the owner belongs to, deduplicated, order preserved.
+        """
+        if not owner_map:
+            return None
+        owner_id = (record.get("properties", {}) or {}).get(OWNER_ID_PROPERTY)
+        if not owner_id:
+            return None
+        owner = owner_map.get(str(owner_id))
+        if owner is None or not owner.email:
+            return None
+        principals = [owner_principal(owner.email)]
+        for team_id in owner.team_ids:
+            principal = team_principal(team_id)
+            if principal not in principals:
+                principals.append(principal)
+        return principals
+
     @classmethod
     def events_from_search_page(
-        cls, object_type: str, page: dict, visibility_policy: list[int]
+        cls,
+        object_type: str,
+        page: dict,
+        visibility_policy: list[int],
+        owner_map: Mapping[str, OwnerInfo] | None = None,
     ) -> list[HubSpotFactEvent]:
         """Map one CRM search response page to FactEvents.
 
         One event per non-null property, sorted by property name for
-        determinism; metadata properties (pk mirror, last-modified) are
-        excluded — the last-modified timestamp becomes ``valid_from``.
+        determinism; metadata properties (pk mirror, last-modified, owner id)
+        are excluded — the last-modified timestamp becomes ``valid_from`` and
+        the owner id drives the ACL. Each event carries the record's owner+team
+        principals (``record_principals``) when ``owner_map`` resolves them.
         """
         events: list[HubSpotFactEvent] = []
         for record in page.get("results", []):
             props = record.get("properties", {})
             modified = props.get(LAST_MODIFIED_PROPERTY[object_type]) or record.get("updatedAt")
             valid_from = _parse_hs_timestamp(modified)
+            principals = cls.record_principals(record, owner_map)
             for name in sorted(props):
                 value = props[name]
                 if name in _METADATA_PROPERTIES or value is None:
@@ -190,6 +303,7 @@ class HubSpotConnector(Connector):
                         raw_payload=record,
                         object_type=object_type,
                         visibility_policy=list(visibility_policy),
+                        record_principals=list(principals) if principals else None,
                     )
                 )
         return events
@@ -249,10 +363,14 @@ class HubSpotConnector(Connector):
         """
         events: list[FactEvent | DocumentEvent] = []
         next_cursor = cursor or "1970-01-01T00:00:00+00:00"
+        # Fetch the owner roster ONCE per cycle: it resolves each record's
+        # owner+team ACL and is the source of the team-membership edges.
+        owner_map = await self._fetch_owners()
+        self.team_members = self._team_members(owner_map)
         for object_type in self.object_types:
             async for page in self._search_pages(object_type, cursor):
                 page_events = self.events_from_search_page(
-                    object_type, page, self.visibility_policy
+                    object_type, page, self.visibility_policy, owner_map
                 )
                 events.extend(page_events)
                 for record in page.get("results", []):
@@ -264,9 +382,10 @@ class HubSpotConnector(Connector):
         return events, next_cursor
 
     async def full_crawl(self) -> AsyncIterator[FactEvent | DocumentEvent]:
-        """Reconciliation crawl: identical to a poll from epoch. (HubSpot has
-        no per-record ACLs to drift, and archived-record reconciliation lands
-        with the §8c tombstone work.)"""
+        """Reconciliation crawl: identical to a poll from epoch. Re-reads the
+        owner roster too, so owner/team ACL drift (a record reassigned to a new
+        owner, a user moved between teams) reconciles. (Archived-record
+        reconciliation lands with the §8c tombstone work.)"""
         events, _ = await self.poll(None)
         for event in events:
             yield event
@@ -278,7 +397,9 @@ class HubSpotConnector(Connector):
         body: dict[str, Any] = {
             "filterGroups": [],
             "sorts": [{"propertyName": modified_prop, "direction": "ASCENDING"}],
-            "properties": [*self.properties[object_type], modified_prop],
+            # The owner id is always requested — it drives per-record visibility
+            # even though it is not emitted as a content fact.
+            "properties": [*self.properties[object_type], modified_prop, OWNER_ID_PROPERTY],
             "limit": PAGE_SIZE,
         }
         if cursor:
@@ -323,6 +444,65 @@ class HubSpotConnector(Connector):
             return response.json()
         raise RuntimeError("unreachable")  # pragma: no cover
 
+    async def _fetch_owners(self) -> dict[str, OwnerInfo]:
+        """The CRM owner roster, keyed by owner id (matches a record's
+        ``hubspot_owner_id``). Paginated, 429-aware.
+
+        A **403** means the Service Key lacks ``crm.objects.owners.read``: we
+        degrade to an EMPTY roster (every record → the admin-assigned fallback),
+        loudly, rather than failing the sync — fail closed, never permissive.
+        """
+        owners: dict[str, OwnerInfo] = {}
+        after: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": PAGE_SIZE}
+            if after:
+                params["after"] = after
+            for attempt in range(MAX_RETRIES):
+                response = await self._client.get(OWNERS_PATH, params=params)
+                if response.status_code == 429 and attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(float(response.headers.get("Retry-After", "1")))
+                    continue
+                break
+            if response.status_code == 403:
+                print(
+                    "hubspot: Owners API returned 403 — add the "
+                    "'crm.objects.owners.read' scope to the Service Key to mirror "
+                    "owner/team ACLs; falling back to the admin-assigned "
+                    "--visibility for every record",
+                    file=sys.stderr,
+                )
+                return {}
+            response.raise_for_status()
+            body = response.json()
+            for owner in body.get("results", []):
+                owner_id = owner.get("id")
+                if owner_id is None:
+                    continue
+                email = (owner.get("email") or "").strip().lower()
+                team_ids = tuple(
+                    str(team["id"]) for team in owner.get("teams", []) or [] if team.get("id")
+                )
+                owners[str(owner_id)] = OwnerInfo(email=email, team_ids=team_ids)
+            after = body.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                return owners
+
+    @staticmethod
+    def _team_members(owner_map: Mapping[str, OwnerInfo]) -> dict[str, set[str]]:
+        """Invert the owner roster into SpiceDB team edges: each
+        ``group:hubspot-team-<id>`` → the ``user:<email>`` of every owner on
+        that team (primary or secondary). This is what lets a subject resolve
+        through their team to a team-owned record."""
+        members: dict[str, set[str]] = {}
+        for owner in owner_map.values():
+            if not owner.email:
+                continue
+            member = owner_principal(owner.email)
+            for team_id in owner.team_ids:
+                members.setdefault(team_principal(team_id), set()).add(member)
+        return members
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -337,9 +517,19 @@ class VerityDebeziumSink:
     already-built deterministic L1 upsert path (one envelope in → one L0
     episode + L1 upserts, no LLM, no embedding).
 
-    The admin-assigned visibility policy rides on the events; the ingest
-    endpoint is the trusted connector plane and does not yet accept it —
-    it lands with the server's ingest-token work.
+    Two visibility paths, per record, mirroring HubSpot's own model:
+
+    - **Owned records** carry an inline ``verity_acl`` with the owner+team
+      tokens (``record_visibility``) and ``acl_provenance: approximated`` — an
+      owner/team approximation of HubSpot record access (it cannot see per-user
+      "Everything" permission or manual shares, so it under-grants; never
+      ``mirrored``, which would claim a literal source ACL). :meth:`post`
+      resolves the owner/team principal strings to tokens here and stamps them.
+    - **Unowned records** (and the webhook lane) fall through to the
+      admin-assigned ``visibility_policy`` (``--visibility``), delivered as the
+      connector-bound policy on the POST query string (``?visibility=1,2``) with
+      ``admin-assigned`` provenance. Inline wins over the bound policy
+      server-side, so a mixed batch resolves each record correctly.
     """
 
     url: str
@@ -366,8 +556,13 @@ class VerityDebeziumSink:
         ``source.connector`` comes from the event, so this sink is shared by
         every structured CRM connector (HubSpot, Salesforce) whose events
         carry an ``object_type``; the L1 partition becomes
-        ``<source>:<object_type>``."""
-        return {
+        ``<source>:<object_type>``.
+
+        When the event has a resolved per-record ACL (``record_visibility``), a
+        TOP-LEVEL ``verity_acl`` sibling carries it with ``approximated``
+        provenance; otherwise none is emitted and the server applies the
+        connector-bound admin-assigned policy from the query string."""
+        payload = {
             "op": "u",
             "source": {
                 "connector": event.source,
@@ -376,9 +571,109 @@ class VerityDebeziumSink:
             },
             "after": {"id": event.entity_id, event.field_name: event.value},
         }
+        record_visibility = getattr(event, "record_visibility", None)
+        if record_visibility is not None:
+            payload["verity_acl"] = {
+                "visibility": list(record_visibility),
+                "confidentiality": "internal",
+                "acl_provenance": "approximated",
+            }
+        return payload
+
+    @staticmethod
+    def _bound_visibility(events: list[FactEvent]) -> str | None:
+        """The admin-assigned policy to bind on this POST, as ``"1,2"``.
+
+        Read off the events' ``visibility_policy`` (every tier-C CRM event
+        carries it). The bound policy is per-POST, so a batch MUST share one
+        policy; a batch that mixes policies is a programming error and raises
+        (fail closed) rather than silently applying one event's ACL to another.
+        Returns ``None`` only when the events carry no policy at all — then the
+        server refuses them unless they declare an inline ACL."""
+        policies = {
+            tuple(p)
+            for e in events
+            if (p := getattr(e, "visibility_policy", None)) is not None
+        }
+        if not policies:
+            return None
+        if len(policies) > 1:
+            raise ValueError(
+                "batch mixes visibility policies "
+                f"({sorted(policies)}); the connector-bound policy is per-POST"
+            )
+        return ",".join(str(t) for t in next(iter(policies)))
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.admin_token}"} if self.admin_token else {}
+
+    def resolve_principals(self, principals: list[str]) -> dict[str, int]:
+        """Materialize owner/team principal strings to int tokens via
+        ``POST /v1/admin/principals`` (idempotent; a principal keeps its token
+        forever). Principals absent from the response stay unresolved and confer
+        no visibility (fail closed)."""
+        if not principals:
+            return {}
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            response = client.post(
+                f"{self.url.rstrip('/')}/v1/admin/principals",
+                json={"tenant_id": self.tenant_id, "principals": list(principals)},
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return {
+                principal: token
+                for principal, token in response.json().get("mappings", {}).items()
+                if isinstance(token, int)
+            }
+
+    def sync_team_edges(self, team_members: Mapping[str, set[str]]) -> int:
+        """Write the team-membership edges into SpiceDB via
+        ``POST /v1/admin/groups`` (``group:hubspot-team-<id> ⊃ user:<member>``),
+        so a subject resolves through their team to team-owned records. Eagerly
+        allocates each group's token. Deterministic order. Returns the edge
+        count. No-op (0) when the owner roster was empty (owners scope absent)."""
+        if not team_members:
+            return 0
+        written = 0
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            for group in sorted(team_members):
+                for member in sorted(team_members[group]):
+                    response = client.post(
+                        f"{self.url.rstrip('/')}/v1/admin/groups",
+                        json={"tenant_id": self.tenant_id, "group": group, "member": member},
+                        headers=self._headers(),
+                    )
+                    response.raise_for_status()
+                    written += 1
+        return written
+
+    def _stamp_record_visibility(self, events: list[FactEvent]) -> None:
+        """Resolve every owned record's owner/team principals to tokens in one
+        round-trip and stamp ``record_visibility`` on those events. Unowned
+        events are left untouched (they use the admin-assigned fallback). The
+        owner principal is minted on demand, so an owned record always resolves
+        to at least its owner — it can never silently degrade to the broader
+        admin fallback."""
+        distinct = sorted(
+            {p for e in events for p in (getattr(e, "record_principals", None) or [])}
+        )
+        if not distinct:
+            return
+        tokens = self.resolve_principals(distinct)
+        for event in events:
+            principals = getattr(event, "record_principals", None)
+            if not principals:
+                continue
+            resolved = [tokens[p] for p in principals if p in tokens]
+            event.record_visibility = resolved or None  # type: ignore[attr-defined]
 
     def post(self, events: list[FactEvent], cursor: str | None = None) -> dict:
         """POST a batch; returns the server's write summary.
+
+        Owned records get their owner/team principals resolved to tokens and
+        stamped as an inline ``approximated`` ACL; unowned records ride the
+        connector-bound admin-assigned ``?visibility=`` policy.
 
         After a successful delivery a best-effort heartbeat goes to
         ``POST /v1/admin/connector-status`` (source, batch size, newest event
@@ -388,13 +683,18 @@ class VerityDebeziumSink:
         """
         if not events:
             return {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+        self._stamp_record_visibility(events)
         headers = {}
         if self.admin_token:
             headers["Authorization"] = f"Bearer {self.admin_token}"
+        params = {"tenant_id": self.tenant_id, "pk": self.pk}
+        bound = self._bound_visibility(events)
+        if bound is not None:
+            params["visibility"] = bound
         with httpx.Client(timeout=30.0, transport=self.transport) as client:
             response = client.post(
                 f"{self.url.rstrip('/')}/v1/ingest/debezium",
-                params={"tenant_id": self.tenant_id, "pk": self.pk},
+                params=params,
                 json=[self.envelope(e) for e in events],
                 headers=headers,
             )
@@ -488,18 +788,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"webhook: {len(events)} fact event(s) -> {summary}")
         return 0
 
-    async def run_once() -> tuple[list[HubSpotFactEvent], str]:
+    async def run_once() -> tuple[list[HubSpotFactEvent], str, dict[str, set[str]]]:
         connector = HubSpotConnector(policy)
         try:
             events, next_cursor = await connector.poll(_read_cursor(args.state_file))
-            return list(events), next_cursor  # type: ignore[arg-type]
+            # team_members is the source of the SpiceDB edges; capture it before
+            # the client closes.
+            return list(events), next_cursor, dict(connector.team_members)  # type: ignore[arg-type]
         finally:
             await connector.aclose()
 
-    events, next_cursor = asyncio.run(run_once())
+    events, next_cursor, team_members = asyncio.run(run_once())
+    # Sync team membership FIRST so a subject can resolve through their team the
+    # moment the team-owned facts land.
+    edges = sink.sync_team_edges(team_members)
     summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
-    print(f"poll: {len(events)} fact event(s), cursor -> {next_cursor} -> {summary}")
+    owned = sum(1 for e in events if getattr(e, "record_principals", None))
+    print(
+        f"poll: {len(events)} fact event(s) ({owned} owner/team-scoped, "
+        f"{edges} team edge(s)), cursor -> {next_cursor} -> {summary}"
+    )
     return 0
 
 

@@ -20,7 +20,10 @@ import pytest
 from verity_ingest.connectors.hubspot import (
     HubSpotConnector,
     HubSpotFactEvent,
+    OwnerInfo,
     VerityDebeziumSink,
+    owner_principal,
+    team_principal,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -261,10 +264,13 @@ def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
     summary = sink.post(events, cursor="2026-07-09T16:00:05.000Z")
 
     assert summary == {"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
-    # First request: the delivery batch itself.
+    # First request: the delivery batch itself. The admin-assigned policy the
+    # events carry (POLICY == [7, 12]) rides as the connector-bound visibility
+    # on the query string — the server materializes every fact against it with
+    # admin-assigned provenance (tier C has no per-record ACL to mirror).
     assert seen[0]["url"] == (
         "http://verity.local:7717/v1/ingest/debezium"
-        "?tenant_id=0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001&pk=id"
+        "?tenant_id=0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001&pk=id&visibility=7%2C12"
     )
     assert seen[0]["auth"] == "Bearer secret-token"
     assert seen[0]["body"] == [VerityDebeziumSink.envelope(e) for e in events]
@@ -279,6 +285,41 @@ def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
         "cursor": "2026-07-09T16:00:05.000Z",
     }
     assert len(seen) == 2
+
+
+def test_bound_visibility_is_the_events_policy_as_comma_string() -> None:
+    # The admin-assigned policy the connector stamped on every event becomes the
+    # connector-bound `?visibility=` the server materializes facts against. This
+    # is the line that was silently missing: before it, HubSpot facts reached
+    # the post-0026 server with NO ACL and were refused wholesale.
+    events = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), POLICY)
+    assert VerityDebeziumSink._bound_visibility(events) == "7,12"
+
+
+def test_bound_visibility_refuses_a_batch_that_mixes_policies() -> None:
+    # The bound policy is per-POST; two events under different policies must not
+    # be silently collapsed to one — that would apply one record's ACL to
+    # another. Fail closed instead.
+    a = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), [7, 12])
+    b = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), [99])
+    with pytest.raises(ValueError, match="mixes visibility policies"):
+        VerityDebeziumSink._bound_visibility(a + b)
+
+
+def test_bound_visibility_none_when_events_carry_no_policy() -> None:
+    # A plain FactEvent (no visibility_policy attr) yields no bound policy — the
+    # server then refuses it unless it declares an inline ACL. Never permissive.
+    from verity_ingest.connector import FactEvent
+
+    bare = FactEvent(
+        source="hubspot",
+        entity_id="1",
+        field_name="email",
+        value="x@y.z",
+        valid_from=utc(2026, 7, 9),
+        raw_payload={},
+    )
+    assert VerityDebeziumSink._bound_visibility([bare]) is None
 
 
 def test_sink_heartbeat_failure_never_fails_the_sync() -> None:
@@ -307,12 +348,19 @@ def test_sink_no_events_no_post() -> None:
 # ---------- truth lane: poll() against a mock HubSpot ----------
 
 
-def make_mock_hubspot(requests_log: list[dict]) -> httpx.MockTransport:
+def make_mock_hubspot(
+    requests_log: list[dict], owners: dict | None = None
+) -> httpx.MockTransport:
     """Serves the fixture pages; contacts paginate; the first deals request
-    is a 429 with Retry-After to exercise rate-limit handling."""
+    is a 429 with Retry-After to exercise rate-limit handling. The Owners API
+    (a GET, not logged with the search POSTs) returns ``owners`` — default an
+    empty roster, so records stay unowned and ride the admin fallback."""
     state = {"deals_throttled": False}
+    owners_body = owners if owners is not None else {"results": []}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/crm/v3/owners":
+            return httpx.Response(200, json=owners_body)
         body = json.loads(request.content)
         requests_log.append(
             {"path": request.url.path, "auth": request.headers.get("Authorization"), "body": body}
@@ -436,3 +484,273 @@ def test_token_comes_from_env_and_is_required(monkeypatch: pytest.MonkeyPatch) -
     legacy = HubSpotConnector(POLICY)
     assert legacy._client.headers["Authorization"] == "Bearer pat-na1-from-env"
     asyncio.run(legacy.aclose())
+
+
+# ---------- owner/team ACL mirror (SPEC §5e.2) ----------
+
+OWNER_MAP = {
+    "77": OwnerInfo(email="rep.one@acme.test", team_ids=("10", "20")),
+    "88": OwnerInfo(email="rep.two@acme.test", team_ids=("10",)),
+}
+
+
+def test_record_principals_owner_first_then_teams_deduped() -> None:
+    record = {"properties": {"hubspot_owner_id": "77"}}
+    assert HubSpotConnector.record_principals(record, OWNER_MAP) == [
+        "user:rep.one@acme.test",  # owner first, deterministic
+        "group:hubspot-team-10",
+        "group:hubspot-team-20",
+    ]
+
+
+def test_record_principals_none_when_unowned_or_unknown_or_no_map() -> None:
+    # No owner map (owners scope absent) → fallback for everything.
+    assert HubSpotConnector.record_principals({"properties": {}}, None) is None
+    # Owner id absent/blank → unowned → fallback.
+    assert HubSpotConnector.record_principals({"properties": {}}, OWNER_MAP) is None
+    assert (
+        HubSpotConnector.record_principals(
+            {"properties": {"hubspot_owner_id": None}}, OWNER_MAP
+        )
+        is None
+    )
+    # Owner id present but not in the roster → fail closed (fallback), never a
+    # fabricated principal.
+    assert (
+        HubSpotConnector.record_principals(
+            {"properties": {"hubspot_owner_id": "does-not-exist"}}, OWNER_MAP
+        )
+        is None
+    )
+
+
+def test_team_members_inverts_roster_lowercasing_and_dropping_emailless() -> None:
+    owners = HubSpotConnector._team_members(
+        {
+            "77": OwnerInfo(email="rep.one@acme.test", team_ids=("10", "20")),
+            "88": OwnerInfo(email="rep.two@acme.test", team_ids=("10",)),
+            "99": OwnerInfo(email="", team_ids=("10",)),  # emailless queue → dropped
+        }
+    )
+    assert owners == {
+        "group:hubspot-team-10": {"user:rep.one@acme.test", "user:rep.two@acme.test"},
+        "group:hubspot-team-20": {"user:rep.one@acme.test"},
+    }
+
+
+def owned_contacts_mock(log: list[dict], owners: dict) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/crm/v3/owners":
+            return httpx.Response(200, json=owners)
+        body = json.loads(request.content)
+        log.append({"path": request.url.path, "body": body})
+        if request.url.path == "/crm/v3/objects/contacts/search":
+            return httpx.Response(200, json=fixture("hubspot_search_contacts_owned.json"))
+        # companies/deals empty for this focused test
+        return httpx.Response(200, json={"results": []})
+
+    return httpx.MockTransport(handler)
+
+
+def test_poll_mirrors_owner_and_team_acl_and_builds_edges() -> None:
+    log: list[dict] = []
+    client = httpx.AsyncClient(
+        base_url="https://api.hubapi.test",
+        transport=owned_contacts_mock(log, fixture("hubspot_owners.json")),
+        headers={"Authorization": "Bearer pat-na1-test"},
+    )
+    connector = HubSpotConnector(POLICY, token="pat-na1-test", client=client)
+
+    async def run():
+        try:
+            return await connector.poll(None)
+        finally:
+            await connector.aclose()
+
+    events, _ = asyncio.run(run())
+
+    # Record 401 (owner 77 → teams 10,20): its facts carry owner + both teams.
+    e401 = next(e for e in events if e.entity_id == "401")
+    assert e401.record_principals == [
+        "user:rep.one@acme.test",  # owner email lowercased from "Rep.One@acme.test"
+        "group:hubspot-team-10",
+        "group:hubspot-team-20",
+    ]
+    # Record 402 (owner 88 → team 10 only).
+    e402 = next(e for e in events if e.entity_id == "402")
+    assert e402.record_principals == ["user:rep.two@acme.test", "group:hubspot-team-10"]
+    # Record 403 (unowned) → no per-record ACL → admin fallback.
+    e403 = next(e for e in events if e.entity_id == "403")
+    assert e403.record_principals is None
+
+    # Team edges inverted from the FULL roster (owner 99 is emailless → dropped).
+    assert connector.team_members == {
+        "group:hubspot-team-10": {"user:rep.one@acme.test", "user:rep.two@acme.test"},
+        "group:hubspot-team-20": {"user:rep.one@acme.test"},
+    }
+
+
+def test_poll_owners_403_degrades_to_admin_fallback() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/crm/v3/owners":
+            return httpx.Response(403, json={"message": "missing scope"})
+        json.loads(request.content)
+        return httpx.Response(200, json=fixture("hubspot_search_contacts_owned.json")) if (
+            request.url.path == "/crm/v3/objects/contacts/search"
+        ) else httpx.Response(200, json={"results": []})
+
+    client = httpx.AsyncClient(
+        base_url="https://api.hubapi.test",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer pat-na1-test"},
+    )
+    connector = HubSpotConnector(POLICY, token="pat-na1-test", client=client)
+
+    async def run():
+        try:
+            return await connector.poll(None)
+        finally:
+            await connector.aclose()
+
+    events, _ = asyncio.run(run())
+    # Owners 403 → empty roster → every record unowned → admin fallback, no edges.
+    assert all(e.record_principals is None for e in events)
+    assert connector.team_members == {}
+
+
+def test_envelope_owned_carries_inline_approximated_acl() -> None:
+    event = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="401",
+        field_name="email",
+        value="owned@acme.test",
+        valid_from=utc(2026, 7, 10, 12),
+        raw_payload={},
+        object_type="contacts",
+        visibility_policy=POLICY,
+        record_principals=["user:rep.one@acme.test", "group:hubspot-team-10"],
+        record_visibility=[31, 32],  # resolved tokens
+    )
+    env = VerityDebeziumSink.envelope(event)
+    assert env["verity_acl"] == {
+        "visibility": [31, 32],
+        "confidentiality": "internal",
+        "acl_provenance": "approximated",
+    }
+    # An unowned event (no record_visibility) emits NO inline block.
+    unowned = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="403",
+        field_name="email",
+        value="unowned@acme.test",
+        valid_from=utc(2026, 7, 10, 14),
+        raw_payload={},
+        object_type="contacts",
+        visibility_policy=POLICY,
+    )
+    assert "verity_acl" not in VerityDebeziumSink.envelope(unowned)
+
+
+def test_sink_resolves_owned_records_and_falls_back_for_unowned() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content) if request.content else {}
+        seen.append({"path": path, "url": str(request.url), "body": body})
+        if path == "/v1/admin/principals":
+            # Deterministic materialization of the owner/team strings.
+            table = {
+                "user:rep.one@acme.test": 31,
+                "group:hubspot-team-10": 32,
+            }
+            return httpx.Response(
+                200, json={"mappings": {p: table[p] for p in body["principals"] if p in table}}
+            )
+        if path == "/v1/ingest/debezium":
+            return httpx.Response(
+                200,
+                json={
+                    "facts_inserted": len(body),
+                    "facts_refused_no_acl": 0,
+                    "facts_retired": 0,
+                    "facts_superseded": 0,
+                    "facts_unchanged": 0,
+                },
+            )
+        return httpx.Response(200, json={})  # heartbeat
+
+    owned = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="401",
+        field_name="email",
+        value="owned@acme.test",
+        valid_from=utc(2026, 7, 10, 12),
+        raw_payload={},
+        object_type="contacts",
+        visibility_policy=POLICY,
+        record_principals=["user:rep.one@acme.test", "group:hubspot-team-10"],
+    )
+    unowned = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="403",
+        field_name="email",
+        value="unowned@acme.test",
+        valid_from=utc(2026, 7, 10, 14),
+        raw_payload={},
+        object_type="contacts",
+        visibility_policy=POLICY,
+    )
+    sink = VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        transport=httpx.MockTransport(handler),
+    )
+    sink.post([owned, unowned])
+
+    # The owned event got its owner/team principals resolved and stamped.
+    assert owned.record_visibility == [31, 32]
+    assert unowned.record_visibility is None
+    # The batch still carries the admin-assigned fallback for the unowned record.
+    ingest = next(s for s in seen if s["path"] == "/v1/ingest/debezium")
+    assert "visibility=7%2C12" in ingest["url"]
+    bodies = ingest["body"]
+    owned_env = next(b for b in bodies if b["after"]["id"] == "401")
+    assert owned_env["verity_acl"] == {
+        "visibility": [31, 32],
+        "confidentiality": "internal",
+        "acl_provenance": "approximated",
+    }
+    unowned_env = next(b for b in bodies if b["after"]["id"] == "403")
+    assert "verity_acl" not in unowned_env  # rides the ?visibility= fallback
+
+
+def test_sink_sync_team_edges_posts_group_membership_in_order() -> None:
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    sink = VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="tnt",
+        transport=httpx.MockTransport(handler),
+    )
+    written = sink.sync_team_edges(
+        {
+            team_principal("20"): {owner_principal("Rep.One@acme.test")},
+            team_principal("10"): {
+                owner_principal("rep.two@acme.test"),
+                owner_principal("rep.one@acme.test"),
+            },
+        }
+    )
+    assert written == 3
+    # Deterministic order: groups sorted, members sorted within each group.
+    assert seen == [
+        {"tenant_id": "tnt", "group": "group:hubspot-team-10", "member": "user:rep.one@acme.test"},
+        {"tenant_id": "tnt", "group": "group:hubspot-team-10", "member": "user:rep.two@acme.test"},
+        {"tenant_id": "tnt", "group": "group:hubspot-team-20", "member": "user:rep.one@acme.test"},
+    ]
+    assert sink.sync_team_edges({}) == 0  # empty roster → no-op
