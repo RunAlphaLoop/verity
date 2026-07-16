@@ -337,9 +337,13 @@ class VerityDebeziumSink:
     already-built deterministic L1 upsert path (one envelope in → one L0
     episode + L1 upserts, no LLM, no embedding).
 
-    The admin-assigned visibility policy rides on the events; the ingest
-    endpoint is the trusted connector plane and does not yet accept it —
-    it lands with the server's ingest-token work.
+    The admin-assigned visibility policy (tier C — HubSpot/Salesforce carry no
+    per-record source ACL) rides on the events as ``visibility_policy`` and is
+    delivered to the server as the connector-bound policy on the POST query
+    string (``?visibility=1,2``). The server materializes every fact in the
+    batch against it with ``admin-assigned`` provenance (SPEC §5e.2). No inline
+    ``verity_acl`` block is emitted: there is no source ACL to mirror, and
+    tagging these facts ``mirrored`` would falsify the audit trail.
     """
 
     url: str
@@ -377,6 +381,30 @@ class VerityDebeziumSink:
             "after": {"id": event.entity_id, event.field_name: event.value},
         }
 
+    @staticmethod
+    def _bound_visibility(events: list[FactEvent]) -> str | None:
+        """The admin-assigned policy to bind on this POST, as ``"1,2"``.
+
+        Read off the events' ``visibility_policy`` (every tier-C CRM event
+        carries it). The bound policy is per-POST, so a batch MUST share one
+        policy; a batch that mixes policies is a programming error and raises
+        (fail closed) rather than silently applying one event's ACL to another.
+        Returns ``None`` only when the events carry no policy at all — then the
+        server refuses them unless they declare an inline ACL."""
+        policies = {
+            tuple(p)
+            for e in events
+            if (p := getattr(e, "visibility_policy", None)) is not None
+        }
+        if not policies:
+            return None
+        if len(policies) > 1:
+            raise ValueError(
+                "batch mixes visibility policies "
+                f"({sorted(policies)}); the connector-bound policy is per-POST"
+            )
+        return ",".join(str(t) for t in next(iter(policies)))
+
     def post(self, events: list[FactEvent], cursor: str | None = None) -> dict:
         """POST a batch; returns the server's write summary.
 
@@ -391,10 +419,14 @@ class VerityDebeziumSink:
         headers = {}
         if self.admin_token:
             headers["Authorization"] = f"Bearer {self.admin_token}"
+        params = {"tenant_id": self.tenant_id, "pk": self.pk}
+        bound = self._bound_visibility(events)
+        if bound is not None:
+            params["visibility"] = bound
         with httpx.Client(timeout=30.0, transport=self.transport) as client:
             response = client.post(
                 f"{self.url.rstrip('/')}/v1/ingest/debezium",
-                params={"tenant_id": self.tenant_id, "pk": self.pk},
+                params=params,
                 json=[self.envelope(e) for e in events],
                 headers=headers,
             )

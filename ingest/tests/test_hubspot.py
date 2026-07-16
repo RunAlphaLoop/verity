@@ -261,10 +261,13 @@ def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
     summary = sink.post(events, cursor="2026-07-09T16:00:05.000Z")
 
     assert summary == {"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
-    # First request: the delivery batch itself.
+    # First request: the delivery batch itself. The admin-assigned policy the
+    # events carry (POLICY == [7, 12]) rides as the connector-bound visibility
+    # on the query string — the server materializes every fact against it with
+    # admin-assigned provenance (tier C has no per-record ACL to mirror).
     assert seen[0]["url"] == (
         "http://verity.local:7717/v1/ingest/debezium"
-        "?tenant_id=0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001&pk=id"
+        "?tenant_id=0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001&pk=id&visibility=7%2C12"
     )
     assert seen[0]["auth"] == "Bearer secret-token"
     assert seen[0]["body"] == [VerityDebeziumSink.envelope(e) for e in events]
@@ -279,6 +282,41 @@ def test_sink_posts_batch_with_tenant_pk_and_bearer() -> None:
         "cursor": "2026-07-09T16:00:05.000Z",
     }
     assert len(seen) == 2
+
+
+def test_bound_visibility_is_the_events_policy_as_comma_string() -> None:
+    # The admin-assigned policy the connector stamped on every event becomes the
+    # connector-bound `?visibility=` the server materializes facts against. This
+    # is the line that was silently missing: before it, HubSpot facts reached
+    # the post-0026 server with NO ACL and were refused wholesale.
+    events = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), POLICY)
+    assert VerityDebeziumSink._bound_visibility(events) == "7,12"
+
+
+def test_bound_visibility_refuses_a_batch_that_mixes_policies() -> None:
+    # The bound policy is per-POST; two events under different policies must not
+    # be silently collapsed to one — that would apply one record's ACL to
+    # another. Fail closed instead.
+    a = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), [7, 12])
+    b = HubSpotConnector.handle_webhook(fixture("hubspot_webhook_v3.json"), [99])
+    with pytest.raises(ValueError, match="mixes visibility policies"):
+        VerityDebeziumSink._bound_visibility(a + b)
+
+
+def test_bound_visibility_none_when_events_carry_no_policy() -> None:
+    # A plain FactEvent (no visibility_policy attr) yields no bound policy — the
+    # server then refuses it unless it declares an inline ACL. Never permissive.
+    from verity_ingest.connector import FactEvent
+
+    bare = FactEvent(
+        source="hubspot",
+        entity_id="1",
+        field_name="email",
+        value="x@y.z",
+        valid_from=utc(2026, 7, 9),
+        raw_payload={},
+    )
+    assert VerityDebeziumSink._bound_visibility([bare]) is None
 
 
 def test_sink_heartbeat_failure_never_fails_the_sync() -> None:

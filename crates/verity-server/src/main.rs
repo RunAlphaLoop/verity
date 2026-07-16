@@ -2439,10 +2439,96 @@ struct IngestParams {
     /// is REFUSED (fail closed), never indexed at a permissive default. Empty
     /// (`visibility=[]`) is a deliberate "writes memory nobody can read", still
     /// a policy, distinct from "no policy".
-    #[serde(default)]
+    ///
+    /// Carried as a comma-separated token list on the query string
+    /// (`?visibility=1,2`). A URL query is `serde_urlencoded`, which cannot
+    /// deserialize a `Vec` from repeated keys, so the wire form is one string
+    /// that we split here — the ONLY way a connector can reach the
+    /// admin-assigned bound-policy path over HTTP.
+    #[serde(default, deserialize_with = "de_comma_tokens")]
     visibility: Option<Vec<PrincipalToken>>,
     #[serde(default)]
     confidentiality: Option<Confidentiality>,
+}
+
+/// Parse `?visibility=1,2,3` into tokens. Absent => `None` (no bound policy =>
+/// the fact is refused unless it declares an inline ACL). Present-but-empty
+/// (`?visibility=`) => `Some(vec![])`, the deliberate "nobody can read this"
+/// policy — still a policy, never widened. A non-integer token fails the whole
+/// request (fail closed) rather than being silently dropped.
+fn de_comma_tokens<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<PrincipalToken>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw else { return Ok(None) };
+    let mut tokens = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        tokens.push(
+            part.parse::<PrincipalToken>()
+                .map_err(serde::de::Error::custom)?,
+        );
+    }
+    Ok(Some(tokens))
+}
+
+#[cfg(test)]
+mod ingest_visibility_param_tests {
+    //! Regression lock for the connector-bound visibility policy on the wire.
+    //! `?visibility=1,2` is a URL query, deserialized by `serde_urlencoded`,
+    //! which CANNOT build a `Vec` from repeated keys — so the field MUST arrive
+    //! as one comma string that `de_comma_tokens` splits. Before this parser
+    //! existed, every form of the param 400'd and the only reachable ACL path
+    //! was inline (provenance `mirrored`) — wrong for tier-C CRM connectors,
+    //! which have no source ACL and must land `admin-assigned`. We exercise the
+    //! real `IngestParams` field (deserialize_with hookup + parser) through a
+    //! JSON string, which presents the value exactly as a query string does.
+    use super::IngestParams;
+    use serde_json::json;
+
+    fn visibility_of(raw: Option<&str>) -> Result<Option<Vec<i32>>, serde_json::Error> {
+        let mut obj = json!({ "tenant_id": "00000000-0000-0000-0000-000000000000" });
+        if let Some(v) = raw {
+            obj["visibility"] = json!(v);
+        }
+        let params: IngestParams = serde_json::from_value(obj)?;
+        Ok(params.visibility)
+    }
+
+    #[test]
+    fn comma_list_becomes_tokens() {
+        assert_eq!(visibility_of(Some("1,2,3")).unwrap(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn whitespace_around_tokens_is_trimmed() {
+        assert_eq!(visibility_of(Some(" 1 , 2 ,3 ")).unwrap(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn empty_string_is_the_nobody_can_read_policy_not_none() {
+        // `?visibility=` is a deliberate empty policy — Some(vec![]), still a
+        // policy the server binds; distinct from absent (no policy => refuse).
+        assert_eq!(visibility_of(Some("")).unwrap(), Some(vec![]));
+    }
+
+    #[test]
+    fn absent_is_none_so_the_fact_is_refused_not_widened() {
+        assert_eq!(visibility_of(None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_non_integer_token_fails_the_whole_request() {
+        // Fail closed: never silently drop a malformed token and bind a
+        // narrower-than-intended policy.
+        assert!(visibility_of(Some("1,notatoken,3")).is_err());
+    }
 }
 
 fn default_pk() -> String {
