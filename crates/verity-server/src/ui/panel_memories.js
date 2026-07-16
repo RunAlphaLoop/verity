@@ -494,7 +494,7 @@
       '<div class="note">old rows are stamped with the time they stopped being true and a link to the row that replaced them' +
       '<span class="api-crumb"> · <code>valid_to</code>' +
       (full.kind === "fact" ? ' + <code>superseded_by</code>' : '') + '</span>' +
-      ' — invalidated, never deleted (hard purge only ever happens through the crypto-shredding pipeline).' +
+      ' — invalidated, never deleted (hard purge only ever happens through the lineage-driven erasure pipeline).' +
       (capped ? ' History window shows the newest ' + HISTORY_WINDOW + ' rows of this source; older versions exist beyond it.' : '') +
       '</div>';
   }

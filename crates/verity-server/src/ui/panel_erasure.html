@@ -11,7 +11,8 @@
        • POST /v1/admin/erasure/preview  — TRUE dry run (rolls back, removes
          nothing); returns would_erase (ErasureReport), coverage_gaps,
          rebac_tuples_would_delete (admin)
-       • POST /v1/admin/erasure          — crypto-shred hard purge; returns
+       • POST /v1/admin/erasure          — lineage-driven hard purge (live-row
+         delete); returns
          erased, rebac_tuples_deleted, purge_report {facts, algorithm, domain,
          signature|null, signed} — SERVER-signed; signed=false = ephemeral dev
          key, disclosed honestly (admin)

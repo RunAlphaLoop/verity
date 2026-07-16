@@ -4,7 +4,7 @@
 **One-liner:** The open-source, permission-aware shared context plane for enterprise AI agents — always fresh from systems of record, provably scoped, fast enough for the inner loop.
 **License:** Apache 2.0, permanently. One codebase. Nothing security-critical ever paywalled.
 
-**Changes from v1.0:** this revision resolves the completeness critique in the architecture itself, not in a risks list. Query embedding is now inside the latency budget with a local ONNX query encoder; a first-class Identity Plane (§6) makes source-ACL inheritance actually enforceable; the ReBAC engine decision is made — **SpiceDB**, because its true push Watch API and ZedToken consistency are load-bearing for our materialization design (OpenFGA only offers paginated `ReadChanges` polling); a Deletion, Retention & Compliance plane (§8) reconciles "invalidate-never-delete" with GDPR via crypto-shredding and a lineage-driven hard-purge pipeline; entity-tagging is stated honestly as a deterministic/probabilistic split with quarantine-by-default and a tagger-recall benchmark metric; `memory.remember` is retrievable at launch; MediaObject + retrieve-by-text ships in v0.1; concurrency targets, read-your-writes semantics, backup/restore/DR, tenant-model reconciliation, embedding-model migration, backfill, schema evolution, purpose-policy authoring, audit-log operations, signed-URI lifecycle, cross-source precedence, cost model, and OSS HA posture are all specified. The MVP is re-baselined at 12 weeks with an explicit staffing assumption.
+**Changes from v1.0:** this revision resolves the completeness critique in the architecture itself, not in a risks list. Query embedding is now inside the latency budget with a local ONNX query encoder; a first-class Identity Plane (§6) makes source-ACL inheritance actually enforceable; the ReBAC engine decision is made — **SpiceDB**, because its true push Watch API and ZedToken consistency are load-bearing for our materialization design (OpenFGA only offers paginated `ReadChanges` polling); a Deletion, Retention & Compliance plane (§8) reconciles "invalidate-never-delete" with GDPR via a lineage-driven hard-purge pipeline (with crypto-shredding as a design-intent that is not yet implemented — see the §8a status note); entity-tagging is stated honestly as a deterministic/probabilistic split with quarantine-by-default and a tagger-recall benchmark metric; `memory.remember` is retrievable at launch; MediaObject + retrieve-by-text ships in v0.1; concurrency targets, read-your-writes semantics, backup/restore/DR, tenant-model reconciliation, embedding-model migration, backfill, schema evolution, purpose-policy authoring, audit-log operations, signed-URI lifecycle, cross-source precedence, cost model, and OSS HA posture are all specified. The MVP is re-baselined at 12 weeks with an explicit staffing assumption.
 
 **Changes from v1.1 (founder request, 2026-07-09):** cross-agent activity awareness is now first-class. Agents can record what they *did* (not just what they observed) as **Action records** — an append-only, scoped, per-entity activity timeline — and any agent can ask "what has been done on this entity, by whom?" via `memory.activity` before acting. See §2 (Action records), §9 (new verbs), §13 (MVP scope).
 
@@ -40,10 +40,10 @@ We do not compete with Mem0/Letta on chat personalization; we interoperate with 
 
 Four hard-separated layers. Every layer above L0 is a derived, rebuildable projection (the evidence-vs-belief split validated by Eywa, Graphiti, and the governed-memory literature). Each layer has a different write path, freshness mechanic, TTL policy, and scoping rule.
 
-### L0 — Evidence Log (immutable, crypto-shreddable)
+### L0 — Evidence Log (immutable, append-only)
 Append-only raw episodes: CDC events, webhook payloads, document versions, transcripts, web-page snapshots, agent observations. Every episode is stamped with **provenance**: source system, source entity ID, writer principal (user `sub` + agent `azp` + `act` delegation chain from the MCP auth token), trust tier, ingest timestamp, content hash. Nothing here is ever rewritten in the normal course of operation. L0 is the audit log substrate, the poisoning-forensics substrate, and the replay source when extraction pipelines improve.
 
-**Compliance carve-out (v1.1):** "immutable" is an operational property, not a legal impossibility. L0 payloads are envelope-encrypted with per-data-subject and per-source data-encryption keys, so GDPR/CCPA erasure is satisfied by **crypto-shredding** (destroying the key renders the ciphertext — including in every backup — permanently unreadable) plus a lineage-driven hard purge of derived tiers. The full mechanics live in §8. `memory.forget` retains its invalidate-never-delete semantics for *belief management*; erasure is a separate, admin-initiated compliance verb with different machinery.
+**Compliance carve-out (v1.1):** "immutable" is an operational property, not a legal impossibility. GDPR/CCPA erasure is satisfied by a **lineage-driven hard purge**: because lineage is tracked from day one, "delete everything derived from this person" across L0–L3 is a graph walk, not a guess — live rows are hard-deleted from the primary store immediately, and physical backups age out over a disclosed retention window (§8b). Crypto-shredding of L0 (per-data-subject DEK destruction that renders even backup ciphertext unreadable) is the intended design (§8a) that would tighten the backup window to zero — but **it is not yet implemented; see the §8a status note.** `memory.forget` retains its invalidate-never-delete semantics for *belief management*; erasure is a separate, admin-initiated compliance verb with different machinery.
 
 ### L1 — Canonical Records (deterministic, bi-temporal)
 Typed, versioned mirrors of system-of-record objects: Account, Contact, Opportunity, Ticket, Page. **A CRM row stays a row.** Updates are deterministic upserts keyed on `(source, entity_id, field)` with bi-temporal versioning:
@@ -230,7 +230,7 @@ Rejected for core: Milvus (ops weight), Chroma (scale ceiling), Turbopuffer-styl
 - **Revocation tombstones:** an in-memory set of item/principal pairs written **synchronously and fail-closed** on ACL-revocation events, hiding items *immediately*, ahead of asynchronous bitmap/index rebuild. Tombstones are durable (written to the changelog before ack), replicated to all serving replicas with acked delivery, and rebuilt on cold start via changelog replay (§11c) — a revoke is confirmed to the caller only after every live serving replica has acknowledged the tombstone or been fenced out of the query path.
 - **Session write-through buffer:** a small per-scope in-memory buffer holding this session's `remember` writes, merged into `recall` results before async consolidation lands in the durable index — this is our read-your-writes guarantee (§4d).
 
-**Durable tier:** Postgres as transactional system of record for L0–L3 rows, tenants, lineage, the key table for crypto-shredding (§8), and the changelog the serving tier tails. **Lance format on object storage** (Apache 2.0, Blob encoding, versioning/time-travel) for multimodal blobs, transcripts, and embedding lineage.
+**Durable tier:** Postgres as transactional system of record for L0–L3 rows, tenants, lineage, the DEK key table for envelope encryption (§8a; the per-subject crypto-shred design that table would serve is roadmap), and the changelog the serving tier tails. **Lance format on object storage** (Apache 2.0, Blob encoding, versioning/time-travel) for multimodal blobs, transcripts, and embedding lineage.
 
 **Optional hot tier:** Valkey for session/working memory and principal-set cache. Never the system of record.
 
@@ -789,15 +789,17 @@ Enforcement notes: the carve-out keys on the item's verified `status`, stamped a
 
 "Invalidate, never delete" is the right *belief-management* semantics and the wrong *compliance* posture if it's the only machinery. An enterprise trust product must survive its first DSAR. This section makes L0 immutability and GDPR Article 17 coexist.
 
-### 8a. Crypto-shredding: erasure for immutable and replicated data
+### 8a. Crypto-shredding: erasure for immutable and replicated data *(design intent — NOT YET IMPLEMENTED)*
+
+> **Implementation status (v0.x).** This subsection describes the target design; it is **not what ships today**. As built: envelope encryption is plumbed but the DEK is **per-tenant** (not per-data-subject), only L0 episode payloads are encrypted (and only when `VERITY_KEK` is set — otherwise the DEK is stored plaintext), L1/L2/L3 and media rows are plaintext, and **erasure destroys no key** (there is no per-subject key to destroy, and none is deleted). So the shipped erasure mechanism is the §8b lineage-driven hard purge of live rows **plus the disclosed backup-retention window** — crypto-shred does not currently make backup ciphertext unreadable. Reaching the design below requires per-data-subject DEK granularity, encrypting all subject-attributable data across the tiers, a KMS-backed key store whose destruction is authoritative against backups, and a multi-subject key policy for shared records. It is roadmap, built only if a deployment demands it; the honest posture until then is §8b + retention window.
 
 - **Envelope encryption at write time:** every L0 episode payload and every Lance blob is encrypted with a **data-encryption key (DEK)** selected by a shred-key policy: per-data-subject DEKs where the payload is attributable to a person (a user's messages, a contact's transcript turns), and per-source(-partition) DEKs otherwise. DEKs live in a Postgres key table, themselves wrapped by a deployment KEK (KMS-backed in cloud/production; file-based in dev).
-- **Erasure = key destruction + purge.** Destroying a DEK renders every ciphertext under it permanently unreadable **everywhere it physically exists — including object-storage versions and every backup ever taken** — without rewriting immutable history. This is what makes "L0 is never rewritten" and "the data is gone" simultaneously true.
+- **Erasure = key destruction + purge.** Destroying a DEK would render every ciphertext under it permanently unreadable **everywhere it physically exists — including object-storage versions and every backup ever taken** — without rewriting immutable history. This is what *would* make "L0 is never rewritten" and "the data is gone" simultaneously true. *(Target, not shipped — see status note.)*
 - Key-table backups are managed separately from data backups with a short retention lag, so a destroyed key cannot be resurrected from an old backup (documented operational requirement; the restore runbook checks key-table recency).
 
 ### 8b. The lineage-driven hard-purge pipeline
 
-Crypto-shredding kills the evidence; derived tiers hold plaintext projections and must be physically purged. Because lineage is built day one, purge is a walk, not a search:
+Derived tiers hold plaintext projections and must be physically purged. Because lineage is built day one, purge is a walk, not a search. **This walk is what ships** — the one step not yet built is the DEK destruction (§8a), marked below:
 
 ```
 erasure request (data subject S / episode set E)
@@ -808,12 +810,14 @@ erasure request (data subject S / episode set E)
   ├─ synchronous: serving tombstones on every affected item (invisible now)
   ├─ hard-delete derived rows in Postgres; delete chunks/vectors from
   │    serving indexes; compact Lance fragments where blobs held plaintext
-  ├─ destroy DEKs for the L0 episodes / blobs (backups now unreadable)
+  ├─ hard-delete the L0 episode rows themselves (like every other tier)
+  ├─ [DESIGN, NOT YET BUILT — §8a] destroy per-subject DEKs so backup
+  │    ciphertext also becomes unreadable; until built, backups age out
   ├─ redact audit-log payloads referencing S (skeleton preserved, §7e)
-  └─ emit signed purge report: refs purged, keys destroyed, timestamps
+  └─ emit signed purge report: refs hard-deleted, timestamps, retention window
 ```
 
-Postgres row deletions age out of PITR backups within the documented backup-retention window; the purge report states this window explicitly (regulator-standard "erasure within X days including backups" language, with X = purge time + backup retention, default 35 days).
+Postgres row deletions age out of PITR backups within the documented backup-retention window; the purge report states this window explicitly (regulator-standard "erasure within X days including backups" language, with X = purge time + backup retention, default 35 days). **Until crypto-shred (§8a) is built, this retention window is the actual erasure boundary for backups — the purge report says so and never claims key destruction.**
 
 ### 8c. Source hard-deletes propagate
 
@@ -933,7 +937,7 @@ POST /v1/actions                         # record_action (idempotent on action_i
 GET  /v1/activity?entity=...&since=...   # scoped agent-activity timeline
 POST /v1/ingest/debezium                 # first-class CDC envelope input
 POST /v1/admin/quarantine/{episode_id}/rollback   # surgical poison rollback
-POST /v1/admin/erasure                   # crypto-shred + hard-purge (admin-only, §8)
+POST /v1/admin/erasure                   # lineage-driven hard purge (admin-only, §8; crypto-shred is §8a roadmap)
 GET  /v1/admin/dsar/export?subject=...   # DSAR export (§8e)
 GET  /v1/media/{blob_ref}?sig=...        # scope-bound signed media redemption (§10)
 GET  /v1/slo/freshness?connector=hubspot # published freshness SLO data
@@ -1026,7 +1030,7 @@ Order-of-magnitude economics buyers and self-hosters ask about first, using defa
 **OSS (feature-complete data plane):**
 - The engine; both storage profiles; hybrid retrieval; all read paths; the local ONNX query/document encoder.
 - The **entire** permission/scoping/enforcement plane: SpiceDB integration, the Identity Plane (directory sync, principal crosswalks, conformance fixtures), visibility materialization, tombstones, scope handles, purpose-policy engine, audit logging, the scope-inspector UI. (Supabase never gated RLS; gating security kills our differentiator.)
-- The **entire** compliance plane: crypto-shredding, hard-purge pipeline, retention policies, DSAR export, backup/restore/DR tooling and runbooks. (A trust product that paywalls GDPR compliance is not a trust product.)
+- The **entire** compliance plane: the lineage-driven hard-purge pipeline, retention policies, DSAR export, backup/restore/DR tooling and runbooks (and crypto-shredding if/when §8a ships). (A trust product that paywalls GDPR compliance is not a trust product.)
 - Bi-temporal L0–L3 schema; MCP server; gRPC/REST; all framework adapters and SDKs.
 - Connector SDK + flagship OSS connectors; the freshness engine; BYO embedding keys; embedding-model migration tooling.
 - The eval/benchmark harness; the dev binary + web UI; single-cluster operation incl. the documented active-standby HA posture.
@@ -1073,7 +1077,7 @@ Goal: prove the two wedges — **provably scoped recall** and **live supersessio
 - **The "Scoped Recall Benchmark" v0** (branded, open, reproducible) — five metrics defined, **three shipped at launch:** (1) cross-entity/tenant leakage rate under adversarial probes incl. prompt injection — target **0**; (2) stale-fact citation rate after a CDC update — target **~0%**; (4) p95 scoped-read latency vs corpus size *and vs QPS*, local-encoder and remote-embedder curves labeled separately. **(3) per-connector freshness lag ships as the public dashboard in v0.2; (5) entity-tagger recall ships with probabilistic tagging in v0.3.** Whoever defines the metric owns the category conversation; defining all five now and shipping honestly-labeled subsets beats shipping five rushed numbers.
 
 ### Launch demo (the whole pitch in one screen)
-A CrewAI agent and a Claude agent share memory about the same account. (1) Edit a deal amount in HubSpot → both agents cite the new value in **<5 seconds**, with provenance and `valid_from`. (2) A session scoped to customer A is **actively prompt-injected** to fetch customer B's quote — and provably fails, with the attempt visible in the audit log and the scope inspector showing exactly why. (3) An agent `remember`s an observation and retrieves it in its next turn — then a second agent sees it seconds later. (4) **The sales agent issues a quote and records the action; the support agent, asked about a refund minutes later, checks `memory.activity` first and sees the quote before answering** — cross-agent awareness, live. (5) One command rolls back everything derived from a poisoned observation; one admin command crypto-shreds a departed contact's data and prints the signed purge report.
+A CrewAI agent and a Claude agent share memory about the same account. (1) Edit a deal amount in HubSpot → both agents cite the new value in **<5 seconds**, with provenance and `valid_from`. (2) A session scoped to customer A is **actively prompt-injected** to fetch customer B's quote — and provably fails, with the attempt visible in the audit log and the scope inspector showing exactly why. (3) An agent `remember`s an observation and retrieves it in its next turn — then a second agent sees it seconds later. (4) **The sales agent issues a quote and records the action; the support agent, asked about a refund minutes later, checks `memory.activity` first and sees the quote before answering** — cross-agent awareness, live. (5) One command rolls back everything derived from a poisoned observation; one admin command hard-purges a departed contact's data across every derived tier (lineage walk, live-row delete) and prints the signed purge report.
 
 **Explicitly out of v0.1:** Salesforce connector + Microsoft Graph/SCIM directory sync (v0.2), remaining framework adapters (v0.2), freshness public dashboard / benchmark metric 3 (v0.2), admin-mutating web UI incl. schema-drift mapping UI (v0.2; CLI covers it at launch), Temporal (v0.3, before managed fleet), Qdrant scale profile + tiered multitenancy (v0.3), L2 LLM fact extraction + probabilistic entity tagging + benchmark metric 5 + sleep-time consolidation (v0.3), native multimodal embedding (v0.x per §10), `subscriptions/listen` (v0.2), Merge.dev long-tail connector (v0.3 — File Storage category first, per §5d), Nango OAuth layer for community connectors (v0.4), embedding-model migration tooling (v0.2 — the dual-vector schema exists at launch; the orchestrated cutover tool follows).
 

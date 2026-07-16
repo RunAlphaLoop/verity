@@ -52,7 +52,7 @@ pub struct EntityTagRow {
     /// ALL chunk rows including invalidated ones; populated only when
     /// `live_only = false` (erasure targets physical rows —
     /// invalidate-don't-delete means superseded rows persist until the §8
-    /// crypto-shredding pipeline runs).
+    /// hard-purge pipeline runs).
     pub total_chunk_count: Option<i64>,
     pub last_seen: Option<DateTime<Utc>>,
     /// Display hint only (drives the `merged` badge): the canonical this
@@ -1553,7 +1553,7 @@ impl PostgresAdapter {
     /// - the tenant partition is mandatory; every other filter optional;
     /// - `include_superseded=false` (default) shows LIVE rows only; true adds
     ///   replaced rows (invalidate-don't-delete — history persists until the
-    ///   §8 crypto-shredding pipeline);
+    ///   §8 hard-purge pipeline);
     /// - `entity` is containment over the same arrays the scope filter
     ///   enforces on (facts match their synthetic `source:entity_id` tag);
     /// - `sources` counts come from the SAME filtered union minus the source

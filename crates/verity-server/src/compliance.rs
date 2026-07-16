@@ -191,12 +191,13 @@ pub(crate) async fn admin_erasure(
     state.storage.flush_facts();
 
     // SERVER-SIGNED PURGE REPORT (replaces the old client-assembled
-    // attestation). We sign the *purge facts* — the refs purged (per-table
-    // counts), keys destroyed (facts + media are the crypto-shredded rows),
-    // timestamps, and the retention window — with an HMAC under the server
-    // signing key (same key/minter as scope handles + media URIs, domain-
-    // separated). The console now shows a signature the SERVER produced, not
-    // one the browser assembled from returned numbers.
+    // attestation). We sign the *purge facts* — the refs hard-deleted (per-table
+    // counts), timestamps, and the disclosed backup-retention window — with an
+    // HMAC under the server signing key (same key/minter as scope handles +
+    // media URIs, domain-separated). The console shows a signature the SERVER
+    // produced, not one the browser assembled from returned numbers. NB: this
+    // attests a live-row HARD DELETE, not crypto-shred — no encryption key is
+    // destroyed (see erasure.rs); the report must never claim otherwise.
     let signed_at = chrono::Utc::now();
     let facts = serde_json::json!({
         "kind": "verity.erasure.purge-report",
@@ -206,15 +207,17 @@ pub(crate) async fn admin_erasure(
         "subject_sha256": req.subject.as_deref().map(sha256_hex),
         "entity_sha256": req.entity.as_deref().map(sha256_hex),
         "media_ids": req.media_ids,
-        // The purge facts being attested: refs purged + keys destroyed.
+        // The purge facts being attested: the live rows hard-deleted now.
         "erased": report,
         "rebac_tuples_deleted": rebac_tuples_deleted,
         "signed_at": signed_at,
-        // The disclosed window during which physical backups may still hold
-        // now-purged rows until they age out and are crypto-shredded.
-        "retention_window": "Physical backups taken before this purge persist until they age out \
-                             of the backup-retention window and are then crypto-shredded; live \
-                             rows and keys are destroyed now.",
+        // The disclosed window during which physical backups still hold the
+        // now-deleted rows until they age out. Verity does not crypto-shred, so
+        // backup copies are not made unreadable — they expire on this schedule.
+        "retention_window": "Live rows were hard-deleted from the primary store now. Physical \
+                             backups taken before this purge still contain them until they age \
+                             out of the backup-retention window; Verity does not crypto-shred, so \
+                             those backup copies remain recoverable until they expire.",
     });
 
     let purge_report = sign_purge_report(&state.minter, facts).map_err(internal)?;
@@ -339,7 +342,7 @@ mod tests {
             "erased": serde_json::json!({ "episodes": 3, "chunks": 12, "facts": 5, "actions": 1 }),
             "rebac_tuples_deleted": true,
             "signed_at": chrono::Utc::now(),
-            "retention_window": "backups age out then crypto-shredded; live rows destroyed now",
+            "retention_window": "live rows hard-deleted now; backups age out on retention (no crypto-shred)",
         })
     }
 
