@@ -11,6 +11,10 @@
        renders
      • GET /v1/slo/freshness?tenant_id — per-source ingest→queryable
        percentiles, measured server-side from real samples
+     • GET /v1/admin/connector-status?tenant_id — source heartbeats; decides
+       whether the "connect a real source" step is still open (heartbeat rows
+       exist only after a connected source actually delivered — sample casts
+       and hand ingests never write one)
 
    HONESTY:
      • every count is as-of-stamped and computed from the SAME query as the
@@ -21,7 +25,11 @@
      • a failed probe renders a failed state chip with the server's error —
        never a fabricated zero;
      • urgency never cheapens a gate: the cards link to the panels; every
-       decision keeps its full dialog weight there.
+       decision keeps its full dialog weight there;
+     • the "connect a real source" step handles no secrets and triggers no
+       backfill (Phase 1) — every action on it is a deep link into the
+       Sources panel's existing flows, and its state derives from the same
+       heartbeat rows that panel renders.
    ========================================================================== */
 (function () {
   var V = window.Verity;
@@ -385,6 +393,76 @@
     if (mint) mint.onclick = function () { V.show("welcome", { step: 3 }); };
   }
 
+  /* ---- "Connect a real source" (Phase 1) — an INDEPENDENT step ---------- */
+  /* Deliberately NOT an eighth VerityFtue item: this panel and the wizard
+     hard-code the 6-core proof-beat structure (slice(0,6), "of 6", id-keyed
+     copy), so this step renders from its own container and its own probe.
+     It appears once the memory beat is satisfied (any memory arrived —
+     hand-added, sample, or quarantined) and retires once a connector
+     heartbeat proves a connected source actually delivered: connector_status
+     rows only exist after a first successful delivery, and neither sample
+     casts nor hand ingests ever write one. The converse is NOT true — a
+     webhook-fed source delivers without ever writing a heartbeat (only
+     connector CLIs and folder watches report one), and freshness samples
+     can't disambiguate (hand ingests write those too) — so the open-step
+     copy claims only "no status report", never that nothing was delivered.
+     Phase 1 ships no secret handling
+     and no backfill triggering — every button here is a deep link into the
+     Sources panel's existing flows (the zero-credential folder dialog is
+     the only live write, and it lives THERE, not here). */
+  function renderConnectSource(container, check, probe) {
+    // Rides the same first-run flow as the checklist: no derivation (legacy
+    // server, failed derive, or no tenant) → no step, same as its absence.
+    if (!check || !probe) { container.innerHTML = ""; return; }
+    var mem = null;
+    check.items.forEach(function (i) { if (i.id === "memory") mem = i; });
+    // No first ingest signal yet — checklist step 4 owns getting there.
+    if (!mem || !mem.done) { container.innerHTML = ""; return; }
+
+    if (probe.ok && probe.rows.length > 0) {
+      // Satisfied: at least one connected source has delivered and reported.
+      // Ongoing per-source status lives on the Sources panel — a completed
+      // step is not a decision, so Home drops it rather than pinning a
+      // permanent trophy card.
+      container.innerHTML = "";
+      return;
+    }
+
+    var chip, note;
+    if (!probe.ok) {
+      // A failed probe renders as failed — never a fabricated "not yet".
+      chip = probe.needsAdmin ? V.stateChip("attn", "needs admin token") : V.stateChip("fail", "check failed");
+      note = probe.needsAdmin
+        ? "whether a connected source has delivered yet needs the admin token — set it in the session bar above"
+        : "couldn’t check for source heartbeats: " + V.esc(probe.err.slice(0, 140));
+    } else {
+      chip = V.stateChip("off", "no status reports yet");
+      note = "no source has sent a status report — connector CLIs and folder watches send one after " +
+        "their first delivery; webhook sources never do, so a webhook you’ve minted may already be " +
+        "delivering (its freshness lives on the Sources panel)";
+    }
+
+    container.innerHTML =
+      '<div class="card">' +
+        '<h2>Connect a real source <span class="sub api-crumb">GET /v1/admin/connector-status</span></h2>' +
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0">' +
+          chip + '<span style="color:var(--dim)">' + note + "</span></div>" +
+        '<div style="color:var(--dim)">Memory is flowing — the next step is a source that feeds itself. Fastest start, ' +
+          "<b>no credentials</b>: watch a local folder on this computer — files you drop there become memory, visible " +
+          "only to the viewers you pick. When you’re ready for live tools, <b>Google Drive</b>, <b>Gmail</b>, " +
+          "<b>Google Directory</b>, and <b>HubSpot</b> connect today — Drive, Gmail, and HubSpot each run their own " +
+          "connector from your terminal; Directory sync starts from the System panel (or <span class=\"ref\">verity-cli dev --directory</span>) " +
+          "using a key-file path set on the server. Credentials never touch this console. <b>Salesforce</b> is listed but gated (awaiting a test org).</div>" +
+        '<div class="toolbar" style="margin:10px 0 0">' +
+          '<button class="primary" id="home-connect-folder">Watch a local folder</button>' +
+          '<button id="home-connect-sources">Open Sources &amp; freshness</button>' +
+          '<span class="asof">' + asofNow() + "</span>" +
+        "</div>" +
+      "</div>";
+    el("home-connect-folder").onclick = function () { V.show("sources", { view: "folder" }); };
+    el("home-connect-sources").onclick = function () { V.show("sources"); };
+  }
+
   /* ---- render ------------------------------------------------------------ */
   async function refresh(tenant) {
     var host = el("home-mount");
@@ -412,6 +490,18 @@
       ? ftue.derive(tenant).catch(function (e) { console.error("ftue derive", e); return null; })
       : Promise.resolve(null);
 
+    // The connect-a-real-source step's own probe (independent of the beats
+    // model above; gated the same way so legacy servers skip both). Resolves
+    // to an outcome, never throws — a failed read must render as failed.
+    var connectPromise = (ftue && dir.status !== "unsupported")
+      ? V.api("/v1/admin/connector-status?tenant_id=" + encodeURIComponent(tenant), { admin: true })
+          .then(function (rows) { return { ok: true, rows: rows || [] }; })
+          .catch(function (e) {
+            var m = String((e && e.message) || e);
+            return { ok: false, err: m, needsAdmin: /HTTP 40[13]/.test(m) };
+          })
+      : Promise.resolve(null);
+
     var probes = [
       [probeEntities, "home-card-entities", "Same or different?", function () { V.show("entities", { view: "queue" }); }],
       [probeKnowledge, "home-card-knowledge", "Knowledge awaiting review", function () { V.show("knowledge"); }],
@@ -422,6 +512,7 @@
       return p[0](tenant).catch(function (e) { return failCard(p[1], p[2], e, p[3]); });
     }));
     var check = await checkPromise;
+    var connect = await connectPromise;
 
     // Re-check the ghost guard AFTER the async probes: the tenant directory
     // often lands mid-flight, and a ghost tenant's probes come back as clean
@@ -460,6 +551,9 @@
         '<button id="home-refresh">Refresh</button>' +
       "</div>" +
       '<div id="home-checklist"></div>' +
+      // Own container, OUTSIDE #home-checklist on purpose: the step must
+      // survive "Hide for this session" (which empties the checklist).
+      '<div id="home-connect-source"></div>' +
       banner +
       '<div class="attn-grid" id="home-grid">' + grid + "</div>" +
       '<div class="card">' +
@@ -478,6 +572,7 @@
       if (btn) btn.onclick = c.go;
     });
     if (check) renderChecklist(el("home-checklist"), check, tenant);
+    renderConnectSource(el("home-connect-source"), check, connect);
     el("home-refresh").onclick = function () { refresh(tenant); };
     el("home-goingest").onclick = function () { V.show("ingest"); };
     el("home-mint2").onclick = function () { V.openMint(); };

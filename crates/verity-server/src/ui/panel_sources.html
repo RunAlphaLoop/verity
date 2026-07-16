@@ -19,6 +19,17 @@
        • GET /v1/admin/backfill         — latest catch-up run per source
        • GET /v1/manifests              — draft/active blueprints
        • GET /v1/admin/principals       — names for the who-can-see picker
+       • GET /v1/admin/folders          — watched local folders (live status)
+       • GET /v1/admin/connectors       — per-source connect readiness
+         (Phase 1: prereq probes, two-tier worker verdict, last heartbeat)
+
+     Connect section (Phase 1, per the approved design): ZERO secret-handling
+     and ZERO backfill triggering — no credential inputs, no new POSTs. The
+     one live action is the zero-credential local-folder watch (the existing
+     POST /v1/admin/folders dialog, promoted as the "fastest start" card).
+     Per-source action cells are keyed off the server's own prereqs and
+     backfill.hint — honest disabled states, never a button that 404s; CRM
+     credential state is unknowable server-side and shown "untracked".
 
      HONESTY KEPT FROM v0.2 (CLAUDE.md 'every measured number honest'):
      • Percentiles come from real samples over the stated window; null = "—",

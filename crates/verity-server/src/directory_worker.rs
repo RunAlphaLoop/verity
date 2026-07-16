@@ -176,11 +176,25 @@ pub(crate) fn venv_exists(repo_root: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the SA key path (`GOOGLE_APPLICATION_CREDENTIALS`) points at a file
+/// that exists on disk — the exact `SpawnError::NoConfig` key precondition,
+/// probed without spawning. Existence only; the key is never read, so present
+/// never claims valid.
+pub(crate) fn sa_key_ready(sa_key_path: Option<&Path>) -> bool {
+    sa_key_path.is_some_and(|p| p.exists())
+}
+
+/// Whether a non-empty DWD subject (`VERITY_GDIRECTORY_SUBJECT`) is configured
+/// — the exact `SpawnError::NoConfig` subject precondition.
+pub(crate) fn subject_ready(subject: Option<&str>) -> bool {
+    subject.is_some_and(|s| !s.trim().is_empty())
+}
+
 /// Whether the directory-sync config (SA key path present on disk + a non-empty
 /// DWD subject) is in place — used by the planes read to decide `startable`.
 /// Never reads the key itself.
 pub(crate) fn config_ready(sa_key_path: Option<&Path>, subject: Option<&str>) -> bool {
-    sa_key_path.is_some_and(|p| p.exists()) && subject.is_some_and(|s| !s.trim().is_empty())
+    sa_key_ready(sa_key_path) && subject_ready(subject)
 }
 
 /// The server-held directory-sync plane: the owned child (if any) plus the
@@ -237,6 +251,41 @@ impl DirectoryPlane {
     pub(crate) fn config_ready(&self) -> bool {
         config_ready(self.sa_key.as_deref(), self.subject.as_deref())
     }
+
+    /// Probe/reap the owned child under the lock: `Some` iff THIS server owns
+    /// a live child RIGHT NOW, with the facts an authoritative status may
+    /// claim (pid, start time, and the tenant it was spawned for). A dead
+    /// child (`Some(exit)`) or an errored wait is reaped — the handle cleared
+    /// — before returning `None`, never reported as a stale "on". Every admin
+    /// read goes through here so the probe/reap discipline (and the worker's
+    /// tenant) can never drift between them.
+    pub(crate) async fn owned_live(&self) -> Option<OwnedWorker> {
+        let mut guard = self.worker.lock().await;
+        match guard.as_mut() {
+            Some(worker) => match worker.child.try_wait() {
+                Ok(None) => Some(OwnedWorker {
+                    pid: worker.pid,
+                    started_at: worker.started_at,
+                    tenant_id: worker.tenant_id,
+                }),
+                _ => {
+                    *guard = None;
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+}
+
+/// Snapshot of a live owned directory child, captured by `owned_live` while
+/// holding the lock — the only facts a tier-1 authoritative status may state.
+pub(crate) struct OwnedWorker {
+    pub(crate) pid: u32,
+    pub(crate) started_at: DateTime<Utc>,
+    /// The tenant this child reconciles (fixed at spawn via `--tenant-id`) —
+    /// a live child for a DIFFERENT tenant is no evidence about the queried one.
+    pub(crate) tenant_id: Uuid,
 }
 
 #[cfg(test)]

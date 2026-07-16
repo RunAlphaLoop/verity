@@ -98,6 +98,13 @@ impl WatcherRegistry {
     async fn remove(&self, id: &Uuid) -> bool {
         self.live.lock().await.remove(id).is_some()
     }
+
+    /// Snapshot of the watch ids this process currently holds a live OS watch
+    /// for. Lets sibling admin reads (connectors_admin) report the folder
+    /// plane authoritatively without reaching into the private map.
+    pub(crate) async fn armed_ids(&self) -> std::collections::HashSet<Uuid> {
+        self.live.lock().await.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

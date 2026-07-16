@@ -10,9 +10,18 @@
                       separate step, typed confirm (ACTIVATE), approver name
                       required + recorded in audit_log by the server.
    Reads autoload when the tenant is known (LAW #3 — no cold Load button):
-     connector-status · slo/freshness · backfill · manifests, allSettled so
-     one failure never blanks the screen. GET /v1/admin/principals feeds the
+     connector-status · slo/freshness · backfill · manifests · folders ·
+     admin/connectors (per-source connect readiness), allSettled so one
+     failure never blanks the screen. GET /v1/admin/principals feeds the
      who-can-see picker in the connect dialog (names, not bare ints).
+
+   Connect section (Phase 1): ZERO secret-handling and ZERO backfill
+   triggering — no credential inputs, no new POSTs. The one live action is
+   the zero-credential local-folder watch (the existing POST /v1/admin/folders
+   dialog, promoted as the fastest start). Every per-source action cell is
+   keyed off the server's own prereqs / backfill.hint: an unwired flow shows
+   the server's honest phase note verbatim, never a button that would 404,
+   and CRM credential state is reported "untracked" — never guessed.
 
    Fail-closed gates kept: empty visibility on mint → the server's own 422
    refusal, surfaced verbatim (no client-side permissive default); the raw
@@ -39,6 +48,8 @@
     backfill: [],   // latest catch-up run per source
     manifests: [],  // draft/active blueprints
     folders: [],    // watched local folders (live status per watch)
+    connectors: [], // per-source connect readiness (Phase-1 read plane)
+    connectorsAsOf: null, // the server's checked_at for those probes
     errs: [],       // per-read load failures (rendered, never hidden)
     loadedAt: 0,
   };
@@ -255,20 +266,30 @@ acl_policy:
         '<div id="src-hint"></div>' +
         '<div id="src-receipt"></div>' +
 
+        /* ---- fastest start: the zero-credential folder watch ---- */
+        '<div class="card">' +
+          '<h2>Fastest start: watch a local folder &mdash; no credential <span class="sub api-crumb">GET /v1/admin/folders</span></h2>' +
+          '<div class="note" style="margin-top:0"><b>Point Verity at a folder on this machine and drop files in — each one becomes memory you can query.</b> ' +
+            "Verity runs on this computer, so it can watch a folder here directly (your browser can&rsquo;t) &mdash; no credential, no connector setup. " +
+            "Word docs, spreadsheets, slide decks, PDFs and plain text are read automatically; a file it can&rsquo;t read is still recorded, with the reason shown, never dropped silently. " +
+            "You choose <b>who can see</b> the files in a folder when you add it &mdash; there is no default: a folder nobody could ever read is refused, not silently created.</div>" +
+          '<div id="src-folders"></div>' +
+        "</div>" +
+
+        /* ---- connect a source: per-source readiness (Phase-1 read) ---- */
+        '<div class="card">' +
+          '<h2>Connect a source <span class="sub api-crumb">GET /v1/admin/connectors</span></h2>' +
+          '<div class="note" style="margin-top:0"><b>Every source family Verity can ingest from, with exactly what this server can truthfully see about each.</b> ' +
+            "Prerequisite checks are probed, never guessed; a worker chip is <b>server-authoritative</b> only when this server owns the process, otherwise it is <b>observed</b> from heartbeats. " +
+            "The console handles no secrets in this phase &mdash; credentials stay outside it: in the connector CLI&rsquo;s environment for Drive/Gmail/CRM, and (for directory sync only) as a key-file path in the <b>server&rsquo;s</b> environment &mdash; either way this console never reads or stores one. Backfills aren&rsquo;t triggered from here yet. " +
+            "The one zero-credential path is the local folder above.</div>" +
+          '<div id="src-connect"></div>' +
+        "</div>" +
+
         /* ---- source health ---- */
         '<div class="card">' +
           '<h2>Your sources <span class="sub api-crumb">GET /v1/admin/connector-status · /v1/admin/backfill</span></h2>' +
           '<div id="src-health"></div>' +
-        "</div>" +
-
-        /* ---- watched folders ---- */
-        '<div class="card">' +
-          '<h2>Watch a local folder <span class="sub api-crumb">GET /v1/admin/folders</span></h2>' +
-          '<div class="note" style="margin-top:0"><b>Point Verity at a folder on this machine and drop files in — each one becomes memory you can query.</b> ' +
-            "Verity runs on this computer, so it can watch a folder here directly (your browser can&rsquo;t). " +
-            "Word docs, spreadsheets, slide decks, PDFs and plain text are read automatically; a file it can&rsquo;t read is still recorded, with the reason shown, never dropped silently. " +
-            "You choose <b>who can see</b> the files in a folder when you add it &mdash; there is no default: a folder nobody could ever read is refused, not silently created.</div>" +
-          '<div id="src-folders"></div>' +
         "</div>" +
 
         /* ---- manifests ---- */
@@ -503,6 +524,7 @@ acl_policy:
         '<div class="et-actions"><button class="primary" id="src-teach-mint">Mint a scope handle</button></div>' +
       "</div>";
     el("src-folders").innerHTML = "";
+    el("src-connect").innerHTML = "";
     el("src-manifests").innerHTML = "";
     el("src-fresh").innerHTML = "";
     el("src-back").innerHTML = "";
@@ -521,17 +543,24 @@ acl_policy:
       V.api("/v1/admin/backfill?" + q, { admin: true }),
       V.api("/v1/manifests?" + q, { admin: true }),
       V.api("/v1/admin/folders?" + q, { admin: true }),
+      V.api("/v1/admin/connectors?" + q, { admin: true }),
     ]);
-    var keys = ["status", "fresh", "backfill", "manifests", "folders"];
+    var keys = ["status", "fresh", "backfill", "manifests", "folders", "connectors"];
     data.errs = [];
     results.forEach(function (r, i) {
       if (r.status === "fulfilled") {
-        // /v1/admin/folders returns { folders: [...] }; the rest return arrays.
+        // /v1/admin/folders returns { folders: [...] } and /v1/admin/connectors
+        // returns { connectors: [...], checked_at }; the rest return arrays.
         var v = r.value;
         if (keys[i] === "folders") data.folders = (v && Array.isArray(v.folders)) ? v.folders : (Array.isArray(v) ? v : []);
+        else if (keys[i] === "connectors") {
+          data.connectors = (v && Array.isArray(v.connectors)) ? v.connectors : [];
+          data.connectorsAsOf = (v && v.checked_at) || null;
+        }
         else data[keys[i]] = Array.isArray(v) ? v : [];
       } else {
-        data[keys[i]] = keys[i] === "folders" ? [] : [];
+        data[keys[i]] = [];
+        if (keys[i] === "connectors") data.connectorsAsOf = null;
         data.errs.push(r.reason && r.reason.message ? r.reason.message : String(r.reason));
       }
     });
@@ -547,7 +576,11 @@ acl_policy:
     var drafts = data.manifests.filter(function (m) { return m.status === "draft"; }).length;
     var failed = data.backfill.filter(function (b) { return String(b.state).toLowerCase() === "failed"; }).length;
     var folderProblems = data.folders.filter(function (f) { return !!f.last_error; }).length;
-    return drafts + failed + folderProblems;
+    // Connect readiness: only a configured-then-broken credential path counts
+    // (the one attn chip that table renders); a never-configured source is a
+    // setup state, not an incident.
+    var credBroken = data.connectors.filter(function (c) { return c.credential === "path-missing"; }).length;
+    return drafts + failed + folderProblems + credBroken;
   }
 
   function renderAll() {
@@ -577,8 +610,9 @@ acl_policy:
       el("src-state").innerHTML = V.stateChip("ok", "syncing normally");
     }
     el("src-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8);
-    renderHealth();
     renderFolders();
+    renderConnectors();
+    renderHealth();
     renderManifests();
     renderFreshness();
     renderBackfill();
@@ -755,12 +789,112 @@ acl_policy:
         "<th>folder on this machine</th><th>state</th>" +
         '<th class="num">files ingested</th><th>last change</th><th>notes</th><th></th>' +
       "</tr></thead><tbody>" + body + "</tbody></table></div>" +
-      '<div class="note">Each watched folder also appears in <b>Your sources</b> above as ' +
+      '<div class="note">Each watched folder also appears in <b>Your sources</b> below as ' +
         '<span class="ref">folder:&lt;name&gt;</span>, with the same freshness numbers as every other source &mdash; ' +
         "so &ldquo;how fast a dropped file becomes searchable&rdquo; is measured, not asserted.</div>";
 
     Array.prototype.forEach.call(host.querySelectorAll(".src-folder-stop"), function (btn) {
       btn.onclick = function () { openFolderStopDialog(rows[Number(btn.getAttribute("data-i"))]); };
+    });
+  }
+
+  /* ================================================ connect readiness */
+
+  // Honest credential chip straight from the server's closed vocabulary. The
+  // server never reads credential contents, so no chip here ever claims
+  // "valid" — and CRM/Drive/Gmail credentials live in the connector CLI's
+  // env, invisible to the server: reported "untracked", never guessed.
+  function connCredCell(c) {
+    var v = String(c.credential || "");
+    var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+    if (v === "not-required") return V.stateChip("ok", "none needed");
+    if (v === "untracked") {
+      return V.stateChip("off", "untracked") +
+        "<div>" + proseRef + "lives in the connector CLI&rsquo;s env &mdash; this server can&rsquo;t see it</span></div>";
+    }
+    if (v === "path-configured") {
+      return V.stateChip("ok", "key path present") +
+        "<div>" + proseRef + "path checked only &mdash; present does not mean valid</span></div>";
+    }
+    if (v === "path-missing") return V.stateChip("attn", "key path missing");
+    if (v === "unset") return V.stateChip("off", "not set");
+    // An unrecognized value is shown as-is, dimly — never mapped to a green.
+    return V.stateChip("off", v || "—");
+  }
+
+  // Two-tier worker verdict, the server's own vocabulary: "on" exists only
+  // with authority "server" (an owned live process); a recent heartbeat is
+  // "unknown" — recent activity does NOT prove a worker is running now.
+  function connWorkerCell(c) {
+    var w = c.worker || {};
+    var chip = w.status === "on" ? V.stateChip("ok", "running")
+      : w.status === "unknown" ? V.stateChip("wait", "unknown")
+      : V.stateChip("off", "off");
+    var words = w.authority === "server" ? "server-authoritative"
+      : w.authority === "observed"
+        ? (w.status === "unknown"
+            ? "heartbeat under 2 min ago &mdash; may have just finished, or be running elsewhere"
+            : "observed from heartbeats")
+        : "never seen for this space";
+    return chip + '<div class="ref" style="word-break:normal;overflow-wrap:break-word">' + words + "</div>";
+  }
+
+  // The action cell obeys the no-dead-button rule: the ONLY live control is
+  // the zero-credential folder watch (the existing dialog). Everything else
+  // renders the server's own words — a failing prereq's fix hint verbatim,
+  // or the honest Phase-1 backfill note — never a button that would 404.
+  function connActionCell(c) {
+    var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+    if (c.source === "folder") {
+      return '<button class="primary src-conn-folder" title="POST /v1/admin/folders — the same watch-a-folder dialog as the card above">Watch a folder&hellip;</button>';
+    }
+    var failing = (c.prereqs || []).filter(function (q) { return !q.ok; });
+    if (failing.length) {
+      return failing.map(function (q) {
+        return V.badge("missing: " + String(q.name || ""), "b-conf-3") +
+          "<br>" + proseRef + V.esc(String(q.hint || "")) + "</span>";
+      }).join("<br>");
+    }
+    var hint = c.backfill && c.backfill.hint;
+    return hint ? proseRef + V.esc(hint) + "</span>" : '<span class="ref">—</span>';
+  }
+
+  function renderConnectors() {
+    var host = el("src-connect");
+    if (!host) return;
+    var rows = data.connectors;
+    if (!rows.length) {
+      // The endpoint always answers with every source family — an empty list
+      // here means the read itself failed (surfaced in the error strip at the
+      // top), not "no connectors". Say so; never paint a fabricated table.
+      host.innerHTML =
+        '<div class="empty">Couldn&rsquo;t read connector readiness &mdash; see the error above. ' +
+        "Nothing on this table is ever guessed, so there is nothing honest to show without the read.</div>";
+      return;
+    }
+    var body = rows.map(function (c) {
+      var hbCell = c.last_heartbeat
+        ? '<span title="' + V.esc(V.fmtTime(c.last_heartbeat)) + '">' + humanAge(ageMs(c.last_heartbeat)) + "</span>"
+        : '<span class="ref">never</span>';
+      return "<tr>" +
+        "<td><b>" + V.esc(c.label || c.source) + "</b>" +
+          '<div class="ref">' + V.esc(c.source) + (c.kind ? " · " + V.esc(c.kind) : "") + "</div></td>" +
+        "<td>" + connCredCell(c) + "</td>" +
+        "<td>" + connWorkerCell(c) + "</td>" +
+        "<td>" + hbCell + "</td>" +
+        '<td style="overflow-wrap:break-word;word-break:normal;max-width:360px">' + connActionCell(c) + "</td>" +
+      "</tr>";
+    }).join("");
+    host.innerHTML =
+      '<div class="tablewrap"><table><thead><tr>' +
+        "<th>source</th><th>credential</th><th>worker</th><th>last status report</th><th>next step</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>" +
+      '<div class="note">Readiness checked ' +
+        (data.connectorsAsOf ? "at " + V.esc(V.fmtTime(data.connectorsAsOf)) : "&mdash;") +
+        " on the server. Prereq checks are existence probes &mdash; the server never reads a credential&rsquo;s contents, " +
+        "so &ldquo;present&rdquo; never means &ldquo;valid&rdquo;.</div>";
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-folder"), function (btn) {
+      btn.onclick = openFolderDialog;
     });
   }
 
