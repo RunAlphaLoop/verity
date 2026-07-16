@@ -64,8 +64,11 @@ pub struct CoverageGaps {
     /// Subject/entity matching is exact-string; an alias or differently-cased
     /// identifier is not walked.
     pub exact_string_matching: String,
-    /// Hard purge removes live rows + destroys keys in the primary store, but
-    /// physical backups already taken persist until they age out.
+    /// Hard purge deletes the subject's live rows from the primary store.
+    /// Physical backups already taken still hold those rows until they age out
+    /// of the retention window — Verity does not crypto-shred (no key is
+    /// destroyed), so within that window the data remains recoverable from a
+    /// backup.
     pub backup_retention_window: String,
 }
 
@@ -82,9 +85,12 @@ impl Default for CoverageGaps {
                  mistyped entity is not walked — confirm identifiers before running."
                     .into(),
             backup_retention_window:
-                "Hard purge removes live rows and destroys keys in the primary store; physical \
-                 backups already taken persist until they age out of the retention window and are \
-                 then crypto-shredded. This window is real and disclosed, not instantaneous."
+                "Hard purge deletes the subject's live rows from the primary store immediately. \
+                 Physical backups taken before the purge still contain those rows until they age \
+                 out of your backup-retention window — Verity does not crypto-shred (no encryption \
+                 key is destroyed), so within that window the purged data remains recoverable from \
+                 a backup. Erasure is immediate in live systems and disclosed-eventual in backups, \
+                 never instantaneous across backups."
                     .into(),
         }
     }

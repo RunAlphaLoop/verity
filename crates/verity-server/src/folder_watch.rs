@@ -32,7 +32,7 @@
 //!
 //! Deletes are a logged no-op: removing a file from a watched folder never
 //! auto-forgets already-ingested memory (invalidate-don't-delete; the §8
-//! crypto-shred pipeline is the only hard-purge path).
+//! hard-purge pipeline is the only physical-delete path).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

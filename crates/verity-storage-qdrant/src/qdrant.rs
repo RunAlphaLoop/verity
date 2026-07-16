@@ -782,7 +782,7 @@ impl StorageAdapter for QdrantAdapter {
     /// valid_to = deleted_at) so the serving index stops surfacing a deleted
     /// entity's content — a documented superset of the Postgres profile's
     /// fact-only behavior (SPEC §8c; history stays queryable via bi-temporal
-    /// reads, hard purge remains the §8 crypto-shredding pipeline). Returns
+    /// reads, hard purge remains the §8 hard-purge pipeline). Returns
     /// the number of facts retired (trait contract).
     async fn retire_entity(
         &self,

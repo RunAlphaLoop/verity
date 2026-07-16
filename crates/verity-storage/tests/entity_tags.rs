@@ -275,7 +275,7 @@ async fn live_only_false_surfaces_invalidated_rows_for_erasure() {
     assert_eq!(row(&live, "user:john").chunk_count, 1);
 
     // Erasure directory (live_only=false): the invalidated tag IS a target —
-    // invalidate-don't-delete keeps the physical row until crypto-shredding.
+    // invalidate-don't-delete keeps the physical row until hard purge.
     let all = a.list_entity_tags(tenant, None, false, 100).await.unwrap();
     assert_eq!(all.total_distinct, 2);
     let jane = row(&all, "user:jane");

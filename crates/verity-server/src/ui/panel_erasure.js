@@ -10,7 +10,7 @@
      • the screen auto-loads the tenant's files once tenant + admin token are
        known (never a cold Load button); locked/no-tenant states TEACH;
      • every fail-closed gate kept: structural admin gate (controls never
-       built without a token), typed-confirm crypto-shred, at-least-one-target
+       built without a token), typed-confirm hard purge, at-least-one-target
        (server 422 mirrored), server-signed report displayed (never assembled;
        dev-key signed:false disclosed), forget always labeled reversible;
      • honesty: preview is a real dry run (rolls back), coverage gaps are the
@@ -283,8 +283,8 @@
 
       /* Step 3 — erase */
       '<div class="card">' +
-        '<h2>Step 3 · Erase permanently <span class="sub">crypto-shred · no undo<span class="api-crumb"> · POST /v1/admin/erasure</span></span></h2>' +
-        '<div class="note">Hard-deletes everything the preview shows and destroys the keys, in one transaction. ' +
+        '<h2>Step 3 · Erase permanently <span class="sub">hard purge · no undo<span class="api-crumb"> · POST /v1/admin/erasure</span></span></h2>' +
+        '<div class="note">Hard-deletes everything the preview shows, in one transaction. ' +
           "There is <b>no undo</b> — unlike <i>Take back one item</i> below, which is reversible. " +
           "If the permissions engine is configured and the target is a person, their access grants are deleted " +
           "<b>first</b>; a failure there stops the whole erasure — nothing is half-removed. " +
@@ -348,7 +348,7 @@
         '<div class="note" id="er-confirm-summary"></div>' +
         '<div class="note" id="er-confirm-preview" style="margin-top:8px"></div>' +
         '<div class="note" style="margin-top:8px;border-left:3px solid var(--state-fail);padding-left:10px">' +
-          "<b>No undo exists.</b> Rows are hard-deleted and keys destroyed in one transaction. " +
+          "<b>No undo exists.</b> Rows are hard-deleted from the primary store in one transaction. " +
           "This is not the reversible <i>take back</i> — there is no reversal." +
         "</div>" +
         '<label class="checkline" id="er-confirm-zero-wrap" style="display:none;margin-top:10px">' +
@@ -600,7 +600,7 @@
           ? "<b>" + invalidated + "</b> published lesson" + (invalidated === 1 ? "" : "s") +
             " lost too much support (below the 3-entity floor) and " +
             (invalidated === 1 ? "was" : "were") + " taken down — the lesson text itself carries no " +
-            "personal data, so it is unpublished, not shredded. "
+            "personal data, so it is unpublished, not deleted. "
           : "No published lesson fell below the 3-entity support floor. ") +
         "Evidence rows withdrawn: <b>" + Number(report.knowledge_evidence || 0) + "</b>. " +
         V.refSpan("k=3 · knowledge_invalidated / knowledge_evidence") + "</div>";
