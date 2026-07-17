@@ -101,6 +101,11 @@
   // panel teardown, and before a same-source re-trigger — no leaked polling.
   var pendingBackfill = null; // { source, label }
   var backfillRuns = {};      // source -> { run_id, source, label, poll, run, err, done }
+  // Phase-4 continuous sync: the (source, label) being toggled this open. The
+  // toggle is a stateless pair of POSTs + a reload — it owns NO setInterval, so
+  // there is no leaked-interval concern here (the row's own sync state, polled
+  // by the panel's normal reads, is the single source of truth).
+  var pendingSync = null; // { source, label, kind }
 
   function el(id) { return V.$(id); }
 
@@ -328,7 +333,8 @@ acl_policy:
           '<div class="note" style="margin-top:0"><b>Every source family Verity can ingest from, with exactly what this server can truthfully see about each.</b> ' +
             "Prerequisite checks are probed, never guessed; a worker chip is <b>server-authoritative</b> only when this server owns the process, otherwise it is <b>observed</b> from heartbeats. " +
             "You can now <b>add or rotate a credential</b> per source: CRM bearers are <b>encrypted at rest</b> under this space&rsquo;s key and the console keeps only a fingerprint &mdash; never the token; Google connectors store only the <b>path</b> to a service-account key file, never its contents. " +
-            "Secret entry needs an admin token (it is refused unauthenticated); backfills still aren&rsquo;t triggered from here yet. " +
+            "Secret entry needs an admin token (it is refused unauthenticated). " +
+            "<b>Continuous sync</b> (gdrive/gmail/hubspot) polls a source on an interval and writes memory until you turn it off &mdash; enabled only when a credential resolves, off by default; gdirectory&rsquo;s toggle maps to the directory plane. " +
             "The one zero-credential path is the local folder above.</div>" +
           // Live backfill strips (Phase 3): one per (source, run_id) triggered
           // this session. Rendered by the poller, NOT by the table re-render, so
@@ -575,6 +581,38 @@ acl_policy:
           "</div>" +
         "</div></div>" +
 
+        /* ---- turn ON continuous sync (cost-confirm · Phase 4) ---- */
+        '<div class="dialog-backdrop" id="src-sync-dialog"><div class="dialog" style="max-width:600px">' +
+          '<h3 id="src-sync-title">Turn on continuous sync</h3>' +
+          '<div id="src-sync-summary"></div>' +
+          '<div class="note" id="src-sync-blurb" style="margin-top:0"></div>' +
+          '<div class="note" style="margin-top:8px"><b>This runs indefinitely until you turn it off.</b> ' +
+            "Each cycle is a short incremental poll that advances the source&rsquo;s cursor and writes real memory &mdash; " +
+            "the credential is resolved fresh per cycle, never left decrypted on disk between polls.</div>" +
+          '<div style="margin-top:12px"><label for="src-sync-interval">poll every (seconds) <span style="font-weight:400">&mdash; how often Verity checks the source; minimum 60</span></label>' +
+            '<input type="number" id="src-sync-interval" value="300" min="60" step="60" style="width:130px">' +
+            '<div class="ref" id="src-sync-interval-echo"></div></div>' +
+          '<div class="err" id="src-sync-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-sync-cancel">Cancel</button>' +
+            '<button class="primary" id="src-sync-go">Start continuous sync</button>' +
+          "</div>" +
+        "</div></div>" +
+
+        /* ---- turn OFF continuous sync (confirm · Phase 4) ---- */
+        '<div class="dialog-backdrop" id="src-sync-off-dialog"><div class="dialog" style="max-width:560px">' +
+          '<h3 id="src-sync-off-title">Turn off continuous sync</h3>' +
+          '<div id="src-sync-off-summary"></div>' +
+          '<div class="note" style="margin-top:0">Verity stops polling this source &mdash; no more automatic cycles. ' +
+            "Any cycle already in flight finishes; nothing already ingested is removed (invalidate elsewhere, never erased here). " +
+            "You can turn it back on anytime.<span class=\"api-crumb\"> POST /v1/admin/connectors/{source}/sync {enabled:false}</span></div>" +
+          '<div class="err" id="src-sync-off-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-sync-off-cancel">Cancel</button>' +
+            '<button class="danger" id="src-sync-off-go">Turn it off</button>' +
+          "</div>" +
+        "</div></div>" +
+
         /* ---- activate manifest (THE human gate) ---- */
         '<div class="dialog-backdrop" id="src-activate-dialog"><div class="dialog" style="max-width:600px">' +
           '<h3 id="src-activate-title">Approve &amp; activate</h3>' +
@@ -629,6 +667,12 @@ acl_policy:
       el("src-backfill-cancel").onclick = function () { V.dialog("src-backfill-dialog").close(); };
       el("src-backfill-go").onclick = runBackfill;
       el("src-backfill-word").oninput = reflectBackfillTyped;
+
+      el("src-sync-cancel").onclick = function () { V.dialog("src-sync-dialog").close(); };
+      el("src-sync-go").onclick = enableSync;
+      el("src-sync-interval").oninput = reflectSyncInterval;
+      el("src-sync-off-cancel").onclick = function () { V.dialog("src-sync-off-dialog").close(); };
+      el("src-sync-off-go").onclick = disableSync;
 
       el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
       el("src-activate-go").onclick = activateManifest;
@@ -1148,12 +1192,13 @@ acl_policy:
         "<td>" + connCredCell(c) + "</td>" +
         "<td>" + connWorkerCell(c) + "</td>" +
         "<td>" + hbCell + "</td>" +
+        '<td style="overflow-wrap:break-word;word-break:normal;max-width:300px">' + connSyncCell(c) + "</td>" +
         '<td style="overflow-wrap:break-word;word-break:normal;max-width:360px">' + connActionCell(c) + "</td>" +
       "</tr>";
     }).join("");
     host.innerHTML =
       '<div class="tablewrap"><table><thead><tr>' +
-        "<th>source</th><th>credential</th><th>worker</th><th>last status report</th><th>next step</th>" +
+        "<th>source</th><th>credential</th><th>worker</th><th>last status report</th><th>continuous sync</th><th>next step</th>" +
       "</tr></thead><tbody>" + body + "</tbody></table></div>" +
       '<div class="note">Readiness checked ' +
         (data.connectorsAsOf ? "at " + V.esc(V.fmtTime(data.connectorsAsOf)) : "&mdash;") +
@@ -1176,6 +1221,244 @@ acl_policy:
         if (row) openBackfillDialog(row);
       };
     });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-sync-on"), function (btn) {
+      btn.onclick = function () {
+        var src = btn.getAttribute("data-src");
+        var row = data.connectors.filter(function (x) { return x.source === src; })[0];
+        if (row) openSyncDialog(row);
+      };
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-sync-off"), function (btn) {
+      btn.onclick = function () {
+        var src = btn.getAttribute("data-src");
+        var row = data.connectors.filter(function (x) { return x.source === src; })[0];
+        if (row) openSyncOffDialog(row);
+      };
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-sync-dir"), function (btn) {
+      btn.onclick = function () {
+        var on = btn.getAttribute("data-on") === "1";
+        toggleDirectorySync(on);
+      };
+    });
+  }
+
+  /* ========================================= continuous sync (Phase 4) */
+
+  // The continuous-sync cell for one connector row. The model: a per-(tenant,
+  // source) SCHEDULER that fires a short incremental --once poll on an interval,
+  // durable in sync_schedules + re-armed on boot. Sources & their toggle:
+  //   • gdrive/gmail/hubspot — a native schedule. The toggle is ENABLED only when
+  //     the server reports backfill.available (a resolvable credential + hubspot
+  //     visibility + gmail subject); otherwise an HONEST disabled state showing
+  //     the exact precondition hint (never a dead toggle that would 422).
+  //   • gdirectory — no connector schedule; its continuous sync IS the directory
+  //     plane, so its toggle maps to the directory worker start/stop (reused),
+  //     keyed off the row's own worker chip for the current on/off state.
+  //   • folder/salesforce — not applicable; the server's sync.hint verbatim.
+  // The live state ("syncing every 5m · last synced 2m ago" / "off") comes
+  // straight from the row's sync:{enabled,interval_secs,last_run_at}. After a
+  // toggle the panel reloads, so the row re-reads its own truth — no dead state.
+  function connSyncCell(c) {
+    var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+    var sync = c.sync || {};
+
+    // gdirectory: map to the directory plane. The row's worker chip is the live
+    // on/off truth (status "on" => an owned live directory child).
+    if (c.source === "gdirectory") {
+      var w = c.worker || {};
+      var running = w.status === "on";
+      var dirState = running
+        ? V.stateChip("ok", "syncing") +
+            '<div class="ref" style="word-break:normal;overflow-wrap:break-word">directory worker reconciling on a loop</div>'
+        : V.stateChip("off", "off");
+      var dirBtn = running
+        ? '<button class="danger src-conn-sync-dir" data-on="1" title="POST /v1/admin/planes/directory/stop">Sync (continuous): on &mdash; turn off</button>'
+        : '<button class="src-conn-sync-dir" data-on="0" title="POST /v1/admin/planes/directory/start — gdirectory’s continuous sync is the directory plane">Sync (continuous)&hellip;</button>';
+      return dirState + '<div style="margin-top:6px">' + dirBtn + "</div>" +
+        "<div>" + proseRef + "continuous sync for the directory is the directory plane, not a poll schedule</span></div>";
+    }
+
+    // folder / salesforce (sync.eligible === false): honest not-applicable, the
+    // server's own hint verbatim. No toggle — there is nothing to arm.
+    if (!sync.eligible) {
+      return V.stateChip("off", "not applicable") +
+        (sync.hint ? "<div>" + proseRef + V.esc(sync.hint) + "</span></div>" : "");
+    }
+
+    // gdrive / gmail / hubspot: a native schedule. When enabled, show the live
+    // cadence + last-sync + a turn-off control. When off, a Sync toggle that
+    // opens the cost-confirm — ENABLED only when a credential is resolvable
+    // (backfill.available), else the honest disabled state with the reason.
+    if (sync.enabled) {
+      var every = sync.interval_secs != null
+        ? "syncing every " + V.esc(V.fmtAge(sync.interval_secs))
+        : "syncing";
+      var last = sync.last_run_at
+        ? " &middot; last synced " + V.esc(humanAge(ageMs(sync.last_run_at)))
+        : " &middot; no cycle has run yet";
+      return V.stateChip("ok", "on") +
+        '<div class="ref" style="word-break:normal;overflow-wrap:break-word">' + every + last + "</div>" +
+        '<div style="margin-top:6px"><button class="danger src-conn-sync-off" data-src="' + V.esc(c.source) + '" ' +
+          'title="POST /v1/admin/connectors/' + V.esc(c.source) + '/sync {enabled:false}">Sync (continuous): on &mdash; turn off</button></div>';
+    }
+
+    // Off. The toggle is enabled only when the credential resolves.
+    var bf = c.backfill || {};
+    if (bf.available) {
+      return V.stateChip("off", "off") +
+        '<div style="margin-top:6px"><button class="src-conn-sync-on" data-src="' + V.esc(c.source) + '" ' +
+          'title="POST /v1/admin/connectors/' + V.esc(c.source) + '/sync — polls the source on an interval and writes memory until turned off">' +
+          "Sync (continuous)&hellip;</button></div>";
+    }
+    // No resolvable credential: an honest disabled toggle (dimmed, non-firing),
+    // the exact precondition hint from the server — never a toggle that 422s.
+    return V.stateChip("off", "off") +
+      '<div style="margin-top:6px"><button class="src-conn-sync-on-off" disabled ' +
+        'title="add a credential first — continuous sync needs a resolvable credential">Sync (continuous)&hellip;</button></div>' +
+      (bf.hint ? "<div>" + proseRef + V.esc(bf.hint) + "</span></div>" : "");
+  }
+
+  function reflectSyncInterval() {
+    var echo = el("src-sync-interval-echo");
+    if (!echo) return;
+    var v = parseInt(el("src-sync-interval").value, 10);
+    if (isNaN(v)) { echo.textContent = ""; return; }
+    if (v < 60) { echo.textContent = "below the 60s floor — continuous sync won't hammer a source; use 60s or more"; return; }
+    echo.textContent = "polls every " + V.fmtAge(v);
+  }
+
+  function openSyncDialog(row) {
+    if (!tenantNow) { V.openMint(); return; }
+    // Re-check the precondition so a stale row can never open a doomed confirm.
+    if (!(row && row.backfill && row.backfill.available)) return;
+    pendingSync = { source: row.source, label: row.label || row.source, kind: row.kind || null };
+    V.clearErr("src-sync-err");
+    el("src-sync-title").textContent = "Turn on continuous sync for " + pendingSync.label;
+    el("src-sync-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>' + V.esc(pendingSync.label) + "</b>" +
+        '<div class="dc-meta" style="margin-top:6px">' + V.esc(pendingSync.source) +
+        (pendingSync.kind ? " · " + V.esc(pendingSync.kind) : "") +
+        " &middot; space " + V.esc(confirmToken()) + "</div></div>";
+    el("src-sync-blurb").innerHTML =
+      "Verity will poll <b>" + V.esc(pendingSync.label) + "</b> every <b id=\"src-sync-blurb-interval\">5m</b> " +
+      "and write memory continuously until you turn this off.";
+    el("src-sync-interval").value = "300";
+    reflectSyncInterval();
+    syncBlurbInterval();
+    el("src-sync-interval").oninput = function () { reflectSyncInterval(); syncBlurbInterval(); };
+    el("src-sync-go").disabled = false;
+    V.dialog("src-sync-dialog").open();
+  }
+
+  // Keep the plain-words "every N" in the cost blurb in step with the input.
+  function syncBlurbInterval() {
+    var span = el("src-sync-blurb-interval");
+    if (!span) return;
+    var v = parseInt(el("src-sync-interval").value, 10);
+    span.textContent = (isNaN(v) || v < 60) ? "5m" : V.fmtAge(v);
+  }
+
+  async function enableSync() {
+    if (!pendingSync) return;
+    V.clearErr("src-sync-err");
+    var v = parseInt(el("src-sync-interval").value, 10);
+    if (isNaN(v) || v < 60) {
+      // Mirror the server's own 60s floor client-side — a sub-floor value is a
+      // clean refusal here (and the server 422s it too), never a silent clamp.
+      V.err("src-sync-err", new Error(
+        "poll interval must be at least 60 seconds — continuous sync must never hammer a source API."));
+      return;
+    }
+    var source = pendingSync.source;
+    var btn = el("src-sync-go");
+    btn.disabled = true;
+    try {
+      var res = await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) + "/sync",
+        { json: { tenant_id: tenantNow, enabled: true, interval_secs: v }, admin: true });
+      V.dialog("src-sync-dialog").close();
+      pendingSync = null;
+      var every = res && res.interval_secs != null ? V.fmtAge(res.interval_secs) : "the chosen interval";
+      var warn = res && res.warning
+        ? " " + V.badge("double-poll", "b-conf-3") + " " + V.esc(res.warning)
+        : "";
+      receipt("ok",
+        "Continuous sync is <b>on</b> for <b>" + V.esc(source) + "</b> &mdash; Verity polls it every <b>" +
+        V.esc(every) + "</b> and writes memory until you turn it off." + warn);
+      V.reload("sources");
+    } catch (e) {
+      // Server refusals verbatim — 422 (sub-floor interval / unresolvable
+      // credential / missing hubspot visibility / gmail subject), 404 (unknown
+      // tenant/source), 409 (busy). The refusal is the product speaking.
+      V.err("src-sync-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  function openSyncOffDialog(row) {
+    if (!tenantNow) { V.openMint(); return; }
+    pendingSync = { source: row.source, label: row.label || row.source, kind: row.kind || null };
+    V.clearErr("src-sync-off-err");
+    el("src-sync-off-title").textContent = "Turn off continuous sync for " + pendingSync.label;
+    el("src-sync-off-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>' + V.esc(pendingSync.label) + "</b>" +
+        '<div class="dc-meta" style="margin-top:6px">' + V.esc(pendingSync.source) + "</div></div>";
+    V.dialog("src-sync-off-dialog").open();
+  }
+
+  async function disableSync() {
+    if (!pendingSync) return;
+    V.clearErr("src-sync-off-err");
+    var source = pendingSync.source;
+    var btn = el("src-sync-off-go");
+    btn.disabled = true;
+    try {
+      await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) + "/sync",
+        { json: { tenant_id: tenantNow, enabled: false }, admin: true });
+      V.dialog("src-sync-off-dialog").close();
+      pendingSync = null;
+      receipt("ok",
+        "Continuous sync is <b>off</b> for <b>" + V.esc(source) + "</b> &mdash; no more automatic polls. " +
+        "Any cycle already in flight finishes; nothing already ingested is removed.");
+      V.reload("sources");
+    } catch (e) {
+      V.err("src-sync-off-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  // gdirectory's Sync toggle maps to the existing directory plane (reused, never
+  // duplicated). on=true means it is currently running => stop; else start.
+  async function toggleDirectorySync(on) {
+    if (!tenantNow) { V.openMint(); return; }
+    var path = on ? "stop" : "start";
+    try {
+      var res = await V.api("/v1/admin/planes/directory/" + path,
+        { json: { tenant_id: tenantNow }, admin: true });
+      if (on) {
+        if (res && res.stopped === false) {
+          // The stop endpoint returns 200 {stopped:false, note:...} when THIS
+          // console doesn't own the worker (it was started elsewhere, e.g.
+          // verity-cli dev --directory). Surfacing a flat "stopped" success here
+          // would be a dishonest receipt on a control that was a no-op — show the
+          // server's honest note instead. Mirrors the start-path already_running.
+          receipt("attn", V.esc(res.note || "Nothing to stop — this console doesn't own the directory worker."));
+        } else {
+          receipt("ok", "Directory sync <b>stopped</b> &mdash; the directory worker is no longer reconciling.");
+        }
+      } else if (res && res.already_running) {
+        receipt("attn", "Directory sync was <b>already running</b> &mdash; an honest no-op, not a failure.");
+      } else {
+        receipt("ok", "Directory sync <b>started</b> &mdash; the directory worker reconciles the full directory on a loop until stopped.");
+      }
+      V.reload("sources");
+    } catch (e) {
+      // The directory plane's own refusal verbatim — 422 (missing repo/venv),
+      // 503 (missing SA key / subject / spawn), each with the exact fix.
+      receipt("attn", "Couldn&rsquo;t toggle directory sync: " + V.esc((e && e.message) || String(e)));
+    }
   }
 
   /* ================================================= watch-folder flow */

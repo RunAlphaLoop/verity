@@ -68,6 +68,32 @@ pub struct ConnectorPathCredential {
     pub subject: Option<String>,
 }
 
+/// A durable continuous-sync schedule (Phase-4, migration 0033): the record that
+/// (tenant, source) has continuous sync armed at `interval_secs`. Continuous sync
+/// is a per-(tenant, source) SCHEDULER firing a short-lived incremental `--once`
+/// poll cycle on this interval — NOT a persistent child. The AUTHORITATIVE cursor
+/// is NOT here; it lives in the connector's own per-(tenant, source) state file.
+/// This is only the schedule (interval + enabled) plus a lightweight last-run
+/// stamp, so the server can re-arm every enabled schedule on boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSchedule {
+    pub tenant_id: TenantId,
+    /// The connector source polled: `gdrive` / `gmail` / `hubspot`.
+    pub source: String,
+    /// Poll cadence in seconds. Floored at 60s by the DB CHECK (rate-limit
+    /// guard); the server default is 300s.
+    pub interval_secs: i32,
+    /// Soft on/off: a disabled schedule stays durable (audit) but is not re-armed
+    /// on boot and does not fire.
+    pub enabled: bool,
+    /// When the most recent `--once` poll cycle for this (tenant, source) fired.
+    /// Display-only; the authoritative cursor is the connector state file. `None`
+    /// until the first cycle runs.
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A materialized principal token: the unit of visibility. Every chunk carries
 /// the set of tokens allowed to see it; the caller's principal set is resolved
 /// once per session and intersected in the index. Empty set = invisible.

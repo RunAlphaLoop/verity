@@ -38,6 +38,26 @@
      per-file ingest choke point, size caps, dotfile/temp skips and the empty-
      visibility refusal are all unchanged.
 
+     Connect section (Phase 4): each eligible source row now carries a
+     "Sync (continuous)" toggle in a dedicated column. The model is a
+     per-(tenant, source) SCHEDULER that fires a short incremental --once poll on
+     an interval (durable in sync_schedules, re-armed on boot) — NOT a persistent
+     child. gdrive/gmail/hubspot get a native schedule: the toggle is ENABLED
+     only when the server reports backfill.available (a resolvable credential +
+     hubspot visibility + gmail subject), else an HONEST disabled state showing
+     the precondition hint — never a dead toggle that 422s. Turning it ON opens a
+     cost-confirm (the System-panel plane-start idiom): "Verity will poll <source>
+     every <interval> and write memory continuously until you turn this off",
+     with a validated interval input (default 300s, floor 60s), then
+     POST /v1/admin/connectors/{source}/sync {enabled:true, interval_secs}.
+     Turning it OFF is a confirm + POST {enabled:false}. The live state
+     ("syncing every 5m · last synced 2m ago" / "off") reads straight from the
+     row's sync:{enabled,interval_secs,last_run_at}; the panel reloads after a
+     toggle so the row re-reads its own truth (no dead toggles). gdirectory's
+     toggle maps to the existing directory plane start/stop (reused, never
+     duplicated); folder/salesforce show an honest "not applicable". The toggle
+     owns NO client-side interval — it is a stateless pair of POSTs + a reload.
+
      Connect section (Phase 3): the zero-credential local-folder watch stays
      the "fastest start"; each eligible source row now has an "Add / rotate
      credential" control opening a source-branched dialog, and gdrive/gmail rows

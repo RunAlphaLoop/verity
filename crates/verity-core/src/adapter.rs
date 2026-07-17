@@ -337,6 +337,60 @@ pub trait StorageAdapter: Send + Sync {
     async fn revoke_connector_credential(&self, _tenant: TenantId, _source: &str) -> Result<bool> {
         Err(unsupported("revoke_connector_credential"))
     }
+
+    // ---- Continuous-sync schedules (Phase-4, migration 0033) ----
+    //
+    // A continuous-sync schedule is the DURABLE record that (tenant, source) has
+    // an interval poll armed. It is operator config, not memory — a durable
+    // upsert/toggle, never an L1 fact (so the invalidate-don't-delete rule does
+    // not apply; a disable is a soft `enabled=false`, retained for audit). The
+    // AUTHORITATIVE cursor is NOT stored here — it lives in the connector's own
+    // per-(tenant, source) state file; this surface only carries the schedule.
+
+    /// Upsert the schedule for (tenant, source): set the poll interval and
+    /// enabled flag. Idempotent on (tenant, source) — a second call rotates the
+    /// interval / flips the flag in place. `interval_secs` is floored at 60s by
+    /// the DB CHECK; a sub-floor value is rejected by storage (never silently
+    /// clamped), so the interval-floor guarantee holds even against a direct
+    /// storage caller. Returns the resulting row.
+    async fn upsert_sync_schedule(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+        _interval_secs: i32,
+        _enabled: bool,
+    ) -> Result<SyncSchedule> {
+        Err(unsupported("upsert_sync_schedule"))
+    }
+
+    /// The schedule for (tenant, source), or `None` when none is stored. The
+    /// toggle endpoint and the connectors readiness row read this to report the
+    /// per-source sync state (enabled / interval / last run).
+    async fn get_sync_schedule(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+    ) -> Result<Option<SyncSchedule>> {
+        Err(unsupported("get_sync_schedule"))
+    }
+
+    /// Every ENABLED schedule across all tenants — the boot re-arm read. On
+    /// server boot the scheduler re-arms one interval loop per row returned here
+    /// (mirrors `folder_watches` re-establishment). Disabled schedules are
+    /// omitted (they stay durable for audit but are not re-armed). Ordered by
+    /// (tenant_id, source) for a stable re-arm sequence.
+    async fn list_enabled_sync_schedules(&self) -> Result<Vec<SyncSchedule>> {
+        Err(unsupported("list_enabled_sync_schedules"))
+    }
+
+    /// Stamp `last_run_at = now()` for (tenant, source) after a `--once` poll
+    /// cycle fires. Lightweight telemetry (display-only "last synced N ago"); the
+    /// authoritative cursor stays in the connector state file. An honest no-op
+    /// (0 rows) when no schedule exists for the key. Returns `true` when a row was
+    /// stamped.
+    async fn touch_sync_schedule_last_run(&self, _tenant: TenantId, _source: &str) -> Result<bool> {
+        Err(unsupported("touch_sync_schedule_last_run"))
+    }
 }
 
 fn unsupported(op: &str) -> StorageError {

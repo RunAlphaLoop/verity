@@ -49,6 +49,7 @@ async fn test_state(admin: AdminAuth) -> Option<Arc<AppState>> {
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
         directory: crate::directory_worker::DirectoryPlane::disabled(),
         connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),
+        sync: std::sync::Arc::new(crate::sync_scheduler::SyncPlane::new()),
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,

@@ -591,6 +591,106 @@ impl PostgresAdapter {
         Ok(done.rows_affected() > 0)
     }
 
+    /// Upsert a continuous-sync schedule.
+    /// See [`StorageAdapter::upsert_sync_schedule`].
+    pub async fn upsert_sync_schedule_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        interval_secs: i32,
+        enabled: bool,
+    ) -> Result<SyncSchedule> {
+        // Enforce the interval floor here (not only via the DB CHECK) so a
+        // sub-floor value returns a clean InvalidInput → 422 instead of a raw
+        // constraint-violation Database error. The DB CHECK is the belt; this is
+        // the braces — either way a sub-floor interval is never armed.
+        if interval_secs < SYNC_INTERVAL_FLOOR_SECS {
+            return Err(StorageError::InvalidInput(format!(
+                "continuous-sync interval {interval_secs}s is below the \
+                 {SYNC_INTERVAL_FLOOR_SECS}s floor — refusing to arm a schedule that would \
+                 hammer the source API"
+            )));
+        }
+        let row = sqlx::query(
+            "INSERT INTO sync_schedules
+                 (tenant_id, source, interval_secs, enabled, updated_at)
+             VALUES ($1, $2, $3, $4, now())
+             ON CONFLICT (tenant_id, source) DO UPDATE
+                 SET interval_secs = EXCLUDED.interval_secs,
+                     enabled = EXCLUDED.enabled,
+                     updated_at = now()
+             RETURNING tenant_id, source, interval_secs, enabled, last_run_at,
+                       created_at, updated_at",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(interval_secs)
+        .bind(enabled)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        sync_schedule_from_row(&row)
+    }
+
+    /// Read the schedule for (tenant, source).
+    /// See [`StorageAdapter::get_sync_schedule`].
+    pub async fn get_sync_schedule_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<SyncSchedule>> {
+        let row = sqlx::query(
+            "SELECT tenant_id, source, interval_secs, enabled, last_run_at,
+                    created_at, updated_at
+             FROM sync_schedules
+             WHERE tenant_id = $1 AND source = $2",
+        )
+        .bind(tenant)
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(row) => Ok(Some(sync_schedule_from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every enabled schedule across tenants — the boot re-arm read.
+    /// See [`StorageAdapter::list_enabled_sync_schedules`].
+    pub async fn list_enabled_sync_schedules_impl(&self) -> Result<Vec<SyncSchedule>> {
+        let rows = sqlx::query(
+            "SELECT tenant_id, source, interval_secs, enabled, last_run_at,
+                    created_at, updated_at
+             FROM sync_schedules
+             WHERE enabled
+             ORDER BY tenant_id, source",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(sync_schedule_from_row).collect()
+    }
+
+    /// Stamp `last_run_at = now()` after a poll cycle.
+    /// See [`StorageAdapter::touch_sync_schedule_last_run`].
+    pub async fn touch_sync_schedule_last_run_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE sync_schedules SET last_run_at = now(), updated_at = now()
+             WHERE tenant_id = $1 AND source = $2",
+        )
+        .bind(tenant)
+        .bind(source)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Run pending migrations and return how many were applied, so boot can
     /// print `applied N migrations` (FTUE §2.3 — a bare `./verity` on a fresh
     /// database must say what it did). The count-before read is best-effort:
@@ -2846,6 +2946,25 @@ pub(crate) fn db_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Database(e.to_string())
 }
 
+/// Continuous-sync interval floor (seconds) — mirrors the `sync_schedules`
+/// `CHECK interval_secs >= 60`. Enforced in `upsert_sync_schedule_impl` so a
+/// sub-floor interval returns a clean `InvalidInput` (→ 422) rather than a raw
+/// constraint-violation from the DB. A schedule tighter than this is never armed.
+pub const SYNC_INTERVAL_FLOOR_SECS: i32 = 60;
+
+/// Map a `sync_schedules` row to a [`SyncSchedule`].
+fn sync_schedule_from_row(row: &PgRow) -> Result<SyncSchedule> {
+    Ok(SyncSchedule {
+        tenant_id: row.try_get("tenant_id").map_err(db_err)?,
+        source: row.try_get("source").map_err(db_err)?,
+        interval_secs: row.try_get("interval_secs").map_err(db_err)?,
+        enabled: row.try_get("enabled").map_err(db_err)?,
+        last_run_at: row.try_get("last_run_at").map_err(db_err)?,
+        created_at: row.try_get("created_at").map_err(db_err)?,
+        updated_at: row.try_get("updated_at").map_err(db_err)?,
+    })
+}
+
 /// Reciprocal-rank fusion of the dense and sparse result lists.
 fn rrf_fuse(lists: Vec<Vec<RecallHit>>, k: usize) -> Vec<RecallHit> {
     const RRF_K: f32 = 60.0;
@@ -4132,6 +4251,33 @@ impl StorageAdapter for PostgresAdapter {
 
     async fn revoke_connector_credential(&self, tenant: TenantId, source: &str) -> Result<bool> {
         self.revoke_connector_credential_impl(tenant, source).await
+    }
+
+    async fn upsert_sync_schedule(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        interval_secs: i32,
+        enabled: bool,
+    ) -> Result<SyncSchedule> {
+        self.upsert_sync_schedule_impl(tenant, source, interval_secs, enabled)
+            .await
+    }
+
+    async fn get_sync_schedule(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<SyncSchedule>> {
+        self.get_sync_schedule_impl(tenant, source).await
+    }
+
+    async fn list_enabled_sync_schedules(&self) -> Result<Vec<SyncSchedule>> {
+        self.list_enabled_sync_schedules_impl().await
+    }
+
+    async fn touch_sync_schedule_last_run(&self, tenant: TenantId, source: &str) -> Result<bool> {
+        self.touch_sync_schedule_last_run_impl(tenant, source).await
     }
 }
 
