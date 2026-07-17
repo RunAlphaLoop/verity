@@ -1541,6 +1541,10 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::get(folder_watch::preview_folder),
         )
         .route(
+            "/v1/admin/folders/browse",
+            axum::routing::get(folder_watch::browse_folder),
+        )
+        .route(
             "/v1/admin/folders/scan/stop",
             post(folder_watch::stop_folder_scan),
         )

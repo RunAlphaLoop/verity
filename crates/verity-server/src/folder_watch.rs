@@ -1418,6 +1418,129 @@ pub(crate) async fn preview_folder(
     })))
 }
 
+/// Cap on subdirectories returned by one browse call — a directory with tens of
+/// thousands of children never blows up the response or the picker.
+const MAX_BROWSE_DIRS: usize = 1000;
+
+#[derive(Deserialize)]
+pub(crate) struct BrowseParams {
+    /// Absolute server-local path to list. Empty/absent => the server's home
+    /// directory (a sane starting point for the picker).
+    #[serde(default)]
+    path: String,
+}
+
+/// Immediate SUBDIRECTORIES of `dir` (dirs only, hidden dotdirs skipped), name
+/// A→Z, capped at [`MAX_BROWSE_DIRS`]. Unreadable subdirs are skipped, never
+/// fatal; only an unreadable ROOT is an `Err` the handler turns into a 422 (a
+/// picker must never render an empty dir as "no folders here").
+fn list_subdirs_bounded(dir: &Path) -> std::io::Result<(Vec<(String, PathBuf)>, bool)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut capped = false;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        // file_type() avoids a follow-symlink stat where possible; fall back to
+        // is_dir() (which does follow) so a symlinked folder is still browsable.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => true,
+            Ok(ft) if ft.is_symlink() => entry.path().is_dir(),
+            _ => false,
+        };
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue; // hidden dirs are noise for a folder-to-watch picker
+        }
+        if out.len() >= MAX_BROWSE_DIRS {
+            capped = true;
+            break;
+        }
+        out.push((name, entry.path()));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((out, capped))
+}
+
+/// GET /v1/admin/folders/browse?path= (admin): a server-side directory picker.
+/// Lists the immediate subdirectories of `path` so the console can navigate the
+/// SERVER's filesystem (the watch runs on the server host; a browser cannot see
+/// the server's real absolute paths). Admin-gated; this exposes no more than an
+/// admin can already reach by typing any absolute path into the watch dialog.
+///
+/// Fail-closed exactly like `preview_folder`: the path is canonicalized (so `..`
+/// and symlinks resolve and the returned path is a real absolute one), must be a
+/// readable directory, and an unreadable root is a 422 refusal — never a false
+/// "empty folder". Empty/absent `path` starts at the server's home directory.
+pub(crate) async fn browse_folder(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<BrowseParams>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+
+    // Default to the server's home directory when no path is given.
+    let requested = if p.path.trim().is_empty() {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    } else {
+        PathBuf::from(p.path.trim())
+    };
+
+    if !requested.is_absolute() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "path must be absolute (server-local): {}",
+                requested.display()
+            ),
+        ));
+    }
+
+    // canonicalize resolves `..`/symlinks and REQUIRES the path to exist — a
+    // missing/unreadable path fails here, fail-closed (never a fabricated tree).
+    let dir = std::fs::canonicalize(&requested).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("cannot open {}: {e}", requested.display()),
+        )
+    })?;
+    if !dir.is_dir() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+
+    let dir_for_list = dir.clone();
+    let (entries, capped) =
+        tokio::task::spawn_blocking(move || list_subdirs_bounded(&dir_for_list))
+            .await
+            .map_err(internal)?
+            .map_err(|e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("refusing: directory is not readable by the server: {e}"),
+                )
+            })?;
+
+    let parent = dir.parent().map(|p| p.to_string_lossy().into_owned());
+    let entries: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(name, path)| serde_json::json!({ "name": name, "path": path.to_string_lossy() }))
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "path": dir.to_string_lossy(),
+        // null at the filesystem root — the picker hides "up" there.
+        "parent": parent,
+        "entries": entries,
+        "capped": capped,
+    })))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct StopScanRequest {
     tenant_id: TenantId,
@@ -1457,6 +1580,25 @@ pub(crate) async fn stop_folder_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browse_lists_subdirs_only_sorted_skipping_hidden() {
+        let base = std::env::temp_dir().join(format!("verity-browse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zeta")).unwrap();
+        std::fs::create_dir_all(base.join("alpha")).unwrap();
+        std::fs::create_dir_all(base.join(".hidden")).unwrap();
+        std::fs::write(base.join("a-file.txt"), b"x").unwrap();
+
+        let (dirs, capped) = list_subdirs_bounded(&base).unwrap();
+        let names: Vec<&str> = dirs.iter().map(|(n, _)| n.as_str()).collect();
+        // Only real subdirs, hidden skipped, files excluded, sorted A→Z.
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert!(!capped);
+        // An unreadable/missing root is an Err (fail closed), never empty-ok.
+        assert!(list_subdirs_bounded(&base.join("does-not-exist")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn skip_rules_cover_hidden_and_editor_temp_files() {
