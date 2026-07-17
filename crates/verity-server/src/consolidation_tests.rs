@@ -58,6 +58,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
         folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
+        folder_scans: Arc::new(crate::folder_watch::FolderScanPlane::new()),
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
         directory: crate::directory_worker::DirectoryPlane::disabled(),
         connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),
@@ -91,6 +92,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
         knowledge_auto_merge,
         watch,
         folder_watchers,
+        folder_scans,
         ..
     } = Arc::try_unwrap(state).ok()?;
     Some((
@@ -110,6 +112,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
             watch,
             folder_watchers,
+            folder_scans,
             knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
             directory: crate::directory_worker::DirectoryPlane::disabled(),
             connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),

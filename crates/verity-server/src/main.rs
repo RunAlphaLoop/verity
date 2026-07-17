@@ -400,6 +400,12 @@ pub(crate) struct AppState {
     /// re-populated from the `folder_watches` table on boot. Ingest is
     /// write-path only — read-path purity is untouched.
     pub(crate) folder_watchers: Arc<folder_watch::WatcherRegistry>,
+    /// Supervised in-process initial-scan plane (folder_watch.rs): one
+    /// background scan per (tenant, folder) that walks a newly-registered
+    /// folder's EXISTING files off the request path, reports progress via
+    /// backfill_run, and is cancellable. Registering a folder no longer blocks
+    /// the HTTP response on that walk. See folder_watch::FolderScanPlane.
+    pub(crate) folder_scans: Arc<folder_watch::FolderScanPlane>,
     /// Console/CLI-started knowledge consolidation worker (SPEC §2 L2). `Some` =
     /// this server spawned + owns a live child → authoritative planes status
     /// (pid, "started from this console") + a real Stop. `None` = not owned
@@ -1351,6 +1357,7 @@ async fn main() -> anyhow::Result<()> {
         resolution: scheduler::ResolutionScheduler::from_env(),
         watch: Arc::new(rebac_watch::WatchStatus::new()),
         folder_watchers: Arc::new(folder_watch::WatcherRegistry::new()),
+        folder_scans: Arc::new(folder_watch::FolderScanPlane::new()),
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
         repo_root: cli.repo_root(),
         listen: cli.listen.clone(),
@@ -1474,6 +1481,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/folders",
             post(folder_watch::add_folder_watch).get(folder_watch::list_folder_watches),
+        )
+        .route(
+            "/v1/admin/folders/preview",
+            axum::routing::get(folder_watch::preview_folder),
+        )
+        .route(
+            "/v1/admin/folders/scan/stop",
+            post(folder_watch::stop_folder_scan),
         )
         .route(
             "/v1/admin/folders/{id}",

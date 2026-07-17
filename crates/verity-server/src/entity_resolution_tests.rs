@@ -42,6 +42,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         revocations: RevocationPlane::new(300),
         watch: std::sync::Arc::new(crate::rebac_watch::WatchStatus::new()),
         folder_watchers: std::sync::Arc::new(crate::folder_watch::WatcherRegistry::new()),
+        folder_scans: std::sync::Arc::new(crate::folder_watch::FolderScanPlane::new()),
         knowledge_worker: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         directory: crate::directory_worker::DirectoryPlane::disabled(),
         connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),
