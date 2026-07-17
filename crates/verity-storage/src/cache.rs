@@ -315,4 +315,38 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
     async fn revoke_connector_credential(&self, tenant: TenantId, source: &str) -> Result<bool> {
         self.inner.revoke_connector_credential(tenant, source).await
     }
+
+    // Phase-4 continuous-sync schedules: pure pass-through (operator config, not
+    // the fact hot path — no L1 caching). Without these the trait defaults return
+    // `unsupported`, silently killing the schedule surface behind the cache the
+    // live server uses.
+    async fn upsert_sync_schedule(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        interval_secs: i32,
+        enabled: bool,
+    ) -> Result<SyncSchedule> {
+        self.inner
+            .upsert_sync_schedule(tenant, source, interval_secs, enabled)
+            .await
+    }
+
+    async fn get_sync_schedule(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<SyncSchedule>> {
+        self.inner.get_sync_schedule(tenant, source).await
+    }
+
+    async fn list_enabled_sync_schedules(&self) -> Result<Vec<SyncSchedule>> {
+        self.inner.list_enabled_sync_schedules().await
+    }
+
+    async fn touch_sync_schedule_last_run(&self, tenant: TenantId, source: &str) -> Result<bool> {
+        self.inner
+            .touch_sync_schedule_last_run(tenant, source)
+            .await
+    }
 }

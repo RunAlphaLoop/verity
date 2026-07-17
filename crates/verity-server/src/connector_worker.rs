@@ -100,6 +100,11 @@ pub(crate) struct ConnectorWorker {
     /// so a decrypted secret never lingers on disk past the child's lifetime.
     /// `None` for the Google sources (no server-written secret file).
     pub(crate) cred_file_path: Option<PathBuf>,
+    /// Which crawl mode this child runs in. Steers the reap: a `PollOnce` cycle
+    /// is a short-lived delta drain with NO `backfill_run` denominator, so its
+    /// exit must NOT be reconciled into `backfill_run` (that would fabricate a
+    /// job row). A `Backfill` exit is reconciled as before.
+    pub(crate) mode: SpawnMode,
 }
 
 /// Best-effort scrub of the materialized bearer temp file on EVERY path that
@@ -174,6 +179,57 @@ pub(crate) fn is_backfillable(source: &str) -> bool {
     matches!(source, "gdrive" | "gmail" | "hubspot")
 }
 
+/// Whether a source supports a continuous-sync `--once` incremental poll cycle:
+/// `gdrive` / `gmail` / `hubspot` (all have a `--once` CLI branch + a persisted
+/// cursor). `gdirectory` has its OWN continuous directory plane (not a `--once`
+/// poll), and `folder` / `salesforce` have no incremental cursor — the caller
+/// (the toggle endpoint) maps `gdirectory` to the directory plane and 422s the
+/// rest. Deliberately the same set as `is_backfillable` today, but a DISTINCT
+/// predicate: a source can be backfillable without a `--once` cursor and vice
+/// versa, so the two gates must not be conflated.
+pub(crate) fn is_pollable(source: &str) -> bool {
+    poll_cursor_basename(source).is_some()
+}
+
+/// Which crawl mode a connector child runs in: the Phase-3 one-shot full
+/// `--backfill` crawl, or the Phase-4 continuous-sync `--once` incremental poll
+/// cycle. The ONLY argv delta is the flag itself (`--backfill` vs `--once`) plus,
+/// for a poll, a `--state-file <per-(tenant,source) cursor path>` (backfill has
+/// no cursor). Everything downstream — spawn/materialize/cleanup/ownership/reap —
+/// is mode-neutral; the mode only steers the reconcile (a poll must NOT fabricate
+/// a `backfill_run` job row) and the log basename (a poll writes `<source>-poll.log`
+/// so its lines never contaminate a backfill's degraded-ACL grep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnMode {
+    /// Phase-3 one-shot full crawl: `--backfill`, no cursor, reconciled into
+    /// `backfill_run`.
+    Backfill,
+    /// Phase-4 continuous-sync incremental poll cycle: `--once --state-file
+    /// <path>`, advances the persisted per-(tenant,source) cursor, exits in
+    /// seconds. NOT reconciled into `backfill_run`.
+    PollOnce,
+}
+
+impl SpawnMode {
+    /// The CLI flag literal for this mode.
+    fn flag(self) -> &'static str {
+        match self {
+            SpawnMode::Backfill => "--backfill",
+            SpawnMode::PollOnce => "--once",
+        }
+    }
+    /// The detached-log basename for a source in this mode. A poll writes to a
+    /// DISTINCT `<source>-poll.log` so a poll cycle's lines never interleave with
+    /// a backfill's log (the reap greps a backfill's whole log for the owners-403
+    /// degraded-ACL signal — a poll's lines must not contaminate that grep).
+    fn log_name(self, source: &str) -> String {
+        match self {
+            SpawnMode::Backfill => format!("{source}.log"),
+            SpawnMode::PollOnce => format!("{source}-poll.log"),
+        }
+    }
+}
+
 /// Whether a source's backfill HARD-REQUIRES a `--subject` (gmail aborts before
 /// any HTTP if unset; gdrive's `--subject` is optional at the credential layer,
 /// though its fact lane self-disables without one).
@@ -214,13 +270,16 @@ pub(crate) enum BackfillIdentity {
 /// `--tenant-id` (+ `--subject`); HubSpot threads `--visibility` /
 /// `--credential-file` and reads tenant/url from env. Returns the module, the
 /// full argv tail, and the log basename.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_spec(
     source: &str,
+    mode: SpawnMode,
     base_url: &str,
     tenant_id: Uuid,
     subject: Option<&str>,
     visibility: Option<&[i32]>,
     cred_file: Option<&Path>,
+    state_file: Option<&Path>,
 ) -> Result<BackfillSpec, SpawnError> {
     if !is_backfillable(source) {
         return Err(SpawnError::NoConfig(format!(
@@ -230,8 +289,24 @@ pub(crate) fn assemble_spec(
         )));
     }
 
+    // A --once poll cycle MUST carry a per-(tenant,source) --state-file (the
+    // cursor path); backfill has no cursor. Fail closed rather than let a poll
+    // fall back to the connector's tenant-AGNOSTIC default cursor (which would
+    // clobber across tenants).
+    let state_file = match mode {
+        SpawnMode::PollOnce => Some(state_file.ok_or_else(|| {
+            SpawnError::NoConfig(format!(
+                "{source} --once poll needs a per-(tenant,source) --state-file (the cursor path) — \
+                 refusing to fall back to the connector's shared default cursor, which would \
+                 clobber across tenants"
+            ))
+        })?),
+        SpawnMode::Backfill => None,
+    };
+
     let module = format!("verity_ingest.connectors.{source}");
-    let log_name = format!("{source}.log");
+    let log_name = mode.log_name(source);
+    let flag = mode.flag().to_string();
 
     // HubSpot (tier-C): NO --verity-url / --tenant-id (the CLI reads those from
     // env); a required --visibility policy + a --credential-file path whose FILE
@@ -239,14 +314,14 @@ pub(crate) fn assemble_spec(
     if source == "hubspot" {
         let visibility = visibility.filter(|v| !v.is_empty()).ok_or_else(|| {
             SpawnError::NoConfig(
-                "hubspot backfill needs a non-empty --visibility policy (tier-C requires a \
+                "hubspot sync needs a non-empty --visibility policy (tier-C requires a \
                  sharing scope) — store a HubSpot credential with a visibility policy first"
                     .to_string(),
             )
         })?;
         let cred_file = cred_file.ok_or_else(|| {
             SpawnError::NoConfig(
-                "hubspot backfill needs a server-materialized --credential-file (the decrypted \
+                "hubspot sync needs a server-materialized --credential-file (the decrypted \
                  bearer) — a resolvable stored bearer is required"
                     .to_string(),
             )
@@ -256,15 +331,19 @@ pub(crate) fn assemble_spec(
             .map(|t| t.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let argv = vec![
+        let mut argv = vec![
             "-m".to_string(),
             module.clone(),
-            "--backfill".to_string(),
+            flag,
             "--visibility".to_string(),
             vis,
             "--credential-file".to_string(),
             cred_file.to_string_lossy().into_owned(),
         ];
+        if let Some(state_file) = state_file {
+            argv.push("--state-file".to_string());
+            argv.push(state_file.to_string_lossy().into_owned());
+        }
         return Ok(BackfillSpec {
             module,
             argv,
@@ -276,7 +355,7 @@ pub(crate) fn assemble_spec(
     let subject = subject.map(str::trim).filter(|s| !s.is_empty());
     if subject_required(source) && subject.is_none() {
         return Err(SpawnError::NoConfig(format!(
-            "{source} backfill needs a mailbox-owner --subject (domain-wide-delegation \
+            "{source} sync needs a mailbox-owner --subject (domain-wide-delegation \
              impersonation) — set it on the stored connector credential (or the server env) \
              then try again; {source} aborts before any HTTP without it"
         )));
@@ -284,7 +363,7 @@ pub(crate) fn assemble_spec(
     let mut argv = vec![
         "-m".to_string(),
         module.clone(),
-        "--backfill".to_string(),
+        flag,
         "--verity-url".to_string(),
         base_url.to_string(),
         "--tenant-id".to_string(),
@@ -293,6 +372,10 @@ pub(crate) fn assemble_spec(
     if let Some(subject) = subject {
         argv.push("--subject".to_string());
         argv.push(subject.to_string());
+    }
+    if let Some(state_file) = state_file {
+        argv.push("--state-file".to_string());
+        argv.push(state_file.to_string_lossy().into_owned());
     }
     Ok(BackfillSpec {
         module,
@@ -423,6 +506,94 @@ pub(crate) fn sweep_orphaned_cred_dirs() {
             );
         }
     }
+}
+
+/// Env override for the continuous-sync cursor-state base dir. Unlike the
+/// per-process credential runtime dir (unpredictable, wiped on boot), this is a
+/// STABLE, PERSISTENT dir: a `--once` poll cursor MUST survive a server restart
+/// (otherwise every reboot re-drains the whole change window). Default:
+/// `<repo>/ingest/.verity/poll-cursors` when a repo is known, else
+/// `<data-home>/verity/poll-cursors`.
+pub(crate) const POLL_STATE_DIR_ENV: &str = "VERITY_POLL_STATE_DIR";
+
+/// The cursor-file basename for a source's `--once` poll cursor. The format
+/// differs per connector (hubspot = a bare ISO-8601 line; gdrive/gmail = a JSON
+/// `{"cursor": ...}`), so the extension mirrors what each connector reads/writes
+/// — but the SCHEME (one file per source under a per-tenant dir) is uniform.
+/// `None` for a source with no `--once` cursor (folder / gdirectory / salesforce).
+pub(crate) fn poll_cursor_basename(source: &str) -> Option<&'static str> {
+    match source {
+        "hubspot" => Some("hubspot_cursor"),
+        "gdrive" => Some("gdrive_cursor.json"),
+        "gmail" => Some("gmail_cursor.json"),
+        _ => None,
+    }
+}
+
+/// Resolve the STABLE per-(tenant, source) cursor-state file path for a `--once`
+/// poll cycle, creating the per-tenant parent dir 0700 if needed. Returns the
+/// absolute path the server passes to the connector as `--state-file` (equivalently
+/// `HUBSPOT_STATE_FILE` / `GDRIVE_STATE_FILE` / `GMAIL_STATE_FILE`).
+///
+/// ISOLATION (non-negotiable): the path is
+/// `<base>/<tenant-uuid>/<source>_cursor[.json]` — scoped by BOTH tenant and
+/// source, so two tenants polling the same source NEVER share a cursor file (which
+/// would race the change token and cross-contaminate resume state). The connector
+/// default (`.verity/<source>_cursor`, relative to the ingest cwd) is
+/// tenant-AGNOSTIC and would clobber across tenants — this helper exists so a
+/// server-driven `--once` spawn never uses that shared default.
+///
+/// The base dir is `$VERITY_POLL_STATE_DIR` when set, else
+/// `<repo>/ingest/.verity/poll-cursors` when a repo root is known, else
+/// `<data-home>/verity/poll-cursors`. It is created recursively (persistent, so
+/// unlike the cred runtime dir it is NOT unpredictable/exclusive — the cursor is
+/// opaque, not a secret; it carries no bearer). Per-tenant dirs are made 0700 so
+/// one tenant's opaque cursor is not world-readable.
+pub(crate) fn poll_cursor_state_file(
+    repo_root: Option<&Path>,
+    tenant: Uuid,
+    source: &str,
+) -> Result<PathBuf, SpawnError> {
+    let basename = poll_cursor_basename(source).ok_or_else(|| {
+        SpawnError::NoConfig(format!(
+            "source {source:?} has no --once poll cursor — continuous sync is not wired for it \
+             (folder / gdirectory / salesforce have no incremental cursor)"
+        ))
+    })?;
+    let base = poll_cursor_base_dir(repo_root);
+    let tenant_dir = base.join(tenant.to_string());
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&tenant_dir).map_err(|e| {
+        SpawnError::Os(format!(
+            "cannot create the poll-cursor dir {}: {e}",
+            tenant_dir.display()
+        ))
+    })?;
+    Ok(tenant_dir.join(basename))
+}
+
+/// The base dir under which per-tenant cursor dirs are created. Env override
+/// wins; else `<repo>/ingest/.verity/poll-cursors` (co-located with the ingest
+/// artifacts, like the directory worker's snapshot checkpoint); else a
+/// data-home fallback so a repo-less server still has a stable spot.
+fn poll_cursor_base_dir(repo_root: Option<&Path>) -> PathBuf {
+    if let Some(dir) = std::env::var_os(POLL_STATE_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    if let Some(repo) = repo_root {
+        return repo.join("ingest").join(".verity").join("poll-cursors");
+    }
+    let home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir);
+    home.join("verity").join("poll-cursors")
 }
 
 /// Write `bytes` to a fresh `O_CREAT|O_EXCL`, mode-0600 temp file inside the
@@ -652,6 +823,7 @@ impl ConnectorPlane {
     pub(crate) async fn start(
         self: &Arc<Self>,
         pool: PgPool,
+        mode: SpawnMode,
         repo_root: Option<&Path>,
         base_url: &str,
         tenant_id: Uuid,
@@ -686,6 +858,7 @@ impl ConnectorPlane {
 
         let worker = spawn(
             repo_root,
+            mode,
             base_url,
             tenant_id,
             source,
@@ -774,6 +947,7 @@ async fn reap(
         let terminal: TerminalExit;
         let run_id: Uuid;
         let cred_file: Option<PathBuf>;
+        let mode: SpawnMode;
         {
             let mut guard = entry.lock().await;
             match guard.as_mut() {
@@ -797,6 +971,7 @@ async fn reap(
                         };
                         run_id = worker.run_id;
                         cred_file = worker.cred_file_path.clone();
+                        mode = worker.mode;
                         terminal = TerminalExit {
                             code,
                             success,
@@ -817,6 +992,7 @@ async fn reap(
                         // hangs at "running". No exit code is available.
                         run_id = worker.run_id;
                         cred_file = worker.cred_file_path.clone();
+                        mode = worker.mode;
                         terminal = TerminalExit {
                             code: None,
                             success: false,
@@ -838,7 +1014,15 @@ async fn reap(
         if let Some(cred) = cred_file.as_deref() {
             unlink_credential_file(cred);
         }
-        reconcile_terminal(&pool, &key, run_id, &terminal).await;
+        // A --once poll is a short-lived delta drain with NO backfill_run
+        // denominator: reconciling it into backfill_run would fabricate a job row
+        // and pollute the "latest run per source" dashboard. A poll's liveness is
+        // carried by the connector's own connector_status heartbeat + the
+        // scheduler's last_run_at stamp — NOT a backfill_run state. Only a
+        // Backfill exit is reconciled here.
+        if mode == SpawnMode::Backfill {
+            reconcile_terminal(&pool, &key, run_id, &terminal).await;
+        }
         plane.last_exit.lock().await.insert(key, terminal);
         return;
     }
@@ -940,6 +1124,7 @@ async fn reconcile_terminal(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     repo_root: Option<&Path>,
+    mode: SpawnMode,
     base_url: &str,
     tenant_id: Uuid,
     source: &str,
@@ -948,6 +1133,13 @@ pub(crate) fn spawn(
     run_id: Uuid,
 ) -> Result<ConnectorWorker, SpawnError> {
     let repo = repo_root.ok_or(SpawnError::NoRepo)?;
+    // A --once poll needs its per-(tenant,source) cursor path resolved BEFORE the
+    // fork (created 0700). Backfill has no cursor. Resolving here (not in the
+    // caller) keeps the per-tenant-dir discipline co-located with the spawn.
+    let state_file = match mode {
+        SpawnMode::PollOnce => Some(poll_cursor_state_file(repo_root, tenant_id, source)?),
+        SpawnMode::Backfill => None,
+    };
     let py = worker_python(repo);
     if !py.exists() {
         return Err(SpawnError::NoVenv(format!(
@@ -982,7 +1174,16 @@ pub(crate) fn spawn(
                 "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
                 sa_key.to_string_lossy().into_owned(),
             ));
-            assemble_spec(source, base_url, tenant_id, subject.as_deref(), None, None)?
+            assemble_spec(
+                source,
+                mode,
+                base_url,
+                tenant_id,
+                subject.as_deref(),
+                None,
+                None,
+                state_file.as_deref(),
+            )?
         }
         BackfillIdentity::HubSpot { bearer, visibility } => {
             // Materialize the decrypted bearer to a fresh O_CREAT|O_EXCL 0600 file
@@ -991,11 +1192,13 @@ pub(crate) fn spawn(
             let cred = write_credential_file(Uuid::new_v4(), bearer)?;
             let spec = match assemble_spec(
                 source,
+                mode,
                 base_url,
                 tenant_id,
                 None,
                 Some(visibility),
                 Some(cred.as_path()),
+                state_file.as_deref(),
             ) {
                 Ok(spec) => spec,
                 Err(e) => {
@@ -1041,12 +1244,17 @@ pub(crate) fn spawn(
     let mut cmd = Command::new(&py);
     cmd.args(&spec.argv)
         .current_dir(repo.join("ingest"))
-        // Server-minted run_id so the panel poll keys on THIS run (no --run-id
-        // CLI flag exists; the connector reads this env into BackfillReporter).
-        .env(RUN_ID_ENV, run_id.to_string())
         .stdin(Stdio::null())
         .stdout(log2)
         .stderr(log);
+    // Server-minted run_id so the panel poll keys on THIS run (no --run-id CLI
+    // flag exists; the connector reads this env into BackfillReporter). ONLY a
+    // backfill needs it — the connectors read VERITY_BACKFILL_RUN_ID exclusively
+    // inside their `if args.backfill:` branch; a --once poll ignores it and it
+    // must not key a fabricated backfill_run row, so we don't thread it for a poll.
+    if mode == SpawnMode::Backfill {
+        cmd.env(RUN_ID_ENV, run_id.to_string());
+    }
     for (k, v) in &extra_env {
         cmd.env(k, v);
     }
@@ -1076,6 +1284,7 @@ pub(crate) fn spawn(
         run_id,
         log_path,
         cred_file_path,
+        mode,
     })
 }
 
@@ -1150,8 +1359,17 @@ mod tests {
 
     #[test]
     fn gdrive_argv_omits_subject_when_absent() {
-        let spec =
-            assemble_spec("gdrive", "http://host:7717", t(), None, None, None).expect("gdrive ok");
+        let spec = assemble_spec(
+            "gdrive",
+            SpawnMode::Backfill,
+            "http://host:7717",
+            t(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("gdrive ok");
         assert_eq!(spec.module, "verity_ingest.connectors.gdrive");
         assert_eq!(spec.log_name, "gdrive.log");
         assert_eq!(
@@ -1174,9 +1392,11 @@ mod tests {
     fn gdrive_argv_includes_subject_when_present() {
         let spec = assemble_spec(
             "gdrive",
+            SpawnMode::Backfill,
             "http://h",
             t(),
             Some("owner@corp.example"),
+            None,
             None,
             None,
         )
@@ -1193,9 +1413,11 @@ mod tests {
     fn gmail_argv_requires_and_includes_subject() {
         let spec = assemble_spec(
             "gmail",
+            SpawnMode::Backfill,
             "http://h",
             t(),
             Some("mbox@corp.example"),
+            None,
             None,
             None,
         )
@@ -1220,21 +1442,49 @@ mod tests {
 
     #[test]
     fn gmail_without_subject_is_no_config() {
-        let err = assemble_spec("gmail", "http://h", t(), None, None, None)
-            .err()
-            .expect("gmail must fail without subject");
+        let err = assemble_spec(
+            "gmail",
+            SpawnMode::Backfill,
+            "http://h",
+            t(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("gmail must fail without subject");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Blank/whitespace subject counts as absent (matches connector abort).
         assert!(matches!(
-            assemble_spec("gmail", "http://h", t(), Some("   "), None, None).err(),
+            assemble_spec(
+                "gmail",
+                SpawnMode::Backfill,
+                "http://h",
+                t(),
+                Some("   "),
+                None,
+                None,
+                None
+            )
+            .err(),
             Some(SpawnError::NoConfig(_))
         ));
     }
 
     #[test]
     fn subject_is_trimmed() {
-        let spec =
-            assemble_spec("gdrive", "http://h", t(), Some("  a@b.co  "), None, None).expect("ok");
+        let spec = assemble_spec(
+            "gdrive",
+            SpawnMode::Backfill,
+            "http://h",
+            t(),
+            Some("  a@b.co  "),
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
         let i = spec.argv.iter().position(|a| a == "--subject").unwrap();
         assert_eq!(spec.argv[i + 1], "a@b.co");
     }
@@ -1246,11 +1496,13 @@ mod tests {
         let cred = Path::new("/run/verity-connector-creds/abc.cred");
         let spec = assemble_spec(
             "hubspot",
+            SpawnMode::Backfill,
             "http://host:7717",
             t(),
             None,
             Some(&[3, 9, 12]),
             Some(cred),
+            None,
         )
         .expect("hubspot ok");
         assert_eq!(spec.module, "verity_ingest.connectors.hubspot");
@@ -1280,20 +1532,183 @@ mod tests {
     fn hubspot_argv_requires_visibility_and_credential_file() {
         // No visibility → NoConfig with the exact honest fix.
         let cred = Path::new("/run/x.cred");
-        let err = assemble_spec("hubspot", "http://h", t(), None, None, Some(cred))
-            .err()
-            .expect("no visibility must fail");
+        let err = assemble_spec(
+            "hubspot",
+            SpawnMode::Backfill,
+            "http://h",
+            t(),
+            None,
+            None,
+            Some(cred),
+            None,
+        )
+        .err()
+        .expect("no visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Empty visibility is treated as absent.
-        let err = assemble_spec("hubspot", "http://h", t(), None, Some(&[]), Some(cred))
-            .err()
-            .expect("empty visibility must fail");
+        let err = assemble_spec(
+            "hubspot",
+            SpawnMode::Backfill,
+            "http://h",
+            t(),
+            None,
+            Some(&[]),
+            Some(cred),
+            None,
+        )
+        .err()
+        .expect("empty visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // No credential-file path → NoConfig.
-        let err = assemble_spec("hubspot", "http://h", t(), None, Some(&[7]), None)
-            .err()
-            .expect("no credential-file must fail");
+        let err = assemble_spec(
+            "hubspot",
+            SpawnMode::Backfill,
+            "http://h",
+            t(),
+            None,
+            Some(&[7]),
+            None,
+            None,
+        )
+        .err()
+        .expect("no credential-file must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
+    }
+
+    // ---- --once poll argv assembly (pure) — the continuous-sync cycle ----
+    // The ONLY delta from the backfill argv is: swap `--backfill`→`--once`, add
+    // `--state-file <per-(tenant,source) cursor path>`, and write a distinct
+    // `<source>-poll.log`. Everything else (env-fed tenant/url for hubspot,
+    // --verity-url/--tenant-id/--subject for Google) is identical.
+
+    #[test]
+    fn gdrive_once_argv_swaps_flag_and_adds_state_file() {
+        let cursor = Path::new("/var/verity/poll/tenant-a/gdrive_cursor.json");
+        let spec = assemble_spec(
+            "gdrive",
+            SpawnMode::PollOnce,
+            "http://host:7717",
+            t(),
+            Some("owner@corp.example"),
+            None,
+            None,
+            Some(cursor),
+        )
+        .expect("gdrive --once ok");
+        // Distinct poll log — never interleaves with the backfill log.
+        assert_eq!(spec.log_name, "gdrive-poll.log");
+        assert_eq!(
+            spec.argv,
+            vec![
+                "-m",
+                "verity_ingest.connectors.gdrive",
+                "--once",
+                "--verity-url",
+                "http://host:7717",
+                "--tenant-id",
+                &t().to_string(),
+                "--subject",
+                "owner@corp.example",
+                "--state-file",
+                "/var/verity/poll/tenant-a/gdrive_cursor.json",
+            ]
+        );
+        // Never both flags (which would ignore --once / clobber the cursor).
+        assert!(!spec.argv.iter().any(|a| a == "--backfill"));
+    }
+
+    #[test]
+    fn gmail_once_argv_carries_subject_and_state_file() {
+        let cursor = Path::new("/var/verity/poll/tb/gmail_cursor.json");
+        let spec = assemble_spec(
+            "gmail",
+            SpawnMode::PollOnce,
+            "http://h",
+            t(),
+            Some("mbox@corp.example"),
+            None,
+            None,
+            Some(cursor),
+        )
+        .expect("gmail --once ok");
+        assert_eq!(spec.log_name, "gmail-poll.log");
+        assert!(spec.argv.iter().any(|a| a == "--once"));
+        let i = spec.argv.iter().position(|a| a == "--state-file").unwrap();
+        assert_eq!(spec.argv[i + 1], "/var/verity/poll/tb/gmail_cursor.json");
+    }
+
+    #[test]
+    fn hubspot_once_argv_carries_state_file_after_credential() {
+        let cred = Path::new("/run/verity-connector-creds/abc.cred");
+        let cursor = Path::new("/var/verity/poll/tc/hubspot_cursor");
+        let spec = assemble_spec(
+            "hubspot",
+            SpawnMode::PollOnce,
+            "http://host:7717",
+            t(),
+            None,
+            Some(&[3, 9]),
+            Some(cred),
+            Some(cursor),
+        )
+        .expect("hubspot --once ok");
+        assert_eq!(spec.log_name, "hubspot-poll.log");
+        assert_eq!(
+            spec.argv,
+            vec![
+                "-m",
+                "verity_ingest.connectors.hubspot",
+                "--once",
+                "--visibility",
+                "3,9",
+                "--credential-file",
+                "/run/verity-connector-creds/abc.cred",
+                "--state-file",
+                "/var/verity/poll/tc/hubspot_cursor",
+            ]
+        );
+        // The tier-C CLI still takes tenant/url from env, never flags.
+        assert!(!spec.argv.iter().any(|a| a == "--verity-url"));
+        assert!(!spec.argv.iter().any(|a| a == "--tenant-id"));
+    }
+
+    #[test]
+    fn once_without_state_file_is_no_config() {
+        // A --once poll with no cursor path must fail closed (never fall back to
+        // the connector's tenant-agnostic default, which would clobber tenants).
+        for s in ["gdrive", "hubspot"] {
+            let subj = if s == "gmail" { Some("m@c.co") } else { None };
+            let vis: Option<&[i32]> = if s == "hubspot" { Some(&[7]) } else { None };
+            let cred = if s == "hubspot" {
+                Some(Path::new("/run/x.cred"))
+            } else {
+                None
+            };
+            let err = assemble_spec(
+                "gdrive",
+                SpawnMode::PollOnce,
+                "http://h",
+                t(),
+                subj,
+                vis,
+                cred,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{s} --once without state-file must fail"));
+            assert!(matches!(err, SpawnError::NoConfig(_)), "{s}");
+        }
+    }
+
+    #[test]
+    fn pollable_matches_the_cursor_sources() {
+        assert!(is_pollable("gdrive"));
+        assert!(is_pollable("gmail"));
+        assert!(is_pollable("hubspot"));
+        // gdirectory has its own directory plane; folder/salesforce have no cursor.
+        for s in ["folder", "gdirectory", "salesforce", "bogus"] {
+            assert!(!is_pollable(s), "{s} must not be pollable");
+        }
     }
 
     // ---- backfillable gating (pure) -------------------------------------
@@ -1312,9 +1727,18 @@ mod tests {
     #[test]
     fn non_backfillable_source_is_no_config() {
         for s in ["folder", "gdirectory", "salesforce", "bogus"] {
-            let err = assemble_spec(s, "http://h", t(), Some("x@y.z"), None, None)
-                .err()
-                .unwrap_or_else(|| panic!("{s} must not assemble"));
+            let err = assemble_spec(
+                s,
+                SpawnMode::Backfill,
+                "http://h",
+                t(),
+                Some("x@y.z"),
+                None,
+                None,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{s} must not assemble"));
             assert!(matches!(err, SpawnError::NoConfig(_)), "{s}");
         }
     }
@@ -1337,6 +1761,7 @@ mod tests {
         let repo = Path::new("/definitely/not/a/verity/repo");
         let err = spawn(
             Some(repo),
+            SpawnMode::Backfill,
             "http://h",
             t(),
             "salesforce",
@@ -1360,6 +1785,7 @@ mod tests {
         // repo precondition.
         let err = spawn(
             None,
+            SpawnMode::Backfill,
             "http://h",
             t(),
             "gmail",
@@ -1377,6 +1803,7 @@ mod tests {
         let repo = Path::new("/definitely/not/a/verity/repo");
         let err = spawn(
             Some(repo),
+            SpawnMode::Backfill,
             "http://h",
             t(),
             "gdrive",
@@ -1395,6 +1822,7 @@ mod tests {
         // credential file (no repo → no spawn, no secret written to disk).
         let err = spawn(
             None,
+            SpawnMode::Backfill,
             "http://h",
             t(),
             "hubspot",
@@ -1440,6 +1868,58 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ---- per-(tenant, source) poll cursor path --------------------------
+
+    #[test]
+    fn poll_cursor_basename_per_source() {
+        assert_eq!(poll_cursor_basename("hubspot"), Some("hubspot_cursor"));
+        assert_eq!(poll_cursor_basename("gdrive"), Some("gdrive_cursor.json"));
+        assert_eq!(poll_cursor_basename("gmail"), Some("gmail_cursor.json"));
+        // Sources with no --once cursor.
+        assert_eq!(poll_cursor_basename("folder"), None);
+        assert_eq!(poll_cursor_basename("gdirectory"), None);
+        assert_eq!(poll_cursor_basename("salesforce"), None);
+    }
+
+    #[test]
+    fn poll_cursor_path_is_isolated_per_tenant_and_source() {
+        let base = std::env::temp_dir().join(format!("verity-poll-test-{}", Uuid::new_v4()));
+        std::env::set_var(POLL_STATE_DIR_ENV, &base);
+
+        let ta = Uuid::from_u128(0xAAAA);
+        let tb = Uuid::from_u128(0xBBBB);
+
+        let a_hub = poll_cursor_state_file(None, ta, "hubspot").expect("a hubspot");
+        let b_hub = poll_cursor_state_file(None, tb, "hubspot").expect("b hubspot");
+        let a_drive = poll_cursor_state_file(None, ta, "gdrive").expect("a gdrive");
+
+        // Two tenants, same source → DIFFERENT files (never a shared cursor).
+        assert_ne!(a_hub, b_hub);
+        // Same tenant, two sources → different files.
+        assert_ne!(a_hub, a_drive);
+        // Path is scoped under both the tenant uuid and the source basename.
+        assert!(a_hub.ends_with(format!("{ta}/hubspot_cursor")));
+        assert!(b_hub.ends_with(format!("{tb}/hubspot_cursor")));
+        assert!(a_drive.ends_with(format!("{ta}/gdrive_cursor.json")));
+        // The per-tenant parent dir was created.
+        assert!(a_hub.parent().unwrap().is_dir());
+        assert!(a_hub.starts_with(&base));
+
+        std::env::remove_var(POLL_STATE_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn poll_cursor_path_rejects_non_cursor_source() {
+        let base = std::env::temp_dir().join(format!("verity-poll-test-{}", Uuid::new_v4()));
+        std::env::set_var(POLL_STATE_DIR_ENV, &base);
+        let err = poll_cursor_state_file(None, Uuid::from_u128(1), "folder")
+            .expect_err("folder has no cursor");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+        std::env::remove_var(POLL_STATE_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- run_id env contract --------------------------------------------
@@ -1488,6 +1968,7 @@ mod tests {
         let go = |p: Arc<ConnectorPlane>, pool: PgPool, root: PathBuf, key: PathBuf| async move {
             p.start(
                 pool,
+                SpawnMode::Backfill,
                 Some(root.as_path()),
                 "http://h",
                 tenant,
@@ -1545,6 +2026,7 @@ mod tests {
                   tenant: Uuid| async move {
             p.start(
                 pool,
+                SpawnMode::Backfill,
                 Some(root.as_path()),
                 "http://h",
                 tenant,

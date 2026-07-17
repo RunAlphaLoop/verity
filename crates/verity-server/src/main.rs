@@ -52,6 +52,9 @@ mod slo;
 #[cfg(test)]
 mod sse_tests;
 mod subscribe;
+mod sync_scheduler;
+#[cfg(test)]
+mod sync_scheduler_tests;
 #[cfg(test)]
 mod system_tests;
 #[cfg(test)]
@@ -439,6 +442,13 @@ pub(crate) struct AppState {
     /// See connector_worker::ConnectorPlane.
     #[allow(dead_code)]
     pub(crate) connectors: Arc<connector_worker::ConnectorPlane>,
+    /// Continuous-sync SCHEDULER plane (Phase 4, sync_scheduler.rs): per-(tenant,
+    /// source) interval loops that fire a short-lived `--once` incremental poll
+    /// cycle (NOT a persistent child). Each schedule is durable in `sync_schedules`
+    /// (migration 0033) and re-armed on boot. The toggle endpoint arms/disarms;
+    /// the loop reuses `ConnectorPlane::start(PollOnce, ..)` for spawn/cleanup/
+    /// ownership, skipping a tick when the prior cycle is still in-flight.
+    pub(crate) sync: Arc<sync_scheduler::SyncPlane>,
 }
 
 impl AppState {
@@ -789,6 +799,39 @@ async fn admin_planes(
     // authoritative when this server owns a live child, else the connector-status
     // heartbeat proxy. The reconcile interval is the group-membership ACL SLO.
     planes.push(directory_plane_row(&state, q.tenant_id).await);
+
+    // 8 · continuous-sync SCHEDULER (Phase 4) — the per-(tenant, source) interval
+    // loops firing `--once` poll cycles. Server-authoritative from the in-memory
+    // armed-loop count (a loop is armed iff this process owns it); the durable
+    // enabled-flag lives in sync_schedules. `config-only`: there is no single
+    // global Start — a schedule is toggled per source via
+    // POST /v1/admin/connectors/{source}/sync, so no dead button and start_hint
+    // is null. "on" iff at least one loop is armed.
+    let armed = state.sync.armed_count().await;
+    let sync_detail = if armed > 0 {
+        format!(
+            "{armed} continuous-sync schedule(s) armed — each fires a short-lived --once poll \
+             cycle on its interval (toggle per source at POST /v1/admin/connectors/{{source}}/sync)"
+        )
+    } else {
+        "no continuous-sync schedules armed — enable one per source at \
+         POST /v1/admin/connectors/{source}/sync (gdrive/gmail/hubspot)"
+            .to_string()
+    };
+    let mut sync_row = plane_row(
+        "sync_scheduler",
+        "Continuous sync (connector poll schedules)",
+        "config-only",
+        if armed > 0 { "on" } else { "off" },
+        sync_detail,
+        false,
+        None,
+    );
+    sync_row
+        .as_object_mut()
+        .expect("plane_row is an object")
+        .insert("armed_loops".into(), serde_json::json!(armed));
+    planes.push(sync_row);
 
     let up = planes.iter().filter(|p| p["status"] == "on").count();
     Ok(Json(serde_json::json!({
@@ -1366,6 +1409,7 @@ async fn main() -> anyhow::Result<()> {
             .filter(|t| !t.is_empty()),
         directory: directory_worker::DirectoryPlane::from_env(),
         connectors: Arc::new(connector_worker::ConnectorPlane::from_env()),
+        sync: Arc::new(sync_scheduler::SyncPlane::new()),
     });
 
     let app = Router::new()
@@ -1477,6 +1521,16 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connectors/{source}/backfill",
             post(connectors_admin::backfill_source),
+        )
+        // Connect-a-source Phase 4 continuous-sync toggle (connectors_admin.rs):
+        // arm/disarm a per-(tenant, source) SCHEDULER that fires a short-lived
+        // `--once` incremental poll cycle on an interval. admin.check-gated. The
+        // schedule is durable (sync_schedules, migration 0033) + re-armed on boot.
+        // gdirectory maps to the directory plane (422 pointing there); folder /
+        // salesforce have no schedule (422).
+        .route(
+            "/v1/admin/connectors/{source}/sync",
+            post(connectors_admin::sync_source),
         )
         .route(
             "/v1/admin/folders",
@@ -1619,6 +1673,13 @@ async fn main() -> anyhow::Result<()> {
     // re-arm the live OS watch. Best-effort — a folder that has gone missing is
     // logged and skipped, never a boot failure.
     folder_watch::reestablish_on_boot(Arc::clone(&state)).await;
+
+    // Re-arm every ENABLED continuous-sync schedule (sync_scheduler.rs): one
+    // interval loop per (tenant, source) that fires a short-lived `--once` poll
+    // cycle. Durable in `sync_schedules` (migration 0033); a disabled schedule is
+    // left inert. Best-effort — an unreadable schedules table logs and skips,
+    // never a boot failure.
+    sync_scheduler::reestablish_on_boot(Arc::clone(&state)).await;
 
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     // FTUE §2.3: unconditional stdout on bind, independent of any log filter.

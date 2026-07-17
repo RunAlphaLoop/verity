@@ -13,6 +13,6 @@ pub use crypto::Kek;
 pub use erasure::{CoverageGaps, ErasurePreview, ErasureReport};
 pub use postgres::{
     AclCorrectionReason, EntityTagDirectory, EntityTagRow, MemoryBrowseFilter, MemoryBrowsePage,
-    MemoryBrowseRow, MemorySourceCount, PostgresAdapter,
+    MemoryBrowseRow, MemorySourceCount, PostgresAdapter, SYNC_INTERVAL_FLOOR_SECS,
 };
 pub use resolve::{fold, refold_incremental, FoldConfig, FoldPlan, DEFAULT_LARGE_COMPONENT_FLOOR};

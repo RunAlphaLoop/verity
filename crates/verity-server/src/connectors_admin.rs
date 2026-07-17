@@ -32,6 +32,7 @@ use crate::{
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::{
     ConnectorCredentialKind, ConnectorCredentialStatus, ConnectorPathCredential, StorageError,
+    SyncSchedule,
 };
 
 // ---------------------------------------------------------------------------
@@ -581,6 +582,7 @@ pub(crate) fn connector_row(
     worker: (&str, &str),
     last_heartbeat: Option<DateTime<Utc>>,
     stored: Option<&ConnectorCredentialStatus>,
+    schedule: Option<&SyncSchedule>,
 ) -> serde_json::Value {
     let prereqs = prereqs_for(spec.source, p);
     let prereqs_ok = prereqs.iter().all(|q| q["ok"] == true);
@@ -592,6 +594,7 @@ pub(crate) fn connector_row(
         "worker": { "status": worker.0, "authority": worker.1 },
         "last_heartbeat": last_heartbeat,
         "backfill": backfill_field(spec.source, stored, p.sa_key_configured),
+        "sync": sync_field(spec.source, schedule),
         "prereqs_ok": prereqs_ok,
         "prereqs": prereqs,
     })
@@ -679,6 +682,21 @@ pub(crate) async fn list_connectors(
         }
     }
 
+    // Phase-4 continuous-sync schedules: the durable per-source schedule state
+    // (enabled/interval/last_run) for the sync toggle read-back. One lookup per
+    // eligible source (gdrive/gmail/hubspot); the others have no schedule row.
+    let mut schedules: HashMap<&'static str, SyncSchedule> = HashMap::new();
+    for spec in SOURCES.iter().filter(|s| sync_eligible(s.source)) {
+        if let Some(sched) = state
+            .storage
+            .get_sync_schedule(q.tenant_id, spec.source)
+            .await
+            .map_err(internal)?
+        {
+            schedules.insert(spec.source, sched);
+        }
+    }
+
     let now = Utc::now();
     let connectors_json: Vec<serde_json::Value> = SOURCES
         .iter()
@@ -693,7 +711,14 @@ pub(crate) async fn list_connectors(
                     )
                 }
             };
-            connector_row(spec, &probes, verdict, hb, stored.get(spec.source))
+            connector_row(
+                spec,
+                &probes,
+                verdict,
+                hb,
+                stored.get(spec.source),
+                schedules.get(spec.source),
+            )
         })
         .collect();
 
@@ -1325,26 +1350,7 @@ pub(crate) async fn backfill_source(
 
     // Resolve the source-family identity: HubSpot (tier-C bearer + visibility)
     // takes a DIFFERENT shape from the Google SA-key path + subject.
-    let identity = if spec.source == "hubspot" {
-        resolve_hubspot_identity(&state, q.tenant_id).await?
-    } else {
-        // Google (gdrive/gmail): stored path (+ subject) XOR the server env SA key.
-        let stored = state
-            .storage
-            .materialize_connector_path(q.tenant_id, spec.source)
-            .await
-            .map_err(credential_status)?;
-        let resolved = resolve_backfill(
-            spec.source,
-            stored.as_ref(),
-            state.connectors.sa_key.as_deref(),
-        )
-        .map_err(|r| (r.status(), r.clone().message()))?;
-        connector_worker::BackfillIdentity::Google {
-            sa_key_path: resolved.sa_key_path,
-            subject: resolved.subject,
-        }
-    };
+    let identity = resolve_connector_identity(&state, q.tenant_id, spec.source).await?;
 
     // Mint the run_id SERVER-SIDE so the panel poll keys on THIS run.
     let run_id = Uuid::new_v4();
@@ -1354,6 +1360,7 @@ pub(crate) async fn backfill_source(
         .connectors
         .start(
             state.pool().clone(),
+            connector_worker::SpawnMode::Backfill,
             state.repo_root.as_deref(),
             &base_url,
             q.tenant_id,
@@ -1372,6 +1379,39 @@ pub(crate) async fn backfill_source(
             "pid": pid,
         }))),
         Err(e) => Err(spawn_error_status(e)),
+    }
+}
+
+/// Resolve the source-family spawn identity for a gdrive/gmail/hubspot child —
+/// the SHARED credential-precedence resolution used by BOTH the one-shot backfill
+/// trigger and the continuous-sync `--once` scheduler (each cycle re-resolves the
+/// CURRENT credential, so a rotation is picked up per cycle with no long-lived
+/// bearer on disk). HubSpot (tier-C bearer + visibility) takes a DIFFERENT shape
+/// from the Google SA-key path + subject; the fail-closed preconditions (a
+/// resolvable credential; hubspot visibility; gmail subject) are identical either
+/// way. Each precondition failure maps to a fixed HTTP status (422/409), never a
+/// 500. The caller has already confirmed the source is spawnable.
+pub(crate) async fn resolve_connector_identity(
+    state: &AppState,
+    tenant_id: Uuid,
+    source: &str,
+) -> Result<connector_worker::BackfillIdentity, (StatusCode, String)> {
+    if source == "hubspot" {
+        resolve_hubspot_identity(state, tenant_id).await
+    } else {
+        // Google (gdrive/gmail): stored path (+ subject) XOR the server env SA key.
+        let stored = state
+            .storage
+            .materialize_connector_path(tenant_id, source)
+            .await
+            .map_err(credential_status)?;
+        let resolved =
+            resolve_backfill(source, stored.as_ref(), state.connectors.sa_key.as_deref())
+                .map_err(|r| (r.status(), r.clone().message()))?;
+        Ok(connector_worker::BackfillIdentity::Google {
+            sa_key_path: resolved.sa_key_path,
+            subject: resolved.subject,
+        })
     }
 }
 
@@ -1496,6 +1536,288 @@ fn spawn_error_status(e: connector_worker::SpawnError) -> (StatusCode, String) {
                  serialized per source across tenants; wait for it to finish, then retry"
             ),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase-4 continuous-sync toggle — POST /v1/admin/connectors/{source}/sync.
+// admin.check-gated. Arms/disarms a per-(tenant, source) SCHEDULER that fires a
+// short-lived `--once` poll cycle on an interval — NOT a persistent child. The
+// schedule is durable in `sync_schedules` (migration 0033) + re-armed on boot.
+// ---------------------------------------------------------------------------
+
+/// The default poll interval (seconds) the toggle applies when the caller omits
+/// `interval_secs`. 300s (5 min) — well above the 60s DB floor, a sane cadence
+/// that never hammers a source API. The floor itself is
+/// `verity_storage::SYNC_INTERVAL_FLOOR_SECS` (enforced by the DB CHECK + the
+/// storage upsert, so a sub-floor value is a clean 422, never a silent clamp).
+pub(crate) const SYNC_DEFAULT_INTERVAL_SECS: i32 = 300;
+
+/// Whether a source is eligible for a native continuous-sync SCHEDULE. `gdrive` /
+/// `gmail` / `hubspot` have a `--once` incremental poll + a persisted cursor.
+/// `gdirectory` has its OWN continuous directory plane (mapped separately by the
+/// toggle to the directory start/stop endpoints). `folder` (always-on in-process
+/// watch) and `salesforce` (not wired) have no schedule.
+fn sync_eligible(source: &str) -> bool {
+    connector_worker::is_pollable(source)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SyncToggleBody {
+    tenant_id: Uuid,
+    enabled: bool,
+    /// Poll cadence in seconds. Floored at `SYNC_INTERVAL_FLOOR_SECS` (60);
+    /// omitted → `SYNC_DEFAULT_INTERVAL_SECS` (300). A sub-floor value is a 422.
+    #[serde(default)]
+    interval_secs: Option<i32>,
+}
+
+/// POST /v1/admin/connectors/{source}/sync {tenant_id, enabled, interval_secs?}
+/// (admin): arm/disarm continuous sync for (tenant, source).
+///
+/// - `gdirectory` maps to the existing directory plane (422 pointing at the
+///   directory start/stop endpoints — a native schedule would duplicate the
+///   directory_worker).
+/// - `folder` / `salesforce` / unknown → 422 (no `--once` schedule).
+/// - ENABLE (gdrive/gmail/hubspot): validate the SAME preconditions as backfill
+///   (a resolvable credential; hubspot visibility; gmail subject) — a bad
+///   precondition is a 422 BEFORE any durable write, so an unusable schedule is
+///   never armed. Then floor the interval (>= 60, default 300), persist via
+///   `upsert_sync_schedule`, arm the scheduler, and fire an immediate first
+///   cycle. DOUBLE-POLL GUARD: if the env-configured knowledge/Temporal worker is
+///   configured to poll this source, the toggle WARNS (a `warning` field) so an
+///   operator never silently double-ingests.
+/// - DISABLE: persist `enabled=false` (durable) + disarm the loop (an in-flight
+///   cycle finishes). Idempotent — disabling an unarmed schedule is an honest
+///   no-op that still persists the durable off-state.
+///
+/// Returns `{ source, enabled, interval_secs, next_run_at?, warning? }`.
+pub(crate) async fn sync_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(source): axum::extract::Path<String>,
+    Json(body): Json<SyncToggleBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let Some(spec) = source_spec(&source) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown source '{source}' — expected one of folder, gdrive, gmail, gdirectory, \
+                 hubspot, salesforce"
+            ),
+        ));
+    };
+    let source = spec.source; // 'static, validated
+
+    // gdirectory has its own continuous directory plane — a native schedule would
+    // duplicate directory_worker. Point the operator at the directory endpoints.
+    if source == "gdirectory" {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "use directory sync for gdirectory — its continuous sync is the directory plane, not a \
+             connector poll schedule; toggle it via POST /v1/admin/planes/directory/start and \
+             /stop (the directory worker reconciles the full directory on every pass)"
+                .to_string(),
+        ));
+    }
+    // folder (always-on in-process) / salesforce (not wired) have no --once cycle.
+    if !sync_eligible(source) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            match source {
+                "folder" => "continuous sync is not applicable to folder — local folder watches \
+                             ingest synchronously when added and catch up on server boot"
+                    .to_string(),
+                "salesforce" => "continuous sync is not wired for salesforce yet — the connector \
+                                 is fixtures-only until a test org lands"
+                    .to_string(),
+                other => format!("continuous sync is not wired for {other}"),
+            },
+        ));
+    }
+
+    // Unknown tenant → clean 404 before any durable write.
+    state
+        .storage
+        .inner()
+        .ensure_tenant(body.tenant_id)
+        .await
+        .map_err(credential_status)?;
+
+    // Hold the sync-plane admission lock across the whole persist→arm/disarm
+    // critical section so two concurrent enable/disable requests for this key
+    // can't interleave their durable upsert and their arm/disarm — otherwise a
+    // late ENABLE's arm() could survive a DISABLE that already ran disarm(),
+    // leaving a GHOST loop polling forever against a durable enabled=false. With
+    // the lock, upsert + arm/disarm are atomic per request.
+    let _admit = state.sync.admit().await;
+
+    // DISABLE: persist the durable off-state + disarm the loop. Idempotent.
+    if !body.enabled {
+        // Persist enabled=false, preserving the stored interval (or the default if
+        // none was ever stored). The interval is inert while disabled.
+        let interval = state
+            .storage
+            .get_sync_schedule(body.tenant_id, source)
+            .await
+            .map_err(credential_status)?
+            .map(|s| s.interval_secs)
+            .unwrap_or(SYNC_DEFAULT_INTERVAL_SECS);
+        state
+            .storage
+            .upsert_sync_schedule(body.tenant_id, source, interval, false)
+            .await
+            .map_err(credential_status)?;
+        state.sync.disarm(body.tenant_id, source).await;
+        return Ok(Json(serde_json::json!({
+            "source": source,
+            "enabled": false,
+            "interval_secs": interval,
+        })));
+    }
+
+    // ENABLE. Resolve + floor the interval FIRST (a sub-floor value must 422
+    // before any spawn/precondition work).
+    let interval = body.interval_secs.unwrap_or(SYNC_DEFAULT_INTERVAL_SECS);
+    if interval < verity_storage::SYNC_INTERVAL_FLOOR_SECS {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "continuous-sync interval {interval}s is below the {}s floor — continuous sync \
+                 must never hammer a source API / trip rate limits; use >= {}s (default {}s)",
+                verity_storage::SYNC_INTERVAL_FLOOR_SECS,
+                verity_storage::SYNC_INTERVAL_FLOOR_SECS,
+                SYNC_DEFAULT_INTERVAL_SECS
+            ),
+        ));
+    }
+
+    // PRECONDITIONS: the SAME fail-closed credential checks as backfill (a
+    // resolvable credential; hubspot visibility; gmail subject). Refuse to arm an
+    // unusable schedule — a 422 here, BEFORE any durable write, so a bad toggle
+    // never leaves a broken armed loop behind.
+    resolve_connector_identity(&state, body.tenant_id, source).await?;
+
+    // DOUBLE-POLL GUARD: the env-configured knowledge/Temporal connector-sync
+    // worker (VERITY_CONNECTORS) is the OTHER continuous source poller. If it is
+    // configured to poll this source, a native per-(tenant, source) schedule would
+    // race the SAME cursor. Warn (there is no shared lock across the Rust process
+    // and the Temporal worker, so this is a config exclusion, not a runtime mutex).
+    let warning = double_poll_warning(source);
+
+    // Persist the durable schedule (floored again in storage — belt + braces).
+    let sched = state
+        .storage
+        .upsert_sync_schedule(body.tenant_id, source, interval, true)
+        .await
+        .map_err(credential_status)?;
+
+    // Arm the scheduler loop, then fire an immediate first cycle (best-effort:
+    // the loop's own first tick is one interval out, so the immediate cycle gives
+    // instant feedback). The cycle is skip-if-running-safe.
+    state
+        .sync
+        .arm(
+            Arc::clone(&state),
+            body.tenant_id,
+            source,
+            sched.interval_secs,
+        )
+        .await;
+    let decision = crate::sync_scheduler::fire_cycle(&state, body.tenant_id, source).await;
+
+    let next_run_at = Utc::now() + chrono::Duration::seconds(sched.interval_secs as i64);
+    let mut out = serde_json::json!({
+        "source": source,
+        "enabled": true,
+        "interval_secs": sched.interval_secs,
+        "next_run_at": next_run_at,
+        // Live in-memory confirmation the loop actually armed this process (the
+        // durable enabled-flag is in sync_schedules; this is the runtime truth).
+        "armed": state.sync.is_armed(body.tenant_id, source).await,
+        "first_cycle": format!("{decision:?}"),
+    });
+    if let Some(w) = warning {
+        out["warning"] = serde_json::Value::String(w);
+    }
+    Ok(Json(out))
+}
+
+/// The double-poll warning for a source if the env-configured knowledge/Temporal
+/// connector-sync worker (`VERITY_CONNECTORS`, comma-separated) lists it. `None`
+/// when the env is unset or does not name this source. A native schedule AND the
+/// Temporal schedule polling the same source would advance the SAME cursor
+/// concurrently — wasted double work + a cursor-rewind hazard. This is a config
+/// exclusion (no shared cross-process lock), so we surface it, never silently
+/// double-ingest.
+fn double_poll_warning(source: &str) -> Option<String> {
+    let connectors = std::env::var("VERITY_CONNECTORS").ok()?;
+    // Normalize each token EXACTLY as the Python knowledge worker does
+    // (orchestration/config.py::enabled_connectors — `token.strip().lower()`), so
+    // `VERITY_CONNECTORS="HubSpot"` — which DOES arm the Python schedule — also
+    // fires this warning. Our source ids are already lowercase, so a
+    // case-sensitive compare would silently miss a capitalized env value and let
+    // both pollers advance the same cursor with no warning.
+    let listed = connectors
+        .split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .any(|c| c == source);
+    listed.then(|| {
+        format!(
+            "the env-configured connector-sync worker (VERITY_CONNECTORS) already polls '{source}' \
+             — running this native schedule AND that worker would advance the same cursor \
+             concurrently (wasted double work + a cursor-rewind hazard). Remove '{source}' from \
+             VERITY_CONNECTORS, or leave this schedule off, so exactly one poller owns the cursor."
+        )
+    })
+}
+
+/// The `sync` field of a connector row (Phase-4): the durable continuous-sync
+/// state for the row's (tenant, source). Shape `{ enabled, interval_secs,
+/// last_run_at, eligible, hint? }`. Only gdrive/gmail/hubspot have a native
+/// schedule; gdirectory maps to the directory plane (reported `eligible:false`
+/// with a hint pointing there); folder/salesforce are `eligible:false`. When a
+/// schedule row exists it carries the persisted enabled/interval/last_run;
+/// otherwise the honest not-yet-armed default.
+pub(crate) fn sync_field(source: &str, schedule: Option<&SyncSchedule>) -> serde_json::Value {
+    if source == "gdirectory" {
+        return serde_json::json!({
+            "enabled": false,
+            "interval_secs": serde_json::Value::Null,
+            "last_run_at": serde_json::Value::Null,
+            "eligible": false,
+            "hint": "continuous sync for gdirectory is the directory plane — toggle it via the \
+                     directory worker start/stop, not a connector schedule",
+        });
+    }
+    if !sync_eligible(source) {
+        let hint = match source {
+            "folder" => "not applicable — folder watches ingest synchronously and catch up on boot",
+            "salesforce" => "continuous sync not wired for salesforce yet (fixtures-only)",
+            _ => "continuous sync not wired for this source",
+        };
+        return serde_json::json!({
+            "enabled": false,
+            "interval_secs": serde_json::Value::Null,
+            "last_run_at": serde_json::Value::Null,
+            "eligible": false,
+            "hint": hint,
+        });
+    }
+    match schedule {
+        Some(s) => serde_json::json!({
+            "enabled": s.enabled,
+            "interval_secs": s.interval_secs,
+            "last_run_at": s.last_run_at,
+            "eligible": true,
+        }),
+        None => serde_json::json!({
+            "enabled": false,
+            "interval_secs": serde_json::Value::Null,
+            "last_run_at": serde_json::Value::Null,
+            "eligible": true,
+        }),
     }
 }
 
@@ -1635,7 +1957,7 @@ mod tests {
         // Rust-native and zero-credential even on a bare server: an empty
         // probe list, so `connector_row` derives prereqs_ok = true.
         assert!(prereqs_for("folder", &bare()).is_empty());
-        let row = connector_row(&SOURCES[0], &bare(), ("off", "server"), None, None);
+        let row = connector_row(&SOURCES[0], &bare(), ("off", "server"), None, None, None);
         assert_eq!(row["prereqs_ok"], true);
     }
 
@@ -1725,7 +2047,7 @@ mod tests {
     fn row_shape_and_the_honest_backfill_notes() {
         let now = Utc::now();
         for spec in SOURCES.iter() {
-            let row = connector_row(spec, &full(), ("off", "none"), None, None);
+            let row = connector_row(spec, &full(), ("off", "none"), None, None, None);
             // The full row contract, per source.
             for key in [
                 "source",
@@ -1746,20 +2068,27 @@ mod tests {
         // honest phase/applicability note — no stored credential can flip them.
         for s in ["folder", "gdirectory", "hubspot", "salesforce"] {
             let spec = source_spec(s).unwrap();
-            let row = connector_row(spec, &full(), ("off", "none"), None, None);
+            let row = connector_row(spec, &full(), ("off", "none"), None, None, None);
             assert_eq!(
                 row["backfill"]["available"], false,
                 "{s} must never be backfillable"
             );
         }
         // Salesforce carries the honest Phase-4 note.
-        let sf = connector_row(&SOURCES[5], &full(), ("off", "none"), None, None);
+        let sf = connector_row(&SOURCES[5], &full(), ("off", "none"), None, None, None);
         assert!(sf["backfill"]["hint"]
             .as_str()
             .expect("hint")
             .contains("awaiting a Salesforce test org"));
         // Heartbeat round-trips as rfc3339, null when never seen.
-        let hb = connector_row(&SOURCES[4], &full(), ("off", "observed"), Some(now), None);
+        let hb = connector_row(
+            &SOURCES[4],
+            &full(),
+            ("off", "observed"),
+            Some(now),
+            None,
+            None,
+        );
         assert_eq!(
             serde_json::from_value::<DateTime<Utc>>(hb["last_heartbeat"].clone())
                 .expect("timestamp")
@@ -1767,7 +2096,8 @@ mod tests {
             now.timestamp_millis()
         );
         assert!(
-            connector_row(&SOURCES[4], &full(), ("off", "none"), None, None)["last_heartbeat"]
+            connector_row(&SOURCES[4], &full(), ("off", "none"), None, None, None)
+                ["last_heartbeat"]
                 .is_null()
         );
     }
@@ -1775,7 +2105,7 @@ mod tests {
     #[test]
     fn prereqs_ok_derives_from_the_same_rows_the_response_carries() {
         // gdirectory on a bare server: every probe fails ⇒ prereqs_ok false.
-        let row = connector_row(&SOURCES[3], &bare(), ("off", "none"), None, None);
+        let row = connector_row(&SOURCES[3], &bare(), ("off", "none"), None, None, None);
         assert_eq!(row["prereqs_ok"], false);
         assert!(row["prereqs"]
             .as_array()
@@ -1783,7 +2113,7 @@ mod tests {
             .iter()
             .all(|q| q["ok"] == false));
         // ...and fully-provisioned: all ok ⇒ prereqs_ok true.
-        let row = connector_row(&SOURCES[3], &full(), ("off", "none"), None, None);
+        let row = connector_row(&SOURCES[3], &full(), ("off", "none"), None, None, None);
         assert_eq!(row["prereqs_ok"], true);
     }
 
@@ -1995,7 +2325,14 @@ mod tests {
         assert_eq!(f["kind"], "bearer");
         assert_eq!(f["fingerprint"], "abcd1234");
         // And it appears in the assembled row, replacing the observed state.
-        let row = connector_row(&SOURCES[4], &bare(), ("off", "none"), None, Some(&status));
+        let row = connector_row(
+            &SOURCES[4],
+            &bare(),
+            ("off", "none"),
+            None,
+            Some(&status),
+            None,
+        );
         assert_eq!(row["credential"]["state"], "tracked");
         assert_eq!(row["credential"]["fingerprint"], "abcd1234");
     }
@@ -2222,5 +2559,103 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(connector_worker::RUN_ID_ENV, "VERITY_BACKFILL_RUN_ID");
         assert!(Uuid::parse_str(&a.to_string()).is_ok());
+    }
+
+    // ---- Phase-4 continuous-sync toggle (pure layer) --------------------
+
+    fn sched(source: &str, enabled: bool, interval: i32) -> SyncSchedule {
+        SyncSchedule {
+            tenant_id: Uuid::from_u128(1),
+            source: source.to_string(),
+            interval_secs: interval,
+            enabled,
+            last_run_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sync_eligible_matches_pollable_sources_only() {
+        assert!(sync_eligible("gdrive"));
+        assert!(sync_eligible("gmail"));
+        assert!(sync_eligible("hubspot"));
+        // gdirectory has its own plane; folder/salesforce have no --once cycle.
+        for s in ["gdirectory", "folder", "salesforce", "bogus"] {
+            assert!(!sync_eligible(s), "{s} must not be sync-eligible");
+        }
+    }
+
+    #[test]
+    fn sync_field_reports_schedule_state_for_eligible_sources() {
+        // A stored, enabled schedule surfaces its enabled/interval/last_run.
+        let s = sched("gdrive", true, 600);
+        let f = sync_field("gdrive", Some(&s));
+        assert_eq!(f["enabled"], true);
+        assert_eq!(f["interval_secs"], 600);
+        assert_eq!(f["eligible"], true);
+        // No schedule yet → the honest not-armed default (eligible, but off/null).
+        let f = sync_field("hubspot", None);
+        assert_eq!(f["enabled"], false);
+        assert_eq!(f["interval_secs"], serde_json::Value::Null);
+        assert_eq!(f["eligible"], true);
+    }
+
+    #[test]
+    fn sync_field_gdirectory_points_at_the_directory_plane() {
+        let f = sync_field("gdirectory", None);
+        assert_eq!(f["enabled"], false);
+        assert_eq!(f["eligible"], false);
+        assert!(f["hint"].as_str().unwrap().contains("directory plane"));
+    }
+
+    #[test]
+    fn sync_field_ineligible_sources_are_off_with_hint() {
+        for s in ["folder", "salesforce"] {
+            let f = sync_field(s, None);
+            assert_eq!(f["enabled"], false, "{s}");
+            assert_eq!(f["eligible"], false, "{s}");
+            assert!(f["hint"].is_string(), "{s} must carry an honest hint");
+        }
+    }
+
+    #[test]
+    fn interval_floor_is_below_the_default() {
+        // The DB floor (60) must be <= the default the toggle applies (300), so
+        // the default is always representable and a sub-floor value is rejectable.
+        assert!(verity_storage::SYNC_INTERVAL_FLOOR_SECS <= SYNC_DEFAULT_INTERVAL_SECS);
+        assert_eq!(verity_storage::SYNC_INTERVAL_FLOOR_SECS, 60);
+        assert_eq!(SYNC_DEFAULT_INTERVAL_SECS, 300);
+        // The handler's floor check: anything below the floor is a 422; the floor
+        // itself and above pass. We assert the boundary the handler uses.
+        assert!(59 < verity_storage::SYNC_INTERVAL_FLOOR_SECS);
+        assert!(60 >= verity_storage::SYNC_INTERVAL_FLOOR_SECS);
+    }
+
+    #[test]
+    fn double_poll_warning_fires_only_when_env_lists_the_source() {
+        // Env unset → no warning.
+        std::env::remove_var("VERITY_CONNECTORS");
+        assert!(double_poll_warning("gdrive").is_none());
+        // Env lists the source → a warning naming the source + the config fix.
+        std::env::set_var("VERITY_CONNECTORS", "gdrive,gmail");
+        let w = double_poll_warning("gdrive").expect("warning when listed");
+        assert!(w.contains("gdrive"));
+        assert!(w.contains("VERITY_CONNECTORS"));
+        // A source NOT listed → no warning.
+        assert!(double_poll_warning("hubspot").is_none());
+
+        // CASE-INSENSITIVE: the Python knowledge worker lowercases each token
+        // (config.py enabled_connectors → `token.strip().lower()`), so
+        // `"HubSpot"`/`"GDrive"` DO arm the Temporal schedule. A case-sensitive
+        // Rust guard would miss a capitalized env value and let both pollers
+        // advance the same cursor silently — the warning MUST fire regardless of
+        // case (kept in this one test since all mutate the shared env var).
+        std::env::set_var("VERITY_CONNECTORS", "HubSpot, GDrive");
+        assert!(double_poll_warning("hubspot")
+            .expect("warning fires for capitalized env value")
+            .contains("hubspot"));
+        assert!(double_poll_warning("gdrive").is_some());
+        std::env::remove_var("VERITY_CONNECTORS");
     }
 }
