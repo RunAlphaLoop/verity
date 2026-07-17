@@ -415,22 +415,28 @@ impl PostgresAdapter {
         tenant: TenantId,
         source: &str,
         plaintext: &[u8],
+        visibility: &[i32],
     ) -> Result<String> {
         let dek = self.tenant_dek_for_secret(tenant).await?;
         let ciphertext = crate::crypto::encrypt(&dek, plaintext)?;
+        // The visibility set is a non-secret side-field (like `subject` on a
+        // path row): persisted alongside the ciphertext but NEVER fed into the
+        // fingerprint (which covers the secret bytes only).
         let fingerprint = crate::crypto::credential_fingerprint(plaintext);
         sqlx::query(
             "INSERT INTO connector_credentials
-                 (tenant_id, source, kind, ciphertext, path, fingerprint, updated_at)
-             VALUES ($1, $2, 'bearer', $3, NULL, $4, now())
+                 (tenant_id, source, kind, ciphertext, path, visibility, fingerprint, updated_at)
+             VALUES ($1, $2, 'bearer', $3, NULL, $4, $5, now())
              ON CONFLICT (tenant_id, source) DO UPDATE
                  SET kind = 'bearer', ciphertext = EXCLUDED.ciphertext,
-                     path = NULL, fingerprint = EXCLUDED.fingerprint,
+                     path = NULL, visibility = EXCLUDED.visibility,
+                     fingerprint = EXCLUDED.fingerprint,
                      updated_at = now()",
         )
         .bind(tenant)
         .bind(source)
         .bind(&ciphertext)
+        .bind(visibility)
         .bind(&fingerprint)
         .execute(&self.pool)
         .await
@@ -477,7 +483,7 @@ impl PostgresAdapter {
         source: &str,
     ) -> Result<Option<ConnectorCredentialStatus>> {
         let row = sqlx::query(
-            "SELECT kind, fingerprint, subject, updated_at FROM connector_credentials
+            "SELECT kind, fingerprint, subject, visibility, updated_at FROM connector_credentials
              WHERE tenant_id = $1 AND source = $2",
         )
         .bind(tenant)
@@ -500,6 +506,7 @@ impl PostgresAdapter {
             kind,
             fingerprint: row.try_get("fingerprint").map_err(db_err)?,
             subject: row.try_get("subject").map_err(db_err)?,
+            visibility: row.try_get("visibility").map_err(db_err)?,
             updated_at: row.try_get("updated_at").map_err(db_err)?,
         }))
     }
@@ -4081,8 +4088,9 @@ impl StorageAdapter for PostgresAdapter {
         tenant: TenantId,
         source: &str,
         plaintext: &[u8],
+        visibility: &[i32],
     ) -> Result<String> {
-        self.store_connector_bearer_impl(tenant, source, plaintext)
+        self.store_connector_bearer_impl(tenant, source, plaintext, visibility)
             .await
     }
 

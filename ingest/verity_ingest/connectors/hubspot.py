@@ -59,10 +59,18 @@ from typing import Any, AsyncIterator, Mapping
 import httpx
 
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
+from verity_ingest.connectors.backfill import BackfillReporter
 from verity_ingest.credentials import StaticKey
 
 SOURCE = "hubspot"
 BASE_URL = "https://api.hubapi.com"
+#: Stable, machine-readable stdout token emitted (once) by a --backfill run when
+#: the owners scope 403-degraded the whole run: owner/team ACLs collapsed to the
+#: admin-assigned --visibility policy. The server greps stdout for this token to
+#: surface backfill ``state=degraded_acl`` (it is ALSO reported to the backfill
+#: dashboard via BackfillReporter.finish(error=DEGRADED_ACL_SIGNAL)). Do NOT bury
+#: the degrade in stderr only — this token is the read-once contract.
+DEGRADED_ACL_SIGNAL = "verity.backfill.degraded_acl"
 #: Preferred credential env var. A HubSpot **Service Key** (Development → Keys →
 #: Service keys) is the current single-account credential; HubSpot deprecated
 #: private apps in 2026. Both are used identically as `Authorization: Bearer
@@ -233,6 +241,12 @@ class HubSpotConnector(Connector):
         #: membership. Empty when the owners scope is absent (fail-closed to the
         #: admin-assigned fallback).
         self.team_members: dict[str, set[str]] = {}
+        #: Set True by :meth:`_fetch_owners` when the Owners API 403s (the Service
+        #: Key lacks ``crm.objects.owners.read``). The whole run then degrades to
+        #: the admin-assigned ``--visibility`` for every record; the runner turns
+        #: this into a distinct, machine-readable ``degraded_acl`` signal so the
+        #: server can surface it (never buried in stderr).
+        self.owners_degraded: bool = False
         self._client = client or httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {self.credential.value}"},
@@ -465,6 +479,7 @@ class HubSpotConnector(Connector):
                     continue
                 break
             if response.status_code == 403:
+                self.owners_degraded = True
                 print(
                     "hubspot: Owners API returned 403 — add the "
                     "'crm.objects.owners.read' scope to the Service Key to mirror "
@@ -744,6 +759,93 @@ def _write_cursor(state_file: Path, cursor: str) -> None:
     state_file.write_text(cursor + "\n")
 
 
+def _read_credential_file(path: Path) -> str:
+    """Read the bearer token from a 0600 credential file (server-materialized).
+
+    The token is the file body (never argv/env — argv is world-visible via
+    ``/proc``). Trailing newline is stripped. The token is NEVER echoed or
+    logged. Enforces owner-only 0600 permissions (fail closed on a laxer mode —
+    a decrypted bearer must not be group/world-readable). An empty file is
+    rejected here so the error is attributable to the flag, not a downstream
+    missing-env message.
+    """
+    st = path.stat()
+    if st.st_mode & 0o077:
+        raise PermissionError(
+            f"--credential-file {path} must be 0600 (owner-only); "
+            f"found mode {st.st_mode & 0o777:o}"
+        )
+    token = path.read_text().rstrip("\n")
+    if not token.strip():
+        raise ValueError(f"--credential-file {path} is empty (no bearer token)")
+    return token
+
+
+def run_backfill(
+    connector: HubSpotConnector,
+    sink: VerityDebeziumSink,
+    reporter: BackfillReporter | None = None,
+    *,
+    flush_every: int = 1,
+) -> int:
+    """§5a reconciliation backfill: drive :meth:`HubSpotConnector.full_crawl`
+    (a poll from epoch over contacts/companies/deals) into the sink, reporting
+    progress to the backfill dashboard.
+
+    Mirrors gdrive/gmail ``run_backfill`` exactly in lifecycle — one-shot,
+    ``total=None`` up front (the search API gives no cheap count), a crash
+    reports a ``failed`` run and re-raises, a clean finish marks ``completed`` —
+    but delivers HubSpot's fact envelopes via :meth:`VerityDebeziumSink.post`
+    (+ :meth:`sync_team_edges`), NOT gmail's DocumentSink.
+
+    Owner/team edges are synced FIRST so a subject resolves through their team
+    the moment the team-owned facts land. When the owners scope 403-degraded the
+    whole run (``connector.owners_degraded``), the reporter's clean finish
+    carries the distinct :data:`DEGRADED_ACL_SIGNAL` note and the runner prints
+    the stable stdout token — so the server surfaces ``state=degraded_acl``
+    rather than a silent success. Returns the number of delivered fact events."""
+    if reporter is not None:
+        reporter.start(total=None)
+    delivered = 0
+    pending = 0
+    collected: list[HubSpotFactEvent] = []
+
+    async def _crawl() -> None:
+        async for event in connector.full_crawl():
+            collected.append(event)  # type: ignore[arg-type]
+
+    try:
+        asyncio.run(_crawl())
+        # Sync team membership FIRST so a subject can resolve through their team
+        # the moment the team-owned facts land (identical to the --once runner).
+        sink.sync_team_edges(connector.team_members)
+        for start in range(0, len(collected), max(1, flush_every)):
+            batch = collected[start : start + max(1, flush_every)]
+            sink.post(batch)
+            delivered += len(batch)
+            pending += len(batch)
+            if reporter is not None and pending >= flush_every:
+                reporter.advance(pending)
+                pending = 0
+    except Exception as exc:  # noqa: BLE001 — surface as a failed run, then re-raise
+        if reporter is not None:
+            if pending:
+                reporter.advance(pending)
+            reporter.fail(exc)
+        raise
+    if reporter is not None:
+        if pending:
+            reporter.advance(pending)
+        # A run whose owners scope 403-degraded finishes CLEAN (the rows landed)
+        # but carries the distinct degraded_acl note so the server surfaces it.
+        reporter.finish(error=DEGRADED_ACL_SIGNAL if connector.owners_degraded else None)
+    if connector.owners_degraded:
+        # Stable, machine-readable stdout token — the read-once contract the
+        # server greps for backfill state=degraded_acl (never stderr-only).
+        print(DEGRADED_ACL_SIGNAL)
+    return delivered
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m verity_ingest.connectors.hubspot",
@@ -751,9 +853,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--once", action="store_true", help="run one truth-lane poll cycle")
     parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="run the §5a reconciliation backfill (poll from epoch over "
+        "contacts/companies/deals) once, reporting progress to the backfill "
+        "dashboard, then exit (one-shot; wins over --once)",
+    )
+    parser.add_argument(
         "--webhook-file",
         type=Path,
         help="process a recorded HubSpot v3 webhook payload (JSON array)",
+    )
+    parser.add_argument(
+        "--credential-file",
+        type=Path,
+        default=None,
+        help="read the HubSpot bearer token from this 0600 file (the file BODY, "
+        "trailing newline stripped) — PREFERRED over HUBSPOT_SERVICE_KEY / "
+        "HUBSPOT_PRIVATE_APP_TOKEN env so a server spawn never puts the token in "
+        "argv or the child environment; never echoed or logged",
     )
     parser.add_argument(
         "--visibility",
@@ -776,8 +894,21 @@ def main(argv: list[str] | None = None) -> int:
     if not policy:
         parser.error("--visibility must name at least one principal token (fail closed)")
 
-    if args.once == bool(args.webhook_file):
-        parser.error("exactly one of --once or --webhook-file is required")
+    # --backfill is the one-shot reconciliation mode and WINS over --once (a
+    # server spawn passes --backfill; --once is ignored if both slip in). Absent
+    # --backfill, exactly one of --once / --webhook-file is required (unchanged).
+    if not args.backfill and args.once == bool(args.webhook_file):
+        parser.error(
+            "exactly one of --backfill, --once, or --webhook-file is required"
+        )
+    if args.backfill and args.webhook_file:
+        parser.error("--backfill and --webhook-file are mutually exclusive")
+
+    # --credential-file wins over both env vars: read the bearer from the 0600
+    # file (server spawn channel; token is the file body, never argv/env).
+    cred_token: str | None = None
+    if args.credential_file is not None:
+        cred_token = _read_credential_file(args.credential_file)
 
     sink = VerityDebeziumSink.from_env()
 
@@ -788,8 +919,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"webhook: {len(events)} fact event(s) -> {summary}")
         return 0
 
+    if args.backfill:
+        # A backfill is a one-shot job, not the poll loop. A server-triggered
+        # backfill pre-mints the run_id and passes it via VERITY_BACKFILL_RUN_ID
+        # so the console panel can poll GET /v1/admin/backfill keyed on THIS run;
+        # a CLI backfill leaves it unset and the reporter self-mints (uuid4).
+        run_id = os.environ.get("VERITY_BACKFILL_RUN_ID") or None
+        backfill_connector = HubSpotConnector(policy, token=cred_token)
+        try:
+            reporter = BackfillReporter(
+                sink.url,
+                sink.tenant_id,
+                backfill_connector.name,
+                api_key=sink.admin_token,
+                run_id=run_id,
+            )
+            delivered = run_backfill(backfill_connector, sink, reporter)
+        finally:
+            asyncio.run(backfill_connector.aclose())
+        print(f"hubspot: backfill delivered {delivered} fact event(s)")
+        return 0
+
     async def run_once() -> tuple[list[HubSpotFactEvent], str, dict[str, set[str]]]:
-        connector = HubSpotConnector(policy)
+        connector = HubSpotConnector(policy, token=cred_token)
         try:
             events, next_cursor = await connector.poll(_read_cursor(args.state_file))
             # team_members is the source of the SpiceDB edges; capture it before

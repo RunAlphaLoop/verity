@@ -265,9 +265,10 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         tenant: TenantId,
         source: &str,
         plaintext: &[u8],
+        visibility: &[i32],
     ) -> Result<String> {
         self.inner
-            .store_connector_bearer(tenant, source, plaintext)
+            .store_connector_bearer(tenant, source, plaintext, visibility)
             .await
     }
 

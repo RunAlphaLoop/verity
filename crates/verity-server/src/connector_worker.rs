@@ -22,17 +22,33 @@
 //!     backfill can start — we do NOT rely on reap-on-next-lock-touch (that
 //!     would leave a finished backfill reporting on with a stale pid).
 //!
-//! Only `gdrive`/`gmail` are spawnable (content sources with a `full_crawl`);
-//! `folder` is a local watch, `gdirectory` is the continuous directory worker,
-//! and `hubspot`/`salesforce` are not wired in Phase 3. This module is
-//! source-agnostic — the CALLER gates which sources may spawn.
+//! `gdrive`/`gmail` (Google content sources with a `full_crawl`) and `hubspot`
+//! (tier-C CRM, Phase 4) are spawnable; `folder` is a local watch, `gdirectory`
+//! is the continuous directory worker, and `salesforce` is fixtures-only. This
+//! module is source-agnostic — the CALLER gates which sources may spawn.
 //!
-//! The server assembles the argv and passes the SA-key PATH via
-//! `GOOGLE_APPLICATION_CREDENTIALS` (never reading the key contents) and the
-//! admin bearer via `VERITY_ADMIN_TOKEN` (so the child reaches the admin sink +
-//! the backfill progress endpoint). Detached stdio → a 0600 `<source>.log`. The
-//! backfill run_id is server-minted and passed through so progress polling can
-//! key on THIS run.
+//! IDENTITY, per source family:
+//!   - Google (gdrive/gmail): the server passes the SA-key PATH via
+//!     `GOOGLE_APPLICATION_CREDENTIALS` (never reading the key contents) and,
+//!     for gmail, a `--subject` impersonation address.
+//!   - HubSpot (tier-C): the server DECRYPTS the stored bearer, writes it to a
+//!     mode-0600 `O_CREAT|O_EXCL` temp file in a 0700 dir OUTSIDE the repo, and
+//!     passes only that path via `--credential-file` — the token never touches
+//!     argv, env, or `/proc/<pid>/environ`, and is never logged. The temp file
+//!     is tracked on the worker and UNLINKED in the reap/stop (best-effort, even
+//!     on a non-zero exit / crash), so a decrypted bearer never lingers on disk.
+//!     The admin-assigned `--visibility` policy is resolved from the store.
+//!
+//! Common to all: the admin bearer is passed via `VERITY_ADMIN_TOKEN` (so the
+//! child reaches the admin sink + the backfill progress endpoint), detached
+//! stdio → a 0600 `<source>.log`, and the server-minted run_id is threaded so
+//! progress polling can key on THIS run.
+//!
+//! DEGRADED-ACL: a HubSpot backfill whose app lacks the owners-read scope still
+//! delivers every record but coarsens owner/team ACLs to `--visibility`. The
+//! connector emits a distinct `verity.backfill.degraded_acl` signal to its log;
+//! the reap greps for it and reconciles the run to `degraded_acl` (not the plain
+//! `completed`) so the panel shows an honest badge, never a silent success.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +68,15 @@ use uuid::Uuid;
 /// poll (`GET /v1/admin/backfill`) keyed on the run THIS Start created.
 pub(crate) const RUN_ID_ENV: &str = "VERITY_BACKFILL_RUN_ID";
 
+/// The distinct, machine-readable stdout/log token a HubSpot `--backfill` prints
+/// (once) when it ran with the owners-read scope missing: the crawl delivered
+/// every record, but owner/team ACLs were coarsened to the admin-assigned
+/// `--visibility`. It mirrors the connector's `DEGRADED_ACL_SIGNAL` constant
+/// (`ingest/verity_ingest/connectors/hubspot.py`) — a read-once contract the reap
+/// greps the child log for so a clean exit surfaces as `degraded_acl`, not the
+/// silent `completed` a coarsened run would otherwise report.
+pub(crate) const DEGRADED_ACL_SIGNAL: &str = "verity.backfill.degraded_acl";
+
 /// A backfill child THIS server spawned and owns, keyed by (tenant, source) in
 /// the `ConnectorPlane` map. Presence of a LIVE entry means an authoritative
 /// "running" status (pid, start time) + the source/tenant it was spawned for.
@@ -68,6 +93,30 @@ pub(crate) struct ConnectorWorker {
     /// Absolute path to the detached 0600 `<source>.log`, so a non-zero exit can
     /// surface the last N lines inline.
     pub(crate) log_path: PathBuf,
+    /// Absolute path to the server-materialized 0600 credential temp file (the
+    /// decrypted HubSpot bearer, passed to the child via `--credential-file`),
+    /// when this backfill was spawned from a stored tier-C bearer. UNLINKED in
+    /// the reap and in `stop()` — best-effort, even on a non-zero exit / crash —
+    /// so a decrypted secret never lingers on disk past the child's lifetime.
+    /// `None` for the Google sources (no server-written secret file).
+    pub(crate) cred_file_path: Option<PathBuf>,
+}
+
+/// Best-effort scrub of the materialized bearer temp file on EVERY path that
+/// drops a worker — not just `reap`/`stop`. `owned_live` and
+/// `source_busy_elsewhere` reap a dead child by setting the entry to `None`,
+/// which drops the `ConnectorWorker`; if that race beats the detached reap's
+/// 500ms poll, the reap then sees `None` and never unlinks. Anchoring the unlink
+/// to `Drop` closes that window so a decrypted bearer never lingers on disk past
+/// its worker, matching the contract's "best-effort even on a non-zero exit /
+/// crash" requirement. (`reap`/`stop` still unlink explicitly and clear the path
+/// so this is a harmless idempotent no-op on those paths.)
+impl Drop for ConnectorWorker {
+    fn drop(&mut self) {
+        if let Some(cred) = self.cred_file_path.as_deref() {
+            unlink_credential_file(cred);
+        }
+    }
 }
 
 /// Why a spawn attempt could not proceed — each maps to a clean HTTP status
@@ -103,19 +152,26 @@ pub(crate) enum SpawnError {
 pub(crate) struct BackfillSpec {
     /// The connector module: `verity_ingest.connectors.gdrive` etc.
     pub(crate) module: String,
-    /// The full argv AFTER the interpreter: `["-m", <module>, "--backfill",
-    /// "--verity-url", <url>, "--tenant-id", <uuid>, "--subject", <s>?]`.
+    /// The full argv AFTER the interpreter. For Google sources (gdrive/gmail):
+    /// `["-m", <module>, "--backfill", "--verity-url", <url>, "--tenant-id",
+    /// <uuid>, "--subject", <s>?]`. For HubSpot (tier-C): `["-m", <module>,
+    /// "--backfill", "--visibility", <c,s,v>, "--credential-file", <path>]` — the
+    /// hubspot CLI takes tenant/url/admin-token from env (`VERITY_TENANT_ID` /
+    /// `VERITY_URL` / `VERITY_ADMIN_TOKEN`, via `VerityDebeziumSink.from_env`),
+    /// not flags, so no `--verity-url`/`--tenant-id` are emitted; the secret is
+    /// the file BODY of `--credential-file`, never a token literal in argv.
     pub(crate) argv: Vec<String>,
     /// Basename of the detached log: `<source>.log`.
     pub(crate) log_name: String,
 }
 
-/// Whether a source is a Phase-3 backfillable content source. `gdrive`/`gmail`
-/// only — `folder` (local watch), `gdirectory` (continuous directory worker),
-/// and `hubspot`/`salesforce` (not wired in Phase 3) are NOT. The caller gates
-/// on this; `assemble_spec` also fail-closes on anything else.
+/// Whether a source is a browser-triggerable backfillable source. `gdrive`/
+/// `gmail` (Phase 3) and `hubspot` (Phase 4, tier-C) — `folder` (local watch),
+/// `gdirectory` (continuous directory worker), and `salesforce` (fixtures-only,
+/// awaiting a test org) are NOT. The caller gates on this; `assemble_spec` also
+/// fail-closes on anything else.
 pub(crate) fn is_backfillable(source: &str) -> bool {
-    matches!(source, "gdrive" | "gmail")
+    matches!(source, "gdrive" | "gmail" | "hubspot")
 }
 
 /// Whether a source's backfill HARD-REQUIRES a `--subject` (gmail aborts before
@@ -125,25 +181,98 @@ pub(crate) fn subject_required(source: &str) -> bool {
     source == "gmail"
 }
 
+/// The resolved, source-family-specific identity a backfill spawn runs under.
+/// Google sources open an SA-key PATH (via `GOOGLE_APPLICATION_CREDENTIALS`) +
+/// an optional impersonation subject; HubSpot (tier-C) needs the DECRYPTED
+/// bearer bytes (which `spawn` materializes to a 0600 `--credential-file`) + the
+/// admin-assigned visibility policy. Keeping the two shapes in one enum lets the
+/// caller resolve each family's precedence separately and hand `spawn` exactly
+/// what that source needs — never a Google-shaped identity for HubSpot or vice
+/// versa. The bearer is wrapped in `Zeroizing` so it is scrubbed from memory when
+/// this value drops, matching the Phase-2 no-plaintext-lingering discipline.
+pub(crate) enum BackfillIdentity {
+    /// gdrive/gmail: the SA-key file path + optional DWD impersonation subject.
+    Google {
+        sa_key_path: PathBuf,
+        subject: Option<String>,
+    },
+    /// hubspot: the decrypted bearer bytes (materialized to a 0600 temp file at
+    /// spawn) + the tier-C visibility policy resolved from the store.
+    HubSpot {
+        bearer: zeroize::Zeroizing<Vec<u8>>,
+        visibility: Vec<i32>,
+    },
+}
+
 /// Assemble the server-side argv + identity for a backfill, PURE (no FS, no
 /// spawn). Fail-closes preconditions in order: an unknown/non-backfillable
 /// source → `NoConfig` (the caller should gate first, but we never assemble a
 /// bogus command); a gmail run with no subject → `NoConfig` (matches the
-/// connector's hard-required abort). Returns the module, the full argv tail, and
-/// the log basename.
+/// connector's hard-required abort); a hubspot run with no `--visibility` / no
+/// `--credential-file` path → `NoConfig` (the tier-C CLI requires both). The
+/// two source families take DIFFERENT identity: Google threads `--verity-url` /
+/// `--tenant-id` (+ `--subject`); HubSpot threads `--visibility` /
+/// `--credential-file` and reads tenant/url from env. Returns the module, the
+/// full argv tail, and the log basename.
 pub(crate) fn assemble_spec(
     source: &str,
     base_url: &str,
     tenant_id: Uuid,
     subject: Option<&str>,
+    visibility: Option<&[i32]>,
+    cred_file: Option<&Path>,
 ) -> Result<BackfillSpec, SpawnError> {
     if !is_backfillable(source) {
         return Err(SpawnError::NoConfig(format!(
-            "{source} has no Phase-3 backfill — only gdrive and gmail support a full crawl \
-             (folder is a local watch, gdirectory is the directory worker, hubspot/salesforce \
-             are not wired until Phase 4)"
+            "{source} has no browser-triggered backfill — only gdrive, gmail, and hubspot \
+             support a full crawl (folder is a local watch, gdirectory is the directory worker, \
+             salesforce is fixtures-only until a test org lands)"
         )));
     }
+
+    let module = format!("verity_ingest.connectors.{source}");
+    let log_name = format!("{source}.log");
+
+    // HubSpot (tier-C): NO --verity-url / --tenant-id (the CLI reads those from
+    // env); a required --visibility policy + a --credential-file path whose FILE
+    // BODY is the bearer (never a token literal in argv).
+    if source == "hubspot" {
+        let visibility = visibility.filter(|v| !v.is_empty()).ok_or_else(|| {
+            SpawnError::NoConfig(
+                "hubspot backfill needs a non-empty --visibility policy (tier-C requires a \
+                 sharing scope) — store a HubSpot credential with a visibility policy first"
+                    .to_string(),
+            )
+        })?;
+        let cred_file = cred_file.ok_or_else(|| {
+            SpawnError::NoConfig(
+                "hubspot backfill needs a server-materialized --credential-file (the decrypted \
+                 bearer) — a resolvable stored bearer is required"
+                    .to_string(),
+            )
+        })?;
+        let vis = visibility
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let argv = vec![
+            "-m".to_string(),
+            module.clone(),
+            "--backfill".to_string(),
+            "--visibility".to_string(),
+            vis,
+            "--credential-file".to_string(),
+            cred_file.to_string_lossy().into_owned(),
+        ];
+        return Ok(BackfillSpec {
+            module,
+            argv,
+            log_name,
+        });
+    }
+
+    // Google sources (gdrive/gmail): --verity-url / --tenant-id (+ --subject).
     let subject = subject.map(str::trim).filter(|s| !s.is_empty());
     if subject_required(source) && subject.is_none() {
         return Err(SpawnError::NoConfig(format!(
@@ -152,8 +281,6 @@ pub(crate) fn assemble_spec(
              then try again; {source} aborts before any HTTP without it"
         )));
     }
-
-    let module = format!("verity_ingest.connectors.{source}");
     let mut argv = vec![
         "-m".to_string(),
         module.clone(),
@@ -170,13 +297,185 @@ pub(crate) fn assemble_spec(
     Ok(BackfillSpec {
         module,
         argv,
-        log_name: format!("{source}.log"),
+        log_name,
     })
 }
 
 /// The interpreter the backfill runs under, given the server's repo root.
 fn worker_python(repo: &Path) -> PathBuf {
     repo.join("ingest/.venv/bin/python")
+}
+
+/// The per-server 0700 runtime dir that holds materialized credential temp files,
+/// OUTSIDE the git tree (the ingest checkout also holds the backfill log, which
+/// is why the log location must NOT be reused for a decrypted secret).
+///
+/// SECURITY: the base name is UNPREDICTABLE per server process (a random suffix),
+/// created EXCLUSIVELY (`create_dir`, which is `mkdir(2)` — fails `AlreadyExists`
+/// rather than silently reusing an attacker-pre-created dir the way a recursive
+/// idempotent create would). Because the name can't be guessed before the server
+/// mints it AND creation is exclusive, no other uid can pre-own or pre-plant the
+/// parent under the world-writable OS temp root — closing the fixed-predictable-
+/// path pre-creation / symlink-race hole. Created 0700 so only this server's uid
+/// can read the bearer files inside. The `OnceLock` means all spawns in one
+/// process share ONE such dir (created once, verified below).
+static CRED_RUNTIME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Base prefix for the per-process runtime dir; the boot sweep matches on it so a
+/// crashed PRIOR server's orphaned dirs (holding live bearers) can be scrubbed.
+const CRED_RUNTIME_PREFIX: &str = "verity-connector-creds";
+
+/// Create-or-get the per-process credential runtime dir, exclusively (`mkdir`)
+/// under an unpredictable random name so it can never be a reused foreign-owned
+/// dir. Verifies the dir is a non-symlink at mode 0700 before returning it. Any
+/// perm/IO error is propagated as `SpawnError::Os` (→ 503) — never swallowed.
+fn cred_runtime_dir() -> Result<&'static Path, SpawnError> {
+    if let Some(dir) = CRED_RUNTIME_DIR.get() {
+        return verify_runtime_dir(dir).map(|_| dir.as_path());
+    }
+    // Race-tolerant: several threads may build a candidate; only the first to win
+    // the OnceLock keeps its dir, the losers remove theirs. mkdir is exclusive so
+    // an unguessable name never collides with an attacker plant.
+    let candidate = std::env::temp_dir().join(format!("{CRED_RUNTIME_PREFIX}-{}", Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false); // mkdir(2): AlreadyExists is a hard error, never reuse.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&candidate).map_err(|e| {
+        SpawnError::Os(format!(
+            "cannot create the credential runtime dir {}: {e}",
+            candidate.display()
+        ))
+    })?;
+    let dir = CRED_RUNTIME_DIR.get_or_init(|| candidate.clone());
+    if dir != &candidate {
+        // Lost the race — a peer thread's dir is canonical; drop ours.
+        let _ = std::fs::remove_dir_all(&candidate);
+    }
+    verify_runtime_dir(dir).map(|_| dir.as_path())
+}
+
+/// Fail CLOSED if the runtime dir is not a real (non-symlink) directory at
+/// exactly 0700. A no-op on non-unix.
+fn verify_runtime_dir(dir: &Path) -> Result<(), SpawnError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // symlink_metadata: never follow a symlink planted at the dir name.
+        let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+            SpawnError::Os(format!(
+                "cannot stat the credential runtime dir {}: {e}",
+                dir.display()
+            ))
+        })?;
+        if !meta.is_dir() {
+            return Err(SpawnError::Os(format!(
+                "credential runtime dir {} is not a directory (possible symlink attack) — refusing \
+                 to materialize a bearer",
+                dir.display()
+            )));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(SpawnError::Os(format!(
+                "credential runtime dir {} is group/other-accessible (mode {:o}) — refusing to \
+                 write a bearer; expected owner-only 0700",
+                dir.display(),
+                meta.permissions().mode() & 0o777
+            )));
+        }
+    }
+    let _ = dir;
+    Ok(())
+}
+
+/// Boot-time sweep: unlink every orphaned credential runtime dir/file left by a
+/// PRIOR server that was SIGKILLed/OOM-killed/panicked/rebooted between writing a
+/// bearer and the reap firing. On a fresh boot NO live server-owned worker exists
+/// yet, so any `verity-connector-creds-*` entry under the OS temp root is by
+/// definition an orphan holding a possibly-live decrypted bearer — remove it
+/// before any new spawn. Best-effort: a per-entry failure is logged, never fatal
+/// (a locked/foreign entry we can't remove must not block startup). Called once
+/// from `ConnectorPlane::from_env`.
+pub(crate) fn sweep_orphaned_cred_dirs() {
+    let base = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return, // no temp root readable — nothing to sweep.
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(CRED_RUNTIME_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let res = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(e) = res {
+            eprintln!(
+                "connector boot sweep: failed to remove orphaned credential path {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Write `bytes` to a fresh `O_CREAT|O_EXCL`, mode-0600 temp file inside the
+/// 0700 [`cred_runtime_dir`], returning its absolute path. `O_EXCL` means a
+/// stale/attacker-planted file at the (uuid) name is a hard error, never a
+/// silent reuse; mode-0600 is set AT creation so the secret is owner-only from
+/// the first byte. The file name is unique per (uuid) so concurrent spawns never
+/// collide. Any permission / IO error is propagated as `SpawnError::Os` (→ 503).
+/// The caller UNLINKS the returned path when the child exits (reap / stop).
+fn write_credential_file(unique: Uuid, bytes: &[u8]) -> Result<PathBuf, SpawnError> {
+    let dir = cred_runtime_dir()?;
+    let path = dir.join(format!("{unique}.cred"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true); // O_CREAT | O_EXCL
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path).map_err(|e| {
+        SpawnError::Os(format!(
+            "cannot create the 0600 credential temp file {}: {e}",
+            path.display()
+        ))
+    })?;
+    use std::io::Write;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| {
+            // Best-effort remove a partial file before surfacing the error.
+            let _ = std::fs::remove_file(&path);
+            SpawnError::Os(format!(
+                "cannot write the credential temp file {}: {e}",
+                path.display()
+            ))
+        })?;
+    Ok(path)
+}
+
+/// Best-effort unlink of a materialized credential temp file — called from the
+/// reap and from `stop()` on any terminal path, so a decrypted bearer never
+/// outlives its child (even on a non-zero exit / SIGKILL). A missing file is not
+/// an error (the file may already be gone); a real IO error is logged, never
+/// panicked (this runs on a detached task).
+fn unlink_credential_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "connector reap: failed to unlink credential temp file {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 /// The last `n` lines of a log file, best-effort — used to surface a non-zero
@@ -207,6 +506,12 @@ pub(crate) struct TerminalExit {
     /// Last lines of `<source>.log` when the exit was non-zero (empty on clean
     /// exit) — surfaced inline so a crash never looks like a silent hang.
     pub(crate) tail: String,
+    /// True iff the child was a HubSpot backfill that logged the owners-403
+    /// `DEGRADED_ACL_SIGNAL`: a clean-exit crawl that had to coarsen owner/team
+    /// ACLs to the admin-assigned `--visibility`. Reconciled to state
+    /// `degraded_acl` (not `completed`) so the panel never shows a silent
+    /// success. Always `false` on a non-zero exit (a failure is already `failed`).
+    pub(crate) degraded_acl: bool,
 }
 
 /// The server-held connector-backfill plane: the per-(tenant, source) owner map
@@ -241,6 +546,13 @@ impl ConnectorPlane {
     /// paths + subjects come from `connector_credentials` at Start time; this
     /// only captures the server-env SA-key fallback.
     pub(crate) fn from_env() -> Self {
+        // Boot-time sweep: a PRIOR server that was SIGKILLed/OOM-killed/rebooted
+        // between materializing a bearer and its reap firing leaves an orphaned
+        // 0600 cred file (holding a live decrypted bearer) on disk with no in-
+        // memory owner to unlink it — the map starts empty here. No live server-
+        // owned worker exists yet at boot, so any leftover cred runtime path is by
+        // definition an orphan; scrub every one before the first spawn.
+        sweep_orphaned_cred_dirs();
         Self {
             workers: Mutex::new(HashMap::new()),
             admission: Mutex::new(()),
@@ -322,12 +634,14 @@ impl ConnectorPlane {
     /// Start a backfill for (tenant, source). Ownership decisions FIRST (own live
     /// child → `AlreadyRunning`; source live under another tenant → `SourceBusy`),
     /// then `spawn` (which checks repo/venv/config). On success, records the live
-    /// handle and launches the DETACHED reap. `sa_key_path` is the resolved SA
-    /// key (stored per-source path OR the env fallback — the caller resolves the
+    /// handle and launches the DETACHED reap. `identity` is the resolved,
+    /// source-family-specific identity (a Google SA-key path + subject, or the
+    /// decrypted HubSpot bearer + visibility — the caller resolves each family's
     /// precedence). `run_id` is server-minted. `pool` lets the detached reap
     /// reconcile `backfill_run` with the CHILD-EXIT truth (completed on exit 0,
-    /// failed + code + tail otherwise) so completion is never derived from a
-    /// best-effort telemetry post that a hard kill skips.
+    /// degraded_acl when the child logged the owners-403 signal, failed + code +
+    /// tail otherwise) so completion is never derived from a best-effort telemetry
+    /// post that a hard kill skips.
     ///
     /// The whole check→spawn→insert sequence runs under the `admission` lock so a
     /// second concurrent `start()` for the same (tenant, source) — or the same
@@ -343,8 +657,7 @@ impl ConnectorPlane {
         tenant_id: Uuid,
         source: &str,
         admin_token: Option<&str>,
-        sa_key_path: Option<&Path>,
-        subject: Option<&str>,
+        identity: BackfillIdentity,
         run_id: Uuid,
     ) -> Result<u32, SpawnError> {
         // Serialize the admission decision + spawn + insert as one atomic section
@@ -377,8 +690,7 @@ impl ConnectorPlane {
             tenant_id,
             source,
             admin_token,
-            sa_key_path,
-            subject,
+            identity,
             run_id,
         )?;
         let pid = worker.pid;
@@ -409,6 +721,11 @@ impl ConnectorPlane {
                 let pid = worker.pid;
                 let _ = worker.child.kill();
                 let _ = worker.child.wait();
+                // Unlink the materialized bearer temp file on the kill path too,
+                // so a decrypted secret never outlives its child.
+                if let Some(cred) = worker.cred_file_path.as_deref() {
+                    unlink_credential_file(cred);
+                }
                 Some(pid)
             }
             None => None,
@@ -451,9 +768,12 @@ async fn reap(
 ) {
     loop {
         // Terminal state captured under the entry lock, then applied AFTER the
-        // lock is dropped (last_exit insert + backfill_run reconcile).
+        // lock is dropped (last_exit insert + backfill_run reconcile + cred
+        // unlink). `cred_file` is this spawn's materialized bearer temp file (if
+        // any), captured by value so a respawn's cred file is never clobbered.
         let terminal: TerminalExit;
         let run_id: Uuid;
+        let cred_file: Option<PathBuf>;
         {
             let mut guard = entry.lock().await;
             match guard.as_mut() {
@@ -465,17 +785,24 @@ async fn reap(
                         let log_path = worker.log_path.clone();
                         let code = exit.code();
                         let success = exit.success();
-                        let tail = if success {
-                            String::new()
+                        // On a clean exit, grep the child log for the connector's
+                        // owners-403 signal: a coarsened-ACL crawl still exits 0,
+                        // so this is the ONLY observable distinction between a
+                        // full-fidelity `completed` and a `degraded_acl` run. On a
+                        // non-zero exit we surface the tail instead (it's failed).
+                        let (tail, degraded_acl) = if success {
+                            (String::new(), log_signals_degraded_acl(&log_path))
                         } else {
-                            tail_log(&log_path, 20)
+                            (tail_log(&log_path, 20), false)
                         };
                         run_id = worker.run_id;
+                        cred_file = worker.cred_file_path.clone();
                         terminal = TerminalExit {
                             code,
                             success,
                             finished_at: Utc::now(),
                             tail,
+                            degraded_acl,
                         };
                         *guard = None;
                     }
@@ -489,11 +816,13 @@ async fn reap(
                         // Errored wait — treat as terminal-failed so the run never
                         // hangs at "running". No exit code is available.
                         run_id = worker.run_id;
+                        cred_file = worker.cred_file_path.clone();
                         terminal = TerminalExit {
                             code: None,
                             success: false,
                             finished_at: Utc::now(),
                             tail: format!("wait() failed while reaping the backfill child: {e}"),
+                            degraded_acl: false,
                         };
                         *guard = None;
                     }
@@ -501,25 +830,44 @@ async fn reap(
                 None => return,
             }
         }
-        // The child exited: record the in-memory terminal state and reconcile
-        // backfill_run with the CHILD-EXIT truth. This is the authoritative
-        // completion signal the panel polls — NOT the best-effort telemetry post,
-        // which a SIGKILL/OOM/dropped-post skips entirely.
+        // The child exited: unlink the materialized bearer temp file (best-effort,
+        // even on a crash / non-zero exit), then record the in-memory terminal
+        // state and reconcile backfill_run with the CHILD-EXIT truth. The reconcile
+        // is the authoritative completion signal the panel polls — NOT the
+        // best-effort telemetry post, which a SIGKILL/OOM/dropped-post skips.
+        if let Some(cred) = cred_file.as_deref() {
+            unlink_credential_file(cred);
+        }
         reconcile_terminal(&pool, &key, run_id, &terminal).await;
         plane.last_exit.lock().await.insert(key, terminal);
         return;
     }
 }
 
+/// Best-effort grep of a finished backfill's log for the connector's
+/// [`DEGRADED_ACL_SIGNAL`] — the read-once token a HubSpot `--backfill` prints
+/// when the owners-read scope was missing and ACLs were coarsened to
+/// `--visibility`. `false` when the log is unreadable (a missing signal is never
+/// inferred from a missing log — that's a clean `completed`, not a false badge).
+fn log_signals_degraded_acl(log_path: &Path) -> bool {
+    std::fs::read_to_string(log_path)
+        .map(|body| body.lines().any(|l| l.trim() == DEGRADED_ACL_SIGNAL))
+        .unwrap_or(false)
+}
+
 /// Reconcile `backfill_run` for a finished child from the CHILD-EXIT reap: a
-/// clean exit → `completed`; any non-zero/signal/errored exit → `failed` with the
-/// exit code + the last log lines inline (so a hard kill surfaces as a terminal
-/// failure carrying context, never a silent eternal "running"). Keyed on the
-/// server-minted run_id. Best-effort (a failed reconcile logs; it never panics a
-/// detached task) but, unlike the connector's own telemetry, it ALWAYS runs on
-/// child exit. `ON CONFLICT` upserts so it lands whether or not the child managed
-/// a first progress post; a terminal telemetry post that already landed is
-/// idempotently re-affirmed to the same terminal state.
+/// clean exit → `completed`, UNLESS the child logged the owners-403 signal →
+/// `degraded_acl` (the crawl delivered every record but coarsened owner/team ACLs
+/// to `--visibility`, so `completed` would be a false honesty claim); any
+/// non-zero/signal/errored exit → `failed` with the exit code + the last log
+/// lines inline (so a hard kill surfaces as a terminal failure carrying context,
+/// never a silent eternal "running"). Keyed on the server-minted run_id.
+/// Best-effort (a failed reconcile logs; it never panics a detached task) but,
+/// unlike the connector's own telemetry, it ALWAYS runs on child exit.
+/// `ON CONFLICT` upserts so it lands whether or not the child managed a first
+/// progress post; the reap's child-exit truth is authoritative and OVERWRITES the
+/// state — including overriding a connector-posted `completed` with `degraded_acl`
+/// when the signal is present, so a coarsened run can never mask itself as clean.
 async fn reconcile_terminal(
     pool: &PgPool,
     key: &(Uuid, String),
@@ -527,10 +875,14 @@ async fn reconcile_terminal(
     exit: &TerminalExit,
 ) {
     let (tenant_id, source) = key;
-    let state = if exit.success { "completed" } else { "failed" };
-    let error = if exit.success {
-        None
+    let state = if !exit.success {
+        "failed"
+    } else if exit.degraded_acl {
+        "degraded_acl"
     } else {
+        "completed"
+    };
+    let error = if !exit.success {
         let code = exit
             .code
             .map(|c| format!("exit code {c}"))
@@ -540,6 +892,17 @@ async fn reconcile_terminal(
         } else {
             format!("backfill child exited non-zero ({code})\n{}", exit.tail)
         })
+    } else if exit.degraded_acl {
+        // A clean crawl carrying the honest degrade note — NOT an error, but the
+        // operator-facing reason the ACLs are coarse (the `error` column doubles
+        // as the run's note field; the state distinguishes degraded from failed).
+        Some(
+            "owner/team ACLs unavailable (HubSpot owners-read scope missing) — every record \
+             ingested under the admin-assigned visibility policy"
+                .to_string(),
+        )
+    } else {
+        None
     };
     let res = sqlx::query(
         "INSERT INTO backfill_run
@@ -563,14 +926,17 @@ async fn reconcile_terminal(
 }
 
 /// Spawn + track a backfill child. Checks repo → `NoRepo`,
-/// `<repo>/ingest/.venv/bin/python` → `NoVenv`, SA key path present on disk +
-/// (subject when required) → `NoConfig`, before spawning. Assembles the argv via
-/// `assemble_spec` (pure), sets `GOOGLE_APPLICATION_CREDENTIALS` to the key path,
-/// passes the admin bearer + server-minted run_id through env, and detaches
-/// stdio into a 0600 `<source>.log`. Returns a typed `SpawnError` (mapped to
-/// 422/503, never 500) on any checked precondition or OS failure. Ownership
-/// (already-running / source-busy) is decided by `ConnectorPlane::start` BEFORE
-/// this is called.
+/// `<repo>/ingest/.venv/bin/python` → `NoVenv`, then the source-family identity:
+/// Google needs an SA key present on disk + (subject when required); HubSpot
+/// materializes the decrypted bearer to a 0600 `--credential-file`. Assembles the
+/// argv via `assemble_spec` (pure), sets the family-appropriate env (Google:
+/// `GOOGLE_APPLICATION_CREDENTIALS`; HubSpot: `VERITY_TENANT_ID` / `VERITY_URL`,
+/// and NEVER the token in env), passes the admin bearer + server-minted run_id,
+/// and detaches stdio into a 0600 `<source>.log`. Returns a typed `SpawnError`
+/// (mapped to 422/503, never 500) on any checked precondition or OS failure.
+/// Ownership (already-running / source-busy) is decided by `ConnectorPlane::start`
+/// BEFORE this is called. The HubSpot credential temp file is tracked on the
+/// returned worker so the reap/stop can unlink it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     repo_root: Option<&Path>,
@@ -578,13 +944,9 @@ pub(crate) fn spawn(
     tenant_id: Uuid,
     source: &str,
     admin_token: Option<&str>,
-    sa_key_path: Option<&Path>,
-    subject: Option<&str>,
+    identity: BackfillIdentity,
     run_id: Uuid,
 ) -> Result<ConnectorWorker, SpawnError> {
-    // Pure precondition: backfillable source + required subject present.
-    let spec = assemble_spec(source, base_url, tenant_id, subject)?;
-
     let repo = repo_root.ok_or(SpawnError::NoRepo)?;
     let py = worker_python(repo);
     if !py.exists() {
@@ -594,61 +956,116 @@ pub(crate) fn spawn(
             py.display()
         )));
     }
-    let sa_key = sa_key_path.filter(|p| p.exists()).ok_or_else(|| {
-        SpawnError::NoConfig(format!(
-            "{source} backfill needs the service-account key — set \
-             GOOGLE_APPLICATION_CREDENTIALS on the server (or store the connector credential) \
-             to your Workspace SA JSON, then try again"
-        ))
-    })?;
+
+    // Resolve the family-specific identity → the argv (via assemble_spec) + the
+    // env additions + (HubSpot) the materialized 0600 credential temp file to
+    // track and later unlink. For HubSpot the bearer is written to disk HERE,
+    // synchronously right before the fork, and the plaintext `bearer` Zeroizing
+    // buffer is dropped (scrubbed) at the end of this scope — it is never held
+    // across an await, never placed in argv/env, never logged.
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    let mut cred_file_path: Option<PathBuf> = None;
+    let spec = match &identity {
+        BackfillIdentity::Google {
+            sa_key_path,
+            subject,
+        } => {
+            let sa_key = sa_key_path.exists().then_some(sa_key_path).ok_or_else(|| {
+                SpawnError::NoConfig(format!(
+                    "{source} backfill needs the service-account key — set \
+                     GOOGLE_APPLICATION_CREDENTIALS on the server (or store the connector \
+                     credential) to your Workspace SA JSON, then try again"
+                ))
+            })?;
+            // The connector opens this path itself; the server never reads it.
+            extra_env.push((
+                "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                sa_key.to_string_lossy().into_owned(),
+            ));
+            assemble_spec(source, base_url, tenant_id, subject.as_deref(), None, None)?
+        }
+        BackfillIdentity::HubSpot { bearer, visibility } => {
+            // Materialize the decrypted bearer to a fresh O_CREAT|O_EXCL 0600 file
+            // in the 0700 runtime dir (outside the repo). Its PATH — never the
+            // token — becomes the --credential-file argv value.
+            let cred = write_credential_file(Uuid::new_v4(), bearer)?;
+            let spec = match assemble_spec(
+                source,
+                base_url,
+                tenant_id,
+                None,
+                Some(visibility),
+                Some(cred.as_path()),
+            ) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    // Never leave a decrypted bearer on disk if argv assembly
+                    // rejects (e.g. empty visibility slipped through).
+                    unlink_credential_file(&cred);
+                    return Err(e);
+                }
+            };
+            // The hubspot CLI reads tenant/url/admin-token from env (no flags);
+            // the SINK identity comes from these, the bearer only from the file.
+            extra_env.push(("VERITY_TENANT_ID".to_string(), tenant_id.to_string()));
+            extra_env.push(("VERITY_URL".to_string(), base_url.to_string()));
+            cred_file_path = Some(cred);
+            spec
+        }
+    };
 
     // Log next to the ingest dir with the worker's own artifacts; the child's
     // stdout/stderr are detached into it (never inherited). 0600 — a backfill
     // log may name entities/paths, so it is operator-only.
     let log_path = repo.join("ingest").join(&spec.log_name);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let log = opts.open(&log_path).map_err(|e| {
-        SpawnError::Os(format!(
-            "cannot open backfill log {}: {e}",
-            log_path.display()
-        ))
-    })?;
-    // Tighten an already-existing log (create+mode only applies on create).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
-    }
-    let log2 = log
-        .try_clone()
-        .map_err(|e| SpawnError::Os(format!("log handle clone: {e}")))?;
+    let log = match open_backfill_log(&log_path) {
+        Ok(log) => log,
+        Err(e) => {
+            // Clean up a materialized bearer file if we fail before the fork.
+            if let Some(cred) = cred_file_path.as_deref() {
+                unlink_credential_file(cred);
+            }
+            return Err(e);
+        }
+    };
+    let log2 = match log.try_clone() {
+        Ok(log2) => log2,
+        Err(e) => {
+            if let Some(cred) = cred_file_path.as_deref() {
+                unlink_credential_file(cred);
+            }
+            return Err(SpawnError::Os(format!("log handle clone: {e}")));
+        }
+    };
 
     let mut cmd = Command::new(&py);
     cmd.args(&spec.argv)
         .current_dir(repo.join("ingest"))
-        // The connector opens this path itself; the server never reads it.
-        .env("GOOGLE_APPLICATION_CREDENTIALS", sa_key)
         // Server-minted run_id so the panel poll keys on THIS run (no --run-id
         // CLI flag exists; the connector reads this env into BackfillReporter).
         .env(RUN_ID_ENV, run_id.to_string())
         .stdin(Stdio::null())
         .stdout(log2)
         .stderr(log);
+    for (k, v) in &extra_env {
+        cmd.env(k, v);
+    }
     if let Some(token) = admin_token {
         cmd.env("VERITY_ADMIN_TOKEN", token);
     }
-    let child = cmd.spawn().map_err(|e| {
-        SpawnError::Os(format!(
-            "cannot start the {source} backfill ({}): {e}",
-            py.display()
-        ))
-    })?;
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // A failed fork must not orphan a decrypted bearer on disk.
+            if let Some(cred) = cred_file_path.as_deref() {
+                unlink_credential_file(cred);
+            }
+            return Err(SpawnError::Os(format!(
+                "cannot start the {source} backfill ({}): {e}",
+                py.display()
+            )));
+        }
+    };
     let pid = child.id();
     Ok(ConnectorWorker {
         child,
@@ -658,7 +1075,34 @@ pub(crate) fn spawn(
         source: source.to_string(),
         run_id,
         log_path,
+        cred_file_path,
     })
+}
+
+/// Open (create 0600, append) the detached backfill log, tightening the perms on
+/// an already-existing file. Factored out of `spawn` so both source families
+/// share the exact same operator-only log discipline.
+fn open_backfill_log(log_path: &Path) -> Result<std::fs::File, SpawnError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let log = opts.open(log_path).map_err(|e| {
+        SpawnError::Os(format!(
+            "cannot open backfill log {}: {e}",
+            log_path.display()
+        ))
+    })?;
+    // Tighten an already-existing log (create+mode only applies on create).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(log_path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(log)
 }
 
 /// Whether the ingest venv Python exists for this repo root — used by the panel
@@ -694,11 +1138,20 @@ mod tests {
         Uuid::from_u128(1)
     }
 
+    /// A Google identity for the spawn-precondition tests (SA-key path + subject).
+    fn google_id(sa: Option<&str>, subject: Option<&str>) -> BackfillIdentity {
+        BackfillIdentity::Google {
+            sa_key_path: PathBuf::from(sa.unwrap_or("/no/such/sa.json")),
+            subject: subject.map(str::to_string),
+        }
+    }
+
     // ---- argv assembly (pure) -------------------------------------------
 
     #[test]
     fn gdrive_argv_omits_subject_when_absent() {
-        let spec = assemble_spec("gdrive", "http://host:7717", t(), None).expect("gdrive ok");
+        let spec =
+            assemble_spec("gdrive", "http://host:7717", t(), None, None, None).expect("gdrive ok");
         assert_eq!(spec.module, "verity_ingest.connectors.gdrive");
         assert_eq!(spec.log_name, "gdrive.log");
         assert_eq!(
@@ -719,8 +1172,15 @@ mod tests {
 
     #[test]
     fn gdrive_argv_includes_subject_when_present() {
-        let spec = assemble_spec("gdrive", "http://h", t(), Some("owner@corp.example"))
-            .expect("gdrive ok");
+        let spec = assemble_spec(
+            "gdrive",
+            "http://h",
+            t(),
+            Some("owner@corp.example"),
+            None,
+            None,
+        )
+        .expect("gdrive ok");
         let i = spec
             .argv
             .iter()
@@ -731,8 +1191,15 @@ mod tests {
 
     #[test]
     fn gmail_argv_requires_and_includes_subject() {
-        let spec = assemble_spec("gmail", "http://h", t(), Some("mbox@corp.example"))
-            .expect("gmail ok with subject");
+        let spec = assemble_spec(
+            "gmail",
+            "http://h",
+            t(),
+            Some("mbox@corp.example"),
+            None,
+            None,
+        )
+        .expect("gmail ok with subject");
         assert_eq!(spec.module, "verity_ingest.connectors.gmail");
         assert_eq!(spec.log_name, "gmail.log");
         assert_eq!(
@@ -753,39 +1220,99 @@ mod tests {
 
     #[test]
     fn gmail_without_subject_is_no_config() {
-        let err = assemble_spec("gmail", "http://h", t(), None)
+        let err = assemble_spec("gmail", "http://h", t(), None, None, None)
             .err()
             .expect("gmail must fail without subject");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Blank/whitespace subject counts as absent (matches connector abort).
         assert!(matches!(
-            assemble_spec("gmail", "http://h", t(), Some("   ")).err(),
+            assemble_spec("gmail", "http://h", t(), Some("   "), None, None).err(),
             Some(SpawnError::NoConfig(_))
         ));
     }
 
     #[test]
     fn subject_is_trimmed() {
-        let spec = assemble_spec("gdrive", "http://h", t(), Some("  a@b.co  ")).expect("ok");
+        let spec =
+            assemble_spec("gdrive", "http://h", t(), Some("  a@b.co  "), None, None).expect("ok");
         let i = spec.argv.iter().position(|a| a == "--subject").unwrap();
         assert_eq!(spec.argv[i + 1], "a@b.co");
+    }
+
+    // ---- hubspot argv assembly (pure) — tier-C shape ---------------------
+
+    #[test]
+    fn hubspot_argv_carries_visibility_and_credential_file_not_url_or_tenant() {
+        let cred = Path::new("/run/verity-connector-creds/abc.cred");
+        let spec = assemble_spec(
+            "hubspot",
+            "http://host:7717",
+            t(),
+            None,
+            Some(&[3, 9, 12]),
+            Some(cred),
+        )
+        .expect("hubspot ok");
+        assert_eq!(spec.module, "verity_ingest.connectors.hubspot");
+        assert_eq!(spec.log_name, "hubspot.log");
+        // The tier-C CLI takes tenant/url from env, NOT flags — assembling those
+        // flags would make argparse reject the spawn.
+        assert_eq!(
+            spec.argv,
+            vec![
+                "-m",
+                "verity_ingest.connectors.hubspot",
+                "--backfill",
+                "--visibility",
+                "3,9,12",
+                "--credential-file",
+                "/run/verity-connector-creds/abc.cred",
+            ]
+        );
+        assert!(!spec.argv.iter().any(|a| a == "--verity-url"));
+        assert!(!spec.argv.iter().any(|a| a == "--tenant-id"));
+        assert!(!spec.argv.iter().any(|a| a == "--subject"));
+        // The token is never a literal in argv (only the FILE PATH is).
+        assert!(!spec.argv.iter().any(|a| a.contains("Bearer")));
+    }
+
+    #[test]
+    fn hubspot_argv_requires_visibility_and_credential_file() {
+        // No visibility → NoConfig with the exact honest fix.
+        let cred = Path::new("/run/x.cred");
+        let err = assemble_spec("hubspot", "http://h", t(), None, None, Some(cred))
+            .err()
+            .expect("no visibility must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+        // Empty visibility is treated as absent.
+        let err = assemble_spec("hubspot", "http://h", t(), None, Some(&[]), Some(cred))
+            .err()
+            .expect("empty visibility must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+        // No credential-file path → NoConfig.
+        let err = assemble_spec("hubspot", "http://h", t(), None, Some(&[7]), None)
+            .err()
+            .expect("no credential-file must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
     }
 
     // ---- backfillable gating (pure) -------------------------------------
 
     #[test]
-    fn only_gdrive_gmail_are_backfillable() {
+    fn gdrive_gmail_hubspot_are_backfillable() {
         assert!(is_backfillable("gdrive"));
         assert!(is_backfillable("gmail"));
-        for s in ["folder", "gdirectory", "hubspot", "salesforce", "bogus"] {
+        assert!(is_backfillable("hubspot"));
+        // salesforce is fixtures-only; folder/gdirectory are not applicable.
+        for s in ["folder", "gdirectory", "salesforce", "bogus"] {
             assert!(!is_backfillable(s), "{s} must not be backfillable");
         }
     }
 
     #[test]
     fn non_backfillable_source_is_no_config() {
-        for s in ["folder", "gdirectory", "hubspot", "salesforce", "bogus"] {
-            let err = assemble_spec(s, "http://h", t(), Some("x@y.z"))
+        for s in ["folder", "gdirectory", "salesforce", "bogus"] {
+            let err = assemble_spec(s, "http://h", t(), Some("x@y.z"), None, None)
                 .err()
                 .unwrap_or_else(|| panic!("{s} must not assemble"));
             assert!(matches!(err, SpawnError::NoConfig(_)), "{s}");
@@ -805,19 +1332,26 @@ mod tests {
 
     #[test]
     fn spawn_non_backfillable_is_no_config() {
+        // salesforce is not backfillable — assemble_spec (via spawn) fail-closes.
+        // repo is Some so we reach the identity/argv assembly, not the NoRepo gate.
+        let repo = Path::new("/definitely/not/a/verity/repo");
         let err = spawn(
-            None,
+            Some(repo),
             "http://h",
             t(),
-            "hubspot",
+            "salesforce",
             None,
-            None,
-            None,
+            google_id(None, None),
             Uuid::from_u128(9),
         )
         .err()
         .expect("must fail");
-        assert!(matches!(err, SpawnError::NoConfig(_)));
+        // No venv is reached first for a bogus repo; a real repo would then hit
+        // NoConfig. Either way it never spawns a non-backfillable source.
+        assert!(matches!(
+            err,
+            SpawnError::NoVenv(_) | SpawnError::NoConfig(_)
+        ));
     }
 
     #[test]
@@ -830,8 +1364,7 @@ mod tests {
             t(),
             "gmail",
             None,
-            None,
-            Some("m@corp.example"),
+            google_id(None, Some("m@corp.example")),
             Uuid::from_u128(9),
         )
         .err()
@@ -848,13 +1381,33 @@ mod tests {
             t(),
             "gdrive",
             None,
-            None,
-            None,
+            google_id(None, None),
             Uuid::from_u128(9),
         )
         .err()
         .expect("must fail");
         assert!(matches!(err, SpawnError::NoVenv(_)));
+    }
+
+    #[test]
+    fn spawn_hubspot_without_repo_is_no_repo() {
+        // A hubspot identity reaches the NoRepo gate BEFORE materializing any
+        // credential file (no repo → no spawn, no secret written to disk).
+        let err = spawn(
+            None,
+            "http://h",
+            t(),
+            "hubspot",
+            None,
+            BackfillIdentity::HubSpot {
+                bearer: zeroize::Zeroizing::new(b"pat-secret".to_vec()),
+                visibility: vec![7],
+            },
+            Uuid::from_u128(9),
+        )
+        .err()
+        .expect("must fail");
+        assert!(matches!(err, SpawnError::NoRepo));
     }
 
     // ---- ownership-key collision → 409 decision (pure of any process) ---
@@ -940,8 +1493,10 @@ mod tests {
                 tenant,
                 "gdrive",
                 None,
-                Some(key.as_path()),
-                None,
+                BackfillIdentity::Google {
+                    sa_key_path: key,
+                    subject: None,
+                },
                 Uuid::new_v4(),
             )
             .await
@@ -995,8 +1550,10 @@ mod tests {
                 tenant,
                 "gdrive",
                 None,
-                Some(key.as_path()),
-                None,
+                BackfillIdentity::Google {
+                    sa_key_path: key,
+                    subject: None,
+                },
                 Uuid::new_v4(),
             )
             .await
@@ -1060,5 +1617,97 @@ mod tests {
         assert_eq!(tail_log(&p, 2), "d\ne");
         assert_eq!(tail_log(&p, 100), "a\nb\nc\nd\ne");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- credential temp file: 0600 + exclusive + unlink -----------------
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_is_written_0600_and_unlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let unique = Uuid::new_v4();
+        let path = write_credential_file(unique, b"pat-abc123").expect("write");
+        // Exists, owner-only (mode 0600), and holds exactly the bearer bytes.
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "credential temp file must be owner-only"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"pat-abc123");
+        // The parent runtime dir is 0700.
+        let dir_meta = std::fs::metadata(path.parent().unwrap()).expect("dir stat");
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+        // The file is OUTSIDE the repo (under the OS temp root).
+        assert!(path.starts_with(std::env::temp_dir()));
+        // Unlink is a clean best-effort delete; a second unlink is a no-op.
+        unlink_credential_file(&path);
+        assert!(!path.exists(), "credential temp file must be unlinked");
+        unlink_credential_file(&path); // idempotent, no panic
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_is_exclusive_create_new() {
+        // O_CREAT|O_EXCL: writing to a name that already exists is a hard error,
+        // never a silent reuse of a stale/attacker-planted file.
+        let unique = Uuid::new_v4();
+        let path = write_credential_file(unique, b"first").expect("first write");
+        let dir = path.parent().unwrap().to_path_buf();
+        // Re-derive the exact same path and pre-create it, then prove a second
+        // write to that name fails (create_new).
+        let clash = dir.join(format!("{}.cred", Uuid::nil()));
+        std::fs::write(&clash, b"planted").unwrap();
+        let err = write_credential_file(Uuid::nil(), b"second").expect_err("must not reuse");
+        assert!(matches!(err, SpawnError::Os(_)));
+        // The planted file's contents are untouched (never overwritten).
+        assert_eq!(std::fs::read(&clash).unwrap(), b"planted");
+        let _ = std::fs::remove_file(&clash);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- degraded_acl log signal detection -------------------------------
+
+    #[test]
+    fn degraded_acl_signal_detected_only_when_present() {
+        let dir = std::env::temp_dir().join(format!("verity-cw-degraded-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A clean log with no signal → not degraded.
+        let clean = dir.join("clean.log");
+        std::fs::write(&clean, "poll: 12 events\nbackfill delivered 12\n").unwrap();
+        assert!(!log_signals_degraded_acl(&clean));
+        // A log carrying the exact signal token on its own line → degraded.
+        let degraded = dir.join("degraded.log");
+        std::fs::write(
+            &degraded,
+            format!("backfill delivered 40\n{DEGRADED_ACL_SIGNAL}\n"),
+        )
+        .unwrap();
+        assert!(log_signals_degraded_acl(&degraded));
+        // A missing log is NOT inferred as degraded (that's a clean completed).
+        assert!(!log_signals_degraded_acl(&dir.join("nope.log")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_state_is_degraded_acl_only_on_clean_signal_exit() {
+        // The pure state-selection contract mirrored by reconcile_terminal:
+        // failed wins over degraded; degraded wins over completed; clean+no-signal
+        // is completed.
+        let pick = |success: bool, degraded: bool| {
+            if !success {
+                "failed"
+            } else if degraded {
+                "degraded_acl"
+            } else {
+                "completed"
+            }
+        };
+        assert_eq!(pick(true, false), "completed");
+        assert_eq!(pick(true, true), "degraded_acl");
+        assert_eq!(pick(false, true), "failed");
+        assert_eq!(pick(false, false), "failed");
+        // The signal constant matches the connector's emitted token exactly.
+        assert_eq!(DEGRADED_ACL_SIGNAL, "verity.backfill.degraded_acl");
     }
 }

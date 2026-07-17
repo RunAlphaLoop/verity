@@ -85,11 +85,18 @@ class BackfillReporter:
             body["cursor"] = cursor
         self._post(body)
 
-    def finish(self, cursor: str | None = None) -> None:
-        """Mark the run ``completed`` (clears any transient error)."""
+    def finish(self, cursor: str | None = None, error: object | None = None) -> None:
+        """Mark the run ``completed``. ``error`` is normally cleared on a clean
+        finish, but a connector may pass a distinct non-fatal note (e.g. the
+        HubSpot owners-scope ``degraded_acl`` signal) to record that the run
+        succeeded with a caveat — the rows landed, but under a coarser ACL than a
+        full mirror. The server keys ``state=degraded_acl`` off this note, so it
+        is a run-level signal, never a silent success."""
         body: dict[str, Any] = {"state": "completed", "processed_delta": 0}
         if cursor is not None:
             body["cursor"] = cursor
+        if error is not None:
+            body["error"] = str(error)
         self._post(body)
 
     def fail(self, error: object, cursor: str | None = None) -> None:

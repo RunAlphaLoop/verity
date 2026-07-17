@@ -18,11 +18,15 @@ import httpx
 import pytest
 
 from verity_ingest.connectors.hubspot import (
+    DEGRADED_ACL_SIGNAL,
     HubSpotConnector,
     HubSpotFactEvent,
     OwnerInfo,
     VerityDebeziumSink,
+    _read_credential_file,
+    main as hubspot_main,
     owner_principal,
+    run_backfill,
     team_principal,
 )
 
@@ -754,3 +758,188 @@ def test_sink_sync_team_edges_posts_group_membership_in_order() -> None:
         {"tenant_id": "tnt", "group": "group:hubspot-team-20", "member": "user:rep.one@acme.test"},
     ]
     assert sink.sync_team_edges({}) == 0  # empty roster → no-op
+
+
+# ---------- --credential-file (server spawn channel; token is the file body) ----------
+
+
+def _write_cred(tmp_path: Path, token: str, mode: int = 0o600) -> Path:
+    p = tmp_path / "bearer.token"
+    p.write_text(token)
+    p.chmod(mode)
+    return p
+
+
+def test_credential_file_reads_body_and_strips_trailing_newline(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "pat-na1-from-file\n")
+    assert _read_credential_file(p) == "pat-na1-from-file"
+
+
+def test_credential_file_rejects_non_0600_mode(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "pat-na1-secret\n", mode=0o644)
+    with pytest.raises(PermissionError, match="0600"):
+        _read_credential_file(p)
+
+
+def test_credential_file_rejects_empty(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "\n")
+    with pytest.raises(ValueError, match="empty"):
+        _read_credential_file(p)
+
+
+def test_credential_file_token_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file body is PREFERRED over both env vars — a server spawn never needs
+    # the token in the child environment.
+    monkeypatch.setenv("HUBSPOT_SERVICE_KEY", "pat-na1-from-env")
+    p = _write_cred(tmp_path, "pat-na1-from-file\n")
+    connector = HubSpotConnector(POLICY, token=_read_credential_file(p))
+    assert connector._client.headers["Authorization"] == "Bearer pat-na1-from-file"
+    asyncio.run(connector.aclose())
+
+
+# ---------- --backfill runner (§5a; mirrors gdrive/gmail run_backfill) ----------
+
+
+def _backfill_sink(seen: list[dict]) -> VerityDebeziumSink:
+    """A VerityDebeziumSink over a mock server that accepts principals, debezium
+    ingest, group edges, connector-status and backfill progress posts."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content) if request.content else {}
+        seen.append({"path": path, "body": body})
+        if path == "/v1/admin/principals":
+            table = {
+                "user:rep.one@acme.test": 31,
+                "user:rep.two@acme.test": 33,
+                "group:hubspot-team-10": 32,
+                "group:hubspot-team-20": 34,
+            }
+            return httpx.Response(
+                200,
+                json={"mappings": {p: table[p] for p in body.get("principals", []) if p in table}},
+            )
+        if path == "/v1/ingest/debezium":
+            return httpx.Response(200, json={"facts_inserted": len(body)})
+        return httpx.Response(200, json={})  # groups, connector-status, backfill
+
+    return VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="tnt-uuid",
+        admin_token="admin-tok",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_run_backfill_delivers_and_finishes_clean() -> None:
+    from verity_ingest.connectors.backfill import BackfillReporter
+
+    hub_log: list[dict] = []
+    connector = HubSpotConnector(
+        POLICY,
+        token="pat-na1-test",
+        client=httpx.AsyncClient(
+            base_url="https://api.hubapi.test",
+            transport=make_mock_hubspot(hub_log, fixture("hubspot_owners.json")),
+            headers={"Authorization": "Bearer pat-na1-test"},
+        ),
+    )
+    seen: list[dict] = []
+    sink = _backfill_sink(seen)
+    reporter = BackfillReporter(
+        sink.url, sink.tenant_id, connector.name, api_key=sink.admin_token, run_id="run-1",
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+    )
+    progress: list[dict] = []
+    reporter._post = lambda body: progress.append(dict(body))  # type: ignore[method-assign]
+
+    delivered = run_backfill(connector, sink, reporter)
+    asyncio.run(connector.aclose())
+
+    assert delivered > 0
+    # Team edges synced (owners fixture resolves), then facts ingested.
+    assert any(s["path"] == "/v1/admin/groups" for s in seen)
+    assert any(s["path"] == "/v1/ingest/debezium" for s in seen)
+    # Lifecycle: running → advance(s) → completed with NO degraded note.
+    assert progress[0]["state"] == "running"
+    assert progress[-1]["state"] == "completed"
+    assert "error" not in progress[-1]
+
+
+def test_run_backfill_owners_403_emits_degraded_acl_signal(capsys) -> None:
+    from verity_ingest.connectors.backfill import BackfillReporter
+
+    def hub_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/crm/v3/owners":
+            return httpx.Response(403, json={"message": "missing scope"})
+        json.loads(request.content)
+        if request.url.path == "/crm/v3/objects/contacts/search":
+            return httpx.Response(200, json=fixture("hubspot_search_contacts_owned.json"))
+        return httpx.Response(200, json={"results": []})
+
+    connector = HubSpotConnector(
+        POLICY,
+        token="pat-na1-test",
+        client=httpx.AsyncClient(
+            base_url="https://api.hubapi.test",
+            transport=httpx.MockTransport(hub_handler),
+            headers={"Authorization": "Bearer pat-na1-test"},
+        ),
+    )
+    seen: list[dict] = []
+    sink = _backfill_sink(seen)
+    reporter = BackfillReporter(
+        sink.url, sink.tenant_id, connector.name, run_id="run-2",
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+    )
+    progress: list[dict] = []
+    reporter._post = lambda body: progress.append(dict(body))  # type: ignore[method-assign]
+
+    run_backfill(connector, sink, reporter)
+    asyncio.run(connector.aclose())
+
+    assert connector.owners_degraded is True
+    # Distinct machine-readable signal on stdout (the read-once contract).
+    assert DEGRADED_ACL_SIGNAL in capsys.readouterr().out
+    # And a distinct reporter note on the clean finish — never a silent success.
+    assert progress[-1]["state"] == "completed"
+    assert progress[-1]["error"] == DEGRADED_ACL_SIGNAL
+
+
+def test_main_backfill_wins_over_once_and_uses_credential_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VERITY_TENANT_ID", "tnt-uuid")
+    monkeypatch.setenv("VERITY_BACKFILL_RUN_ID", "server-minted-run")
+    monkeypatch.delenv("HUBSPOT_SERVICE_KEY", raising=False)
+    monkeypatch.delenv("HUBSPOT_PRIVATE_APP_TOKEN", raising=False)
+    cred = _write_cred(tmp_path, "pat-na1-file-only\n")
+
+    captured: dict = {}
+
+    def fake_run_backfill(connector, sink, reporter, **kw):
+        captured["auth"] = connector._client.headers["Authorization"]
+        captured["run_id"] = reporter.run_id
+        return 5
+
+    monkeypatch.setattr("verity_ingest.connectors.hubspot.run_backfill", fake_run_backfill)
+
+    # --backfill wins over --once (both passed): the one-shot backfill path runs.
+    rc = hubspot_main(
+        ["--backfill", "--once", "--visibility", "7,12", "--credential-file", str(cred)]
+    )
+    assert rc == 0
+    # The token came from the file (env was unset), never echoed.
+    assert captured["auth"] == "Bearer pat-na1-file-only"
+    # The server-minted run_id flowed through VERITY_BACKFILL_RUN_ID.
+    assert captured["run_id"] == "server-minted-run"
+
+
+def test_main_requires_exactly_one_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VERITY_TENANT_ID", "tnt-uuid")
+    with pytest.raises(SystemExit):
+        hubspot_main(["--visibility", "7,12"])  # no mode
+    with pytest.raises(SystemExit):
+        hubspot_main(["--backfill", "--webhook-file", "x.json", "--visibility", "7,12"])
