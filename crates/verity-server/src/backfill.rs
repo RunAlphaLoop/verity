@@ -54,6 +54,12 @@ pub(crate) struct BackfillProgressRequest {
     /// Items processed in THIS post; the row accumulates the deltas.
     #[serde(default)]
     pub(crate) processed_delta: i64,
+    /// Items walked but deliberately DECLINED in THIS post (over the size cap,
+    /// hidden/temp, empty partial). Accumulates like `processed_delta`; a
+    /// missing field is 0 (connectors that don't skip never post it). This is a
+    /// progress signal, never an audit ledger.
+    #[serde(default)]
+    pub(crate) skipped_delta: i64,
     /// The backfill's own checkpoint, opaque. Absent → the stored cursor kept.
     #[serde(default)]
     pub(crate) cursor: Option<String>,
@@ -73,12 +79,13 @@ pub(crate) async fn record_progress(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO backfill_run
-             (id, tenant_id, source, state, total, processed, cursor, error, started_at, updated_at)
-         VALUES ($1, $2, $3, COALESCE($4, 'running'), $5, $6, $7, $8, now(), now())
+             (id, tenant_id, source, state, total, processed, skipped, cursor, error, started_at, updated_at)
+         VALUES ($1, $2, $3, COALESCE($4, 'running'), $5, $6, $7, $8, $9, now(), now())
          ON CONFLICT (id) DO UPDATE SET
              state      = COALESCE(EXCLUDED.state, backfill_run.state),
              total      = COALESCE(EXCLUDED.total, backfill_run.total),
              processed  = backfill_run.processed + EXCLUDED.processed,
+             skipped    = backfill_run.skipped + EXCLUDED.skipped,
              cursor     = COALESCE(EXCLUDED.cursor, backfill_run.cursor),
              error      = EXCLUDED.error,
              updated_at = now()",
@@ -89,6 +96,7 @@ pub(crate) async fn record_progress(
     .bind(&req.state)
     .bind(req.total)
     .bind(req.processed_delta.max(0))
+    .bind(req.skipped_delta.max(0))
     .bind(&req.cursor)
     .bind(&req.error)
     .execute(pool)
@@ -131,7 +139,7 @@ pub(crate) async fn latest_runs(
 ) -> sqlx::Result<Vec<serde_json::Value>> {
     let rows = sqlx::query(
         "SELECT DISTINCT ON (source)
-             id, source, state, total, processed, cursor, error, started_at, updated_at
+             id, source, state, total, processed, skipped, cursor, error, started_at, updated_at
          FROM backfill_run
          WHERE tenant_id = $1
          ORDER BY source, started_at DESC",
@@ -147,6 +155,7 @@ pub(crate) async fn latest_runs(
                 "state": row.try_get::<String, _>("state")?,
                 "total": row.try_get::<Option<i64>, _>("total")?,
                 "processed": row.try_get::<i64, _>("processed")?,
+                "skipped": row.try_get::<i64, _>("skipped")?,
                 "cursor": row.try_get::<Option<String>, _>("cursor")?,
                 "error": row.try_get::<Option<String>, _>("error")?,
                 "started_at": row.try_get::<DateTime<Utc>, _>("started_at")?,
@@ -199,6 +208,7 @@ mod tests {
             state: state.map(Into::into),
             total,
             processed_delta: delta,
+            skipped_delta: 0,
             cursor: cursor.map(Into::into),
             error: error.map(Into::into),
         }

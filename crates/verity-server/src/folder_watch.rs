@@ -36,8 +36,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -48,10 +49,12 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use verity_core::types::{AclProvenance, Confidentiality, PrincipalToken, TenantId};
 
+use crate::backfill::{record_progress, BackfillProgressRequest};
 use crate::{
     ingest_document, internal, storage_status, AppState, DeliveredContent, DocumentIngest,
     HandlerResult,
@@ -66,6 +69,27 @@ pub(crate) const MAX_FILE_BYTES: u64 = 200 * 1024;
 /// enough that an editor's multi-write save (and most mid-write partials)
 /// coalesce into one event; short enough to feel live in the demo.
 const DEBOUNCE: Duration = Duration::from_millis(800);
+
+/// Pre-flight count entry cap: the bounded folder-preview walk visits at most
+/// this many entries (files + dirs) before giving up and reporting `capped`.
+/// The whole point is that the COUNT itself must never hang on a huge tree —
+/// `capped = true` means "at least this many; the real tree is bigger", never
+/// an exact total. It also bounds the DFS stack (and so any symlink cycle).
+const MAX_PREVIEW_ENTRIES: u64 = 5_000;
+
+/// Pre-flight count wall-clock budget: the preview walk aborts (and reports
+/// `capped`) after this long even if the entry cap hasn't tripped, so counting
+/// a slow/networked filesystem never itself hangs the request.
+const PREVIEW_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Big-folder guard thresholds — the SERVER-side copy of the UI's
+/// `BIG_FOLDER_FILES` / `BIG_FOLDER_BYTES`. Above EITHER (or a capped count),
+/// `add_folder_watch` refuses to start the scan unless the request carries an
+/// explicit `acknowledge_large` ack. The client confirm is UX; this is the
+/// authoritative gate (a raw `curl` can't bypass it), mirroring the fail-closed
+/// posture everywhere else in the write path.
+const BIG_FOLDER_FILES: u64 = 200;
+const BIG_FOLDER_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 // ---------------------------------------------------------------------------
 // Live watcher registry: OS-level handles kept alive for the process lifetime.
@@ -104,6 +128,70 @@ impl WatcherRegistry {
     /// plane authoritatively without reaching into the private map.
     pub(crate) async fn armed_ids(&self) -> std::collections::HashSet<Uuid> {
         self.live.lock().await.keys().copied().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initial-scan plane: supervised in-process background scans, keyed on
+// (tenant, folder), each with a cooperative cancel flag + a JoinHandle.
+// ---------------------------------------------------------------------------
+
+/// A live initial-scan of a folder's EXISTING files. The scan runs in a
+/// detached tokio task; this handle lets Stop cancel it cooperatively (the
+/// task checks `cancel` between files and writes its own terminal row on the
+/// way out) and lets a re-register supersede a predecessor cooperatively.
+struct ScanHandle {
+    run_id: Uuid,
+    /// Cooperative cancel: the scan loop reads this between files and, if set,
+    /// stops cleanly (already-ingested files stay) after writing a terminal
+    /// `paused` row. The ONLY stop mechanism — we never abort(), so backfill_run
+    /// never gets stuck at `running`.
+    cancel: Arc<AtomicBool>,
+    /// The scan's JoinHandle. Held so the task's lifecycle is tied to this entry
+    /// and observable in tests (`is_finished`). Never abort()ed: dropping it just
+    /// detaches, leaving the task to reach its cooperative terminal row.
+    task: JoinHandle<()>,
+}
+
+/// Server-held initial-scan plane: one background scan per (tenant, folder id).
+/// Mirrors `ConnectorPlane`'s admission discipline (a dedicated `admission`
+/// mutex serializes check→spawn→insert) so two concurrent registers for the
+/// same folder can't both spawn a scan and double-count into the same run.
+/// Bundled as ONE `Arc` field on `AppState`.
+#[derive(Default)]
+pub(crate) struct FolderScanPlane {
+    scans: Mutex<HashMap<(TenantId, Uuid), ScanHandle>>,
+    admission: Mutex<()>,
+}
+
+impl FolderScanPlane {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel an in-flight initial scan for (tenant, folder). Sets the
+    /// cooperative flag so the task writes its own terminal row and exits after
+    /// the current file, then drops the handle. Returns the cancelled run_id, or
+    /// `None` if no scan was live (honest no-op). The `task` is left to finish on
+    /// its own so its terminal `paused` row lands.
+    async fn cancel(&self, tenant: TenantId, folder_id: Uuid) -> Option<Uuid> {
+        let mut map = self.scans.lock().await;
+        let handle = map.remove(&(tenant, folder_id))?;
+        // Cooperative: the task observes `cancel` between files and exits cleanly,
+        // writing its own terminal `paused` row. We deliberately do NOT abort()
+        // here — that would drop the task before it can write the terminal row and
+        // leave backfill_run stuck at `running`. The handle is already removed, so
+        // status is honest immediately; the task finishes on its own within one
+        // per-file iteration. Re-register (spawn_initial_scan) supersedes the same
+        // cooperative way.
+        handle.cancel.store(true, Ordering::SeqCst);
+        Some(handle.run_id)
+    }
+
+    /// True iff a scan is currently tracked for (tenant, folder). Used by tests.
+    #[cfg(test)]
+    async fn is_scanning(&self, tenant: TenantId, folder_id: Uuid) -> bool {
+        self.scans.lock().await.contains_key(&(tenant, folder_id))
     }
 }
 
@@ -406,6 +494,352 @@ async fn touch_last_seen(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Background initial scan: walk existing files, ingest each through the same
+// choke point, report progress via backfill_run, cancellable + supervised.
+// ---------------------------------------------------------------------------
+
+/// Best-effort backfill_run reporter for one folder scan: holds the invariant
+/// identity (pool, run_id, tenant, source) so each post is a short call. Writes
+/// DIRECTLY (no self-HTTP) via the same SQL the POST /v1/admin/backfill handler
+/// uses. `state` is self-validated by construction — the methods only ever pass
+/// "running"/"completed"/"failed"/"paused" (all in the backfill VALID_STATES).
+/// A failed post never fails the scan — it is telemetry, mirroring the connector
+/// heartbeat's best-effort posture.
+struct ScanReporter<'a> {
+    pool: &'a PgPool,
+    run_id: Uuid,
+    tenant_id: TenantId,
+    source: String,
+}
+
+impl ScanReporter<'_> {
+    async fn post(
+        &self,
+        state: Option<&str>,
+        total: Option<i64>,
+        processed_delta: i64,
+        skipped_delta: i64,
+        error: Option<String>,
+    ) {
+        let req = BackfillProgressRequest {
+            run_id: self.run_id,
+            tenant_id: self.tenant_id,
+            source: self.source.clone(),
+            state: state.map(|s| s.to_string()),
+            total,
+            processed_delta,
+            skipped_delta,
+            cursor: None,
+            error,
+        };
+        if let Err(e) = record_progress(self.pool, &req).await {
+            tracing::warn!(run_id = %self.run_id, "folder scan: backfill_run progress write failed: {e}");
+        }
+    }
+
+    /// Scan start: set the discovered total and mark running.
+    async fn start(&self, total: i64) {
+        self.post(Some("running"), Some(total), 0, 0, None).await;
+    }
+
+    /// One file ingested.
+    async fn advance(&self) {
+        self.post(None, None, 1, 0, None).await;
+    }
+
+    /// One file deliberately skipped (too large / hidden / temp / empty).
+    async fn skip(&self) {
+        self.post(None, None, 0, 1, None).await;
+    }
+
+    /// Clean finish.
+    async fn complete(&self) {
+        self.post(Some("completed"), None, 0, 0, None).await;
+    }
+
+    /// Operator-cancelled: honest terminal `paused` with the retained-files note.
+    async fn cancelled(&self, note: String) {
+        self.post(Some("paused"), None, 0, 0, Some(note)).await;
+    }
+
+    /// Abnormal terminal `failed`: the scan could not enumerate the folder, or
+    /// the task panicked mid-scan. Writes an honest terminal row (with the error)
+    /// so the strip flips off `running` instead of polling a wedged run forever.
+    async fn failed(&self, note: String) {
+        self.post(Some("failed"), None, 0, 0, Some(note)).await;
+    }
+}
+
+/// Panic-safety guard for one in-flight initial scan. Created ARMED and threaded
+/// into `run_initial_scan`, which calls [`ScanCleanup::finish`] on EVERY clean
+/// terminal path (completed / paused / enumeration-failure) — that drops the
+/// plane handle and disarms the guard. If the guard is dropped still armed, the
+/// only remaining cause is a panic inside the scan (e.g. malformed-file
+/// extraction unwinding through `ingest_document`): its Drop spawns a detached
+/// task that writes a terminal `failed` backfill_run row AND drops the handle, so
+/// a panicked scan never wedges the run at `running` nor leaves the folder
+/// reading as live-scanning forever. Mirrors the fail-closed, self-reconciling
+/// posture of the Phase-3 connector reap, kept in-process.
+struct ScanCleanup {
+    state: Arc<AppState>,
+    tenant: TenantId,
+    folder_id: Uuid,
+    run_id: Uuid,
+    source: String,
+    armed: bool,
+}
+
+impl ScanCleanup {
+    fn new(
+        state: Arc<AppState>,
+        tenant: TenantId,
+        folder_id: Uuid,
+        run_id: Uuid,
+        source: String,
+    ) -> Self {
+        Self {
+            state,
+            tenant,
+            folder_id,
+            run_id,
+            source,
+            armed: true,
+        }
+    }
+
+    /// Clean exit: the scan already wrote its own terminal row. Drop the plane
+    /// handle (if still ours) and disarm so Drop does nothing.
+    async fn finish(&mut self) {
+        self.armed = false;
+        drop_scan_handle(&self.state, self.tenant, self.folder_id, self.run_id).await;
+    }
+}
+
+impl Drop for ScanCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Armed at drop ⇒ the scan panicked before its clean terminal write. Drop
+        // can't await, so spawn a detached reconciler: write a terminal `failed`
+        // row and drop the plane handle. Best-effort telemetry, same posture as
+        // every other backfill progress write.
+        let state = Arc::clone(&self.state);
+        let (tenant, folder_id, run_id, source) = (
+            self.tenant,
+            self.folder_id,
+            self.run_id,
+            self.source.clone(),
+        );
+        tracing::error!(%run_id, %source, "folder scan: task panicked; reconciling terminal failed");
+        tokio::spawn(async move {
+            let reporter = ScanReporter {
+                pool: state.pool(),
+                run_id,
+                tenant_id: tenant,
+                source,
+            };
+            reporter
+                .failed(
+                    "initial scan aborted: an internal error occurred while reading a file".into(),
+                )
+                .await;
+            drop_scan_handle(&state, tenant, folder_id, run_id).await;
+        });
+    }
+}
+
+/// The supervised background initial scan: walk the folder's EXISTING files and
+/// ingest each through the SAME `ingest_file` choke point (extraction / dedup /
+/// size-cap / skip logic unchanged), reporting processed/skipped/total to
+/// `backfill_run` under the server-minted `run_id` (source `folder:<name>`).
+///
+/// Cooperative cancellation: `cancel` is checked before each file; when set the
+/// scan stops cleanly (already-ingested files stay) and reconciles a terminal
+/// `paused` row. On clean finish it reconciles `completed` and advances
+/// `last_seen` (so a crash mid-scan re-scans on next boot — last_seen only moves
+/// AFTER the walk). Double-ingest with the OS-watcher (armed before this runs) is
+/// CHUNK-idempotent: `ingest_document` keys chunks on the content hash and the
+/// doc id is the stable filename, so a file caught by both paths never
+/// double-populates the search index. It is NOT idempotent at the L0/telemetry
+/// layer — a doubly-caught file appends a second episode row and increments
+/// items_synced/freshness once more — so overlap is cheap and non-corrupting,
+/// but not literally a no-op. The overlap window is a single settle interval.
+async fn run_initial_scan(
+    state: Arc<AppState>,
+    watch: WatchRow,
+    run_id: Uuid,
+    cancel: Arc<AtomicBool>,
+    mut guard: ScanCleanup,
+) {
+    let pool = state.pool();
+    let path = PathBuf::from(&watch.path);
+    let reporter = ScanReporter {
+        pool,
+        run_id,
+        tenant_id: watch.tenant_id,
+        source: source_name(&watch.name),
+    };
+
+    // Count up front so the strip has a denominator (folder scans CAN count).
+    // The enumeration is the UNBOUNDED, synchronous std::fs DFS — offload it to a
+    // blocking thread (exactly as preview_folder does for its bounded count) so a
+    // huge/deep/networked tree can never pin a tokio worker before the first
+    // await. A JoinError (the blocking thread panicked) fails the scan cleanly.
+    let files = match tokio::task::spawn_blocking(move || collect_files(&path)).await {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(folder = %watch.name, %run_id, "folder scan: enumeration failed: {e}");
+            reporter
+                .failed(format!("initial scan could not enumerate the folder: {e}"))
+                .await;
+            guard.finish().await;
+            return;
+        }
+    };
+    reporter.start(files.len() as i64).await;
+
+    let mut processed = 0i64;
+    let mut skipped = 0i64;
+    let mut cancelled = false;
+    for file in files {
+        // Cooperative cancel: check BEFORE each file so a Stop takes effect
+        // between files (already-ingested files stay).
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        match ingest_file(&state, &watch, &file).await {
+            Ok(true) => {
+                processed += 1;
+                reporter.advance().await;
+            }
+            Ok(false) => {
+                // Deliberately declined (too large / hidden / temp / empty) —
+                // an honest skip, neither processed nor an error.
+                skipped += 1;
+                reporter.skip().await;
+            }
+            Err((status, msg)) => {
+                tracing::warn!(folder = %watch.name, %status, "folder watch: initial ingest failed: {msg}");
+            }
+        }
+    }
+
+    // Terminal reconcile keyed on run_id — the scan owns its own terminal write
+    // (no detached reap: this in-process task observes its own completion).
+    if cancelled {
+        reporter
+            .cancelled(format!(
+                "initial scan stopped by operator after {processed} ingested, {skipped} skipped — \
+                 already-ingested files retained; new files still watched"
+            ))
+            .await;
+        tracing::info!(folder = %watch.name, %run_id, processed, skipped, "folder scan: cancelled");
+    } else {
+        reporter.complete().await;
+        // last_seen only advances after a clean, complete walk so a crash
+        // mid-scan re-scans the folder on next boot.
+        let _ = touch_last_seen(pool, watch.id).await;
+        tracing::info!(folder = %watch.name, %run_id, processed, skipped, "folder scan: completed");
+    }
+
+    // Clean terminal path: the scan wrote its own terminal row above, so disarm
+    // the guard (it drops the handle now, and will NOT spawn a `failed` write).
+    // The only way the guard stays armed is a panic before this point — its Drop
+    // then writes `failed` + drops the handle, so backfill_run never wedges at
+    // `running` and the folder never reads as live-scanning forever.
+    guard.finish().await;
+}
+
+/// Remove this scan's handle from the plane IF it is still the one registered for
+/// this run (a Stop or a re-register may have already removed/replaced it). Runs
+/// on every task exit — normal completion, cancellation, enumeration failure, or
+/// a panic — so a wedged task never leaves the folder reading as live-scanning
+/// forever.
+async fn drop_scan_handle(state: &AppState, tenant: TenantId, folder_id: Uuid, run_id: Uuid) {
+    let mut map = state.folder_scans.scans.lock().await;
+    if map
+        .get(&(tenant, folder_id))
+        .is_some_and(|h| h.run_id == run_id)
+    {
+        map.remove(&(tenant, folder_id));
+    }
+}
+
+/// Admit + spawn a supervised initial scan for `watch`, returning the minted
+/// run_id. Serialized under the plane's `admission` lock so two concurrent
+/// registers for the same folder can't both spawn (the second cooperatively
+/// supersedes the predecessor and replaces its handle). The `watch` is cloned
+/// into the task.
+async fn spawn_initial_scan(state: &Arc<AppState>, watch: &WatchRow) -> Uuid {
+    let _admit = state.folder_scans.admission.lock().await;
+    let run_id = Uuid::now_v7();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let task_state = Arc::clone(state);
+    let task_watch = clone_watch(watch);
+    let task_cancel = Arc::clone(&cancel);
+    let task = tokio::spawn(async move {
+        // Panic-safe supervision (finding: a panic mid-scan — e.g. a malformed
+        // file blowing up extraction — must NOT skip the terminal backfill_run
+        // write AND the handle cleanup, or the run wedges at `running` and the
+        // folder reads as live-scanning forever). A ScanCleanup guard is created
+        // ARMED; run_initial_scan disarms it on every clean terminal path
+        // (completed / paused / enumeration-failure). If the guard is still armed
+        // when dropped — the only remaining case is a panic — its Drop spawns the
+        // terminal `failed` write + handle removal.
+        let guard = ScanCleanup::new(
+            Arc::clone(&task_state),
+            task_watch.tenant_id,
+            task_watch.id,
+            run_id,
+            source_name(&task_watch.name),
+        );
+        run_initial_scan(task_state, task_watch, run_id, task_cancel, guard).await;
+    });
+
+    let mut map = state.folder_scans.scans.lock().await;
+    // A prior in-flight scan for this folder (a rapid re-register): supersede it
+    // COOPERATIVELY — set its cancel flag and let it drain to its OWN terminal
+    // `paused` row between files, exactly like the FolderScanPlane::cancel path.
+    // We deliberately do NOT abort() it: an abort drops the predecessor's task at
+    // its next await, and while its ScanCleanup guard would still reconcile a
+    // terminal `failed` row on drop, a hard abort can also cut a half-written
+    // ingest and races the flag it can't observe. The map entry is ALREADY
+    // replaced by the new run above, so the predecessor's own cleanup keys on its
+    // (now-superseded) run_id and can't disturb the new handle — status is honest
+    // immediately, and the old run reaches a real terminal state on its own.
+    if let Some(prev) = map.insert(
+        (watch.tenant_id, watch.id),
+        ScanHandle {
+            run_id,
+            cancel,
+            task,
+        },
+    ) {
+        prev.cancel.store(true, Ordering::SeqCst);
+        // `prev.task` is dropped here (JoinHandle drop just detaches; it does NOT
+        // abort), so the predecessor runs on to its cooperative `paused` terminal.
+        drop(prev.task);
+    }
+    run_id
+}
+
+/// Clone a WatchRow (arm_watch consumes one, the scan task needs its own).
+fn clone_watch(watch: &WatchRow) -> WatchRow {
+    WatchRow {
+        id: watch.id,
+        tenant_id: watch.tenant_id,
+        name: watch.name.clone(),
+        path: watch.path.clone(),
+        visibility: watch.visibility.clone(),
+        confidentiality: watch.confidentiality,
+        last_seen: watch.last_seen,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boot re-establishment: re-scan for missed files, then re-arm.
 // ---------------------------------------------------------------------------
 
@@ -501,6 +935,92 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The bounded pre-flight count of a folder: how many ingestable files and how
+/// many bytes it holds, and whether the count hit a cap (`capped = true` means
+/// "at least this many; the tree is bigger — we stopped counting"). Never an
+/// exact total on a large tree; that is the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FolderCount {
+    files: u64,
+    bytes: u64,
+    capped: bool,
+}
+
+/// Bounded, fail-closed pre-flight count of a folder — the guard the UI uses to
+/// decide whether to require an explicit "this is a big folder" confirm before
+/// starting the scan. A clone of the `collect_files` DFS, but: it only
+/// accumulates integers (never materializes the tree), it counts a file's bytes
+/// from the DirEntry metadata (skip-rules applied, same as ingest), and it trips
+/// `capped` + stops the moment either the entry cap ([`MAX_PREVIEW_ENTRIES`]) or
+/// the wall-clock budget ([`PREVIEW_BUDGET`]) is hit — so counting a 16 GB tree
+/// can never itself hang.
+///
+/// Fail-closed on the ROOT: unlike `collect_files` (which swallows every
+/// read_dir error), an unreadable ROOT is an `Err` the handler turns into an
+/// operator-facing refusal — a folder Verity can't enumerate must never register
+/// as a silent 0-file count. Interior unreadable subdirs are still skipped (they
+/// contribute nothing).
+fn count_folder_bounded(root: &Path) -> std::io::Result<FolderCount> {
+    let started = Instant::now();
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut visited = 0u64;
+    let mut capped = false;
+
+    // Fail closed on the root: it stat()s as a dir but must also be enumerable.
+    let root_entries = std::fs::read_dir(root)?;
+    let mut stack: Vec<Vec<PathBuf>> = vec![sorted_paths(root_entries)];
+
+    'walk: while let Some(level) = stack.last_mut() {
+        let Some(path) = level.pop() else {
+            stack.pop();
+            continue;
+        };
+        if visited >= MAX_PREVIEW_ENTRIES || started.elapsed() >= PREVIEW_BUDGET {
+            capped = true;
+            break 'walk;
+        }
+        visited += 1;
+        let Some(name) = file_name(&path) else {
+            continue;
+        };
+        if is_skippable(name) {
+            continue;
+        }
+        // DirEntry-free re-stat: use symlink-following metadata once per entry
+        // (same as ingest, which reads through symlinks). A missing/again-racing
+        // entry contributes nothing.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            // Interior unreadable subdirs are swallowed (they add nothing); only
+            // the ROOT read failure fails closed.
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                stack.push(sorted_paths(entries));
+            }
+        } else if meta.is_file() {
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+
+    Ok(FolderCount {
+        files,
+        bytes,
+        capped,
+    })
+}
+
+/// Collect + name-sort a read_dir into a reversed stack level so `pop()` yields
+/// entries in ascending name order (deterministic, matches collect_files).
+fn sorted_paths(entries: std::fs::ReadDir) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    paths.reverse();
+    paths
+}
+
 async fn load_active_watches(pool: &PgPool) -> sqlx::Result<Vec<WatchRow>> {
     let rows = sqlx::query(
         "SELECT id, tenant_id, name, path, visibility, confidentiality, last_seen
@@ -542,6 +1062,14 @@ pub(crate) struct AddFolderWatchRequest {
     visibility: Vec<PrincipalToken>,
     #[serde(default = "default_confidentiality")]
     confidentiality: Confidentiality,
+    /// Explicit "yes, read this big folder" ack. The server runs its OWN bounded
+    /// pre-flight count and REFUSES a big folder (over [`BIG_FOLDER_FILES`] /
+    /// [`BIG_FOLDER_BYTES`], or a capped count) unless this is `true` — so a raw
+    /// `curl` at `~/Downloads` can't silently ingest 2,111 files. The UI sets it
+    /// only after the operator confirms the big-folder dialog. Below threshold it
+    /// is irrelevant (the scan starts regardless).
+    #[serde(default)]
+    acknowledge_large: bool,
 }
 
 fn default_confidentiality() -> Confidentiality {
@@ -599,6 +1127,36 @@ pub(crate) async fn add_folder_watch(
         ));
     }
 
+    // Big-folder guard (SERVER-side, authoritative): before recording anything,
+    // run the SAME bounded pre-flight count the preview endpoint uses (offloaded
+    // to a blocking thread so the async runtime never stalls). Above threshold —
+    // or a capped count ("at least this many; the tree is bigger") — refuse
+    // unless the request explicitly acknowledged the size. This is the gate a raw
+    // `curl` at ~/Downloads hits: the client dialog is UX, this is the wall.
+    if !req.acknowledge_large {
+        let count_path = path.clone();
+        let count = tokio::task::spawn_blocking(move || count_folder_bounded(&count_path))
+            .await
+            .map_err(internal)?
+            .map_err(|e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("refusing: folder is not readable by the server: {e}"),
+                )
+            })?;
+        if count.capped || count.files > BIG_FOLDER_FILES || count.bytes > BIG_FOLDER_BYTES {
+            let approx = if count.capped { "at least " } else { "~" };
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "this folder has {approx}{} files ({approx}{} bytes) — Verity would read and \
+                     store their contents as memory; re-send with acknowledge_large=true to confirm",
+                    count.files, count.bytes
+                ),
+            ));
+        }
+    }
+
     // Fail-closed (SPEC §5e): the visibility tokens are the who-can-see-it
     // policy, materialized at setup. `[]` is a deliberate "nobody"; the field
     // itself is mandatory in the request shape. No permissive default.
@@ -645,29 +1203,31 @@ pub(crate) async fn add_folder_watch(
         last_seen: None,
     };
 
-    // Ingest files already present (the "drop first, then configure" and the
-    // seed-a-folder flows both land here), then arm the live watch.
-    let mut ingested = 0usize;
-    for file in collect_files(&path) {
-        match ingest_file(&state, &watch, &file).await {
-            Ok(true) => ingested += 1,
-            Ok(false) => {}
-            Err((status, msg)) => {
-                tracing::warn!(folder = %name, %status, "folder watch: initial ingest failed: {msg}");
-            }
-        }
-    }
-    let _ = touch_last_seen(state.pool(), effective_id).await;
-
-    // If a watch with this name was already armed, drop it before re-arming so
-    // we don't hold two OS watches for the same folder.
+    // REGISTER-FAST: arm the live OS watch for NEW files (fast — it only creates
+    // the debouncer + spawns the consumer, never scans existing files), then hand
+    // the walk-and-ingest of EXISTING files to a supervised background task and
+    // RETURN IMMEDIATELY. The handler must not block on the initial scan (the bug
+    // this fixes: a 2,111-file folder hung the request for minutes).
+    //
+    // If a watch with this name was already armed, drop it before re-arming so we
+    // don't hold two OS watches for the same folder.
     state.folder_watchers.remove(&effective_id).await;
-    if let Err(e) = arm_watch(Arc::clone(&state), watch).await {
+    if let Err(e) = arm_watch(Arc::clone(&state), clone_watch(&watch)).await {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("folder recorded but the live watch could not be armed: {e}"),
         ));
     }
+
+    // Kick off the background initial scan (existing files). It reports
+    // processed/total/skipped to backfill_run under `run_id` and reconciles a
+    // terminal state on finish; the UI polls GET /v1/admin/backfill on `run_id`.
+    // Double-ingest with the just-armed OS watcher is CHUNK-idempotent (content
+    // hash + stable doc id ⇒ the search index is never double-populated); it is
+    // not idempotent at the L0/telemetry layer (a second episode row, one extra
+    // items_synced/freshness sample). Cheap and non-corrupting, not literally a
+    // no-op — the overlap window is one settle interval.
+    let run_id = spawn_initial_scan(&state, &watch).await;
 
     Ok(Json(serde_json::json!({
         "folder_id": effective_id,
@@ -676,7 +1236,11 @@ pub(crate) async fn add_folder_watch(
         "visibility": visibility,
         "confidentiality": req.confidentiality,
         "created": created,
-        "initial_files_ingested": ingested,
+        // The scan of existing files runs in the background; the client tracks it
+        // via `run_id` against GET /v1/admin/backfill. No synchronous ingest count
+        // is returned any more — it would have meant blocking on the whole scan.
+        "run_id": run_id,
+        "scan": "started",
         "watching": true,
     })))
 }
@@ -786,6 +1350,107 @@ pub(crate) async fn stop_folder_watch(
 }
 
 // ---------------------------------------------------------------------------
+// HTTP: pre-flight preview (bounded count) + stop an in-flight initial scan.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct PreviewParams {
+    #[allow(dead_code)] // admitted for symmetry/audit; the count is path-only
+    tenant_id: TenantId,
+    path: String,
+}
+
+/// GET /v1/admin/folders/preview?tenant_id=&path= (admin): a BOUNDED pre-flight
+/// count of a folder — {files, bytes, capped} — so the UI can decide whether to
+/// require an explicit "this is a big folder" confirm before registering. The
+/// count is bounded ([`MAX_PREVIEW_ENTRIES`] / [`PREVIEW_BUDGET`]) so it never
+/// hangs on a huge tree; `capped = true` means "at least this many, bigger than
+/// we counted". Read-only (never creates the folder, unlike register). Fails
+/// closed on an unreadable path (a 422 refusal, never a false 0-file count).
+pub(crate) async fn preview_folder(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<PreviewParams>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+
+    let path = PathBuf::from(&p.path);
+    if !path.is_absolute() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("path must be absolute (server-local): {}", p.path),
+        ));
+    }
+    // Read-only: a non-existent path is "nothing to count" (NOT a mkdir side
+    // effect — register creates the inbox, preview must not).
+    if !path.exists() {
+        return Ok(Json(serde_json::json!({
+            "exists": false,
+            "files": 0,
+            "bytes": 0,
+            "capped": false,
+        })));
+    }
+    if !path.is_dir() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{} is not a directory", p.path),
+        ));
+    }
+
+    // The bounded walk uses std::fs (blocking); offload it so the async runtime
+    // never stalls for the (bounded) budget.
+    let count = tokio::task::spawn_blocking(move || count_folder_bounded(&path))
+        .await
+        .map_err(internal)?
+        .map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("refusing: folder is not readable by the server: {e}"),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "exists": true,
+        "files": count.files,
+        "bytes": count.bytes,
+        "capped": count.capped,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct StopScanRequest {
+    tenant_id: TenantId,
+    folder_id: Uuid,
+}
+
+/// POST /v1/admin/folders/scan/stop (admin): cancel an IN-PROGRESS initial scan
+/// cleanly. Cooperative — the task checks a cancel flag between files and exits
+/// after the current file, writing its own terminal `paused` row (so the strip
+/// flips to the honest stopped state). Already-ingested files STAY; the live
+/// OS-watch for new files is UNAFFECTED (this is not the steady-state watch-off,
+/// which is DELETE /v1/admin/folders/{id}). An unknown/finished scan is a
+/// truthful no-op (`stopped: false`).
+pub(crate) async fn stop_folder_scan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<StopScanRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let run_id = state
+        .folder_scans
+        .cancel(req.tenant_id, req.folder_id)
+        .await;
+    Ok(Json(serde_json::json!({
+        "folder_id": req.folder_id,
+        "stopped": run_id.is_some(),
+        "run_id": run_id,
+        // Explicit so the UI copy stays honest: nothing already ingested is lost.
+        "memory_retained": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -817,6 +1482,159 @@ mod tests {
     #[test]
     fn source_name_is_folder_prefixed() {
         assert_eq!(source_name("acme-drop"), "folder:acme-drop");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hermetic (no DSN, no server): the pure pre-flight-count + scan-plane
+    // primitives — bounded count caps, register-plane cancel flips state.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bounded_count_sums_files_and_bytes_below_cap() {
+        let dir = std::env::temp_dir().join(format!("verity-count-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), b"12345").expect("write a"); // 5 bytes
+        std::fs::write(dir.join("sub/b.txt"), b"678").expect("write b"); // 3 bytes
+        std::fs::write(dir.join(".hidden"), b"skipme").expect("write hidden"); // skipped
+        std::fs::write(dir.join("c.tmp"), b"tmp").expect("write tmp"); // skipped
+
+        let count = count_folder_bounded(&dir).expect("count");
+        assert_eq!(count.files, 2, "only the two non-skippable files count");
+        assert_eq!(count.bytes, 8, "bytes sum the two counted files");
+        assert!(!count.capped, "a tiny tree is not capped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_count_trips_capped_past_entry_cap() {
+        let dir = std::env::temp_dir().join(format!("verity-count-cap-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // MAX_PREVIEW_ENTRIES is 5000; write a few more than that so the walk
+        // must trip capped (empty files keep the test cheap).
+        for i in 0..(MAX_PREVIEW_ENTRIES + 50) {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"").expect("write");
+        }
+        let count = count_folder_bounded(&dir).expect("count");
+        assert!(
+            count.capped,
+            "a tree bigger than the entry cap must report capped"
+        );
+        assert!(
+            count.files <= MAX_PREVIEW_ENTRIES,
+            "the count stops at the entry cap, never walks the whole tree"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_count_fails_closed_on_unreadable_root() {
+        // A path that does not exist as a readable dir → Err (fail closed), not a
+        // silent 0-file count. (read_dir on a missing path errors.)
+        let missing = std::env::temp_dir().join(format!("verity-missing-{}", Uuid::now_v7()));
+        assert!(
+            count_folder_bounded(&missing).is_err(),
+            "an unreadable/absent root must be an Err, never a false 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_plane_cancel_flips_scanning_state() {
+        // Pure plane mechanics, no AppState: insert a live handle, prove cancel
+        // sets the flag, removes the handle (status no longer claims live), and
+        // returns the run_id; a second cancel is an honest no-op.
+        let plane = FolderScanPlane::new();
+        let tenant: TenantId = Uuid::now_v7();
+        let folder_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // A trivial task that just waits on the flag, so it is genuinely live.
+        let flag = Arc::clone(&cancel);
+        let task = tokio::spawn(async move {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        plane.scans.lock().await.insert(
+            (tenant, folder_id),
+            ScanHandle {
+                run_id,
+                cancel: Arc::clone(&cancel),
+                task,
+            },
+        );
+
+        assert!(
+            plane.is_scanning(tenant, folder_id).await,
+            "a registered scan reads as live"
+        );
+        let cancelled = plane.cancel(tenant, folder_id).await;
+        assert_eq!(cancelled, Some(run_id), "cancel returns the run_id");
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "cancel sets the cooperative flag the task checks"
+        );
+        assert!(
+            !plane.is_scanning(tenant, folder_id).await,
+            "after cancel the handle is gone — status no longer claims live"
+        );
+        // Second cancel: honest no-op.
+        assert_eq!(plane.cancel(tenant, folder_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn tracking_returns_before_scan_task_completes() {
+        // The register-fast contract: recording the scan handle returns while the
+        // scan task is STILL RUNNING — the caller (the HTTP handler) never blocks
+        // on the walk. Modeled on spawn_initial_scan's insert step: a task that
+        // parks until released, a handle recorded for it, and an assertion that we
+        // observe the live handle BEFORE the task has finished.
+        let plane = Arc::new(FolderScanPlane::new());
+        let tenant: TenantId = Uuid::now_v7();
+        let folder_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+
+        let release = Arc::new(AtomicBool::new(false));
+        let task_release = Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            // Simulates the still-in-flight scan of existing files.
+            while !task_release.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let handle = plane
+            .scans
+            .lock()
+            .await
+            .insert(
+                (tenant, folder_id),
+                ScanHandle {
+                    run_id,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    task,
+                },
+            )
+            .map(|_| ());
+        assert!(handle.is_none(), "first scan for a folder replaces nothing");
+
+        // We are HERE (analogous to the handler having returned its 200) while the
+        // scan task is provably not yet finished.
+        assert!(
+            plane.is_scanning(tenant, folder_id).await,
+            "the scan is tracked as live the instant registration returns"
+        );
+        {
+            let map = plane.scans.lock().await;
+            assert!(
+                !map.get(&(tenant, folder_id)).unwrap().task.is_finished(),
+                "register returned BEFORE the scan task ran to completion"
+            );
+        }
+
+        // Now let the task finish and clean up.
+        release.store(true, Ordering::SeqCst);
+        let _ = plane.cancel(tenant, folder_id).await;
     }
 
     // -----------------------------------------------------------------------
@@ -855,6 +1673,7 @@ mod tests {
             revocations: crate::revocation::RevocationPlane::new(300),
             watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
             folder_watchers: Arc::new(WatcherRegistry::new()),
+            folder_scans: Arc::new(FolderScanPlane::new()),
             knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
             directory: crate::directory_worker::DirectoryPlane::disabled(),
             connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),

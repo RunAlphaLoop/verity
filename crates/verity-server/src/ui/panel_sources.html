@@ -23,6 +23,21 @@
        • GET /v1/admin/connectors       — per-source connect readiness
          (Phase 1: prereq probes, two-tier worker verdict, last heartbeat)
 
+     Folder-onboarding fix: watching a folder no longer blocks the request on a
+     synchronous ingest of every existing file (the bug: a 2,111-file / 16 GB
+     folder hung the button for minutes with no feedback). The Start-watching
+     flow now (1) hits GET /v1/admin/folders/preview for a BOUNDED file/byte
+     count and, above a threshold, requires an explicit big-folder confirm; then
+     (2) POSTs /v1/admin/folders which returns FAST with a server-minted run_id
+     for a background initial scan; and (3) shows a LIVE progress strip (the same
+     backfill-strip idiom) keyed on that run_id, polling GET /v1/admin/backfill —
+     "watching · N / M files · K skipped" — with a Stop control
+     (POST /v1/admin/folders/scan/stop) that cancels the in-flight scan
+     cooperatively. The same live strip appears on the matching "Your sources"
+     folder row while its initial scan runs. The OS-watcher for NEW files, the
+     per-file ingest choke point, size caps, dotfile/temp skips and the empty-
+     visibility refusal are all unchanged.
+
      Connect section (Phase 3): the zero-credential local-folder watch stays
      the "fastest start"; each eligible source row now has an "Add / rotate
      credential" control opening a source-branched dialog, and gdrive/gmail rows

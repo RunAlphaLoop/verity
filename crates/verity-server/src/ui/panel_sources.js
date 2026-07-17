@@ -65,6 +65,20 @@
   // opens (destroyed/rebuilt each open so a stale tenant's names never linger).
   var folderViewersPicker = null;
   var pendingFolderStop = null; // { folder_id, source, path } for the stop dialog
+  // Folder-onboarding fix: the register body held between the pre-flight preview
+  // and the big-folder confirm (the actual register runs only on confirm — or
+  // immediately when the count is below the threshold).
+  var pendingFolderRegister = null; // { body, viewerNames, path, count }
+  // Live INITIAL-SCAN tracking, keyed by folder_id (folder scans are keyed on a
+  // server-minted run_id, but a folder can only have one in-flight scan at a
+  // time, so folder_id is the stable UI key). Each entry owns ONE setInterval
+  // whose handle lives here so it is cleared on terminal state, on Stop, on
+  // tenant switch, and on panel teardown — no leaked polling.
+  var folderScans = {}; // folder_id -> { run_id, folder_id, source, path, run, err, done, stopped, poll }
+  // Above EITHER of these the UI requires an explicit big-folder confirm before
+  // starting the scan (mirrors the server's own bounded pre-flight guard).
+  var BIG_FOLDER_FILES = 200;
+  var BIG_FOLDER_BYTES = 100 * 1024 * 1024; // 100 MB
   // Client-side only: sources minted this session that have not yet posted a
   // heartbeat or delivery. Labeled as client-side in the table — honest.
   var pendingLocal = [];
@@ -200,6 +214,18 @@ acl_policy:
   }
 
   function fmtCount(n) { return n == null ? "—" : String(n); }
+
+  // Human byte size for the big-folder confirm ("16.0 GB"). Never fabricated —
+  // fed only from the server's real (bounded) pre-flight byte count.
+  function fmtBytes(n) {
+    if (n == null) return "—";
+    var b = Number(n);
+    if (!(b >= 0)) return "—";
+    if (b < 1024) return b + " B";
+    var u = ["KB", "MB", "GB", "TB"], i = -1;
+    do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+    return (b < 10 ? b.toFixed(1) : Math.round(b)) + " " + u[i];
+  }
 
   // Operator-set alert threshold (ms) — display highlighting only.
   function targetMs() {
@@ -471,6 +497,20 @@ acl_policy:
           "</div>" +
         "</div></div>" +
 
+        /* ---- big-folder pre-flight confirm (folder-onboarding fix) ---- */
+        '<div class="dialog-backdrop" id="src-folder-big-dialog"><div class="dialog" style="max-width:600px">' +
+          "<h3>This is a big folder</h3>" +
+          '<div id="src-folder-big-summary"></div>' +
+          '<div class="note" style="margin-top:0">Verity will <b>read and store the contents of these files as memory</b>, ' +
+            "shared with exactly the keys you picked. It reads them in the background &mdash; you can watch progress and stop the scan at any point (already-read files stay). " +
+            "The count above is a bounded pre-flight estimate; a <span class=\"ref\">&ge;</span> prefix means the real folder is bigger than we stopped counting.</div>" +
+          '<div class="err" id="src-folder-big-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-folder-big-cancel">Cancel</button>' +
+            '<button class="danger" id="src-folder-big-go">Read &amp; store these files</button>' +
+          "</div>" +
+        "</div></div>" +
+
         /* ---- add / rotate a credential (Phase 2, source-branched) ---- */
         '<div class="dialog-backdrop" id="src-cred-dialog"><div class="dialog" style="max-width:640px">' +
           '<h3 id="src-cred-title">Add a credential</h3>' +
@@ -578,6 +618,8 @@ acl_policy:
       el("src-folder-stop-cancel").onclick = function () { V.dialog("src-folder-stop-dialog").close(); };
       el("src-folder-stop-go").onclick = stopFolder;
       el("src-folder-stop-word").oninput = reflectFolderStopTyped;
+      el("src-folder-big-cancel").onclick = function () { pendingFolderRegister = null; V.dialog("src-folder-big-dialog").close(); };
+      el("src-folder-big-go").onclick = confirmBigFolder;
 
       el("src-cred-cancel").onclick = closeCredDialog;
       el("src-cred-test").onclick = testCredential;
@@ -618,6 +660,8 @@ acl_policy:
     // interval outlives a screen that can't own a run (leaked-interval guard).
     stopAllBackfillPolls();
     backfillRuns = {};
+    stopAllFolderScanPolls();
+    folderScans = {};
     var live = el("src-backfill-live");
     if (live) live.innerHTML = "";
     el("src-state").innerHTML = V.stateChip("off", "no space");
@@ -641,6 +685,8 @@ acl_policy:
     if (tenantNow && tenant !== tenantNow) {
       stopAllBackfillPolls();
       backfillRuns = {};
+      stopAllFolderScanPolls();
+      folderScans = {};
       var live = el("src-backfill-live");
       if (live) live.innerHTML = "";
     }
@@ -905,6 +951,14 @@ acl_policy:
       var stopBtn = String(f.status || "").toLowerCase() === "stopped"
         ? '<span class="ref">stopped</span>'
         : '<button class="danger src-folder-stop" data-i="' + i + '">Stop&hellip;</button>';
+      // A live initial-scan strip (folder-onboarding fix): when this folder has
+      // a background scan tracked this session, it renders in a full-width row
+      // below, keyed on the folder_id — the same strip the dialog shows.
+      var fid = f.folder_id != null ? String(f.folder_id) : (f.id != null ? String(f.id) : "");
+      var scanRow = (fid && folderScans[fid])
+        ? '<tr class="src-folder-scan-holder"><td colspan="6" style="padding-top:0">' +
+            '<div id="src-folder-scan-row-' + V.esc(fid) + '"></div></td></tr>'
+        : "";
       return "<tr>" +
         '<td><b>' + V.esc(f.path || "(path not reported)") + "</b>" +
           (f.source ? '<div class="ref">' + V.esc(f.source) + "</div>" : "") + "</td>" +
@@ -914,7 +968,7 @@ acl_policy:
         '<td style="overflow-wrap:break-word;word-break:normal;max-width:320px">' +
           (notes.length ? notes.join("<br>") : '<span class="ref">&mdash;</span>') + "</td>" +
         "<td>" + stopBtn + "</td>" +
-      "</tr>";
+      "</tr>" + scanRow;
     }).join("");
 
     host.innerHTML =
@@ -929,6 +983,10 @@ acl_policy:
     Array.prototype.forEach.call(host.querySelectorAll(".src-folder-stop"), function (btn) {
       btn.onclick = function () { openFolderStopDialog(rows[Number(btn.getAttribute("data-i"))]); };
     });
+
+    // Paint any live initial-scan strips into their freshly-rendered row mounts
+    // (renderFolders just replaced the DOM, so the row div is empty until now).
+    Object.keys(folderScans).forEach(function (k) { renderFolderScan(k); });
   }
 
   /* ================================================ connect readiness */
@@ -1127,6 +1185,7 @@ acl_policy:
     V.clearErr("src-folder-err");
     el("src-folder-result").innerHTML = "";
     el("src-folder-go").disabled = false;
+    pendingFolderRegister = null;
     if (!el("src-folder-path").value.trim()) el("src-folder-path").value = "./verity-inbox";
     el("src-folder-conf").value = "";
     V.dialog("src-folder-dialog").open();
@@ -1147,6 +1206,14 @@ acl_policy:
     folderViewersPicker.load(tenantNow);
   }
 
+  // Start watching, in three honest steps (folder-onboarding fix):
+  //   1. hit GET /v1/admin/folders/preview for a BOUNDED file/byte count;
+  //   2. above a threshold, require an explicit big-folder confirm — otherwise
+  //      register straight away;
+  //   3. POST /v1/admin/folders (returns FAST with a run_id) and start the live
+  //      progress strip keyed on that run_id.
+  // The register no longer blocks on ingesting every existing file — that scan
+  // runs in the background on the server; here we only kick it off and watch it.
   async function addFolder() {
     V.clearErr("src-folder-err");
     el("src-folder-result").innerHTML = "";
@@ -1177,31 +1244,112 @@ acl_policy:
       visibility: viewers.map(function (v) { return v.token; }),
       confidentiality: conf,
     };
+    var viewerNames = viewers.map(function (v) { return v.principal; }).join(", ");
+    pendingFolderRegister = { body: body, viewerNames: viewerNames, path: path, count: null };
+
     var btn = el("src-folder-go");
     btn.disabled = true;
     try {
-      var res = await V.api("/v1/admin/folders", { json: body, admin: true });
-      var viewerNames = viewers.map(function (v) { return v.principal; }).join(", ");
-      el("src-folder-result").innerHTML =
-        '<div class="card" style="margin-top:12px;margin-bottom:0">' +
-          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-            V.stateChip("ok", "watching") +
-            '<span class="asof">' + V.esc(res.path || path) + "</span>" +
-          "</div>" +
-          '<div class="note" style="margin-top:8px"><b>Drop a file into this folder and it becomes memory.</b> ' +
-            "It will be shared with <b>" + V.esc(viewerNames) + "</b> and nobody wider. " +
-            "The folder appears in the list below &mdash; and in <b>Your sources</b> as " +
-            '<span class="ref">' + V.esc(res.source || "folder:…") + "</span> &mdash; the moment the first file lands." +
-            (res.created ? " Verity created the folder for you." : "") + "</div>" +
-        "</div>";
-      V.reload("sources");
+      // Bounded pre-flight count so a huge tree can't be silently ingested — and
+      // so the count itself never hangs (the server caps the walk). A preview
+      // failure (unreadable path / path-is-file) is a real refusal, surfaced
+      // verbatim; we do NOT register a folder the server can't read.
+      var pre = await V.api(
+        "/v1/admin/folders/preview?tenant_id=" + encodeURIComponent(tenantNow) +
+          "&path=" + encodeURIComponent(path),
+        { admin: true });
+      pendingFolderRegister.count = pre;
+      var files = pre && pre.files != null ? Number(pre.files) : 0;
+      var bytes = pre && pre.bytes != null ? Number(pre.bytes) : 0;
+      var big = files > BIG_FOLDER_FILES || bytes > BIG_FOLDER_BYTES ||
+        (pre && pre.capped); // capped => at least the cap; treat as big
+      if (big) {
+        // Hand off to the explicit confirm — the register runs only on confirm.
+        openBigFolderConfirm(pre);
+        btn.disabled = false;
+        return;
+      }
+      // Below threshold: proceed straight to a fast register + live strip.
+      await registerFolder();
+      // Re-enable so another folder can be added without reopening — the just-
+      // registered scan lives on independently in its own strip.
+      btn.disabled = false;
     } catch (e) {
       // Server refusals (empty visibility, unreadable path) surface verbatim —
       // the refusal is the product speaking, not an error to soften.
       V.err("src-folder-err", e);
-    } finally {
       btn.disabled = false;
     }
+  }
+
+  // The big-folder confirm: an EXPLICIT "this folder has ~N files (X) — Verity
+  // will read and store their contents as memory; continue?" gate. The register
+  // fires only when the operator confirms here.
+  function openBigFolderConfirm(count) {
+    V.clearErr("src-folder-big-err");
+    var files = count && count.files != null ? Number(count.files) : 0;
+    var bytes = count && count.bytes != null ? Number(count.bytes) : 0;
+    var ge = count && count.capped ? "&ge;&thinsp;" : "~";
+    el("src-folder-big-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>' +
+        V.esc((pendingFolderRegister && pendingFolderRegister.path) || "this folder") + "</b>" +
+        ' has ' + ge + "<b>" + V.esc(files) + "</b> file" + (files === 1 ? "" : "s") +
+        " (" + ge + "<b>" + V.esc(fmtBytes(bytes)) + "</b>)." +
+      "</div>";
+    el("src-folder-big-go").disabled = false;
+    V.dialog("src-folder-big-dialog").open();
+  }
+
+  async function confirmBigFolder() {
+    if (!pendingFolderRegister) { V.dialog("src-folder-big-dialog").close(); return; }
+    V.clearErr("src-folder-big-err");
+    var btn = el("src-folder-big-go");
+    btn.disabled = true;
+    try {
+      // The operator has confirmed the big folder — carry the explicit ack the
+      // server's own big-folder guard requires (below threshold this field is
+      // never set, so the guard only ever waves through a small folder silently).
+      pendingFolderRegister.body.acknowledge_large = true;
+      await registerFolder();
+      V.dialog("src-folder-big-dialog").close();
+    } catch (e) {
+      V.err("src-folder-big-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  // POST /v1/admin/folders — returns FAST with a server-minted run_id for the
+  // background initial scan. Renders the live strip in the dialog result and
+  // begins polling GET /v1/admin/backfill on that run_id. Throws on a server
+  // refusal so the caller can surface it in the right error slot.
+  async function registerFolder() {
+    if (!pendingFolderRegister) return;
+    var reg = pendingFolderRegister;
+    var res = await V.api("/v1/admin/folders", { json: reg.body, admin: true });
+    var source = (res && res.source) || "folder:…";
+    var folderId = res && res.folder_id;
+    el("src-folder-result").innerHTML =
+      '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+          V.stateChip("ok", "watching") +
+          '<span class="asof">' + V.esc((res && res.path) || reg.path) + "</span>" +
+        "</div>" +
+        '<div class="note" style="margin-top:8px"><b>Watching this folder.</b> ' +
+          "Existing files are being read in the background now; new files you drop in become memory too. " +
+          "Everything is shared with <b>" + V.esc(reg.viewerNames) + "</b> and nobody wider. " +
+          "The folder appears in <b>Your sources</b> as " +
+          '<span class="ref">' + V.esc(source) + "</span>." +
+          ((res && res.created) ? " Verity created the folder for you." : "") + "</div>" +
+        // The live initial-scan strip renders here, keyed on the run_id.
+        '<div id="src-folder-scan-' + V.esc(String(folderId)) + '"></div>' +
+      "</div>";
+    // Track the background initial scan (only when the server minted a run_id;
+    // an already-existing re-register still returns one).
+    if (folderId && res && res.run_id) {
+      startFolderScanTracking(folderId, source, reg.path, res.run_id);
+    }
+    pendingFolderRegister = null;
+    V.reload("sources");
   }
 
   function openFolderStopDialog(f) {
@@ -1239,6 +1387,225 @@ acl_policy:
     } catch (e) {
       V.err("src-folder-stop-err", e);
       btn.disabled = false;
+    }
+  }
+
+  /* ==================================== folder initial-scan live tracking */
+
+  // Begin (or restart) live tracking for one folder's background initial scan,
+  // keyed on the server-minted run_id. Clears any prior poll for the same
+  // folder first so a re-register never leaks an interval.
+  function startFolderScanTracking(folderId, source, path, runId) {
+    var key = String(folderId);
+    stopFolderScanPoll(key);
+    folderScans[key] = {
+      run_id: runId || null,
+      folder_id: folderId,
+      source: source,
+      path: path,
+      run: null,      // the matched GET row, once it lands
+      err: null,      // a poll error, surfaced (never hidden)
+      done: false,    // terminal (completed/failed/degraded_acl/paused) reached
+      stopped: false, // the operator cancelled the scan (terminal "paused")
+      poll: null,
+    };
+    renderFolderScan(key);
+    pollFolderScanOnce(key);
+    folderScans[key].poll = setInterval(function () { pollFolderScanOnce(key); }, 2000);
+  }
+
+  function stopFolderScanPoll(key) {
+    var r = folderScans[key];
+    if (r && r.poll) { clearInterval(r.poll); r.poll = null; }
+  }
+
+  // Clear every live folder-scan poll — called on panel teardown / no-tenant /
+  // tenant switch so no interval outlives the screen (leaked-interval guard).
+  function stopAllFolderScanPolls() {
+    Object.keys(folderScans).forEach(function (k) { stopFolderScanPoll(k); });
+  }
+
+  // A folder scan is terminal on the same completed/failed/degraded_acl the
+  // backfill strip uses, PLUS "paused" — the honest terminal an operator Stop
+  // lands as (already-ingested files retained).
+  function isFolderScanTerminal(state) {
+    var s = String(state || "").toLowerCase();
+    return s === "completed" || s === "failed" || s === "degraded_acl" || s === "paused";
+  }
+
+  async function pollFolderScanOnce(key) {
+    var r = folderScans[key];
+    if (!r) return;
+    try {
+      var rows = await V.api(
+        "/v1/admin/backfill?tenant_id=" + encodeURIComponent(tenantNow),
+        { admin: true });
+      var list = Array.isArray(rows) ? rows : [];
+      // Match on the SERVER-MINTED run_id so a different run never bleeds its
+      // telemetry into this strip.
+      var match = r.run_id
+        ? list.filter(function (x) { return x.run_id === r.run_id; })[0]
+        : null;
+      r.err = null;
+      if (match) {
+        r.run = match;
+        if (isFolderScanTerminal(match.state)) {
+          r.done = true;
+          if (String(match.state).toLowerCase() === "paused") r.stopped = true;
+          stopFolderScanPoll(key);
+          // Refresh so Your sources reflects the finished scan (file count, etc.).
+          V.reload("sources");
+        }
+      }
+      // No match yet: the scan may not have posted its first progress row. Keep
+      // polling; the strip shows "starting" until the run_id appears.
+    } catch (e) {
+      r.err = (e && e.message) || String(e);
+    }
+    renderFolderScan(key);
+  }
+
+  // The live progress strip for one folder's initial scan. Reuses the backfill
+  // strip idiom: exact bar when total is known, honest indeterminate + processed
+  // count otherwise, a Stop control while running, and a Dismiss once terminal.
+  // Rendered into BOTH the dialog result (id "src-folder-scan-<id>") and the Your
+  // sources folder row (id "src-folder-scan-row-<id>") when either exists.
+  function renderFolderScan(key) {
+    var r = folderScans[key];
+    if (!r) return;
+    var html = r ? folderScanStripHtml(r) : "";
+    ["src-folder-scan-" + key, "src-folder-scan-row-" + key].forEach(function (id) {
+      var host = document.getElementById(id);
+      if (host) {
+        host.innerHTML = html;
+        wireFolderScanStrip(host, key);
+      }
+    });
+  }
+
+  function folderScanStripHtml(r) {
+    var run = r.run;
+    var state = run ? String(run.state || "").toLowerCase() : "starting";
+    var processed = run ? (run.processed || 0) : 0;
+    var skipped = run ? (run.skipped || 0) : 0;
+    var total = run ? run.total : null;
+
+    var line, chip;
+    if (r.err) {
+      chip = V.stateChip("attn", "can't read progress");
+      line = '<span class="pct">' + V.esc(r.err) + "</span>";
+    } else if (!run) {
+      chip = V.stateChip("wait", "starting");
+      line = '<div class="bar indet"></div><span class="pct">reading existing files &mdash; waiting for the first progress report</span>';
+    } else if (state === "completed") {
+      chip = V.stateChip("ok", "watching");
+      line = '<div class="bar completed"><i style="width:100%"></i></div>' +
+        '<span class="pct">' + V.esc(processed) + " file" + (processed === 1 ? "" : "s") +
+        " ingested" + (skipped ? " · " + V.esc(skipped) + " skipped" : "") + "</span>";
+    } else if (state === "paused") {
+      chip = V.stateChip("off", "scan stopped");
+      line = '<div class="bar paused"><i style="width:100%"></i></div>' +
+        '<span class="pct">stopped after ' + V.esc(processed) + " file" + (processed === 1 ? "" : "s") +
+        " ingested" + (skipped ? " · " + V.esc(skipped) + " skipped" : "") + "</span>";
+    } else if (state === "failed") {
+      chip = V.stateChip("fail", "scan failed");
+      line = '<span class="pct">' + V.esc(processed) + " ingested before the scan failed" +
+        (skipped ? " · " + V.esc(skipped) + " skipped" : "") + "</span>";
+    } else if (state === "degraded_acl") {
+      chip = V.stateChip("attn", "watching · ACLs coarsened");
+      line = '<div class="bar completed"><i style="width:100%"></i></div>' +
+        '<span class="pct">' + V.esc(processed) + " ingested" +
+        (skipped ? " · " + V.esc(skipped) + " skipped" : "") + "</span>";
+    } else {
+      // running: "watching · N / M files · K skipped".
+      chip = V.stateChip("wait", "scanning");
+      if (total != null && total > 0) {
+        var pct = Math.max(0, Math.min(100, (processed / total) * 100));
+        line = '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+          '<span class="pct">watching &middot; ' + V.esc(processed) + " / " + V.esc(total) + " files" +
+          (skipped ? " · " + V.esc(skipped) + " skipped" : "") + "</span>";
+      } else {
+        line = '<div class="bar indet"></div>' +
+          '<span class="pct">watching &middot; ' + V.esc(processed) + " files" +
+          (skipped ? " · " + V.esc(skipped) + " skipped" : "") + " read so far</span>";
+      }
+    }
+
+    var tail;
+    if (state === "completed" || state === "degraded_acl") {
+      tail = '<div class="note" style="margin-top:8px">Watching &mdash; ' + V.esc(processed) +
+        " file" + (processed === 1 ? "" : "s") + " ingested; drop new files in and they become memory." +
+        (state === "degraded_acl" && run && run.error ? " (" + V.esc(run.error) + ")" : "") + "</div>";
+    } else if (state === "paused") {
+      tail = '<div class="note" style="margin-top:8px">Initial scan stopped &mdash; already-read files stay searchable, and Verity keeps watching for <b>new</b> files you drop in.</div>';
+    } else if (state === "failed") {
+      tail = '<div class="note" style="margin-top:8px">' + V.badge("scan failed", "b-conf-3") + " " +
+        (run && run.error ? '<span class="note" style="margin-top:0">' + V.esc(run.error) + "</span>" : "the initial scan exited abnormally — see the server log.") + "</div>";
+    } else if (!r.err) {
+      tail = '<div class="note" style="margin-top:8px">Reading existing files &mdash; this strip updates live and stops on its own when the scan drains. New files are watched regardless.</div>';
+    } else {
+      tail = "";
+    }
+
+    // A Stop control while the scan is in flight; a Dismiss once terminal.
+    var controls = "";
+    if (!r.done) {
+      controls = '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
+        '<button class="danger src-folder-scan-stop" data-key="' + V.esc(String(r.folder_id)) + '">Stop scan</button>' +
+        "</div>";
+    } else {
+      controls = '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
+        '<button class="src-folder-scan-dismiss" data-key="' + V.esc(String(r.folder_id)) + '">Dismiss</button>' +
+        "</div>";
+    }
+
+    return '<div style="margin-top:8px">' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        chip +
+        '<span class="ref" style="margin-left:auto">' +
+          (r.run_id ? "scan " + V.esc(r.run_id) : "run id pending") + "</span>" +
+      "</div>" +
+      '<div style="min-width:180px;margin-top:8px">' + line + "</div>" +
+      tail + controls +
+    "</div>";
+  }
+
+  function wireFolderScanStrip(host, key) {
+    Array.prototype.forEach.call(host.querySelectorAll(".src-folder-scan-stop"), function (btn) {
+      btn.onclick = function () { stopFolderScan(key); };
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-folder-scan-dismiss"), function (btn) {
+      btn.onclick = function () {
+        stopFolderScanPoll(key);
+        delete folderScans[key];
+        renderFolders();
+        var dlgHost = document.getElementById("src-folder-scan-" + key);
+        if (dlgHost) dlgHost.innerHTML = "";
+      };
+    });
+  }
+
+  // Cooperatively cancel an in-flight initial scan (POST
+  // /v1/admin/folders/scan/stop). Already-ingested files stay; the OS watch for
+  // NEW files is unaffected. The strip flips to the honest "paused" terminal on
+  // the next poll (or immediately if the server reports the run_id back).
+  async function stopFolderScan(key) {
+    var r = folderScans[key];
+    if (!r) return;
+    var btns = document.querySelectorAll('.src-folder-scan-stop[data-key="' + key + '"]');
+    Array.prototype.forEach.call(btns, function (b) { b.disabled = true; });
+    try {
+      await V.api("/v1/admin/folders/scan/stop", {
+        json: { tenant_id: tenantNow, folder_id: r.folder_id },
+        admin: true,
+      });
+      // The task writes its own terminal "paused" row; poll once now so the
+      // strip flips promptly instead of waiting the full interval.
+      await pollFolderScanOnce(key);
+    } catch (e) {
+      r.err = (e && e.message) || String(e);
+      renderFolderScan(key);
+      Array.prototype.forEach.call(btns, function (b) { b.disabled = false; });
     }
   }
 
