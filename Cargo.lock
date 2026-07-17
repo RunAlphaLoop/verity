@@ -4820,6 +4820,7 @@ dependencies = [
  "verity-encoder",
  "verity-manifest",
  "verity-storage",
+ "zeroize",
  "zip",
 ]
 
@@ -4830,6 +4831,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "chrono",
+ "hmac 0.12.1",
  "moka",
  "pgvector",
  "rand 0.9.4",

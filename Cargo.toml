@@ -48,6 +48,10 @@ object_store = { version = "0.14", features = ["aws"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# Secret-intake redaction (Phase 2): pasted connector secrets are wrapped in a
+# masking newtype that zeroizes its bytes on drop so key material never lingers
+# in freed memory. `zeroize_derive` is unused — we hand-roll Drop on the wrapper.
+zeroize = "1.9"
 rand_core = { version = "0.6", features = ["getrandom"] }
 ort = "2.0.0-rc.12"
 tokenizers = "0.23"

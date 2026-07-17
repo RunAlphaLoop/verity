@@ -244,6 +244,72 @@ pub trait StorageAdapter: Send + Sync {
     ) -> Result<()> {
         Err(unsupported("set_embedding_route"))
     }
+
+    // ---- Connector credential intake (SPEC §5e, Phase-2 secret intake) ----
+    //
+    // ALL crypto stays inside the storage profile: the trait surface is
+    // plaintext-in / decrypted-out; the AES-256-GCM envelope, the tenant DEK,
+    // and the salted-HMAC fingerprint are computed in the impl and never
+    // exposed here. Returns are only a fingerprint or a decrypted-on-demand
+    // value — the server never touches raw key material.
+
+    /// Store a tier-C bearer token (HubSpot/Salesforce) encrypted-at-rest under
+    /// the tenant DEK, returning its salted-HMAC fingerprint prefix. HARD-REFUSES
+    /// (never warn-and-store-plaintext) when `VERITY_KEK` is unset OR the tenant
+    /// DEK is plaintext-provenance (stored length <= 32) — a secret must not be
+    /// written against a DEK that isn't actually KEK-wrapped. Upsert on
+    /// (tenant, source): a second store rotates the secret in place.
+    async fn store_connector_bearer(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+        _plaintext: &[u8],
+    ) -> Result<String> {
+        Err(unsupported("store_connector_bearer"))
+    }
+
+    /// Store a tier-A Google SA-key file PATH (not a secret; no crypto),
+    /// returning its salted-HMAC fingerprint prefix. Upsert on (tenant, source).
+    async fn store_connector_path(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+        _path: &str,
+    ) -> Result<String> {
+        Err(unsupported("store_connector_path"))
+    }
+
+    /// Non-secret status of a stored credential (kind, fingerprint, updated_at),
+    /// or `None` when nothing is stored for (tenant, source). NEVER returns the
+    /// secret or the path plaintext.
+    async fn get_connector_credential_status(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+    ) -> Result<Option<ConnectorCredentialStatus>> {
+        Err(unsupported("get_connector_credential_status"))
+    }
+
+    /// Decrypt-on-demand read of a stored BEARER secret (Phase-3 spawn /
+    /// test-probe use). Decrypts under the tenant DEK — inherits the KEK-unset
+    /// fail-closed refusal for free. `None` when no bearer credential is stored;
+    /// an error when the row is a `path` kind (no secret to materialize).
+    async fn materialize_connector_bearer(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(unsupported("materialize_connector_bearer"))
+    }
+
+    /// Revoke a stored credential: deletes the (tenant, source) row. Returns
+    /// `true` when a row was removed, `false` for an honest no-op (nothing was
+    /// stored). Credentials are operator config, not memory — a hard delete here
+    /// does NOT violate the invalidate-don't-delete rule (which governs L0/L1
+    /// records).
+    async fn revoke_connector_credential(&self, _tenant: TenantId, _source: &str) -> Result<bool> {
+        Err(unsupported("revoke_connector_credential"))
+    }
 }
 
 fn unsupported(op: &str) -> StorageError {

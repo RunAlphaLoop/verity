@@ -59,6 +59,7 @@ async fn test_state(with_s3: bool) -> Option<(Arc<AppState>, TenantId)> {
         admin: AdminAuth {
             key: [0u8; 32],
             expected_tag: None, // dev mode: admin surfaces open
+            allowed_origin: None,
         },
         rebac: None,
         revocations: RevocationPlane::new(300),

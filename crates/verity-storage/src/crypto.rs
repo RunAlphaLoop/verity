@@ -25,12 +25,51 @@
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+use hmac::{Hmac, Mac};
 use rand_core::RngCore;
+use sha2::Sha256;
 
 use verity_core::types::{Result, StorageError};
 
 pub(crate) const DEK_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
+
+/// Salted-HMAC fingerprint prefix of a credential secret/path (Phase-2 secret
+/// intake). Keyed under `VERITY_SCOPE_KEY` (the same server signing key used
+/// for scope handles) so the digest is NOT a bare `sha256(plaintext)`
+/// confirmation oracle — an attacker who guesses the plaintext cannot confirm
+/// it without the key. When the key is unset a per-process ephemeral salt is
+/// used (fingerprints are non-portable across restarts, which is honest for a
+/// dev deployment). Returns a short hex prefix — never the full digest, never
+/// the plaintext.
+pub(crate) fn credential_fingerprint(material: &[u8]) -> String {
+    // Reuse the server's signing-key env so a fingerprint is stable across
+    // replicas of a real deployment; ephemeral otherwise (crypto.rs stays
+    // self-contained — it reads the env directly rather than importing the
+    // server's scope module).
+    let key: Vec<u8> =
+        match std::env::var("VERITY_SIGNING_KEY").or_else(|_| std::env::var("VERITY_SCOPE_KEY")) {
+            Ok(hex) if hex.trim().len() == 64 => (0..32)
+                .map(|i| u8::from_str_radix(&hex.trim()[i * 2..i * 2 + 2], 16).unwrap_or(0))
+                .collect(),
+            _ => {
+                let mut salt = [0u8; 32];
+                OsRng.fill_bytes(&mut salt);
+                salt.to_vec()
+            }
+        };
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("any key length works");
+    mac.update(b"verity-connector-credential:v1");
+    mac.update(material);
+    let digest = mac.finalize().into_bytes();
+    // Domain-tagged prefix so the UI can show `fp:<8 hex>` without ever
+    // approaching a length that would let it be a full-digest oracle.
+    let mut out = String::from("fp:");
+    for byte in digest.iter().take(6) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
 
 /// The deployment key-encryption key (SPEC §8a: "file-based in dev" — here,
 /// env-based; KMS wrapping is a cloud profile).

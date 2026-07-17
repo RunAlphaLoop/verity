@@ -108,6 +108,47 @@ pub(crate) fn spawn_fold_audit(
     });
 }
 
+/// Record a connector-credential lifecycle event (Phase-2 secret intake): a
+/// `credential.create` or `credential.revoke` on one (tenant, source). Actor is
+/// the admin secret-intake surface itself (`actor_azp = 'admin'`, no scope
+/// handle). The `query_summary` carries ONLY the source and the salted-HMAC
+/// `fingerprint` — NEVER the secret, never the token, never the path plaintext.
+/// Append-only and non-blocking, exactly like [`spawn_audit`].
+pub(crate) fn spawn_credential_audit(
+    state: &Arc<AppState>,
+    tenant_id: TenantId,
+    verb: &'static str,
+    source: &str,
+    fingerprint: &str,
+) {
+    let pool = state.pool().clone();
+    // Source + fingerprint only. The fingerprint is a salted-HMAC prefix, safe
+    // to persist; the secret itself is never in scope here.
+    let summary: String = format!("{source} fingerprint={fingerprint}")
+        .chars()
+        .take(120)
+        .collect();
+    tokio::spawn(async move {
+        let result = sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
+                                    entity_scope, confidentiality, query_summary, result_ids)
+             VALUES ($1, $2, NULL, 'admin', $3, $4, $5, 0, $6, $7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant_id)
+        .bind(verb)
+        .bind(Vec::<i32>::new())
+        .bind(Vec::<String>::new())
+        .bind(&summary)
+        .bind(Vec::<Uuid>::new())
+        .execute(&pool)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(verb, "credential audit insert failed: {e}");
+        }
+    });
+}
+
 #[derive(Deserialize)]
 pub(crate) struct AuditParams {
     tenant_id: TenantId,
