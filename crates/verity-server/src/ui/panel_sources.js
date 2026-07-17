@@ -81,6 +81,12 @@
   // picker for tier-C (rebuilt each open so a stale tenant never lingers).
   var pendingCred = null; // { source, label, kind, cls, subjectRequired, rotate }
   var credViewersPicker = null;
+  // Phase-3 backfill: the (source, label) being confirmed this open, and the
+  // live runs triggered this session keyed by source. Each active run owns ONE
+  // setInterval; the handle lives here so it is cleared on terminal state, on
+  // panel teardown, and before a same-source re-trigger — no leaked polling.
+  var pendingBackfill = null; // { source, label }
+  var backfillRuns = {};      // source -> { run_id, source, label, poll, run, err, done }
 
   function el(id) { return V.$(id); }
 
@@ -298,6 +304,10 @@ acl_policy:
             "You can now <b>add or rotate a credential</b> per source: CRM bearers are <b>encrypted at rest</b> under this space&rsquo;s key and the console keeps only a fingerprint &mdash; never the token; Google connectors store only the <b>path</b> to a service-account key file, never its contents. " +
             "Secret entry needs an admin token (it is refused unauthenticated); backfills still aren&rsquo;t triggered from here yet. " +
             "The one zero-credential path is the local folder above.</div>" +
+          // Live backfill strips (Phase 3): one per (source, run_id) triggered
+          // this session. Rendered by the poller, NOT by the table re-render, so
+          // an auto-refresh never wipes a run in flight.
+          '<div id="src-backfill-live"></div>' +
           '<div id="src-connect"></div>' +
         "</div>" +
 
@@ -509,6 +519,22 @@ acl_policy:
           "</div>" +
         "</div></div>" +
 
+        /* ---- run backfill (typed-tenant-NAME confirm · Phase 3) ---- */
+        '<div class="dialog-backdrop" id="src-backfill-dialog"><div class="dialog" style="max-width:600px">' +
+          '<h3 id="src-backfill-title">Run a catch-up import</h3>' +
+          '<div id="src-backfill-summary"></div>' +
+          '<div class="note" style="margin-top:0">This <b>replays this source&rsquo;s history</b> into Verity and writes <b>real memory</b> &mdash; ' +
+            "a bi-temporal write that is invalidated later, never un-written. It runs as a one-shot full crawl on the server. " +
+            "What it ingests is <b>not queryable the instant the bar turns green</b>: each item still has to resolve into entities behind the resolve debounce, so give it a moment after the crawl drains before you query or point an agent at it.</div>" +
+          '<div style="margin-top:12px"><label for="src-backfill-word">to confirm this write, type the space name <b id="src-backfill-name"></b> exactly</label>' +
+            '<input type="text" id="src-backfill-word" autocomplete="off" spellcheck="false"></div>' +
+          '<div class="err" id="src-backfill-err"></div>' +
+          '<div class="actions">' +
+            '<button id="src-backfill-cancel">Cancel</button>' +
+            '<button class="danger" id="src-backfill-go" disabled>Run backfill</button>' +
+          "</div>" +
+        "</div></div>" +
+
         /* ---- activate manifest (THE human gate) ---- */
         '<div class="dialog-backdrop" id="src-activate-dialog"><div class="dialog" style="max-width:600px">' +
           '<h3 id="src-activate-title">Approve &amp; activate</h3>' +
@@ -558,6 +584,10 @@ acl_policy:
       el("src-cred-go").onclick = saveCredential;
       el("src-cred-revoke").onclick = revokeCredential;
 
+      el("src-backfill-cancel").onclick = function () { V.dialog("src-backfill-dialog").close(); };
+      el("src-backfill-go").onclick = runBackfill;
+      el("src-backfill-word").oninput = reflectBackfillTyped;
+
       el("src-activate-cancel").onclick = function () { V.dialog("src-activate-dialog").close(); };
       el("src-activate-go").onclick = activateManifest;
       el("src-activate-word").oninput = reflectActivateTyped;
@@ -584,6 +614,12 @@ acl_policy:
   /* =========================================================== loading */
 
   function renderNoTenant() {
+    // No space selected: tear down every live poll and drop the strips so no
+    // interval outlives a screen that can't own a run (leaked-interval guard).
+    stopAllBackfillPolls();
+    backfillRuns = {};
+    var live = el("src-backfill-live");
+    if (live) live.innerHTML = "";
     el("src-state").innerHTML = V.stateChip("off", "no space");
     el("src-health").innerHTML =
       '<div class="empty-teach sp-a">' +
@@ -600,6 +636,14 @@ acl_policy:
   }
 
   async function refresh(tenant) {
+    // A space switch orphans any in-flight strips (a run belongs to the space it
+    // was triggered in) — tear their polls down before adopting the new tenant.
+    if (tenantNow && tenant !== tenantNow) {
+      stopAllBackfillPolls();
+      backfillRuns = {};
+      var live = el("src-backfill-live");
+      if (live) live.innerHTML = "";
+    }
     tenantNow = tenant;
     V.clearErr("src-err");
     el("src-hint").innerHTML = "";
@@ -680,6 +724,7 @@ acl_policy:
     el("src-asof").textContent = "checked " + new Date().toTimeString().slice(0, 8);
     renderFolders();
     renderConnectors();
+    renderBackfillLive();
     renderHealth();
     renderManifests();
     renderFreshness();
@@ -936,14 +981,35 @@ acl_policy:
     return chip + '<div class="ref" style="word-break:normal;overflow-wrap:break-word">' + words + "</div>";
   }
 
-  // The action cell obeys the no-dead-button rule: the ONLY live control is
-  // the zero-credential folder watch (the existing dialog). Everything else
-  // renders the server's own words — a failing prereq's fix hint verbatim,
-  // or the honest Phase-1 backfill note — never a button that would 404.
+  // The action cell obeys the no-dead-button rule: the live controls are the
+  // zero-credential folder watch, the Phase-2 credential dialog, and — Phase 3 —
+  // "Run backfill", ENABLED only when the server's own backfill.available is true
+  // (gdrive/gmail with a resolvable credential). When it is false the honest
+  // disabled state shows backfill.hint VERBATIM — never a button that would 4xx.
   // Which sources take a UI-entered credential (Phase 2). folder is
   // zero-credential; everything else in the registry does. Mirrors the server's
   // credential_class (folder => None, the rest => TierC/Google).
   function credEligible(source) { return source !== "folder"; }
+
+  // The backfill portion of the action cell (Phase 3). available => an enabled
+  // control that opens the typed-tenant-NAME confirm; else the server's hint
+  // verbatim as an honest disabled state (a dimmed, non-clickable button so the
+  // affordance reads the same, but it never fires). Never rendered for folder.
+  function connBackfillControl(c) {
+    var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
+    var bf = c.backfill || {};
+    var hint = bf.hint || "";
+    if (bf.available) {
+      return '<button class="primary src-conn-backfill" data-src="' + V.esc(c.source) + '" ' +
+        'title="POST /v1/admin/connectors/' + V.esc(c.source) + '/backfill — replays this source’s history into real memory">' +
+        "Run backfill&hellip;</button>" +
+        (hint ? "<br>" + proseRef + V.esc(hint) + "</span>" : "");
+    }
+    // Honest disabled state — the hint says exactly why, and there is no live
+    // button to click (fail-visible, never a dead trigger).
+    return '<button class="src-conn-backfill-off" disabled title="backfill is not available for this source yet">Run backfill&hellip;</button>' +
+      (hint ? "<br>" + proseRef + V.esc(hint) + "</span>" : "");
+  }
 
   function connActionCell(c) {
     var proseRef = '<span class="ref" style="word-break:normal;overflow-wrap:break-word">';
@@ -958,8 +1024,14 @@ acl_policy:
           "<br>" + proseRef + V.esc(String(q.hint || "")) + "</span>";
       }).join("<br>"));
     } else {
-      var hint = c.backfill && c.backfill.hint;
-      if (hint) parts.push(proseRef + V.esc(hint) + "</span>");
+      // gdrive/gmail carry the Run-backfill control (enabled or the honest
+      // disabled state). Every other source keeps its plain backfill note.
+      if (c.backfill && (c.backfill.available || String(c.source) === "gdrive" || String(c.source) === "gmail")) {
+        parts.push(connBackfillControl(c));
+      } else {
+        var hint = c.backfill && c.backfill.hint;
+        if (hint) parts.push(proseRef + V.esc(hint) + "</span>");
+      }
     }
     // Phase-2 credential control: add if none stored, rotate if one is. Rows
     // carry the source in data-src so the handler re-reads the fresh row.
@@ -1014,6 +1086,13 @@ acl_policy:
         var src = btn.getAttribute("data-src");
         var row = data.connectors.filter(function (x) { return x.source === src; })[0];
         if (row) openCredDialog(row);
+      };
+    });
+    Array.prototype.forEach.call(host.querySelectorAll(".src-conn-backfill"), function (btn) {
+      btn.onclick = function () {
+        var src = btn.getAttribute("data-src");
+        var row = data.connectors.filter(function (x) { return x.source === src; })[0];
+        if (row) openBackfillDialog(row);
       };
     });
   }
@@ -1451,6 +1530,213 @@ acl_policy:
     } finally {
       btn.disabled = false;
     }
+  }
+
+  /* ============================================ backfill (Phase 3) flow */
+
+  // The tenant NAME the confirm re-affirms. tenantName() resolves it from the
+  // directory; when absent (a real id not on the truncated page) we fall back to
+  // the id itself so the typed-confirm still has an exact token to match — never
+  // an empty string that would let a blank confirm through.
+  function confirmToken() {
+    var n = V.tenantName(tenantNow);
+    return (n && n.trim()) ? n : tenantNow;
+  }
+
+  function openBackfillDialog(row) {
+    if (!tenantNow) { V.openMint(); return; }
+    // Only gdrive/gmail with an available backfill reach an enabled button, but
+    // re-check here so a stale row can never open a doomed confirm.
+    if (!(row && row.backfill && row.backfill.available)) return;
+    pendingBackfill = { source: row.source, label: row.label || row.source };
+    V.clearErr("src-backfill-err");
+    var token = confirmToken();
+    el("src-backfill-title").textContent = "Run a catch-up import for " + pendingBackfill.label;
+    el("src-backfill-summary").innerHTML =
+      '<div class="dc-evidence" style="margin-top:0"><b>What you are running:</b> a full-crawl replay of <b>' +
+        V.esc(pendingBackfill.label) + "</b>&rsquo;s history into this space." +
+        '<div class="dc-meta" style="margin-top:6px">' + V.esc(pendingBackfill.source) +
+        " &middot; space " + V.esc(token) + "</div></div>";
+    el("src-backfill-name").textContent = token;
+    el("src-backfill-word").value = "";
+    el("src-backfill-go").disabled = true;
+    V.dialog("src-backfill-dialog").open();
+  }
+
+  function reflectBackfillTyped() {
+    el("src-backfill-go").disabled =
+      el("src-backfill-word").value.trim() !== confirmToken();
+  }
+
+  async function runBackfill() {
+    if (!pendingBackfill) return;
+    V.clearErr("src-backfill-err");
+    var source = pendingBackfill.source;
+    var label = pendingBackfill.label;
+    var btn = el("src-backfill-go");
+    btn.disabled = true;
+    try {
+      // No request body — the endpoint is admin-gated with the identity in the
+      // query string; POST is explicit since opts.json is absent (default GET).
+      var res = await V.api(
+        "/v1/admin/connectors/" + encodeURIComponent(source) +
+          "/backfill?tenant_id=" + encodeURIComponent(tenantNow),
+        { method: "POST", admin: true });
+      V.dialog("src-backfill-dialog").close();
+      pendingBackfill = null;
+      // Server-minted run_id — the poll keys on THIS run so it never renders
+      // another run's telemetry.
+      startBackfillTracking(source, label, res && res.run_id, res && res.pid);
+    } catch (e) {
+      // Server refusals verbatim — 409 (already running / source busy under
+      // another tenant), 422 (not wired / no key / no subject), 503 (spawn).
+      V.err("src-backfill-err", e);
+      btn.disabled = false;
+    }
+  }
+
+  // Begin (or restart) live tracking for one (source, run_id). Clears any prior
+  // poll for the same source first so a re-trigger never leaks an interval.
+  function startBackfillTracking(source, label, runId, pid) {
+    stopBackfillPoll(source);
+    backfillRuns[source] = {
+      run_id: runId || null,
+      source: source,
+      label: label,
+      pid: pid || null,
+      run: null,       // the matched GET row, once it lands
+      err: null,       // a poll error, surfaced (never hidden)
+      done: false,     // terminal (completed/failed) reached
+      poll: null,
+    };
+    renderBackfillLive();
+    pollBackfillOnce(source);
+    backfillRuns[source].poll = setInterval(function () { pollBackfillOnce(source); }, 2000);
+  }
+
+  function stopBackfillPoll(source) {
+    var r = backfillRuns[source];
+    if (r && r.poll) { clearInterval(r.poll); r.poll = null; }
+  }
+
+  // Clear every live poll — called on panel teardown / no-tenant so no interval
+  // outlives the screen (the leaked-interval guard).
+  function stopAllBackfillPolls() {
+    Object.keys(backfillRuns).forEach(function (s) { stopBackfillPoll(s); });
+  }
+
+  function isTerminal(state) {
+    var s = String(state || "").toLowerCase();
+    return s === "completed" || s === "failed";
+  }
+
+  async function pollBackfillOnce(source) {
+    var r = backfillRuns[source];
+    if (!r) return;
+    try {
+      var rows = await V.api(
+        "/v1/admin/backfill?tenant_id=" + encodeURIComponent(tenantNow),
+        { admin: true });
+      var list = Array.isArray(rows) ? rows : [];
+      // Match on the SERVER-MINTED run_id — NOT just the source — so a different
+      // run for the same source never bleeds its telemetry into this strip.
+      var match = r.run_id
+        ? list.filter(function (x) { return x.run_id === r.run_id; })[0]
+        : null;
+      r.err = null;
+      if (match) {
+        r.run = match;
+        if (isTerminal(match.state)) {
+          r.done = true;
+          stopBackfillPoll(source);
+          // The terminal state is authoritative because the server's child-exit
+          // reap reconciles backfill_run (completed on exit 0; failed + code +
+          // log tail otherwise) — so a SIGKILL/OOM/dropped-telemetry child still
+          // resolves here instead of hanging. Refresh the panel so the connectors
+          // table + catch-up table reflect the finished run.
+          V.reload("sources");
+        }
+      }
+      // No match yet: the child may not have posted its first progress row. Keep
+      // polling; the strip shows "starting" until the run_id appears.
+    } catch (e) {
+      r.err = (e && e.message) || String(e);
+    }
+    renderBackfillLive();
+  }
+
+  // Render the live strips from backfillRuns — driven by the poller, never wiped
+  // by a table re-render. Exact bar when total is known; honest indeterminate +
+  // processed count otherwise. On completion: "ingested — becoming queryable
+  // (~resolve debounce)", NOT "done, query now".
+  function renderBackfillLive() {
+    var host = el("src-backfill-live");
+    if (!host) return;
+    var sources = Object.keys(backfillRuns);
+    if (!sources.length) { host.innerHTML = ""; return; }
+    host.innerHTML = sources.map(function (s) {
+      var r = backfillRuns[s];
+      var run = r.run;
+      var state = run ? String(run.state || "").toLowerCase() : "starting";
+      var chip, progress, tail;
+
+      if (r.err) {
+        chip = V.stateChip("attn", "can't read progress");
+        progress = '<span class="pct">' + V.esc(r.err) + "</span>";
+      } else if (!run) {
+        chip = V.stateChip("wait", "starting");
+        progress = '<div class="bar indet"></div><span class="pct">spawned' +
+          (r.pid ? " (pid " + V.esc(r.pid) + ")" : "") + " &mdash; waiting for the first progress report</span>";
+      } else {
+        chip = backfillChip(run.state);
+        progress = progressCell(run);
+      }
+
+      if (state === "completed") {
+        // HONESTY: the green bar means the crawl DRAINED, not that the data is
+        // queryable. Entities still resolve async behind the resolve debounce —
+        // the CTA gates on that, never on the bar.
+        tail = '<div class="note" style="margin-top:8px">' +
+          V.stateChip("ok", "ingested") +
+          " &mdash; <b>becoming queryable</b> (~resolve debounce). The crawl drained; each item is still resolving into entities, " +
+          "so give it a moment before you query this source or point an agent at it.</div>";
+      } else if (state === "failed") {
+        tail = '<div class="note" style="margin-top:8px">' + V.badge("failed", "b-conf-3") + " " +
+          (run && run.error
+            ? '<span class="note" style="margin-top:0">' + V.esc(run.error) + "</span>"
+            : "the backfill exited non-zero — see the connector log on the server (ingest/" + V.esc(s) + ".log).") +
+          "</div>";
+      } else if (!r.err) {
+        tail = '<div class="note" style="margin-top:8px">Replaying history &mdash; this strip updates live and stops on its own when the crawl drains.</div>';
+      } else {
+        tail = "";
+      }
+
+      return '<div class="card" style="margin-top:12px;margin-bottom:0">' +
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+          chip +
+          "<b>" + V.esc(r.label) + "</b>" +
+          '<span class="ref" style="margin-left:auto">' +
+            (r.run_id ? "run " + V.esc(r.run_id) : "run id pending") + "</span>" +
+        "</div>" +
+        '<div style="min-width:180px;margin-top:8px">' + progress + "</div>" +
+        tail +
+        (r.done
+          ? '<div class="actions" style="justify-content:flex-start;margin-top:8px">' +
+              '<button class="src-backfill-dismiss" data-src="' + V.esc(s) + '">Dismiss</button>' +
+            "</div>"
+          : "") +
+      "</div>";
+    }).join("");
+
+    Array.prototype.forEach.call(host.querySelectorAll(".src-backfill-dismiss"), function (btn) {
+      btn.onclick = function () {
+        var s = btn.getAttribute("data-src");
+        stopBackfillPoll(s);
+        delete backfillRuns[s];
+        renderBackfillLive();
+      };
+    });
   }
 
   /* =========================================================== manifests */

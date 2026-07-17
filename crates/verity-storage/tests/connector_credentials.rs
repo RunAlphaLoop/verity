@@ -236,8 +236,9 @@ async fn path_store_status_and_no_bearer_materialize() {
         return;
     };
     let path = "/etc/verity/creds/sa-key.json";
+    let subject = "admin@example.com";
     let fingerprint = adapter
-        .store_connector_path(tenant, "gdrive", path)
+        .store_connector_path(tenant, "gdrive", path, Some(subject))
         .await
         .expect("path store needs no KEK");
     assert!(fingerprint.starts_with("fp:"));
@@ -249,6 +250,8 @@ async fn path_store_status_and_no_bearer_materialize() {
         .expect("path status present");
     assert_eq!(status.kind, ConnectorCredentialKind::Path);
     assert_eq!(status.fingerprint, fingerprint);
+    // Phase-3: the non-secret DWD subject round-trips through the store.
+    assert_eq!(status.subject.as_deref(), Some(subject));
 
     // At rest: path present verbatim, ciphertext NULL.
     let row = sqlx::query_as::<_, (Option<Vec<u8>>, Option<String>)>(

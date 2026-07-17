@@ -445,20 +445,23 @@ impl PostgresAdapter {
         tenant: TenantId,
         source: &str,
         path: &str,
+        subject: Option<&str>,
     ) -> Result<String> {
         let fingerprint = crate::crypto::credential_fingerprint(path.as_bytes());
         sqlx::query(
             "INSERT INTO connector_credentials
-                 (tenant_id, source, kind, ciphertext, path, fingerprint, updated_at)
-             VALUES ($1, $2, 'path', NULL, $3, $4, now())
+                 (tenant_id, source, kind, ciphertext, path, subject, fingerprint, updated_at)
+             VALUES ($1, $2, 'path', NULL, $3, $4, $5, now())
              ON CONFLICT (tenant_id, source) DO UPDATE
                  SET kind = 'path', ciphertext = NULL,
-                     path = EXCLUDED.path, fingerprint = EXCLUDED.fingerprint,
+                     path = EXCLUDED.path, subject = EXCLUDED.subject,
+                     fingerprint = EXCLUDED.fingerprint,
                      updated_at = now()",
         )
         .bind(tenant)
         .bind(source)
         .bind(path)
+        .bind(subject)
         .bind(&fingerprint)
         .execute(&self.pool)
         .await
@@ -474,7 +477,7 @@ impl PostgresAdapter {
         source: &str,
     ) -> Result<Option<ConnectorCredentialStatus>> {
         let row = sqlx::query(
-            "SELECT kind, fingerprint, updated_at FROM connector_credentials
+            "SELECT kind, fingerprint, subject, updated_at FROM connector_credentials
              WHERE tenant_id = $1 AND source = $2",
         )
         .bind(tenant)
@@ -496,7 +499,38 @@ impl PostgresAdapter {
         Ok(Some(ConnectorCredentialStatus {
             kind,
             fingerprint: row.try_get("fingerprint").map_err(db_err)?,
+            subject: row.try_get("subject").map_err(db_err)?,
             updated_at: row.try_get("updated_at").map_err(db_err)?,
+        }))
+    }
+
+    /// Read back a stored Google `path` credential (path plaintext + subject) for
+    /// a Phase-3 backfill spawn. See [`StorageAdapter::materialize_connector_path`].
+    pub async fn materialize_connector_path_impl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorPathCredential>> {
+        let row = sqlx::query(
+            "SELECT kind, path, subject FROM connector_credentials
+             WHERE tenant_id = $1 AND source = $2",
+        )
+        .bind(tenant)
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let kind: String = row.try_get("kind").map_err(db_err)?;
+        if kind != "path" {
+            return Err(StorageError::InvalidInput(format!(
+                "connector credential for source {source:?} is a {kind} credential, \
+                 not a path — no SA-key path to materialize"
+            )));
+        }
+        Ok(Some(ConnectorPathCredential {
+            path: row.try_get("path").map_err(db_err)?,
+            subject: row.try_get("subject").map_err(db_err)?,
         }))
     }
 
@@ -4057,8 +4091,10 @@ impl StorageAdapter for PostgresAdapter {
         tenant: TenantId,
         source: &str,
         path: &str,
+        subject: Option<&str>,
     ) -> Result<String> {
-        self.store_connector_path_impl(tenant, source, path).await
+        self.store_connector_path_impl(tenant, source, path, subject)
+            .await
     }
 
     async fn get_connector_credential_status(
@@ -4068,6 +4104,14 @@ impl StorageAdapter for PostgresAdapter {
     ) -> Result<Option<ConnectorCredentialStatus>> {
         self.get_connector_credential_status_impl(tenant, source)
             .await
+    }
+
+    async fn materialize_connector_path(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorPathCredential>> {
+        self.materialize_connector_path_impl(tenant, source).await
     }
 
     async fn materialize_connector_bearer(

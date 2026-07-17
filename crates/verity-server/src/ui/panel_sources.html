@@ -23,6 +23,19 @@
        • GET /v1/admin/connectors       — per-source connect readiness
          (Phase 1: prereq probes, two-tier worker verdict, last heartbeat)
 
+     Connect section (Phase 3): the zero-credential local-folder watch stays
+     the "fastest start"; each eligible source row now has an "Add / rotate
+     credential" control opening a source-branched dialog, and gdrive/gmail rows
+     whose server reports backfill.available carry a live "Run backfill" control.
+     Triggering replays the source's history and writes REAL memory; a
+     typed-tenant-NAME confirm re-affirms identity at that irreversible
+     bi-temporal write, and a live progress strip polls GET /v1/admin/backfill on
+     the SERVER-MINTED run_id. On child-exit completion the strip says
+     "ingested — becoming queryable (~resolve debounce)", never "done, query now"
+     — the green bar means crawl-drained, not resolved. A source without
+     backfill.available keeps its honest disabled state showing backfill.hint
+     verbatim, never a button that 4xxs.
+
      Connect section (Phase 2): the zero-credential local-folder watch stays
      the "fastest start"; each eligible source row now has an "Add / rotate
      credential" control opening a source-branched dialog. tier-C (HubSpot/
