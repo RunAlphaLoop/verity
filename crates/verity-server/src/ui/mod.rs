@@ -106,7 +106,10 @@ const UI_STYLE: &str = concat!(
 
 const UI_SCRIPTS: &str = concat!(
     // ---- scripts: core first (defines Verity registry), then panels ----
-    "<script>\n",
+    // The `__CSP_NONCE__` placeholder is replaced per-request in `ui_page` with a
+    // fresh random nonce that the Content-Security-Policy header pins, so ONLY
+    // this block executes — an injected <script> without the nonce is refused.
+    "<script nonce=\"__CSP_NONCE__\">\n",
     include_str!("core.js"),
     "\n",
     // ---- panel JS fragments — APPEND ONE LINE PER PANEL ----
@@ -188,8 +191,74 @@ fn assembled_body() -> &'static str {
 /// upgrade (found 2026-07-11: a rebuilt server, a reloaded tab, and a stale
 /// bundle running against the new API). One header keeps the no-skew promise
 /// true; the page is a single local response, so there is nothing to cache.
-pub(crate) async fn ui_page() -> ([(header::HeaderName, &'static str); 1], Html<String>) {
-    let page = format!(
+pub(crate) async fn ui_page() -> (axum::http::HeaderMap, Html<String>) {
+    let nonce = gen_csp_nonce();
+    let page = page_html(&nonce);
+
+    // Content-Security-Policy: script-src is nonce-only (no 'unsafe-inline',
+    // no 'unsafe-eval') — the single highest-value control, because it stops an
+    // injected/XSS <script> from executing at all, which is what would otherwise
+    // read the admin bearer out of sessionStorage or drive the credential-paste
+    // endpoint. style-src keeps 'unsafe-inline' (the console has ~788 inline
+    // style="" attributes that cannot carry a nonce; injected CSS cannot run
+    // JS, a deliberate low-risk tradeoff). The page is fully self-contained
+    // (default-src 'self'), so everything else is locked to same-origin, and
+    // frame-ancestors 'none' blocks clickjacking of the console.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_str(&csp_header_value(&nonce))
+            .expect("CSP header value is ASCII"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    (headers, Html(page))
+}
+
+/// A fresh, unpredictable per-request CSP nonce (128 bits from the OS CSPRNG,
+/// hex-encoded). Unpredictability is load-bearing: a guessable nonce would let
+/// an injected script carry it and execute.
+fn gen_csp_nonce() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The CSP header value for a given nonce. Pure so it is unit-testable.
+fn csp_header_value(nonce: &str) -> String {
+    format!(
+        "default-src 'self'; \
+         script-src 'nonce-{nonce}'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self'; \
+         object-src 'none'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'; \
+         form-action 'self'"
+    )
+}
+
+/// The full page with every `__CSP_NONCE__` placeholder (the two inline
+/// `<script>` tags) replaced by `nonce`. Pure so it is unit-testable.
+fn page_html(nonce: &str) -> String {
+    format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -198,8 +267,8 @@ pub(crate) async fn ui_page() -> ([(header::HeaderName, &'static str); 1], Html<
          </head>\n<body data-build-hash=\"{hash}\">\n{body}</body>\n</html>\n",
         hash = BUILD_HASH,
         body = assembled_body(),
-    );
-    ([(header::CACHE_CONTROL, "no-store")], Html(page))
+    )
+    .replace("__CSP_NONCE__", nonce)
 }
 
 #[cfg(test)]
@@ -243,5 +312,81 @@ mod tests {
                  it would paint off-screen below the rail"
             );
         }
+    }
+
+    /// script-src must be nonce-only: no 'unsafe-inline' / 'unsafe-eval' can
+    /// creep in, or the whole point (an injected <script> cannot run) is lost.
+    #[test]
+    fn csp_script_src_is_nonce_only() {
+        let csp = csp_header_value("deadbeef");
+        assert!(
+            csp.contains("script-src 'nonce-deadbeef'"),
+            "script-src not nonce-based: {csp}"
+        );
+        // Isolate the script-src directive and prove it carries no inline/eval escape.
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src"))
+            .expect("script-src present");
+        assert!(
+            !script_src.contains("unsafe-inline"),
+            "script-src allows unsafe-inline: {script_src}"
+        );
+        assert!(
+            !script_src.contains("unsafe-eval"),
+            "script-src allows unsafe-eval: {script_src}"
+        );
+        // The console has zero external script origins — nonce is the only source.
+        assert!(
+            !script_src.contains("http"),
+            "script-src allows an external origin: {script_src}"
+        );
+        // Clickjacking + MIME-sniffing hardening travel with it.
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "missing frame-ancestors: {csp}"
+        );
+        assert!(
+            csp.contains("object-src 'none'"),
+            "missing object-src: {csp}"
+        );
+    }
+
+    /// EVERY inline <script> in the served page must carry the request nonce.
+    /// A single un-nonced block would be BLOCKED by the CSP — a blank/broken
+    /// console — so this guards both the security AND the console loading.
+    #[test]
+    fn every_inline_script_carries_the_nonce() {
+        let nonce = "nonce123abc";
+        let page = page_html(nonce);
+        let total = page.matches("<script").count();
+        let nonced = page.matches(&format!("<script nonce=\"{nonce}\"")).count();
+        assert!(
+            total >= 2,
+            "expected the two inline script blocks, found {total}"
+        );
+        assert_eq!(
+            total,
+            nonced,
+            "{} of {} <script> tags are un-nonced — CSP would blank the console",
+            total - nonced,
+            total
+        );
+        // The placeholder must be fully substituted (none left to leak un-nonced).
+        assert!(
+            !page.contains("__CSP_NONCE__"),
+            "an unreplaced CSP nonce placeholder remains"
+        );
+    }
+
+    /// The nonce is fresh per request (unpredictable) and 128 bits.
+    #[test]
+    fn nonce_is_fresh_and_128_bits() {
+        let a = gen_csp_nonce();
+        let b = gen_csp_nonce();
+        assert_eq!(a.len(), 32, "expected 16 bytes hex-encoded");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two nonces collided — not random per request");
     }
 }
