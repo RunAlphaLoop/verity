@@ -1787,11 +1787,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.backfill:
         # A backfill is a one-shot job, not a loop. Dry runs have no server to
         # report to, so the reporter is omitted (its posts would no-op anyway).
+        # A server-triggered backfill pre-mints the run_id and passes it via
+        # VERITY_BACKFILL_RUN_ID so the console panel can poll GET
+        # /v1/admin/backfill keyed on THIS run; a CLI backfill leaves it unset and
+        # the reporter self-mints (uuid4).
+        run_id = os.environ.get("VERITY_BACKFILL_RUN_ID") or None
         reporter = (
             None
             if args.dry_run
             else BackfillReporter(
-                args.verity_url, config.tenant_id, connector.name, api_key=api_key
+                args.verity_url,
+                config.tenant_id,
+                connector.name,
+                api_key=api_key,
+                run_id=run_id,
             )
         )
         delivered = run_backfill(connector, registry, sink, reporter, fact_sink=fact_sink)

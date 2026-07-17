@@ -60,6 +60,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         folder_watchers: std::sync::Arc::new(crate::folder_watch::WatcherRegistry::new()),
         knowledge_worker: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         directory: crate::directory_worker::DirectoryPlane::disabled(),
+        connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,

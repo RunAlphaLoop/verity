@@ -41,7 +41,26 @@ pub struct ConnectorCredentialStatus {
     pub kind: ConnectorCredentialKind,
     /// Salted-HMAC prefix of the secret/path (VERITY_SCOPE_KEY) — safe to echo.
     pub fingerprint: String,
+    /// Non-secret domain-wide-delegation impersonation subject (Workspace admin
+    /// address) for a Google `path` credential, resolved at Phase-3 spawn time
+    /// for `--subject`. `None` for bearer credentials and for path rows with no
+    /// subject (e.g. a gdrive service account granted directly on shared
+    /// drives). Not a secret — safe to surface, unlike the path/ciphertext.
+    pub subject: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A resolved Google `path` credential read back for a Phase-3 backfill spawn:
+/// the SA-key file PATH plaintext (needed to set `GOOGLE_APPLICATION_CREDENTIALS`
+/// on the child) plus the non-secret impersonation `subject` (for `--subject`).
+/// Unlike [`ConnectorCredentialStatus`] this DOES surface the path — it is the
+/// spawn-side read, only ever handed to the child's env, never logged/echoed to
+/// a client. `None` from `materialize_connector_path` when nothing is stored, or
+/// an error when the stored row is a `bearer` kind (no path to materialize).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorPathCredential {
+    pub path: String,
+    pub subject: Option<String>,
 }
 
 /// A materialized principal token: the unit of visibility. Every chunk carries

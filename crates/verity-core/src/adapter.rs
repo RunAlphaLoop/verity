@@ -270,11 +270,16 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Store a tier-A Google SA-key file PATH (not a secret; no crypto),
     /// returning its salted-HMAC fingerprint prefix. Upsert on (tenant, source).
+    /// `subject` is the non-secret domain-wide-delegation impersonation address
+    /// (a Workspace admin) resolved at spawn time for `--subject`; `None` when
+    /// unset (gdrive may omit it, gmail requires it). The fingerprint covers the
+    /// path bytes only — the subject does not alter it.
     async fn store_connector_path(
         &self,
         _tenant: TenantId,
         _source: &str,
         _path: &str,
+        _subject: Option<&str>,
     ) -> Result<String> {
         Err(unsupported("store_connector_path"))
     }
@@ -288,6 +293,21 @@ pub trait StorageAdapter: Send + Sync {
         _source: &str,
     ) -> Result<Option<ConnectorCredentialStatus>> {
         Err(unsupported("get_connector_credential_status"))
+    }
+
+    /// Read back a stored Google `path` credential for a Phase-3 backfill spawn:
+    /// the SA-key file PATH plaintext + the non-secret impersonation subject.
+    /// Unlike `get_connector_credential_status` this DOES surface the path (the
+    /// spawn needs it for `GOOGLE_APPLICATION_CREDENTIALS`); the caller hands it
+    /// only to the child's env, never to a client. `None` when nothing is stored
+    /// for (tenant, source); an error when the stored row is a `bearer` kind (no
+    /// path to materialize).
+    async fn materialize_connector_path(
+        &self,
+        _tenant: TenantId,
+        _source: &str,
+    ) -> Result<Option<ConnectorPathCredential>> {
+        Err(unsupported("materialize_connector_path"))
     }
 
     /// Decrypt-on-demand read of a stored BEARER secret (Phase-3 spawn /

@@ -8,6 +8,12 @@
 mod audit;
 mod backfill;
 mod compliance;
+// Phase-3 backfill worker module. Its public surface (start/stop/status +
+// argv assembly) is consumed by the connector backfill endpoint + panel, wired
+// in a sibling task; allow dead_code until that lands so this module lands
+// self-contained with its own hermetic tests.
+#[allow(dead_code)]
+mod connector_worker;
 mod connectors;
 mod connectors_admin;
 #[cfg(test)]
@@ -420,6 +426,13 @@ pub(crate) struct AppState {
     /// `--directory` flag routes through the server start endpoint, never a
     /// second child. See directory_worker::DirectoryPlane.
     pub(crate) directory: directory_worker::DirectoryPlane,
+    /// Console-triggered per-(tenant, source) ONE-SHOT backfill plane (Phase 3):
+    /// the owner map keyed on (tenant, source) + the env SA-key fallback. Only
+    /// gdrive/gmail are spawnable; callers gate. Wrapped in `Arc` so the detached
+    /// completion reap can clone the plane to clear its own entry on child exit.
+    /// See connector_worker::ConnectorPlane.
+    #[allow(dead_code)]
+    pub(crate) connectors: Arc<connector_worker::ConnectorPlane>,
 }
 
 impl AppState {
@@ -936,7 +949,7 @@ async fn knowledge_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_j
 }
 
 /// The base-url the spawned worker should call back on, derived from `--listen`.
-fn worker_base_url(listen: &str) -> String {
+pub(crate) fn worker_base_url(listen: &str) -> String {
     format!("http://{listen}")
 }
 
@@ -1345,6 +1358,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|t| !t.is_empty()),
         directory: directory_worker::DirectoryPlane::from_env(),
+        connectors: Arc::new(connector_worker::ConnectorPlane::from_env()),
     });
 
     let app = Router::new()
@@ -1447,6 +1461,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/connectors/{source}/credential/test",
             post(connectors_admin::test_credential),
+        )
+        // Connect-a-source Phase 3 backfill trigger (connectors_admin.rs): a
+        // one-shot full-crawl for gdrive/gmail. admin.check-gated (NOT
+        // SecretIntakeAuth — no secret in the request; the SA-key path + subject
+        // are resolved server-side from the store or env). Every non-backfillable
+        // source → 422 with the honest phase/applicability note.
+        .route(
+            "/v1/admin/connectors/{source}/backfill",
+            post(connectors_admin::backfill_source),
         )
         .route(
             "/v1/admin/folders",

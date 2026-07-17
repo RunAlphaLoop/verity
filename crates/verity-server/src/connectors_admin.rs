@@ -26,10 +26,13 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    connectors, directory_worker, internal, AppState, HandlerResult, Secret, SecretIntakeAuth,
+    connector_worker, connectors, directory_worker, internal, AppState, HandlerResult, Secret,
+    SecretIntakeAuth,
 };
 use verity_core::adapter::StorageAdapter;
-use verity_core::types::{ConnectorCredentialKind, ConnectorCredentialStatus, StorageError};
+use verity_core::types::{
+    ConnectorCredentialKind, ConnectorCredentialStatus, ConnectorPathCredential, StorageError,
+};
 
 // ---------------------------------------------------------------------------
 // Source registry — the six source families Phase 1 lists.
@@ -455,9 +458,9 @@ pub(crate) fn folder_worker_verdict(armed: usize) -> (&'static str, &'static str
     (if armed > 0 { "on" } else { "off" }, "server")
 }
 
-/// The honest Phase-1 backfill note. `available` is `false` for EVERY source —
-/// there is no backfill trigger in this phase — and the hint says exactly why
-/// per source, so the panel never renders a dead button or a vague "soon".
+/// The honest backfill note for a source that CANNOT be triggered — the same
+/// phase/applicability wording the refused POST returns, so the row and the
+/// trigger never disagree.
 pub(crate) fn backfill_hint(source: &str) -> &'static str {
     match source {
         "folder" => {
@@ -468,14 +471,58 @@ pub(crate) fn backfill_hint(source: &str) -> &'static str {
             "not applicable — directory sync reconciles the full directory on every pass"
         }
         "salesforce" => {
-            "backfill — not wired yet (Phase 3); awaiting a Salesforce test org (the \
-             connector is fixtures-only so far)"
+            "backfill not wired for salesforce yet (Phase 4) — awaiting a Salesforce test org \
+             (the connector is fixtures-only so far)"
         }
         _ => {
-            "backfill — not wired yet (Phase 3); run the connector CLI \
+            "backfill not wired for hubspot yet (Phase 4) — run the connector CLI \
              (ingest/verity_ingest/connectors) to backfill for now"
         }
     }
+}
+
+/// The `backfill` field of a connector row (Phase-3). `available: true` ONLY for
+/// gdrive/gmail with a resolvable SA-key credential (a stored `path` row OR the
+/// server env `GOOGLE_APPLICATION_CREDENTIALS`) — and, for gmail, a stored
+/// subject (gmail aborts without one). Otherwise `available: false` with the
+/// exact honest hint naming what is missing (or the phase note for non-content
+/// sources). `env_sa_key` is whether the server env supplies the SA path.
+pub(crate) fn backfill_field(
+    source: &str,
+    stored: Option<&ConnectorCredentialStatus>,
+    env_sa_key: bool,
+) -> serde_json::Value {
+    if !connector_worker::is_backfillable(source) {
+        return serde_json::json!({ "available": false, "hint": backfill_hint(source) });
+    }
+    let stored_path = stored.is_some_and(|s| s.kind == ConnectorCredentialKind::Path);
+    let (available, hint) = if !stored_path && !env_sa_key {
+        (
+            false,
+            format!(
+                "no {source} service-account key yet — store a Google credential for this \
+                 source, or set GOOGLE_APPLICATION_CREDENTIALS on the server, to enable backfill"
+            ),
+        )
+    } else if connector_worker::subject_required(source)
+        && !stored.is_some_and(|s| s.subject.as_deref().is_some_and(|v| !v.trim().is_empty()))
+    {
+        // gmail: a path is present but there is no impersonation subject to run
+        // under (a stored subject is the only source; env can't carry one).
+        (
+            false,
+            format!(
+                "{source} needs a stored impersonation subject — re-store the {source} \
+                 credential with a subject (domain-wide delegation) to enable backfill"
+            ),
+        )
+    } else {
+        (
+            true,
+            format!("ready — full-crawl backfill for {source} can be triggered"),
+        )
+    };
+    serde_json::json!({ "available": available, "hint": hint })
 }
 
 /// The `credential` field of a connector row. When a credential is stored for
@@ -520,7 +567,7 @@ pub(crate) fn connector_row(
         "credential": credential_field(spec.source, p, stored),
         "worker": { "status": worker.0, "authority": worker.1 },
         "last_heartbeat": last_heartbeat,
-        "backfill": { "available": false, "hint": backfill_hint(spec.source) },
+        "backfill": backfill_field(spec.source, stored, p.sa_key_configured),
         "prereqs_ok": prereqs_ok,
         "prereqs": prereqs,
     })
@@ -819,10 +866,18 @@ pub(crate) async fn store_credential(
             })?;
             let intake = validate_google(body, subject_required, canonicalize_readable_file)
                 .map_err(|msg| (StatusCode::UNPROCESSABLE_ENTITY, msg))?;
-            let _ = &intake.subject;
+            // Phase-3 carry-over: persist the non-secret DWD impersonation subject
+            // (validated/trimmed by validate_google) so a browser-triggered
+            // backfill spawn can resolve `--subject` from the store instead of
+            // relying solely on a server env var.
             let fingerprint = state
                 .storage
-                .store_connector_path(q.tenant_id, spec.source, &intake.path)
+                .store_connector_path(
+                    q.tenant_id,
+                    spec.source,
+                    &intake.path,
+                    intake.subject.as_deref(),
+                )
                 .await
                 .map_err(credential_status)?;
             (fingerprint, ConnectorCredentialKind::Path)
@@ -1058,6 +1113,263 @@ pub(crate) async fn revoke_credential(
 }
 
 // ---------------------------------------------------------------------------
+// Phase-3 backfill trigger — POST /v1/admin/connectors/{source}/backfill.
+// admin.check-gated (NOT SecretIntakeAuth: there is no secret in the request —
+// the SA-key path + subject are resolved SERVER-SIDE from the store or env).
+// gdrive/gmail spawn a one-shot full crawl; every other source is a 422 with the
+// honest phase/applicability note. The credential/precedence resolution is a
+// PURE function (injected values) so its honesty rules are pinned hermetically.
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+/// The resolved spawn inputs for a gdrive/gmail backfill: the SA-key file PATH
+/// (for `GOOGLE_APPLICATION_CREDENTIALS`) and the impersonation `subject` (for
+/// `--subject`; `None` allowed for gdrive, required for gmail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedBackfill {
+    pub(crate) sa_key_path: PathBuf,
+    pub(crate) subject: Option<String>,
+}
+
+/// Why a backfill trigger is refused, each mapped to a fixed HTTP status by the
+/// handler — never a 500. The message is the exact, copyable honest fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BackfillReject {
+    /// Source is not a Phase-3 backfillable content source (hubspot/salesforce
+    /// not wired; folder/gdirectory not applicable). → 422.
+    NotBackfillable(String),
+    /// No SA-key path resolvable from the store or the server env. → 422.
+    NoCredential(String),
+    /// A path is present in BOTH the store and the server env — refuse rather
+    /// than silently pick one (never a double source of truth). → 409.
+    Ambiguous(String),
+    /// gmail requires an impersonation subject and none is stored. → 422.
+    SubjectMissing(String),
+}
+
+impl BackfillReject {
+    /// The HTTP status this rejection maps to (409 for the ambiguous both-present
+    /// case, 422 for every honest-precondition case). Never 500.
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            BackfillReject::Ambiguous(_) => StatusCode::CONFLICT,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
+    pub(crate) fn message(self) -> String {
+        match self {
+            BackfillReject::NotBackfillable(m)
+            | BackfillReject::NoCredential(m)
+            | BackfillReject::Ambiguous(m)
+            | BackfillReject::SubjectMissing(m) => m,
+        }
+    }
+}
+
+/// The honest phase/applicability note for a source that CANNOT be backfilled in
+/// Phase 3. Matches the Phase-1 row hint intent so a refused trigger and the
+/// panel row say the same thing.
+fn not_backfillable_reason(source: &str) -> String {
+    match source {
+        "folder" => "backfill is not applicable to folder — local folder watches ingest \
+                     synchronously when added and catch up on server boot"
+            .to_string(),
+        "gdirectory" => "backfill is not applicable to gdirectory — directory sync reconciles \
+                         the full directory on every pass (run the directory plane instead)"
+            .to_string(),
+        "hubspot" | "salesforce" => format!(
+            "backfill not wired for {source} yet (Phase 4) — run the connector CLI \
+             (ingest/verity_ingest/connectors) to backfill for now"
+        ),
+        other => format!("backfill not wired for {other} yet (Phase 4)"),
+    }
+}
+
+/// Resolve the SA-key path + subject for a gdrive/gmail backfill, PURE (no DB, no
+/// FS, no env): all inputs are injected. Precedence rules (non-negotiable):
+///   - source MUST be backfillable (gdrive/gmail) — else `NotBackfillable`;
+///   - the path comes from the STORED credential OR the server env, but NOT both
+///     (both present → `Ambiguous` 409; neither → `NoCredential` 422);
+///   - the subject comes from the STORED config only; gmail requires it
+///     (`SubjectMissing` 422 when absent). When the path came from env (no stored
+///     row), gmail still needs a stored subject — env alone can't carry one, so
+///     that path honestly 422s too.
+pub(crate) fn resolve_backfill(
+    source: &str,
+    stored: Option<&ConnectorPathCredential>,
+    env_sa_key: Option<&std::path::Path>,
+) -> Result<ResolvedBackfill, BackfillReject> {
+    if !connector_worker::is_backfillable(source) {
+        return Err(BackfillReject::NotBackfillable(not_backfillable_reason(
+            source,
+        )));
+    }
+    let stored_path = stored.map(|c| c.path.as_str()).filter(|p| !p.is_empty());
+    let env_path = env_sa_key.filter(|p| !p.as_os_str().is_empty());
+
+    let sa_key_path = match (stored_path, env_path) {
+        (Some(_), Some(_)) => {
+            return Err(BackfillReject::Ambiguous(format!(
+                "the {source} SA-key path is provided BOTH by a stored connector credential AND \
+                 the server's GOOGLE_APPLICATION_CREDENTIALS env — refusing to guess which is \
+                 authoritative; unset the env var or revoke the stored credential so exactly one \
+                 remains, then retry"
+            )));
+        }
+        (Some(p), None) => PathBuf::from(p),
+        (None, Some(p)) => p.to_path_buf(),
+        (None, None) => {
+            return Err(BackfillReject::NoCredential(format!(
+                "no {source} service-account key to back fill with — store a Google credential \
+                 for this source (POST /v1/admin/connectors/{source}/credential) or set \
+                 GOOGLE_APPLICATION_CREDENTIALS on the server, then retry"
+            )));
+        }
+    };
+
+    // Subject comes from the stored config only (env can't carry a per-source
+    // subject). gmail hard-requires it (it aborts before any HTTP without one).
+    let subject = stored
+        .and_then(|c| c.subject.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if connector_worker::subject_required(source) && subject.is_none() {
+        return Err(BackfillReject::SubjectMissing(format!(
+            "{source} backfill needs a mailbox-owner impersonation subject (domain-wide \
+             delegation) — store the {source} credential WITH a subject \
+             (POST /v1/admin/connectors/{source}/credential {{path, subject}}); {source} aborts \
+             before any HTTP without it"
+        )));
+    }
+
+    Ok(ResolvedBackfill {
+        sa_key_path,
+        subject,
+    })
+}
+
+/// POST /v1/admin/connectors/{source}/backfill?tenant_id= (admin): trigger a
+/// one-shot full-crawl backfill for gdrive/gmail. admin.check-gated (NOT
+/// SecretIntakeAuth — no secret in the request; the SA-key path + subject are
+/// resolved server-side). Every non-backfillable source (folder/gdirectory not
+/// applicable; hubspot/salesforce Phase 4) → 422 with the honest note. For
+/// gdrive/gmail: resolve the path (store XOR env; both → 409) + subject (stored;
+/// gmail requires it → 422), check ingest prereqs (repo/venv → 422), ensure the
+/// tenant, MINT a run_id, and spawn the child. Returns
+/// `{ run_id, source, tenant_id, state: "started", pid }`. Unknown source → 404,
+/// unknown tenant → 404 (never a 500). An already-running (tenant,source) → 409;
+/// the same source live under another tenant → 409 naming it.
+pub(crate) async fn backfill_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(source): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ListParams>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let Some(spec) = source_spec(&source) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "unknown source '{source}' — expected one of folder, gdrive, gmail, gdirectory, \
+                 hubspot, salesforce"
+            ),
+        ));
+    };
+
+    // Unknown tenant → clean 404, never a foreign-key 500 on the spawn/write.
+    state
+        .storage
+        .inner()
+        .ensure_tenant(q.tenant_id)
+        .await
+        .map_err(credential_status)?;
+
+    // Read the stored path credential (path + subject) for this (tenant, source).
+    // A bearer-kind row (wrong source) surfaces as InvalidInput → 422 via
+    // credential_status; the non-backfillable gate below catches CRM sources
+    // first anyway.
+    let stored = if connector_worker::is_backfillable(spec.source) {
+        state
+            .storage
+            .materialize_connector_path(q.tenant_id, spec.source)
+            .await
+            .map_err(credential_status)?
+    } else {
+        None
+    };
+
+    // Pure resolution: source backfillable + path (store XOR env) + subject.
+    let resolved = resolve_backfill(
+        spec.source,
+        stored.as_ref(),
+        state.connectors.sa_key.as_deref(),
+    )
+    .map_err(|r| (r.status(), r.clone().message()))?;
+
+    // Mint the run_id SERVER-SIDE so the panel poll keys on THIS run.
+    let run_id = Uuid::new_v4();
+    let base_url = crate::worker_base_url(&state.listen);
+
+    match state
+        .connectors
+        .start(
+            state.pool().clone(),
+            state.repo_root.as_deref(),
+            &base_url,
+            q.tenant_id,
+            spec.source,
+            state.admin_token.as_deref(),
+            Some(resolved.sa_key_path.as_path()),
+            resolved.subject.as_deref(),
+            run_id,
+        )
+        .await
+    {
+        Ok(pid) => Ok(Json(serde_json::json!({
+            "run_id": run_id,
+            "source": spec.source,
+            "tenant_id": q.tenant_id,
+            "state": "started",
+            "pid": pid,
+        }))),
+        Err(e) => Err(spawn_error_status(e)),
+    }
+}
+
+/// Map a `connector_worker::SpawnError` to a fixed HTTP status — NEVER a 500.
+/// NoRepo/NoVenv → 422 (a fixable server-config precondition), NoConfig → 503
+/// (the identity resolved by the pure layer but the FS check failed), Os → 503,
+/// AlreadyRunning/SourceBusy → 409 with the busy identity named.
+fn spawn_error_status(e: connector_worker::SpawnError) -> (StatusCode, String) {
+    use connector_worker::SpawnError::*;
+    match e {
+        NoRepo => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the server doesn't know its repo path — start it with --repo <path> or VERITY_REPO \
+             so it can find ingest/.venv"
+                .to_string(),
+        ),
+        NoVenv(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+        NoConfig(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+        Os(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+        AlreadyRunning { pid } => (
+            StatusCode::CONFLICT,
+            format!("a backfill for this tenant + source is already running (pid {pid})"),
+        ),
+        SourceBusy { tenant, pid } => (
+            StatusCode::CONFLICT,
+            format!(
+                "this source already has a live backfill under tenant {tenant} (pid {pid}) — a \
+                 service-account key / rate budget is shared per source, so backfills are \
+                 serialized per source across tenants; wait for it to finish, then retry"
+            ),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hermetic tests — the pure layer only (registry, credential, verdicts,
 // prereq assembly from injected probe results). No DB, no FS, no spawns.
 // ---------------------------------------------------------------------------
@@ -1284,7 +1596,7 @@ mod tests {
         let now = Utc::now();
         for spec in SOURCES.iter() {
             let row = connector_row(spec, &full(), ("off", "none"), None, None);
-            // The full Phase-1 row contract, per source.
+            // The full row contract, per source.
             for key in [
                 "source",
                 "label",
@@ -1298,11 +1610,19 @@ mod tests {
             ] {
                 assert!(row.get(key).is_some(), "{} missing {key}", spec.source);
             }
-            // Phase 1 ships zero backfill triggering — never an available:true.
-            assert_eq!(row["backfill"]["available"], false);
             assert!(!row["backfill"]["hint"].as_str().expect("hint").is_empty());
         }
-        // Salesforce carries the honest awaiting-test-org note.
+        // Phase-3: every NON-backfillable source stays available:false with the
+        // honest phase/applicability note — no stored credential can flip them.
+        for s in ["folder", "gdirectory", "hubspot", "salesforce"] {
+            let spec = source_spec(s).unwrap();
+            let row = connector_row(spec, &full(), ("off", "none"), None, None);
+            assert_eq!(
+                row["backfill"]["available"], false,
+                "{s} must never be backfillable"
+            );
+        }
+        // Salesforce carries the honest Phase-4 note.
         let sf = connector_row(&SOURCES[5], &full(), ("off", "none"), None, None);
         assert!(sf["backfill"]["hint"]
             .as_str()
@@ -1536,6 +1856,7 @@ mod tests {
         let status = ConnectorCredentialStatus {
             kind: ConnectorCredentialKind::Bearer,
             fingerprint: "abcd1234".to_string(),
+            subject: None,
             updated_at: Utc::now(),
         };
         let f = credential_field("hubspot", &bare(), Some(&status));
@@ -1546,5 +1867,185 @@ mod tests {
         let row = connector_row(&SOURCES[4], &bare(), ("off", "none"), None, Some(&status));
         assert_eq!(row["credential"]["state"], "tracked");
         assert_eq!(row["credential"]["fingerprint"], "abcd1234");
+    }
+
+    // ---- Phase-3 backfill: pure credential/subject precedence resolution ----
+
+    use std::path::Path;
+
+    fn stored_path(subject: Option<&str>) -> ConnectorPathCredential {
+        ConnectorPathCredential {
+            path: "/srv/sa.json".to_string(),
+            subject: subject.map(str::to_string),
+        }
+    }
+
+    fn path_status(subject: Option<&str>) -> ConnectorCredentialStatus {
+        ConnectorCredentialStatus {
+            kind: ConnectorCredentialKind::Path,
+            fingerprint: "fp".to_string(),
+            subject: subject.map(str::to_string),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_non_backfillable_sources() {
+        for s in ["folder", "gdirectory", "hubspot", "salesforce", "bogus"] {
+            let err = resolve_backfill(s, None, Some(Path::new("/srv/sa.json")))
+                .err()
+                .unwrap_or_else(|| panic!("{s} must not resolve"));
+            assert!(matches!(err, BackfillReject::NotBackfillable(_)), "{s}");
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        // hubspot/salesforce carry the Phase-4 wording.
+        for s in ["hubspot", "salesforce"] {
+            let msg = resolve_backfill(s, None, None).err().unwrap().message();
+            assert!(msg.contains("Phase 4"), "{s}: {msg}");
+        }
+    }
+
+    #[test]
+    fn resolve_from_stored_path_only() {
+        let cred = stored_path(None);
+        let got = resolve_backfill("gdrive", Some(&cred), None).expect("gdrive ok");
+        assert_eq!(got.sa_key_path, PathBuf::from("/srv/sa.json"));
+        assert_eq!(got.subject, None);
+    }
+
+    #[test]
+    fn resolve_from_env_only() {
+        let got =
+            resolve_backfill("gdrive", None, Some(Path::new("/env/sa.json"))).expect("gdrive ok");
+        assert_eq!(got.sa_key_path, PathBuf::from("/env/sa.json"));
+    }
+
+    #[test]
+    fn resolve_both_present_is_ambiguous_409() {
+        let cred = stored_path(None);
+        let err = resolve_backfill("gdrive", Some(&cred), Some(Path::new("/env/sa.json")))
+            .err()
+            .expect("both present must 409");
+        assert!(matches!(err, BackfillReject::Ambiguous(_)));
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn resolve_neither_present_is_no_credential_422() {
+        let err = resolve_backfill("gdrive", None, None)
+            .err()
+            .expect("neither present must 422");
+        assert!(matches!(err, BackfillReject::NoCredential(_)));
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn gmail_requires_a_stored_subject() {
+        // Path present (env), but gmail has no stored subject → 422.
+        let err = resolve_backfill("gmail", None, Some(Path::new("/env/sa.json")))
+            .err()
+            .expect("gmail without subject must 422");
+        assert!(matches!(err, BackfillReject::SubjectMissing(_)));
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // A blank stored subject is treated as absent.
+        let blank = stored_path(Some("   "));
+        assert!(matches!(
+            resolve_backfill("gmail", Some(&blank), None).err(),
+            Some(BackfillReject::SubjectMissing(_))
+        ));
+        // With a real stored subject it resolves and the subject is trimmed.
+        let cred = stored_path(Some("  mbox@corp.example  "));
+        let got = resolve_backfill("gmail", Some(&cred), None).expect("gmail ok with subject");
+        assert_eq!(got.subject.as_deref(), Some("mbox@corp.example"));
+    }
+
+    #[test]
+    fn gdrive_subject_is_optional_but_carried_when_stored() {
+        let cred = stored_path(Some("owner@corp.example"));
+        let got = resolve_backfill("gdrive", Some(&cred), None).expect("gdrive ok");
+        assert_eq!(got.subject.as_deref(), Some("owner@corp.example"));
+    }
+
+    // ---- backfill_field row note (available gating) ----------------------
+
+    #[test]
+    fn backfill_field_available_only_with_a_resolvable_credential() {
+        // Non-backfillable sources are always unavailable with the phase note.
+        for s in ["folder", "gdirectory", "hubspot", "salesforce"] {
+            let f = backfill_field(s, None, true);
+            assert_eq!(f["available"], false, "{s}");
+        }
+        // gdrive: no credential anywhere → unavailable, honest hint.
+        let f = backfill_field("gdrive", None, false);
+        assert_eq!(f["available"], false);
+        assert!(f["hint"].as_str().unwrap().contains("service-account"));
+        // gdrive: env SA key set → available.
+        assert_eq!(backfill_field("gdrive", None, true)["available"], true);
+        // gdrive: stored path (no env) → available.
+        let st = path_status(None);
+        assert_eq!(
+            backfill_field("gdrive", Some(&st), false)["available"],
+            true
+        );
+        // gmail: path present but NO subject → unavailable (needs subject).
+        assert_eq!(backfill_field("gmail", None, true)["available"], false);
+        let st_no_subj = path_status(None);
+        assert_eq!(
+            backfill_field("gmail", Some(&st_no_subj), true)["available"],
+            false
+        );
+        // gmail: stored path WITH subject → available.
+        let st_subj = path_status(Some("mbox@corp.example"));
+        assert_eq!(
+            backfill_field("gmail", Some(&st_subj), false)["available"],
+            true
+        );
+    }
+
+    // ---- SpawnError → HTTP status mapping (never 500) --------------------
+
+    #[test]
+    fn spawn_error_maps_to_stable_statuses_never_500() {
+        use connector_worker::SpawnError;
+        assert_eq!(
+            spawn_error_status(SpawnError::NoRepo).0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            spawn_error_status(SpawnError::NoVenv("x".into())).0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            spawn_error_status(SpawnError::NoConfig("x".into())).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            spawn_error_status(SpawnError::Os("x".into())).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            spawn_error_status(SpawnError::AlreadyRunning { pid: 7 }).0,
+            StatusCode::CONFLICT
+        );
+        let busy = spawn_error_status(SpawnError::SourceBusy {
+            tenant: Uuid::from_u128(42),
+            pid: 9,
+        });
+        assert_eq!(busy.0, StatusCode::CONFLICT);
+        // The 409 message names the busy tenant so the operator knows who to wait on.
+        assert!(busy.1.contains(&Uuid::from_u128(42).to_string()));
+    }
+
+    // ---- run_id path: a fresh server-minted id per trigger --------------
+
+    #[test]
+    fn server_mints_a_fresh_run_id() {
+        // The handler mints Uuid::new_v4() per call; two mints never collide, and
+        // each is a valid UUID string the child reads from VERITY_BACKFILL_RUN_ID.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_ne!(a, b);
+        assert_eq!(connector_worker::RUN_ID_ENV, "VERITY_BACKFILL_RUN_ID");
+        assert!(Uuid::parse_str(&a.to_string()).is_ok());
     }
 }

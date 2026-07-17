@@ -276,8 +276,11 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         tenant: TenantId,
         source: &str,
         path: &str,
+        subject: Option<&str>,
     ) -> Result<String> {
-        self.inner.store_connector_path(tenant, source, path).await
+        self.inner
+            .store_connector_path(tenant, source, path, subject)
+            .await
     }
 
     async fn get_connector_credential_status(
@@ -288,6 +291,14 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner
             .get_connector_credential_status(tenant, source)
             .await
+    }
+
+    async fn materialize_connector_path(
+        &self,
+        tenant: TenantId,
+        source: &str,
+    ) -> Result<Option<ConnectorPathCredential>> {
+        self.inner.materialize_connector_path(tenant, source).await
     }
 
     async fn materialize_connector_bearer(
