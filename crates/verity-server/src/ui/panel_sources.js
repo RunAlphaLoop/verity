@@ -462,7 +462,12 @@ acl_policy:
             "Every file you drop in is read and stored as memory, stamped with the visibility you choose below; " +
             "edit a file and the new version replaces the old. Hidden and half-written files (names starting with a dot, <span class=\"ref\">.tmp</span>, <span class=\"ref\">.swp</span>, editor backups) are skipped, and very large files are skipped with a note &mdash; nothing is ever indexed without a visibility you set.</div>" +
           '<div style="margin-top:12px"><label for="src-folder-path">folder on this machine <span style="font-weight:400">— an absolute path the server can reach</span></label>' +
-            '<input type="text" id="src-folder-path" value="./verity-inbox" placeholder="./verity-inbox" autocomplete="off" spellcheck="false"></div>' +
+            '<div style="display:flex;gap:6px;align-items:stretch;margin-top:4px">' +
+              '<input type="text" id="src-folder-path" value="./verity-inbox" placeholder="./verity-inbox" autocomplete="off" spellcheck="false" style="flex:1">' +
+              '<button type="button" id="src-folder-browse" class="tight" title="Browse the folders on the machine the server runs on">Browse&hellip;</button>' +
+            "</div>" +
+            '<div id="src-folder-nav" style="display:none;margin-top:8px;border:1px solid var(--line);border-radius:6px;overflow:hidden"></div>' +
+          "</div>" +
           '<div class="note" style="margin-top:6px">Not sure? Leave <span class="ref">./verity-inbox</span> &mdash; Verity creates it beside the server if it doesn&rsquo;t exist, and you can drop files straight in. ' +
             "The path is where the server looks, not where your browser looks.</div>" +
           '<div style="margin-top:12px"><label>who can see the files in this folder <span style="font-weight:400">— pick the keys; there is no default</span></label>' +
@@ -1487,6 +1492,76 @@ acl_policy:
       onOpenDirectory: function () { V.show("principals"); },
     });
     folderViewersPicker.load(tenantNow);
+
+    // Server-side folder picker: the watch runs on the server host, and a
+    // browser cannot see the server's real absolute paths — so "Browse" walks
+    // the SERVER's directories via GET /v1/admin/folders/browse.
+    var nav = el("src-folder-nav");
+    nav.style.display = "none";
+    nav.innerHTML = "";
+    el("src-folder-browse").onclick = function () {
+      if (nav.style.display === "none") {
+        var typed = el("src-folder-path").value.trim();
+        // Start at the typed path if it is already an absolute server path,
+        // else at the server's home directory (empty path).
+        browseFolderAt(typed.charAt(0) === "/" ? typed : "");
+      } else {
+        nav.style.display = "none";
+        nav.innerHTML = "";
+      }
+    };
+  }
+
+  async function browseFolderAt(path) {
+    var nav = el("src-folder-nav");
+    nav.style.display = "block";
+    nav.innerHTML = '<div class="note" style="padding:8px;margin:0">Loading&hellip;</div>';
+    var url = "/v1/admin/folders/browse" + (path ? "?path=" + encodeURIComponent(path) : "");
+    try {
+      renderFolderNav(await V.api(url, { admin: true }));
+    } catch (e) {
+      // The server's fail-closed refusal (unreadable / not a directory) shown verbatim.
+      nav.innerHTML = '<div class="err" style="padding:8px;margin:0">' +
+        V.esc((e && e.message) || String(e)) + "</div>";
+    }
+  }
+
+  function renderFolderNav(res) {
+    var nav = el("src-folder-nav");
+    var h =
+      '<div style="display:flex;gap:6px;align-items:center;padding:8px;border-bottom:1px solid var(--line)">' +
+        '<span class="ref" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+          V.esc(res.path) + '">' + V.esc(res.path) + "</span>" +
+        '<button type="button" class="tight" data-nav-use="1">Use this folder</button>' +
+      "</div>" +
+      '<div style="max-height:200px;overflow:auto">';
+    if (res.parent) {
+      h += '<div class="nav-dir" data-nav-path="' + V.esc(res.parent) +
+        '" style="padding:6px 10px;cursor:pointer">&uarr; ..</div>';
+    }
+    if (!res.entries.length) {
+      h += '<div class="note" style="padding:8px;margin:0">no sub-folders here &mdash; use this folder to watch it</div>';
+    }
+    res.entries.forEach(function (e) {
+      h += '<div class="nav-dir" data-nav-path="' + V.esc(e.path) +
+        '" style="padding:6px 10px;cursor:pointer" title="' + V.esc(e.path) + '">&#128193; ' +
+        V.esc(e.name) + "</div>";
+    });
+    h += "</div>";
+    if (res.capped) {
+      h += '<div class="note" style="padding:6px 8px;margin:0">showing the first ' +
+        "folders &mdash; this directory has more</div>";
+    }
+    nav.innerHTML = h;
+    // Handlers assigned in JS (not inline onclick=) so they run under the CSP.
+    nav.querySelector("[data-nav-use]").onclick = function () {
+      el("src-folder-path").value = res.path;
+      nav.style.display = "none";
+      nav.innerHTML = "";
+    };
+    Array.prototype.forEach.call(nav.querySelectorAll(".nav-dir"), function (d) {
+      d.onclick = function () { browseFolderAt(d.getAttribute("data-nav-path")); };
+    });
   }
 
   // Start watching, in three honest steps (folder-onboarding fix):
