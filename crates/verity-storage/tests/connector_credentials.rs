@@ -59,7 +59,7 @@ async fn kek_unset_store_bearer_refuses() {
         return;
     };
     let err = adapter
-        .store_connector_bearer(tenant, "hubspot", b"pat-secret-abc")
+        .store_connector_bearer(tenant, "hubspot", b"pat-secret-abc", &[7])
         .await
         .expect_err("no-KEK store must fail closed");
     let msg = format!("{err}");
@@ -92,7 +92,7 @@ async fn plaintext_provenance_dek_store_bearer_refuses() {
         .await
         .unwrap();
     let err = keyed
-        .store_connector_bearer(tenant, "hubspot", b"pat-secret-abc")
+        .store_connector_bearer(tenant, "hubspot", b"pat-secret-abc", &[7])
         .await
         .expect_err("plaintext-provenance DEK must refuse a secret");
     let msg = format!("{err}");
@@ -120,7 +120,7 @@ async fn bearer_store_status_materialize_revoke_roundtrip() {
     let secret = b"pat-super-secret-token-value";
 
     let fingerprint = adapter
-        .store_connector_bearer(tenant, "hubspot", secret)
+        .store_connector_bearer(tenant, "hubspot", secret, &[7])
         .await
         .expect("store bearer under KEK");
     assert!(
@@ -189,7 +189,7 @@ async fn bearer_store_status_materialize_revoke_roundtrip() {
 
     // Rotation is an upsert: a second store replaces the secret in place.
     let fp2 = adapter
-        .store_connector_bearer(tenant, "hubspot", b"rotated-token")
+        .store_connector_bearer(tenant, "hubspot", b"rotated-token", &[7])
         .await
         .unwrap();
     assert_ne!(fp2, fingerprint, "rotation changes the fingerprint");

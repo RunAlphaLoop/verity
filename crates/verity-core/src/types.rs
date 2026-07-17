@@ -47,6 +47,11 @@ pub struct ConnectorCredentialStatus {
     /// subject (e.g. a gdrive service account granted directly on shared
     /// drives). Not a secret — safe to surface, unlike the path/ciphertext.
     pub subject: Option<String>,
+    /// Non-secret tier-C VISIBILITY policy (a set of `PrincipalToken` = i32) for
+    /// a `bearer` credential, resolved at Phase-4 spawn time for `--visibility`.
+    /// `None` for `path` credentials (which carry no tier-C policy). Not a
+    /// secret — safe to surface, like `subject` (unlike the ciphertext).
+    pub visibility: Option<Vec<i32>>,
     pub updated_at: DateTime<Utc>,
 }
 

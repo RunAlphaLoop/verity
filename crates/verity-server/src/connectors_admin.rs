@@ -471,13 +471,12 @@ pub(crate) fn backfill_hint(source: &str) -> &'static str {
             "not applicable — directory sync reconciles the full directory on every pass"
         }
         "salesforce" => {
-            "backfill not wired for salesforce yet (Phase 4) — awaiting a Salesforce test org \
+            "backfill not wired for salesforce yet — awaiting a Salesforce test org \
              (the connector is fixtures-only so far)"
         }
-        _ => {
-            "backfill not wired for hubspot yet (Phase 4) — run the connector CLI \
-             (ingest/verity_ingest/connectors) to backfill for now"
-        }
+        // hubspot is backfillable and never reaches this hint (it has its own
+        // bearer+visibility gating in backfill_field); this covers unknown sources.
+        _ => "backfill not wired for this source",
     }
 }
 
@@ -494,6 +493,31 @@ pub(crate) fn backfill_field(
 ) -> serde_json::Value {
     if !connector_worker::is_backfillable(source) {
         return serde_json::json!({ "available": false, "hint": backfill_hint(source) });
+    }
+    // HubSpot (tier-C): a browser-triggered backfill needs a stored bearer WITH a
+    // non-empty visibility policy (the connector's `--visibility` is resolved from
+    // the store, fail-closed). `env_sa_key` is a Google concept and never gates
+    // HubSpot; the env bearer alone can't be materialized to a --credential-file,
+    // so `available` reflects the STORED bearer+visibility (the spawn path).
+    if source == "hubspot" {
+        let has_bearer = stored.is_some_and(|s| s.kind == ConnectorCredentialKind::Bearer);
+        let has_visibility =
+            stored.is_some_and(|s| s.visibility.as_ref().is_some_and(|v| !v.is_empty()));
+        let (available, hint) = if has_bearer && has_visibility {
+            (
+                true,
+                "ready — full-crawl backfill for hubspot can be triggered".to_string(),
+            )
+        } else {
+            (
+                false,
+                "no hubspot bearer with a visibility policy yet — store a HubSpot credential \
+                 with a visibility policy (POST /v1/admin/connectors/hubspot/credential \
+                 {token, visibility}) to enable backfill"
+                    .to_string(),
+            )
+        };
+        return serde_json::json!({ "available": available, "hint": hint });
     }
     let stored_path = stored.is_some_and(|s| s.kind == ConnectorCredentialKind::Path);
     let (available, hint) = if !stored_path && !env_sa_key {
@@ -842,17 +866,21 @@ pub(crate) async fn store_credential(
             let intake =
                 validate_tier_c(body).map_err(|msg| (StatusCode::UNPROCESSABLE_ENTITY, msg))?;
             // The visibility set is validated here (fail-closed: empty refused)
-            // as a forward-compat gate, but Phase 2 does NOT persist or enforce
-            // it — the contract wires spawn scoping in Phase 3, which will
-            // collect visibility at spawn time. It is intentionally NOT stored:
-            // there is no visibility column on connector_credentials yet, and
-            // asserting a sharing scope was applied when nothing is persisted
-            // would be a false enforcement claim. The bearer is exposed EXACTLY
-            // once, here, to the encryptor — never logged, never formatted.
-            let _ = &intake.visibility;
+            // and, since Phase 4 (migration 0030), PERSISTED alongside the
+            // bearer so a browser-triggered backfill spawn can resolve
+            // `--visibility` from the store. It is a non-secret tier-C sharing
+            // policy — stored in its own `visibility` column, echoed in status,
+            // but NEVER fed into the fingerprint (which covers the secret bytes
+            // only). The bearer is exposed EXACTLY once, here, to the encryptor
+            // — never logged, never formatted.
             let fingerprint = state
                 .storage
-                .store_connector_bearer(q.tenant_id, spec.source, intake.token.expose().as_bytes())
+                .store_connector_bearer(
+                    q.tenant_id,
+                    spec.source,
+                    intake.token.expose().as_bytes(),
+                    &intake.visibility,
+                )
                 .await
                 .map_err(credential_status)?;
             (fingerprint, ConnectorCredentialKind::Bearer)
@@ -1178,11 +1206,11 @@ fn not_backfillable_reason(source: &str) -> String {
         "gdirectory" => "backfill is not applicable to gdirectory — directory sync reconciles \
                          the full directory on every pass (run the directory plane instead)"
             .to_string(),
-        "hubspot" | "salesforce" => format!(
-            "backfill not wired for {source} yet (Phase 4) — run the connector CLI \
-             (ingest/verity_ingest/connectors) to backfill for now"
-        ),
-        other => format!("backfill not wired for {other} yet (Phase 4)"),
+        "salesforce" => "backfill not wired for salesforce yet — awaiting a Salesforce test org \
+                         (the connector is fixtures-only so far); run the connector CLI \
+                         (ingest/verity_ingest/connectors) to backfill for now"
+            .to_string(),
+        other => format!("backfill not wired for {other} yet"),
     }
 }
 
@@ -1286,27 +1314,37 @@ pub(crate) async fn backfill_source(
         .await
         .map_err(credential_status)?;
 
-    // Read the stored path credential (path + subject) for this (tenant, source).
-    // A bearer-kind row (wrong source) surfaces as InvalidInput → 422 via
-    // credential_status; the non-backfillable gate below catches CRM sources
-    // first anyway.
-    let stored = if connector_worker::is_backfillable(spec.source) {
-        state
+    // Non-backfillable sources (folder/gdirectory/salesforce) fail closed HERE
+    // with the honest phase/applicability note, before any credential read.
+    if !connector_worker::is_backfillable(spec.source) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            not_backfillable_reason(spec.source),
+        ));
+    }
+
+    // Resolve the source-family identity: HubSpot (tier-C bearer + visibility)
+    // takes a DIFFERENT shape from the Google SA-key path + subject.
+    let identity = if spec.source == "hubspot" {
+        resolve_hubspot_identity(&state, q.tenant_id).await?
+    } else {
+        // Google (gdrive/gmail): stored path (+ subject) XOR the server env SA key.
+        let stored = state
             .storage
             .materialize_connector_path(q.tenant_id, spec.source)
             .await
-            .map_err(credential_status)?
-    } else {
-        None
+            .map_err(credential_status)?;
+        let resolved = resolve_backfill(
+            spec.source,
+            stored.as_ref(),
+            state.connectors.sa_key.as_deref(),
+        )
+        .map_err(|r| (r.status(), r.clone().message()))?;
+        connector_worker::BackfillIdentity::Google {
+            sa_key_path: resolved.sa_key_path,
+            subject: resolved.subject,
+        }
     };
-
-    // Pure resolution: source backfillable + path (store XOR env) + subject.
-    let resolved = resolve_backfill(
-        spec.source,
-        stored.as_ref(),
-        state.connectors.sa_key.as_deref(),
-    )
-    .map_err(|r| (r.status(), r.clone().message()))?;
 
     // Mint the run_id SERVER-SIDE so the panel poll keys on THIS run.
     let run_id = Uuid::new_v4();
@@ -1321,8 +1359,7 @@ pub(crate) async fn backfill_source(
             q.tenant_id,
             spec.source,
             state.admin_token.as_deref(),
-            Some(resolved.sa_key_path.as_path()),
-            resolved.subject.as_deref(),
+            identity,
             run_id,
         )
         .await
@@ -1336,6 +1373,99 @@ pub(crate) async fn backfill_source(
         }))),
         Err(e) => Err(spawn_error_status(e)),
     }
+}
+
+/// Resolve the HubSpot tier-C backfill identity: the DECRYPTED bearer + the
+/// stored visibility policy, applying the fail-closed preconditions in order.
+///
+/// - env-vs-store disambiguation: a server `HUBSPOT_SERVICE_KEY` /
+///   `HUBSPOT_PRIVATE_APP_TOKEN` AND a stored bearer both present → 409 (never
+///   silently pick one — the same precedence rule the credential store uses).
+/// - a resolvable bearer: neither stored nor env → 422 with the exact fix.
+/// - a stored non-empty visibility policy: tier-C requires a sharing scope, so
+///   an absent/empty stored visibility → 422 (memory nobody can read is never a
+///   permissive default).
+///
+/// It then materializes the bearer (decrypt-on-demand under the tenant DEK). The
+/// bearer bytes are wrapped in `Zeroizing` so they scrub on drop; `spawn` writes
+/// them to a 0600 `--credential-file` and unlinks it on child exit — the token
+/// never touches argv/env/logs.
+async fn resolve_hubspot_identity(
+    state: &AppState,
+    tenant_id: Uuid,
+) -> Result<connector_worker::BackfillIdentity, (StatusCode, String)> {
+    let env_bearer_present = env_precedence_hit("hubspot", |k| std::env::var(k).ok()).is_some();
+
+    // The non-secret stored status tells us kind + visibility WITHOUT decrypting.
+    let status = state
+        .storage
+        .get_connector_credential_status(tenant_id, "hubspot")
+        .await
+        .map_err(credential_status)?;
+    let stored_bearer_present = status
+        .as_ref()
+        .is_some_and(|s| s.kind == ConnectorCredentialKind::Bearer);
+
+    // Env-vs-store precedence: refuse rather than guess which is authoritative.
+    if env_bearer_present && stored_bearer_present {
+        return Err((
+            StatusCode::CONFLICT,
+            "the hubspot bearer is provided BOTH by a stored connector credential AND the \
+             server's HUBSPOT_SERVICE_KEY / HUBSPOT_PRIVATE_APP_TOKEN env — refusing to guess \
+             which is authoritative; unset the env var or revoke the stored credential so \
+             exactly one remains, then retry"
+                .to_string(),
+        ));
+    }
+    if !env_bearer_present && !stored_bearer_present {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no hubspot bearer to back fill with — store a HubSpot credential with a visibility \
+             policy first (POST /v1/admin/connectors/hubspot/credential {token, visibility}), or \
+             set HUBSPOT_SERVICE_KEY on the server, then retry"
+                .to_string(),
+        ));
+    }
+
+    // A stored non-empty visibility policy is mandatory (tier-C fail-closed). An
+    // env-only bearer has no stored visibility, so it honestly 422s here too —
+    // the tier-C sharing scope must be stored alongside the credential.
+    let visibility = status
+        .as_ref()
+        .and_then(|s| s.visibility.clone())
+        .filter(|v| !v.is_empty())
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "store a HubSpot credential with a visibility policy first — a tier-C backfill \
+             coarsens every record to the admin-assigned visibility, so an empty/absent policy \
+             would ingest memory no reader can act under (POST \
+             /v1/admin/connectors/hubspot/credential {token, visibility})"
+                .to_string(),
+        ))?;
+
+    // Decrypt-on-demand under the tenant DEK (inherits the KEK-unset fail-closed
+    // refusal). None here would be a store/status race; fail closed, never spawn.
+    let bearer = match state
+        .storage
+        .materialize_connector_bearer(tenant_id, "hubspot")
+        .await
+        .map_err(credential_status)?
+    {
+        Some(b) => b,
+        None => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no stored hubspot bearer to materialize — store a HubSpot credential with a \
+                 visibility policy first"
+                    .to_string(),
+            ))
+        }
+    };
+
+    Ok(connector_worker::BackfillIdentity::HubSpot {
+        bearer: zeroize::Zeroizing::new(bearer),
+        visibility,
+    })
 }
 
 /// Map a `connector_worker::SpawnError` to a fixed HTTP status — NEVER a 500.
@@ -1857,6 +1987,7 @@ mod tests {
             kind: ConnectorCredentialKind::Bearer,
             fingerprint: "abcd1234".to_string(),
             subject: None,
+            visibility: Some(vec![7]),
             updated_at: Utc::now(),
         };
         let f = credential_field("hubspot", &bare(), Some(&status));
@@ -1885,24 +2016,35 @@ mod tests {
             kind: ConnectorCredentialKind::Path,
             fingerprint: "fp".to_string(),
             subject: subject.map(str::to_string),
+            visibility: None,
             updated_at: Utc::now(),
         }
     }
 
     #[test]
     fn resolve_refuses_non_backfillable_sources() {
-        for s in ["folder", "gdirectory", "hubspot", "salesforce", "bogus"] {
+        // resolve_backfill is the GOOGLE (path/subject) resolver. hubspot is
+        // backfillable but takes a DIFFERENT (bearer/visibility) path, resolved by
+        // resolve_hubspot_identity — never routed through here. These are the
+        // sources with no browser-triggered backfill at all.
+        for s in ["folder", "gdirectory", "salesforce", "bogus"] {
             let err = resolve_backfill(s, None, Some(Path::new("/srv/sa.json")))
                 .err()
                 .unwrap_or_else(|| panic!("{s} must not resolve"));
             assert!(matches!(err, BackfillReject::NotBackfillable(_)), "{s}");
             assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
-        // hubspot/salesforce carry the Phase-4 wording.
-        for s in ["hubspot", "salesforce"] {
-            let msg = resolve_backfill(s, None, None).err().unwrap().message();
-            assert!(msg.contains("Phase 4"), "{s}: {msg}");
-        }
+        // salesforce carries the honest fixtures-only note (hubspot no longer does
+        // — it is wired).
+        let msg = resolve_backfill("salesforce", None, None)
+            .err()
+            .unwrap()
+            .message();
+        assert!(msg.contains("test org"), "salesforce: {msg}");
+        // hubspot is now backfillable, so the Google resolver does NOT refuse it as
+        // non-backfillable (it would fail later for lacking a path, which is
+        // irrelevant — the handler never calls this for hubspot).
+        assert!(connector_worker::is_backfillable("hubspot"));
     }
 
     #[test]
@@ -1968,13 +2110,46 @@ mod tests {
 
     // ---- backfill_field row note (available gating) ----------------------
 
+    /// A bearer credential status with an optional visibility policy — the
+    /// tier-C shape the HubSpot backfill_field arm gates on.
+    fn bearer_status(visibility: Option<Vec<i32>>) -> ConnectorCredentialStatus {
+        ConnectorCredentialStatus {
+            kind: ConnectorCredentialKind::Bearer,
+            fingerprint: "fp".to_string(),
+            subject: None,
+            visibility,
+            updated_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn backfill_field_available_only_with_a_resolvable_credential() {
-        // Non-backfillable sources are always unavailable with the phase note.
+        // With NO stored credential these are all unavailable (folder/gdirectory/
+        // salesforce are never backfillable; hubspot needs a stored bearer).
         for s in ["folder", "gdirectory", "hubspot", "salesforce"] {
             let f = backfill_field(s, None, true);
             assert_eq!(f["available"], false, "{s}");
         }
+        // hubspot: a stored bearer WITH a non-empty visibility policy → available;
+        // a bearer with empty/absent visibility → NOT (tier-C fail-closed). The
+        // env_sa_key flag is a Google concept and never gates hubspot.
+        assert_eq!(
+            backfill_field("hubspot", Some(&bearer_status(Some(vec![7, 9]))), false)["available"],
+            true
+        );
+        assert_eq!(
+            backfill_field("hubspot", Some(&bearer_status(Some(vec![]))), true)["available"],
+            false
+        );
+        assert_eq!(
+            backfill_field("hubspot", Some(&bearer_status(None)), true)["available"],
+            false
+        );
+        // A path-kind row under hubspot (wrong shape) is not a usable bearer.
+        assert_eq!(
+            backfill_field("hubspot", Some(&path_status(None)), true)["available"],
+            false
+        );
         // gdrive: no credential anywhere → unavailable, honest hint.
         let f = backfill_field("gdrive", None, false);
         assert_eq!(f["available"], false);

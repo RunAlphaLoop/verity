@@ -29,9 +29,12 @@ use uuid::Uuid;
 use crate::{internal, storage_status, AppState, HandlerResult};
 
 /// The lifecycle states a backfill run may report. Kept in sync with the CHECK
-/// constraint in migrations/0021_backfill_runs.sql; validated here so a bad
-/// value is a clean 400, not a Postgres constraint 500.
-const VALID_STATES: [&str; 4] = ["running", "paused", "completed", "failed"];
+/// constraint in migrations/0021_backfill_runs.sql (widened by 0031 to add
+/// `degraded_acl`); validated here so a bad value is a clean 400, not a Postgres
+/// constraint 500. `degraded_acl` is a Phase-4 terminal state: a full crawl that
+/// completed but had to coarsen owner/team ACLs to the admin-assigned
+/// `--visibility` (the connector's HubSpot app lacked the owners-read scope).
+const VALID_STATES: [&str; 5] = ["running", "paused", "completed", "failed", "degraded_acl"];
 
 #[derive(Deserialize)]
 pub(crate) struct BackfillProgressRequest {

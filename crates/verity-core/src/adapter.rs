@@ -259,11 +259,18 @@ pub trait StorageAdapter: Send + Sync {
     /// DEK is plaintext-provenance (stored length <= 32) — a secret must not be
     /// written against a DEK that isn't actually KEK-wrapped. Upsert on
     /// (tenant, source): a second store rotates the secret in place.
+    ///
+    /// `visibility` is the tier-C sharing policy: a set of principal tokens
+    /// (`PrincipalToken` = i32) applied to every record a store-backed backfill
+    /// spawn ingests. It is NOT a secret and does NOT alter the fingerprint —
+    /// it is persisted alongside the ciphertext (bearer rows only) so a Phase-4
+    /// backfill can resolve `--visibility` from the store.
     async fn store_connector_bearer(
         &self,
         _tenant: TenantId,
         _source: &str,
         _plaintext: &[u8],
+        _visibility: &[i32],
     ) -> Result<String> {
         Err(unsupported("store_connector_bearer"))
     }

@@ -774,7 +774,19 @@ acl_policy:
       var mintedOnly = names[name] === 2;
       var evAge = hb ? ageMs(hb.last_event_at) : null;
       var hbAge = hb ? ageMs(hb.updated_at) : null;
-      var bfError = bf && bf.error ? bf.error : null;
+      var bfState = bf ? String(bf.state || "").toLowerCase() : "";
+      // Belt-and-suspenders for the best-effort reconcile: a completed row still
+      // carrying the raw degrade token in `error` means the reap's reconcile to
+      // degraded_acl didn't land (transient DB fault) — treat it as degraded so a
+      // coarsened crawl never paints a clean green success.
+      if (bfState === "completed" && bf.error === "verity.backfill.degraded_acl") bfState = "degraded_acl";
+      // A degraded_acl run is NOT a failure — it completed the full crawl but had
+      // to coarsen owner/team ACLs to the admin-assigned visibility. Its `error`
+      // column carries that honest note, so treat it as a failure ONLY when the
+      // state is actually failed (never paint a clean degraded run red).
+      var bfError = bf && bf.error && bfState === "failed" ? bf.error : null;
+      var bfDegraded = bfState === "degraded_acl";
+      var bfDegradedNote = bfDegraded && bf.error ? bf.error : null;
 
       var stateCell, liveText;
       if (mintedOnly) {
@@ -802,6 +814,14 @@ acl_policy:
       }
       if (bfError) {
         notes.push(V.badge("catch-up failed", "b-conf-3") + ' <span class="note" style="margin-top:0">' + V.esc(bfError) + "</span>");
+      }
+      if (bfDegraded) {
+        // Honest, non-red: the crawl delivered every record but the fine-grained
+        // owner/team ACLs were unavailable, so records use the admin-assigned
+        // visibility policy. Never a silent success.
+        notes.push(V.badge("ACLs coarsened", "b-conf-2") +
+          ' <span class="note" style="margin-top:0">owner/team ACLs unavailable — using the admin-assigned visibility policy' +
+          (bfDegradedNote ? " (" + V.esc(bfDegradedNote) + ")" : "") + "</span>");
       }
       if (hb && hb.cursor) {
         notes.push('<span class="ref" title="opaque connector checkpoint — display only">checkpoint ' + V.esc(hb.cursor) + "</span>");
@@ -1024,9 +1044,12 @@ acl_policy:
           "<br>" + proseRef + V.esc(String(q.hint || "")) + "</span>";
       }).join("<br>"));
     } else {
-      // gdrive/gmail carry the Run-backfill control (enabled or the honest
-      // disabled state). Every other source keeps its plain backfill note.
-      if (c.backfill && (c.backfill.available || String(c.source) === "gdrive" || String(c.source) === "gmail")) {
+      // gdrive/gmail/hubspot carry the Run-backfill control (enabled when the
+      // server reports backfill.available, else the honest disabled state with
+      // the exact hint). Every other source keeps its plain backfill note.
+      if (c.backfill && (c.backfill.available ||
+        String(c.source) === "gdrive" || String(c.source) === "gmail" ||
+        String(c.source) === "hubspot")) {
         parts.push(connBackfillControl(c));
       } else {
         var hint = c.backfill && c.backfill.hint;
@@ -1627,7 +1650,9 @@ acl_policy:
 
   function isTerminal(state) {
     var s = String(state || "").toLowerCase();
-    return s === "completed" || s === "failed";
+    // degraded_acl is a TERMINAL state (a completed-but-coarsened crawl), so the
+    // live poll stops on it just like completed/failed — never an eternal spin.
+    return s === "completed" || s === "failed" || s === "degraded_acl";
   }
 
   async function pollBackfillOnce(source) {
@@ -1680,6 +1705,15 @@ acl_policy:
       var state = run ? String(run.state || "").toLowerCase() : "starting";
       var chip, progress, tail;
 
+      // Belt-and-suspenders for the best-effort reconcile: if the reap's
+      // reconcile_terminal DB write failed (transient fault / pool exhaustion),
+      // the last persisted row is the connector-posted state='completed' carrying
+      // the raw degrade token in error. Treat that as degraded, NEVER a silent
+      // green success — a coarsened crawl must never read as clean-completed.
+      // Derived BEFORE the chip so the chip is amber (not green) too.
+      var degradeToken = "verity.backfill.degraded_acl";
+      if (state === "completed" && run && run.error === degradeToken) state = "degraded_acl";
+
       if (r.err) {
         chip = V.stateChip("attn", "can't read progress");
         progress = '<span class="pct">' + V.esc(r.err) + "</span>";
@@ -1688,7 +1722,7 @@ acl_policy:
         progress = '<div class="bar indet"></div><span class="pct">spawned' +
           (r.pid ? " (pid " + V.esc(r.pid) + ")" : "") + " &mdash; waiting for the first progress report</span>";
       } else {
-        chip = backfillChip(run.state);
+        chip = backfillChip(state);
         progress = progressCell(run);
       }
 
@@ -1706,6 +1740,17 @@ acl_policy:
             ? '<span class="note" style="margin-top:0">' + V.esc(run.error) + "</span>"
             : "the backfill exited non-zero — see the connector log on the server (ingest/" + V.esc(s) + ".log).") +
           "</div>";
+      } else if (state === "degraded_acl") {
+        // HONEST, non-red: the crawl drained every record, but the connector's
+        // HubSpot app lacked the owners-read scope, so owner/team ACLs were
+        // coarsened to the admin-assigned visibility policy. Never a silent
+        // success — the operator sees exactly what was (and wasn't) applied.
+        tail = '<div class="note" style="margin-top:8px">' +
+          V.stateChip("attn", "ingested · ACLs coarsened") +
+          ' &mdash; <b>owner/team ACLs unavailable</b> — every record used the admin-assigned ' +
+          "visibility policy" +
+          (run && run.error ? " (" + V.esc(run.error) + ")" : "") +
+          ". The crawl drained; grant the HubSpot owners-read scope and re-run for fine-grained ACLs.</div>";
       } else if (!r.err) {
         tail = '<div class="note" style="margin-top:8px">Replaying history &mdash; this strip updates live and stops on its own when the crawl drains.</div>';
       } else {
@@ -1850,6 +1895,8 @@ acl_policy:
     if (s === "running") return V.stateChip("wait", "running");
     if (s === "completed") return V.stateChip("ok", "completed");
     if (s === "failed") return V.stateChip("fail", "failed");
+    // A completed-but-coarsened crawl: amber, never green (honest, not failed).
+    if (s === "degraded_acl") return V.stateChip("attn", "ACLs coarsened");
     if (s === "paused") return V.stateChip("off", "paused");
     return V.stateChip("off", s || "—");
   }
