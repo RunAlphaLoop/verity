@@ -2702,6 +2702,18 @@ impl PostgresAdapter {
     /// bounded milliseconds, not a full count.
     const EXACT_SCAN_MAX_ROWS: i64 = 20_000;
 
+    /// HNSW candidate-list size for the broad-scope (HNSW) branch. pgvector's
+    /// default is 40, which — measured on the 115k-chunk my-workspace corpus at
+    /// broad (union-of-all-tokens) scope — silently returns recall@8 = 0/8: the
+    /// dense single-token cluster gives the graph a poor entry point and the
+    /// small candidate list never reaches the true neighbours. There is a sharp
+    /// recall cliff (0/8 at ef<=150, 8/8 at ef>=200, docs/BENCHMARKS.md), so 200
+    /// is the *minimum proven* value for full recall — not a magic number. Cost:
+    /// broad-scope p50 ~0.3ms(wrong)->~2.5ms(correct), still ~40x under the
+    /// ~106ms exact baseline. The exact/small-set branch never touches HNSW, so
+    /// this GUC only applies where the planner actually chooses the graph.
+    const HNSW_EF_SEARCH: i64 = 200;
+
     async fn recall_dense(&self, q: &RecallQuery, embedding: &[f32]) -> Result<Vec<RecallHit>> {
         let scope = &q.scope;
         // Query-routing cutover (SPEC §5c step 2): once a tenant's route is
@@ -2751,9 +2763,34 @@ impl PostgresAdapter {
                 .await
                 .map_err(db_err)?;
         } else {
-            // Broad set: HNSW with iterative scans so selective predicates
-            // don't collapse recall (pgvector 0.8, SPEC §4).
-            sqlx::query("SET LOCAL hnsw.iterative_scan = relaxed_order")
+            // Broad set: HNSW. Two GUCs, both SET LOCAL so they revert at
+            // tx.commit() and can never leak onto the next pooled checkout
+            // (max_connections=16; the whole recall runs in this one tx).
+            //
+            // (1) ef_search: pgvector's default 40 silently drops recall to 0/8
+            //     on the 115k corpus at broad scope — a live correctness bug.
+            //     HNSW_EF_SEARCH=200 is the measured minimum for recall@8 = 1.0.
+            //     The literal is an i64 const (never caller data), so the format!
+            //     is SQL-safe by the same argument as the predicate strings.
+            // (2) iterative_scan=strict_order: keeps HNSW re-pulling candidates
+            //     until k pass the mandatory scope pre-filter, WITHOUT the
+            //     mis-ordering/recall risk of relaxed_order (pgvector #862).
+            //     strict_order preserves distance ordering; measured cost here
+            //     is ~zero because the planner already picks HNSW when the
+            //     filter is non-selective.
+            //
+            // Neither GUC changes WHAT is allowed: tenant_id / valid_to IS NULL
+            // / visibility && $scope / confidentiality <= ceiling (+ entity
+            // fence) remain HARD pre-filters on the ranked SELECT below. These
+            // only change HOW the ANN is scanned.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SET LOCAL hnsw.ef_search = {}",
+                Self::HNSW_EF_SEARCH
+            )))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query("SET LOCAL hnsw.iterative_scan = strict_order")
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;

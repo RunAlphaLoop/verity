@@ -494,3 +494,49 @@ ONNX session is the served ceiling, Postgres the core ceiling.
    ~105ms end-to-end served on a laptop; sub-ms permissioned `get`; QPS saturates ~50–120 on a
    single untuned Postgres container.** The ≥300 QPS / server-hardware numbers remain unproven
    — gated on Postgres tuning and encoder pooling, not the Rust build.
+
+## 2026-07-17 — broad-scope HNSW `ef_search` fix (scoped-ANN recall bug)
+
+**Setup:** real `my-workspace` tenant, **115,643 live chunks** (384-d, HNSW m=16/ef_construction=64,
+`embedding` column), k=8, broad scope = union of all visibility tokens (~0% filter selectivity — the
+SPEC O(N) worst case for exact, the easy non-selective case for HNSW). 50 warm runs after 5 warmups,
+per-run metric = server-side `EXPLAIN (ANALYZE)` `Execution Time`. **Probe: a SYNTHETIC non-self-matching
+vector** (renormalised mean of two real corpus embeddings) — deliberately *not* the seed-0 self-match,
+which trivially finds itself and inflates both latency and recall. Laptop ParadeDB PG17 container, single
+instance, **WARM** cache (cold is higher — the `embedding` HNSW index is ~200MB of pages; not characterised
+here). No vendor-quoted numbers.
+
+The dense recall leg (`recall_dense`) routes by an EXPLAIN row estimate: `<= 20,000` → exact brute-force
+top-k (perfect recall, faster under selective filters); `> 20,000` → the global HNSW index. This tenant's
+broad-scope estimate is ~115k, so it takes the **HNSW branch**. That branch was running at pgvector's
+**default `ef_search = 40`**, which silently drops relevant results on a large corpus:
+
+| config (broad, 115k, synthetic probe) | p50 | p95 | p99 | recall@8 |
+|---|---|---|---|---|
+| exact brute-force (ground truth) | 79.4ms | 231ms | 372ms | 8/8 |
+| **before** — `ef_search=40` + `iterative_scan=relaxed_order` | **0.39ms** | 1.17ms | 1.36ms | **6/8** |
+| **after** — `ef_search=200` + `iterative_scan=strict_order` | 2.09ms | 4.07ms | 4.87ms | **8/8** |
+
+**Findings:**
+
+1. **The default `ef_search=40` was a live silent-recall-loss bug for large tenants.** On this real 115k
+   corpus at broad scope the pre-change ship path returned **6/8** — two relevant results silently dropped —
+   at a headline 0.39ms that *looked* great but was wrong. `ef_search` was set nowhere in the repo, so every
+   large-tenant broad recall inherited the default. (An earlier synthetic sweep on a denser single-token
+   cluster showed the cliff as deep as 0/8; on this probe it is 6/8 — same direction, same fix.)
+2. **The fix is `ef_search = 200`, a query-path `SET LOCAL` only — no migration, no index build.** It
+   restores **recall@8 = 8/8** at **2.09ms p50**, still **~38× faster** than the 79ms exact baseline. The
+   ~5× latency increase over the (wrong) default is entirely the cost of honesty.
+3. **`iterative_scan` per se buys nothing here** — the planner already picks the global HNSW index when the
+   filter is non-selective; the win is `ef_search`, not the iterative feature. We switch `relaxed_order →
+   `strict_order` only to preserve distance ordering and avoid pgvector #862 mis-ordering; measured cost ~0.
+4. **Scope safety is unchanged and proven.** The four mandatory pre-filters (`tenant_id`, `valid_to IS NULL`,
+   `visibility && $scope`, `confidentiality <= ceiling`, + entity fence) remain HARD pre-filters on the ranked
+   SELECT; `ef_search`/`iterative_scan` change only *how* the ANN is scanned, never *what* is allowed. The
+   `scoped_ann` storage test seeds >20k in-scope chunks (forcing the HNSW branch) plus an out-of-scope
+   distance-0 exact-copy near-neighbor and asserts it is **never** returned — leak count 0.
+5. **Not covered / still open:** selective-scope recall (the 1–10% selectivity "valley") is unaffected by this
+   change — it correctly falls to a GIN-visibility-bitmap + exact top-N and is fast because the in-scope set is
+   small, but that is O(rows-in-scope) and grows. Cold-cache broad-scope latency was not characterised.
+   `ef_search=200` and the 20k router threshold are laptop/corpus-tuned heuristics; re-derive on production
+   hardware and at larger corpora.
