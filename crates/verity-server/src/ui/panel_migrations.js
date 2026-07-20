@@ -623,7 +623,7 @@
             '<div class="et-body">A source appears here once its connector posts catch-up progress — an ' +
               "empty list is not an error. Connect a source to start pulling in history. " +
               "(Reminder: this panel is unrelated to the search-model upgrade above.)</div>" +
-            '<div class="et-actions"><button class="primary" id="mig-open-sources">Open Sources &amp; freshness</button></div>' +
+            '<div class="et-actions"><button class="primary" id="mig-open-sources">Open Sources</button></div>' +
           "</div>";
         el("mig-open-sources").onclick = function () { V.show("sources"); };
         return;

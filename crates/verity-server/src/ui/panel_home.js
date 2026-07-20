@@ -455,7 +455,7 @@
           "using a key-file path set on the server. Credentials never touch this console. <b>Salesforce</b> is listed but gated (awaiting a test org).</div>" +
         '<div class="toolbar" style="margin:10px 0 0">' +
           '<button class="primary" id="home-connect-folder">Watch a local folder</button>' +
-          '<button id="home-connect-sources">Open Sources &amp; freshness</button>' +
+          '<button id="home-connect-sources">Open Sources</button>' +
           '<span class="asof">' + asofNow() + "</span>" +
         "</div>" +
       "</div>";

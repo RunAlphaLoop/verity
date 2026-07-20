@@ -446,7 +446,7 @@
       '</div>' +
       '<div class="dc-question">Verity refused to index this &mdash; ' + V.esc(groupPlain(g)) + '.</div>' +
       '<div class="dc-src" style="color:var(--dim);font-size:var(--fs-sm)">delivered through connected-source inbox ' +
-        webhookRef(r.webhook_id) + ' <span class="refreshed">(a webhook URL minted on Sources &amp; freshness ' +
+        webhookRef(r.webhook_id) + ' <span class="refreshed">(a webhook URL minted on Sources ' +
         '&mdash; the server can&rsquo;t list webhook names yet, so only the id is shown)</span></div>' +
       '<div class="dc-evidence"><b>Why this is safe:</b> because the permissions could not be verified, ' +
         'this payload <b>never entered the index</b> — no search, brief, or agent can see it. ' +

@@ -78,8 +78,9 @@
       tenant ? tryApi("/v1/admin/quarantine?tenant_id=" + enc, { admin: true }) : none,
       tenant ? tryApi("/v1/slo/freshness?tenant_id=" + enc, { admin: true }) : none,
       tenant ? tryApi("/v1/admin/audit?tenant_id=" + enc + "&limit=500", { admin: true }) : none,
+      tenant ? tryApi("/v1/admin/memories?tenant_id=" + enc + "&limit=1", { admin: true }) : none,
     ]);
-    var pr = res[0], kn = res[1], qu = res[2], fr = res[3], au = res[4];
+    var pr = res[0], kn = res[1], qu = res[2], fr = res[3], au = res[4], me = res[5];
 
     var principals = pr.ok ? ((pr.value && pr.value.principals) || []) : [];
     var named = principals.filter(function (p) { return /^(user|group):/.test(p.principal); });
@@ -93,6 +94,12 @@
     var knCount = kn.ok ? (((kn.value && kn.value.items) || []).length) : 0;
     var quCount = qu.ok ? ((qu.value || []).length) : 0;
     var frCount = fr.ok ? ((fr.value || []).length) : 0;
+    // Corpus existence — the real "is there memory here" signal. The memories
+    // browse returns per-source counts; their sum is the stored total. This is
+    // WHAT actually exists (any age), not just what arrived in the freshness
+    // window — a workspace full of older memory must still read "done".
+    var memSources = me.ok ? ((me.value && me.value.sources) || []) : [];
+    var memStored = memSources.reduce(function (s, x) { return s + (x.count || 0); }, 0);
     var auditRows = au.ok ? (au.value || []) : [];
     var recalls = auditRows.filter(function (r) { return r.verb === "recall"; });
     var hitRow = null, zeroRow = null;
@@ -182,13 +189,14 @@
 
     /* --- item 4 · memory in ------------------------------------------- */
     var memBits = [];
+    if (memStored) memBits.push(memStored.toLocaleString() + " memor" + (memStored === 1 ? "y" : "ies") + " stored");
     if (frCount) memBits.push(frCount + " source" + (frCount === 1 ? "" : "s") + " delivered memory in the last 24 h");
     if (knCount) memBits.push(knCount + " knowledge item" + (knCount === 1 ? "" : "s"));
     if (quCount) memBits.push(quCount + " item" + (quCount === 1 ? "" : "s") + " held in quarantine — held on purpose (its permissions couldn’t be mapped), which still proves memory is flowing in");
-    var anyMemProbe = kn.ok || qu.ok || fr.ok;
+    var anyMemProbe = me.ok || kn.ok || qu.ok || fr.ok;
     var i4 = {
       n: 4, id: "memory", title: "Memory in", done: memBits.length > 0,
-      needsAdmin: !anyMemProbe && (qu.needsAdmin || fr.needsAdmin),
+      needsAdmin: !anyMemProbe && (me.needsAdmin || qu.needsAdmin || fr.needsAdmin),
       evidence: memBits.length ? memBits.join(" · ")
         : (anyMemProbe ? "no memory stored or quarantined yet"
           : (tenant ? "counts unavailable — " + (qu.err || kn.err || "").slice(0, 80) : "no space yet")),
@@ -266,7 +274,7 @@
             '<div class="dc-actions"><button id="ftue-mcp-copy">Copy MCP block</button></div></div>' +
           '<div class="dc-side"><div class="dc-name">Connect a real source</div>' +
             '<div class="dc-src">mirror the permissions your tools already have — webhooks, CDC, documents</div>' +
-            '<div class="dc-actions"><button id="ftue-gosources">Open Sources &amp; freshness</button></div></div>' +
+            '<div class="dc-actions"><button id="ftue-gosources">Open Sources</button></div></div>' +
           '<div class="dc-side"><div class="dc-name">Run the latency benchmark</div>' +
             '<div class="dc-src"><b>No numbers appear anywhere until your own benchmark has run</b> — this slot stays honestly empty until then.</div>' +
             '<div class="ref" style="margin-top:8px">cargo run -p verity-bench -- seed --chunks 100000<br>cargo run -p verity-bench -- run</div></div>' +
