@@ -22,6 +22,27 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
+      spicedb:
+        # ReBAC engine (SPEC §7a). Same image + preshared key as
+        # deploy/docker-compose.yml so VERITY_SPICEDB_KEY matches. The v0.1
+        # Rust client speaks the HTTP gateway (8443); SPICEDB_HTTP_ENABLED turns
+        # it on. In-memory datastore (default) — ephemeral is correct for CI;
+        # every soundness test writes its own schema via ensure_schema().
+        # GitHub Actions service containers cannot override the image command,
+        # so serve flags are passed as env: SPICEDB_GRPC_PRESHARED_KEY
+        # (== --grpc-preshared-key), SPICEDB_HTTP_ENABLED (== --http-enabled).
+        image: authzed/spicedb
+        env:
+          SPICEDB_GRPC_PRESHARED_KEY: verity-dev-key
+          SPICEDB_HTTP_ENABLED: "true"
+        ports:
+          - 8443:8443
+          - 50051:50051
+        options: >-
+          --health-cmd "grpc_health_probe -addr=localhost:50051"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +61,11 @@ jobs:
       - run: cargo test --workspace
         env:
           VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity
+          # SpiceDB HTTP gateway + preshared key: makes the ReBAC / restricted-
+          # tier / post-revocation soundness tests RUN (they now hard-error, not
+          # skip, without an engine — M0 deliverables #1/#2).
+          VERITY_SPICEDB_URL: http://localhost:8443
+          VERITY_SPICEDB_KEY: verity-dev-key
 
   # Framework conformance harness (task #29): the six adapter packages driven
   # through REAL framework machinery (retrievers, BaseStore, unified Memory,

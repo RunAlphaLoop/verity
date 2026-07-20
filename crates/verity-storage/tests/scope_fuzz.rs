@@ -3,7 +3,8 @@
 //! result that violates the scope predicate is a leak and fails the build.
 //!
 //! Soundness only (no result may leak); completeness is a quality metric
-//! measured elsewhere. Requires VERITY_TEST_DSN; skips when absent.
+//! measured elsewhere. Requires VERITY_TEST_DSN; HARD-ERRORS (panics) when
+//! absent — a scope-soundness gate that silently no-ops is worse than no gate.
 
 use chrono::{DateTime, Duration, Utc};
 use rand::prelude::*;
@@ -136,10 +137,11 @@ fn scope_admits(
 
 #[tokio::test]
 async fn no_read_path_leaks_across_scopes() {
-    let Some(dsn) = std::env::var("VERITY_TEST_DSN").ok() else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for scope-soundness test no_read_path_leaks_across_scopes; \
+         refusing to silently no-op — a scope-fuzzer that skips is the exact process gap that let \
+         the §5e.6a L1-fact leak survive",
+    );
     let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
     adapter.migrate().await.expect("migrate");
     let tenant = adapter

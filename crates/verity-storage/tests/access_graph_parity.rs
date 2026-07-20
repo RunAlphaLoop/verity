@@ -8,7 +8,10 @@
 //! revoke-in-window sub-case: revoking a token in-window must drop the docs it
 //! alone granted, exactly as `scope_for`/`RevocationPlane::subtract` would.
 //!
-//! Requires VERITY_TEST_DSN; skips when absent (sibling-test convention).
+//! Requires VERITY_TEST_DSN; HARD-ERRORS (panics) when absent — the aggregate
+//! must equal the enforcement pre-filter (incl. empty-token → empty and
+//! revoke-in-window subtraction); a soundness gate that silently skips is the
+//! process gap this milestone closes.
 
 use chrono::Utc;
 use serde_json::json;
@@ -18,15 +21,18 @@ use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::{ObjectSelector, PostgresAdapter};
 
-async fn setup() -> Option<(PostgresAdapter, TenantId)> {
-    let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
+async fn setup() -> (PostgresAdapter, TenantId) {
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for the access-graph parity soundness tests (spec §9 \
+         T1/T2/T4/T5); refusing to silently no-op",
+    );
     let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
     adapter.migrate().await.expect("migrate");
     let tenant = adapter
         .create_tenant(&format!("test-{}", uuid::Uuid::now_v7()))
         .await
         .expect("tenant");
-    Some((adapter, tenant))
+    (adapter, tenant)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -97,10 +103,7 @@ async fn enforcement_docs(
 
 #[tokio::test]
 async fn t1_aggregate_equals_enforcement_prefilter() {
-    let Some((a, tenant)) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (a, tenant) = setup().await;
     // Tokens: 10=eng, 11=all-staff. Docs seeded with varied visibility/conf/prov.
     seed_chunk(
         &a,
@@ -176,10 +179,7 @@ async fn t1_aggregate_equals_enforcement_prefilter() {
 
 #[tokio::test]
 async fn t1_revoke_in_window_drops_docs() {
-    let Some((a, tenant)) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (a, tenant) = setup().await;
     // d/only-eng is reachable ONLY via token 10.
     seed_chunk(
         &a,
@@ -246,10 +246,7 @@ async fn t1_revoke_in_window_drops_docs() {
 
 #[tokio::test]
 async fn t2_empty_token_set_is_empty_aggregate() {
-    let Some((a, tenant)) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (a, tenant) = setup().await;
     seed_chunk(
         &a,
         tenant,
@@ -274,10 +271,7 @@ async fn t2_empty_token_set_is_empty_aggregate() {
 
 #[tokio::test]
 async fn t5_object_decode_and_reverse_resolve() {
-    let Some((a, tenant)) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (a, tenant) = setup().await;
     seed_chunk(
         &a,
         tenant,
@@ -347,10 +341,7 @@ fn t6_access_methods_never_select_content() {
 
 #[tokio::test]
 async fn t4_tenant_isolation() {
-    let Some((a, tenant_a)) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (a, tenant_a) = setup().await;
     let tenant_b = a
         .create_tenant(&format!("test-{}", uuid::Uuid::now_v7()))
         .await

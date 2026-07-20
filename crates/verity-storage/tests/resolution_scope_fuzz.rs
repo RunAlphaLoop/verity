@@ -13,8 +13,9 @@
 //! email, unconfirmed Tier-2, Tier-3 mention, anti-linked strong evidence) can
 //! fold A and B into one canonical or drag A's chunks into B's entity scope.
 //!
-//! Requires VERITY_TEST_DSN; skips (passes trivially) when absent — CI sets it,
-//! so in CI this gate is always live.
+//! Requires VERITY_TEST_DSN; HARD-ERRORS (panics) when absent — a resolution
+//! scope-leak gate that silently skips defeats the §7e handle-enforcement
+//! invariant; CI sets the DSN so this gate is always live.
 
 use chrono::{Duration, Utc};
 use rand::prelude::*;
@@ -31,11 +32,14 @@ use verity_storage::PostgresAdapter;
 const ITERS: u64 = 5;
 const MAGIC: &str = "quantum";
 
-async fn setup() -> Option<PostgresAdapter> {
-    let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
+async fn setup() -> PostgresAdapter {
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for the resolution scope-leak soundness fuzzer (SPEC §7e \
+         resolution cases); refusing to silently no-op",
+    );
     let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
     adapter.migrate().await.expect("migrate");
-    Some(adapter)
+    adapter
 }
 
 /// The worker-plane fold + materialization, via EXISTING storage methods only:
@@ -138,10 +142,7 @@ async fn name_fact(a: &PostgresAdapter, t: TenantId, source: &str, entity_id: &s
 
 #[tokio::test]
 async fn no_resolution_cross_entity_scope_leak() {
-    let Some(a) = setup().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let a = setup().await;
 
     for seed in 0..ITERS {
         let mut rng = StdRng::seed_from_u64(seed);

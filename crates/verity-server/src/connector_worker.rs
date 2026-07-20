@@ -1343,6 +1343,13 @@ pub(crate) struct ConnectorStatus {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate the process-global `POLL_STATE_DIR_ENV`.
+    /// `std::env::set_var`/`remove_var` touch shared process state, so without
+    /// this the default multi-threaded runner lets one test's `remove_var`
+    /// clobber another's `set_var` mid-assertion (a `starts_with` flake). Guards
+    /// only these env-mutating tests; no product code is affected.
+    static POLL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn t() -> Uuid {
         Uuid::from_u128(1)
     }
@@ -1885,6 +1892,7 @@ mod tests {
 
     #[test]
     fn poll_cursor_path_is_isolated_per_tenant_and_source() {
+        let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("verity-poll-test-{}", Uuid::new_v4()));
         std::env::set_var(POLL_STATE_DIR_ENV, &base);
 
@@ -1913,6 +1921,7 @@ mod tests {
 
     #[test]
     fn poll_cursor_path_rejects_non_cursor_source() {
+        let _env = POLL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("verity-poll-test-{}", Uuid::new_v4()));
         std::env::set_var(POLL_STATE_DIR_ENV, &base);
         let err = poll_cursor_state_file(None, Uuid::from_u128(1), "folder")

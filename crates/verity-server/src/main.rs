@@ -38,6 +38,7 @@ mod manifests;
 mod media;
 #[cfg(test)]
 mod media_tests;
+mod metrics;
 mod playground;
 #[cfg(test)]
 mod principals_tests;
@@ -467,6 +468,13 @@ pub(crate) struct AppState {
     /// the loop reuses `ConnectorPlane::start(PollOnce, ..)` for spawn/cleanup/
     /// ownership, skipping a tick when the prior cycle is still in-flight.
     pub(crate) sync: Arc<sync_scheduler::SyncPlane>,
+    /// M0 instrument panel (metrics.rs): hand-rolled atomic counters/gauges
+    /// rendered by `/metrics`. The hot-path counters (recall, exact-scan,
+    /// revocation subtract, audit drops) are cheap `Relaxed` adds; scrape-time
+    /// DB gauges (quarantine depth, degraded ACL runs, watch-cursor lag) are
+    /// read in the handler, never on the read path. Aggregate-only — no
+    /// tenant labels, no secrets.
+    pub(crate) metrics: Arc<metrics::Metrics>,
 }
 
 impl AppState {
@@ -1366,7 +1374,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let pg = PostgresAdapter::connect(&cli.dsn).await?;
+    // M0 instrument panel: build the shared metric block first so the storage
+    // adapter and the revocation plane can be wired to its hot-path counters
+    // before they are moved into AppState.
+    let app_metrics = Arc::new(metrics::Metrics::new());
+    let mut pg = PostgresAdapter::connect(&cli.dsn).await?;
+    pg.set_exact_scan_counter(app_metrics.exact_scan_counter());
     let applied = pg.migrate().await?;
     if applied > 0 {
         println!("applied {applied} migrations");
@@ -1400,7 +1413,11 @@ async fn main() -> anyhow::Result<()> {
         purposes: PurposePack::from_env()?,
         admin: AdminAuth::from_env(),
         rebac,
-        revocations: RevocationPlane::from_env(),
+        revocations: {
+            let mut r = RevocationPlane::from_env();
+            r.set_subtraction_counter(app_metrics.revocation_subtractions_arc());
+            r
+        },
         allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
@@ -1428,10 +1445,15 @@ async fn main() -> anyhow::Result<()> {
         directory: directory_worker::DirectoryPlane::from_env(),
         connectors: Arc::new(connector_worker::ConnectorPlane::from_env()),
         sync: Arc::new(sync_scheduler::SyncPlane::new()),
+        metrics: app_metrics,
     });
 
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        // M0 deliverable #4: real /healthz probes Postgres (+ SpiceDB when
+        // configured) with a bounded timeout; stays UNAUTHENTICATED (load
+        // balancers hit it). /metrics renders aggregate Prometheus text.
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics::metrics_handler))
         // Read-only scope-inspector UI (SPEC §11d) — embedded, zero-build.
         .route("/ui", get(ui::ui_page))
         .route("/v1/scopes", post(open_scope))
@@ -1917,6 +1939,105 @@ async fn open_scope(
     })))
 }
 
+// ---------- health ----------
+
+/// Bounded per-dependency probe timeout for `/healthz`. Small enough that a
+/// hung dependency surfaces fast to a load balancer, large enough to ride out a
+/// momentary GC/network blip.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pure health-decision core (unit-testable without a DB/engine): given the
+/// Postgres probe result and the SpiceDB probe result (`None` = ReBAC not
+/// configured, so not probed), produce the `/healthz` status + JSON body. 200
+/// only when every configured dependency is up; 503 naming the FIRST down
+/// dependency (Postgres before SpiceDB). Named-dependency body is the operator
+/// signal — no secrets, no tenant data.
+fn health_decision(pg_ok: bool, spicedb_ok: Option<bool>) -> (StatusCode, serde_json::Value) {
+    if !pg_ok {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"status": "unhealthy", "postgres": "down"}),
+        );
+    }
+    if spicedb_ok == Some(false) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"status": "unhealthy", "spicedb": "down"}),
+        );
+    }
+    (StatusCode::OK, serde_json::json!({"status": "ok"}))
+}
+
+/// GET /healthz (UNAUTHENTICATED, M0 deliverable #4). Probes Postgres
+/// (`SELECT 1`) and SpiceDB (when configured) each under a bounded timeout,
+/// then defers the verdict to [`health_decision`]. 200 `{"status":"ok"}` only
+/// when every configured dependency answers; 503 with a small JSON body naming
+/// the DOWN dependency otherwise. No secrets, no tenant data.
+async fn healthz(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
+    // Postgres: a trivial round-trip proves the pool + server are live.
+    let pg_ok = matches!(
+        tokio::time::timeout(
+            HEALTH_PROBE_TIMEOUT,
+            sqlx::query("SELECT 1").fetch_one(state.pool()),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    // SpiceDB: only probed when ReBAC is configured (dev mode has no engine).
+    let spicedb_ok = match &state.rebac {
+        None => None,
+        Some(rebac) => Some(matches!(
+            tokio::time::timeout(HEALTH_PROBE_TIMEOUT, rebac.health_ping()).await,
+            Ok(Ok(()))
+        )),
+    };
+    let (status, body) = health_decision(pg_ok, spicedb_ok);
+    (status, Json(body))
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::{health_decision, StatusCode};
+
+    #[test]
+    fn healthy_pg_no_rebac_is_200() {
+        let (status, body) = health_decision(true, None);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[test]
+    fn healthy_pg_and_spicedb_is_200() {
+        let (status, body) = health_decision(true, Some(true));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[test]
+    fn pg_down_is_503_naming_postgres() {
+        let (status, body) = health_decision(false, Some(true));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["postgres"], "down");
+        // Postgres is checked first: a healthy SpiceDB is not the named dep.
+        assert!(body.get("spicedb").is_none());
+    }
+
+    #[test]
+    fn spicedb_down_is_503_naming_spicedb() {
+        let (status, body) = health_decision(true, Some(false));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["spicedb"], "down");
+        assert!(body.get("postgres").is_none());
+    }
+
+    #[test]
+    fn pg_down_takes_precedence_over_spicedb_down() {
+        let (status, body) = health_decision(false, Some(false));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["postgres"], "down");
+    }
+}
+
 // ---------- recall ----------
 
 #[derive(Deserialize)]
@@ -1938,6 +2059,10 @@ async fn recall(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecallRequest>,
 ) -> HandlerResult<Json<Vec<RecallHit>>> {
+    // M0 instrumentation: count every recall + observe end-to-end latency
+    // (cheap Relaxed atomics; no allocation on the hot path).
+    state.metrics.record_recall_request();
+    let started = std::time::Instant::now();
     let payload = state.verify_scope(&req.scope_handle)?;
     // Text-only requests get the dense leg via the local encoder (hybrid
     // recall); callers may still send a precomputed embedding instead.
@@ -1964,6 +2089,7 @@ async fn recall(
         summary.as_deref(),
         hits.iter().map(|h| h.chunk_id).collect(),
     );
+    state.metrics.observe_recall_latency(started.elapsed());
     Ok(Json(hits))
 }
 

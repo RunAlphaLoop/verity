@@ -41,6 +41,11 @@ pub(crate) struct RevocationPlane {
     /// Per-tenant set of tokens with an in-window revocation row.
     cache: moka::sync::Cache<TenantId, Arc<Vec<PrincipalToken>>>,
     window_secs: i64,
+    /// M0 `/metrics`: `revocation_subtractions_total`, bumped by the number of
+    /// tokens actually dropped in `subtract`. `None` until the server wires the
+    /// shared counter (`set_subtraction_counter`); the increment is a cheap
+    /// `Relaxed` add on the read path.
+    subtractions: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl RevocationPlane {
@@ -51,7 +56,13 @@ impl RevocationPlane {
                 .time_to_live(CACHE_TTL)
                 .build(),
             window_secs: window_secs.max(0),
+            subtractions: None,
         }
+    }
+
+    /// Wire the shared `revocation_subtractions_total` counter (M0 `/metrics`).
+    pub(crate) fn set_subtraction_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.subtractions = Some(counter);
     }
 
     pub(crate) fn from_env() -> Self {
@@ -106,11 +117,20 @@ impl RevocationPlane {
         if revoked.is_empty() {
             return Ok(principals.to_vec());
         }
-        Ok(principals
+        let kept: Vec<PrincipalToken> = principals
             .iter()
             .copied()
             .filter(|t| !revoked.contains(t))
-            .collect())
+            .collect();
+        // M0: count the tokens actually dropped (never the whole set). Only the
+        // subtract path that removes something increments the counter.
+        if let Some(c) = &self.subtractions {
+            let dropped = principals.len().saturating_sub(kept.len()) as u64;
+            if dropped > 0 {
+                c.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(kept)
     }
 
     /// Durably record revocation rows (one per affected principal × lost
@@ -278,8 +298,11 @@ async fn current_token_set(
 mod tests {
     use super::*;
 
-    async fn test_pool() -> Option<(PgPool, TenantId)> {
-        let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
+    async fn test_pool() -> (PgPool, TenantId) {
+        let dsn = std::env::var("VERITY_TEST_DSN").expect(
+            "VERITY_TEST_DSN must be set for the revocation-subtraction soundness test \
+             (fail-closed window subtraction); refusing to silently no-op",
+        );
         let adapter = verity_storage::PostgresAdapter::connect(&dsn)
             .await
             .expect("connect");
@@ -289,7 +312,7 @@ mod tests {
             .create_tenant(&format!("revocation-test-{}", Uuid::now_v7()))
             .await
             .expect("tenant");
-        Some((adapter.pool().clone(), tenant))
+        (adapter.pool().clone(), tenant)
     }
 
     /// DSN-only: in-window rows are subtracted from any principal set;
@@ -297,10 +320,7 @@ mod tests {
     /// so exclusion is immediate in-process.
     #[tokio::test]
     async fn window_subtraction_is_immediate_and_expires() {
-        let Some((pool, tenant)) = test_pool().await else {
-            eprintln!("VERITY_TEST_DSN not set; skipping");
-            return;
-        };
+        let (pool, tenant) = test_pool().await;
         let plane = RevocationPlane::new(300);
 
         // Warm the cache with the empty set, then record: the invalidation

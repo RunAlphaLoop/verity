@@ -1,6 +1,9 @@
 //! Integration tests for the deterministic bi-temporal L1 contract (SPEC §2).
 //! Requires a live database: VERITY_TEST_DSN=postgres://verity:verity@localhost:5433/verity
-//! Skips (passes trivially) when the env var is absent so `cargo test` works offline.
+//! HARD-ERRORS (panics) when the env var is absent: `supersession_lifecycle`
+//! gates the invalidate-don't-delete bi-temporal contract (a stale-leak vector)
+//! and `recall_fails_closed` is a direct empty-principal fail-closed assertion —
+//! a soundness gate that silently skips is worse than no gate.
 
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -9,8 +12,11 @@ use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::PostgresAdapter;
 
-async fn test_adapter() -> Option<(PostgresAdapter, TenantId, EpisodeId)> {
-    let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
+async fn test_adapter() -> (PostgresAdapter, TenantId, EpisodeId) {
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for the bi-temporal soundness tests (SPEC §2 \
+         invalidate-don't-delete + fail-closed recall); refusing to silently no-op",
+    );
     let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
     adapter.migrate().await.expect("migrate");
     // Unique tenant per run keeps tests independent of prior state.
@@ -32,7 +38,7 @@ async fn test_adapter() -> Option<(PostgresAdapter, TenantId, EpisodeId)> {
         })
         .await
         .expect("episode");
-    Some((adapter, tenant, episode))
+    (adapter, tenant, episode)
 }
 
 fn key() -> FactKey {
@@ -56,10 +62,7 @@ fn read_scope(tenant: TenantId) -> Scope {
 
 #[tokio::test]
 async fn supersession_lifecycle() {
-    let Some((adapter, tenant, episode)) = test_adapter().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = test_adapter().await;
     let t0 = Utc::now() - Duration::minutes(10);
     let write = |value: serde_json::Value, at| FactWrite {
         tenant_id: tenant,
@@ -120,10 +123,7 @@ async fn supersession_lifecycle() {
 
 #[tokio::test]
 async fn recall_fails_closed() {
-    let Some((adapter, tenant, episode)) = test_adapter().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = test_adapter().await;
     adapter
         .upsert_chunks(vec![ChunkWrite {
             tenant_id: tenant,

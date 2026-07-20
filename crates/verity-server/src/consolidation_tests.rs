@@ -66,6 +66,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,
+        metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
     });
     Some((state, tenant))
 }
@@ -121,6 +122,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             repo_root: None,
             listen: "127.0.0.1:0".to_string(),
             admin_token: None,
+            metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         }),
         tenant,
     ))

@@ -35,6 +35,7 @@ pub(crate) fn spawn_audit(
     let confidentiality = payload.max_confidentiality as i16;
     // First 120 chars of the query text/ref — a summary, never full content.
     let query_summary: Option<String> = query_summary.map(|s| s.chars().take(120).collect());
+    let metrics = Arc::clone(&state.metrics);
     tokio::spawn(async move {
         let result = sqlx::query(
             "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
@@ -54,6 +55,7 @@ pub(crate) fn spawn_audit(
         .execute(&pool)
         .await;
         if let Err(e) = result {
+            metrics.record_audit_drop();
             tracing::warn!(verb, "audit_log insert failed: {e}");
         }
     });
@@ -88,6 +90,7 @@ pub(crate) fn spawn_fold_audit(
     .chars()
     .take(120)
     .collect();
+    let metrics = Arc::clone(&state.metrics);
     tokio::spawn(async move {
         let result = sqlx::query(
             "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
@@ -103,6 +106,7 @@ pub(crate) fn spawn_fold_audit(
         .execute(&pool)
         .await;
         if let Err(e) = result {
+            metrics.record_audit_drop();
             tracing::warn!("fold_link audit insert failed: {e}");
         }
     });
@@ -128,6 +132,7 @@ pub(crate) fn spawn_credential_audit(
         .chars()
         .take(120)
         .collect();
+    let metrics = Arc::clone(&state.metrics);
     tokio::spawn(async move {
         let result = sqlx::query(
             "INSERT INTO audit_log (id, tenant_id, actor_sub, actor_azp, verb, principals,
@@ -144,6 +149,7 @@ pub(crate) fn spawn_credential_audit(
         .execute(&pool)
         .await;
         if let Err(e) = result {
+            metrics.record_audit_drop();
             tracing::warn!(verb, "credential audit insert failed: {e}");
         }
     });

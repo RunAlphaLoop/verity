@@ -236,6 +236,15 @@ impl Rebac {
         serde_json::from_str(&text).map_err(|e| RebacError::Malformed(e.to_string()))
     }
 
+    /// Liveness probe for `/healthz` (M0): a cheap unary gateway call that
+    /// proves SpiceDB is reachable and answering. `POST /v1/schema/read` is a
+    /// single fast round-trip (unlike the streaming `watch_probe`); the caller
+    /// wraps it in a bounded `tokio::time::timeout`. Any transport/API failure
+    /// surfaces as `Err` → 503.
+    pub(crate) async fn health_ping(&self) -> RebacResult<()> {
+        self.post("/v1/schema/read", json!({})).await.map(|_| ())
+    }
+
     /// POST a (possibly server-streaming) gateway call; returns the `result`
     /// object of each NDJSON line. Any in-stream `error` line fails the call.
     async fn post_stream(&self, path: &str, body: Value) -> RebacResult<Vec<Value>> {
@@ -853,15 +862,16 @@ mod tests {
         }
     }
 
-    /// Gated on VERITY_SPICEDB_URL (skips when absent, like VERITY_TEST_DSN):
-    /// schema write is idempotent; nested membership resolves transitively;
-    /// delete shrinks the closure.
+    /// Gated on VERITY_SPICEDB_URL — HARD-ERRORS (panics) when absent (CI
+    /// provides SpiceDB): schema write is idempotent; nested membership resolves
+    /// transitively; delete shrinks the closure.
     #[tokio::test]
     async fn spicedb_schema_and_transitive_membership() {
-        let Some(rebac) = Rebac::from_env() else {
-            eprintln!("VERITY_SPICEDB_URL not set; skipping");
-            return;
-        };
+        let rebac = Rebac::from_env().expect(
+            "VERITY_SPICEDB_URL must be set for the ReBAC transitive-membership soundness test \
+             (the foundation of restricted-tier BatchCheck); refusing to silently no-op — CI \
+             provides SpiceDB",
+        );
         rebac.ensure_schema().await.expect("schema");
         rebac.ensure_schema().await.expect("schema is idempotent");
 

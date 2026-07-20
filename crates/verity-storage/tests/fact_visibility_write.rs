@@ -3,7 +3,10 @@
 //! `confidentiality` at creation, supersession must carry the ACL forward onto
 //! each new value row, and `correct_fact_acl` must rewrite the ACL in place
 //! across the whole key history + append one audit row (the append-only
-//! carve-out). Requires a live DB (VERITY_TEST_DSN); skips when absent.
+//! carve-out). Requires a live DB (VERITY_TEST_DSN); HARD-ERRORS (panics) when
+//! absent — this is the WRITE side of the §5e.6a fact-visibility leak (without
+//! persisted ACLs the read-path enforcement has nothing to filter on), so a
+//! silent skip is a soundness gap, not a convenience.
 
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -12,8 +15,11 @@ use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
 use verity_storage::{AclCorrectionReason, PostgresAdapter};
 
-async fn harness() -> Option<(PostgresAdapter, TenantId, EpisodeId)> {
-    let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
+async fn harness() -> (PostgresAdapter, TenantId, EpisodeId) {
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for the fact-visibility write-path soundness tests (SPEC \
+         §5e ACL materialization); refusing to silently no-op",
+    );
     let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
     adapter.migrate().await.expect("migrate");
     let tenant = adapter
@@ -34,7 +40,7 @@ async fn harness() -> Option<(PostgresAdapter, TenantId, EpisodeId)> {
         })
         .await
         .expect("episode");
-    Some((adapter, tenant, episode))
+    (adapter, tenant, episode)
 }
 
 fn key() -> FactKey {
@@ -61,10 +67,7 @@ fn scope(tenant: TenantId, principals: Vec<PrincipalToken>) -> Scope {
 /// verbatim on the current row.
 #[tokio::test]
 async fn upsert_materializes_visibility_and_confidentiality() {
-    let Some((adapter, tenant, episode)) = harness().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = harness().await;
     adapter
         .upsert_fact(FactWrite {
             tenant_id: tenant,
@@ -95,10 +98,7 @@ async fn upsert_materializes_visibility_and_confidentiality() {
 /// fail closed: even a broad scope carrying every principal cannot read it.
 #[tokio::test]
 async fn empty_visibility_is_invisible_to_every_scope() {
-    let Some((adapter, tenant, episode)) = harness().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = harness().await;
     let k = FactKey {
         source: "hubspot".into(),
         entity_id: "deal-empty".into(),
@@ -149,10 +149,7 @@ async fn empty_visibility_is_invisible_to_every_scope() {
 /// acl_provenance): the second value row is stamped with ITS OWN write's ACL.
 #[tokio::test]
 async fn supersession_carries_acl_onto_new_value_row() {
-    let Some((adapter, tenant, episode)) = harness().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = harness().await;
     let k = FactKey {
         source: "hubspot".into(),
         entity_id: "deal-super".into(),
@@ -203,10 +200,7 @@ async fn supersession_carries_acl_onto_new_value_row() {
 /// touched too, a historical read (`fact_as_of`) also sees the corrected ACL.
 #[tokio::test]
 async fn correct_fact_acl_rewrites_in_place_and_audits() {
-    let Some((adapter, tenant, episode)) = harness().await else {
-        eprintln!("VERITY_TEST_DSN not set; skipping");
-        return;
-    };
+    let (adapter, tenant, episode) = harness().await;
     let k = FactKey {
         source: "hubspot".into(),
         entity_id: "deal-correct".into(),

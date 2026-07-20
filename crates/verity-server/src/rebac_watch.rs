@@ -115,6 +115,22 @@ impl WatchStatus {
         self.enabled.store(on, Ordering::Relaxed);
     }
 
+    /// M0 `/metrics` reads: the enablement/connection/degraded flags as bools
+    /// so the freshness alarm can expose `watch_enabled` / `watch_connected` /
+    /// `watch_degraded` gauges. A disabled consumer (`enabled_now() == false`)
+    /// makes the cursor-lag sentinel meaningful — see metrics.rs.
+    pub(crate) fn enabled_now(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn connected_now(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn degraded_now(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
     fn set_connected(&self, on: bool) {
         self.connected.store(on, Ordering::Relaxed);
     }
@@ -753,6 +769,7 @@ mod tests {
             repo_root: None,
             listen: "127.0.0.1:0".to_string(),
             admin_token: None,
+            metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         });
         Some((state, tenant))
     }

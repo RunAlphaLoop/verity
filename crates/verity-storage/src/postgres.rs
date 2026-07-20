@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -308,6 +310,13 @@ pub struct PostgresAdapter {
     /// the tenant vs global (NULL-tenant) default from `settings` exactly as
     /// before, so the fail-safe default (`V1`) is unchanged.
     routes: moka::sync::Cache<TenantId, EmbeddingRoute>,
+    /// M0 instrumentation seam: incremented each time `recall_dense` takes the
+    /// ≤`EXACT_SCAN_MAX_ROWS` exact-scan branch, so `/metrics` can expose
+    /// `exact_scan_fallback_total` without the storage crate depending on the
+    /// server. `None` unless the server wires a shared counter at construction
+    /// (`set_exact_scan_counter`); the increment is a `Relaxed` atomic add on a
+    /// cloned `Arc`, no lock, read-path-safe.
+    exact_scan_fallback: Option<Arc<AtomicU64>>,
 }
 
 impl PostgresAdapter {
@@ -330,7 +339,15 @@ impl PostgresAdapter {
             kek,
             deks: moka::sync::Cache::new(10_000),
             routes: moka::sync::Cache::new(10_000),
+            exact_scan_fallback: None,
         })
+    }
+
+    /// Wire the shared `exact_scan_fallback_total` counter (M0 `/metrics`). The
+    /// server calls this once at construction with the counter it also renders
+    /// at scrape time; keeps the storage crate free of any server dependency.
+    pub fn set_exact_scan_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.exact_scan_fallback = Some(counter);
     }
 
     /// The tenant's data-encryption key, provisioning it lazily on first use
@@ -3346,7 +3363,12 @@ impl PostgresAdapter {
 
         if estimated_rows <= Self::EXACT_SCAN_MAX_ROWS {
             // Small filtered set: exact top-k over it (perfect recall, and
-            // faster than graph traversal under selective filters).
+            // faster than graph traversal under selective filters). M0: count
+            // the fallback so `/metrics` can expose how often the exact branch
+            // runs (cheap Relaxed add on the optional shared counter).
+            if let Some(c) = &self.exact_scan_fallback {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
             sqlx::query("SET LOCAL enable_indexscan = off")
                 .execute(&mut *tx)
                 .await
