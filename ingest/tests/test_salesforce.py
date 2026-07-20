@@ -58,11 +58,15 @@ def make_mock_salesforce(
     *,
     reject_first_query: bool = False,
     shares_fail: bool = False,
+    roster_fail: bool = False,
+    roster_500: bool = False,
 ) -> httpx.MockTransport:
     """Routes the token endpoint and SOQL queries to fixtures. Tokens mint as
     ``sf-token-1``, ``sf-token-2``, ... With ``reject_first_query`` the very
     first data request gets a documented 401 INVALID_SESSION_ID body to
-    exercise the shared 401-retry-once hook."""
+    exercise the shared 401-retry-once hook. With ``roster_fail`` the
+    User/GroupMember roster queries 403 (degraded-ACL path); with
+    ``roster_500`` the User query returns a non-403 500 (non-403 degrade path)."""
     state = {"mints": 0, "data_requests": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -90,6 +94,19 @@ def make_mock_salesforce(
         if request.url.path == NEXT_RECORDS_PATH:
             return httpx.Response(200, json=fixture("query_accounts_page2.json"))
         assert request.url.path == QUERY_PATH
+        # Roster queries — matched most-specific first (GroupMember before
+        # User / Account so substrings don't collide). No FROM Group query is
+        # issued: the group token derives from the id alone.
+        if "FROM GroupMember" in soql:
+            if roster_fail:
+                return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
+            return httpx.Response(200, json=fixture("query_groupmembers.json"))
+        if "FROM User " in soql:
+            if roster_fail:
+                return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
+            if roster_500:
+                return httpx.Response(500, json=[{"errorCode": "UNKNOWN_EXCEPTION"}])
+            return httpx.Response(200, json=fixture("query_users.json"))
         if "FROM AccountShare" in soql:
             if shares_fail:
                 return httpx.Response(500, json=[{"errorCode": "UNKNOWN_EXCEPTION"}])
@@ -235,19 +252,40 @@ def test_contact_and_opportunity_pages_map_exactly() -> None:
 # ---------- ACL honesty: AccountShare rows → additive principal metadata ----------
 
 
-def test_principal_for_share_key_prefixes() -> None:
+def test_principal_for_share_classifies_raw_ids() -> None:
+    # principal_for_share is now a RAW-ID classifier, not a token minter: the
+    # raw-id ``user:005…``/``group:00G…`` strings it used to return were the
+    # identity gap. Token crosswalk happens in resolve_share_principals.
     assert (
         SalesforceConnector.principal_for_share({"UserOrGroupId": "005xx000001X8UzAAK"})
-        == "user:005xx000001X8UzAAK"
+        == "005xx000001X8UzAAK"
     )
     assert (
         SalesforceConnector.principal_for_share({"UserOrGroupId": "00Gxx0000000001EAA"})
-        == "group:00Gxx0000000001EAA"
+        == "00Gxx0000000001EAA"
     )
-    # Unknown prefixes contribute nothing (additive metadata: skipping cannot
-    # widen visibility).
+    # Unknown prefixes contribute nothing (skipping cannot widen visibility).
     assert SalesforceConnector.principal_for_share({"UserOrGroupId": "0DLxx00000001AAA"}) is None
     assert SalesforceConnector.principal_for_share({}) is None
+
+
+def test_resolve_share_principals_crosswalk() -> None:
+    from verity_ingest.connectors.salesforce import SalesforceUserInfo
+
+    roster = {"005xx000001X8UzAAK": SalesforceUserInfo(email="ae@acme.test")}
+    # (a) User → lowercased cross-source token; Group → stable salesforce token.
+    assert SalesforceConnector.resolve_share_principals(
+        ["005xx000001X8UzAAK", "00Gxx0000000001EAA"], roster
+    ) == ["user:ae@acme.test", "group:salesforce-group-00Gxx0000000001EAA"]
+    # unresolvable 005 (not in roster / no email) is DROPPED → None (fail closed)
+    assert SalesforceConnector.resolve_share_principals(["005xx000009ZZZAAK"], roster) is None
+    assert SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], {}) is None
+    # all-dropped / empty → None so the record rides the admin --visibility floor
+    assert SalesforceConnector.resolve_share_principals([], roster) is None
+    # a group id alone still resolves (no roster dependency)
+    assert SalesforceConnector.resolve_share_principals(["00Gxx0000000001EAA"], {}) == [
+        "group:salesforce-group-00Gxx0000000001EAA"
+    ]
 
 
 # ---------- sink conformance: FactEvent → exact Debezium envelope ----------
@@ -278,9 +316,10 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
     assert next_cursor == "2026-07-09T03:15:22.000+0000"
 
     # one token mint, then Account (query + queryMore), Contact, Opportunity,
-    # AccountShare — all with the cached Bearer token
+    # AccountShare, then the roster (User + GroupMember, BFS) — all with the
+    # cached Bearer token.
     paths = [entry["path"] for entry in log]
-    assert paths == [
+    assert paths[:6] == [
         TOKEN_PATH,
         QUERY_PATH,
         NEXT_RECORDS_PATH,
@@ -288,6 +327,7 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
         QUERY_PATH,
         QUERY_PATH,
     ]
+    assert paths.count(TOKEN_PATH) == 1
     assert "grant_type=client_credentials" in log[0]["body"]
     data_requests = log[1:]
     assert all(entry["auth"] == "Bearer sf-token-1" for entry in data_requests)
@@ -298,26 +338,55 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
         "SELECT Id, Name, Industry, Website, AnnualRevenue, LastModifiedDate FROM Account "
         "WHERE LastModifiedDate > 2026-07-08T00:00:00Z ORDER BY LastModifiedDate ASC"
     )
-    share_soql = data_requests[-1]["q"]
+    share_soql = next(q for entry in data_requests if "FROM AccountShare" in (q := entry["q"]))
     assert share_soql.startswith(
         "SELECT AccountId, UserOrGroupId, AccountAccessLevel, RowCause FROM AccountShare"
     )
     for account_id in ("001xx000003DGb1AAG", "001xx000003DGb2AAG", "001xx000003DGb3AAG"):
         assert f"'{account_id}'" in share_soql
 
-    # share principals: additive metadata on Account events only
+    # roster queries fired for the collected share ids
+    queries = [entry["q"] for entry in data_requests]
+    user_soql = next(q for q in queries if "FROM User " in q)
+    assert user_soql == (
+        "SELECT Id, Email, IsActive FROM User WHERE Id IN ('005xx000001X8UzAAK')"
+    )
+    assert any("FROM GroupMember" in q and "'00Gxx0000000001EAA'" in q for q in queries)
+
+    # RAW share ids collected as additive metadata on Account events only
     by_account = {
         e.entity_id: e.share_principals
         for e in events
         if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
     }
     assert by_account == {
-        "001xx000003DGb1AAG": ["user:005xx000001X8UzAAK", "group:00Gxx0000000001EAA"],
-        "001xx000003DGb2AAG": ["user:005xx000001X8UzAAK"],
+        "001xx000003DGb1AAG": ["005xx000001X8UzAAK", "00Gxx0000000001EAA"],
+        "001xx000003DGb2AAG": ["005xx000001X8UzAAK"],
         "001xx000003DGb3AAG": [],  # no AccountShare rows recorded for Initech
     }
     assert all(
         e.share_principals == []
+        for e in events
+        if isinstance(e, SalesforceFactEvent) and e.object_type != "Account"
+    )
+
+    # share ids crosswalked → cross-source principal strings (005 → lowercased
+    # user:<email>; 00G → stable group token). Non-Account events untouched.
+    by_account_principals = {
+        e.entity_id: e.record_principals
+        for e in events
+        if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
+    }
+    assert by_account_principals == {
+        "001xx000003DGb1AAG": [
+            "user:ae@acme.test",
+            "group:salesforce-group-00Gxx0000000001EAA",
+        ],
+        "001xx000003DGb2AAG": ["user:ae@acme.test"],
+        "001xx000003DGb3AAG": None,  # no shares → admin --visibility floor
+    }
+    assert all(
+        e.record_principals is None
         for e in events
         if isinstance(e, SalesforceFactEvent) and e.object_type != "Account"
     )
@@ -367,6 +436,218 @@ def test_fetch_account_shares_false_skips_share_query() -> None:
     events, _ = run_poll(connector, "2026-07-08T00:00:00.000+0000")
     assert len(events) == 18
     assert not any("FROM AccountShare" in entry.get("q", "") for entry in log)
+
+
+# ---------- group-edge mirroring: GroupMember → SpiceDB (nested, cycle-safe) ----------
+
+
+def test_poll_builds_nested_cycle_safe_group_edges() -> None:
+    log: list[dict] = []
+    connector = make_connector(log)
+    run_poll(connector, "2026-07-08T00:00:00.000+0000")
+
+    # Direct edges only (SpiceDB closes transitivity). Nesting preserved: a
+    # 00G member becomes a group:salesforce-group-<child> edge. The mutual
+    # reference (1⊃2, 2⊃1) terminates via the visited-set (no hang).
+    assert connector.group_edges == {
+        "group:salesforce-group-00Gxx0000000001EAA": {
+            "user:ae@acme.test",
+            "group:salesforce-group-00Gxx0000000002EAA",
+        },
+        "group:salesforce-group-00Gxx0000000002EAA": {
+            "group:salesforce-group-00Gxx0000000001EAA",
+        },
+    }
+
+
+def test_group_only_member_user_is_fetched_and_edged() -> None:
+    # A user (005) that is ONLY a GroupMember — never a direct AccountShare
+    # principal — must still be queried for its email and edged into the group.
+    # This is the common case for group shares; the User query covers the UNION
+    # of share-derived AND group-member 005 ids.
+    GROUP = "00Gxx0000000009EAA"
+    MEMBER = "005xx000009MEMBER1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TOKEN_PATH:
+            payload = dict(fixture("token.json"))
+            payload["access_token"] = "sf-token-1"
+            return httpx.Response(200, json=payload)
+        soql = request.url.params.get("q", "")
+        if "FROM GroupMember" in soql:
+            return httpx.Response(
+                200,
+                json={
+                    "totalSize": 1,
+                    "done": True,
+                    "records": [{"GroupId": GROUP, "UserOrGroupId": MEMBER}],
+                },
+            )
+        if "FROM User " in soql:
+            # The member 005 must be IN this query even though no AccountShare
+            # named it (we pass NO share-derived user_ids below).
+            assert f"'{MEMBER}'" in soql
+            return httpx.Response(
+                200,
+                json={
+                    "totalSize": 1,
+                    "done": True,
+                    "records": [{"Id": MEMBER, "Email": "member1@acme.test", "IsActive": True}],
+                },
+            )
+        raise AssertionError(f"unexpected SOQL: {soql}")
+
+    connector = SalesforceConnector(
+        POLICY,
+        my_domain="acme",
+        client_id="k",
+        client_secret="s",
+        client=httpx.AsyncClient(
+            base_url="https://acme.my.salesforce.com", transport=httpx.MockTransport(handler)
+        ),
+        token_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def run():
+        try:
+            # NO share-derived user_ids — the member 005 is discovered purely via
+            # the group. It must still land in the edge as user:<email>.
+            return await connector._fetch_roster([], [GROUP])
+        finally:
+            await connector.aclose()
+
+    _users, group_edges = asyncio.run(run())
+    assert group_edges == {"group:salesforce-group-00Gxx0000000009EAA": {"user:member1@acme.test"}}
+
+
+def test_sync_group_edges_posts_sorted_and_nest_capable() -> None:
+    posts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    sink = VerityDebeziumSink(
+        url="http://sink", tenant_id="t", transport=httpx.MockTransport(handler)
+    )
+    edges = {
+        "group:salesforce-group-00Gxx0000000001EAA": {
+            "group:salesforce-group-00Gxx0000000002EAA",
+            "user:ae@acme.test",
+        },
+    }
+    assert sink.sync_group_edges(edges) == 2
+    # deterministic: groups sorted, members sorted within each; a member that is
+    # itself a group flows through unchanged (endpoint is nest-capable).
+    assert [(p["group"], p["member"]) for p in posts] == [
+        ("group:salesforce-group-00Gxx0000000001EAA", "group:salesforce-group-00Gxx0000000002EAA"),
+        ("group:salesforce-group-00Gxx0000000001EAA", "user:ae@acme.test"),
+    ]
+    # empty map → no-op
+    assert sink.sync_group_edges({}) == 0
+    # back-compat alias unchanged for HubSpot
+    assert VerityDebeziumSink.sync_team_edges is VerityDebeziumSink.sync_group_edges
+
+
+# ---------- degraded ACL: 403 on the roster → admin fallback + signal ----------
+
+
+def test_roster_403_degrades_to_admin_fallback(capsys: pytest.CaptureFixture[str]) -> None:
+    log: list[dict] = []
+    events, _ = run_poll(make_connector(log, roster_fail=True), "2026-07-08T00:00:00.000+0000")
+
+    # facts proceed; every record falls back to the admin --visibility floor
+    assert len(events) == 18
+    assert all(
+        e.record_principals is None for e in events if isinstance(e, SalesforceFactEvent)
+    )
+    stderr = capsys.readouterr().err
+    assert "salesforce: User/Group roster query returned 403" in stderr
+
+
+def test_roster_degraded_flag_set_on_403() -> None:
+    log: list[dict] = []
+    connector = make_connector(log, roster_fail=True)
+    run_poll(connector, "2026-07-08T00:00:00.000+0000")
+    assert connector.roster_degraded is True
+    assert connector.group_edges == {}
+
+
+# ---------- envelope: resolved verity_acl UNIONed over the admin floor ----------
+
+
+def test_envelope_emits_approximated_verity_acl_when_resolved() -> None:
+    page = fixture("query_accounts_page1.json")
+    event = SalesforceConnector.events_from_query_page("Account", page, POLICY)[2]
+    event.record_visibility = [41, 55]  # sink-resolved tokens
+    assert VerityDebeziumSink.envelope(event)["verity_acl"] == {
+        "visibility": [41, 55],
+        "confidentiality": "internal",
+        "acl_provenance": "approximated",
+    }
+    # a share-less event carries NO inline block → rides the ?visibility= floor
+    bare = SalesforceConnector.events_from_query_page("Account", page, POLICY)[3]
+    assert "verity_acl" not in VerityDebeziumSink.envelope(bare)
+    assert VerityDebeziumSink._bound_visibility([bare]) == "7,12"
+
+
+def test_stamp_unions_admin_floor_into_resolved_visibility() -> None:
+    # The write path REPLACES the bound admin policy with any inline verity_acl
+    # (ingest.rs or_else). AccountShare is a SUBSET of effective visibility, so
+    # the sink must UNION the admin --visibility floor (POLICY = [7, 12]) into
+    # the resolved record_visibility, floor first, so the inline block is a
+    # SUPERSET of the floor — the record can never LOSE its admin floor.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/principals":
+            body = json.loads(request.content)
+            table = {"user:ae@acme.test": 41, "group:salesforce-group-00Gxx0000000001EAA": 55}
+            return httpx.Response(
+                200, json={"mappings": {p: table[p] for p in body["principals"] if p in table}}
+            )
+        raise AssertionError(request.url.path)
+
+    sink = VerityDebeziumSink(
+        url="http://sink", tenant_id="t", transport=httpx.MockTransport(handler)
+    )
+    event = SalesforceFactEvent(
+        source="salesforce",
+        entity_id="001xx000003DGb1AAG",
+        field_name="Name",
+        value="Acme Corp",
+        valid_from=utc(2026, 7, 8, 18, 4, 57),
+        raw_payload={},
+        object_type="Account",
+        visibility_policy=POLICY,
+        record_principals=["user:ae@acme.test", "group:salesforce-group-00Gxx0000000001EAA"],
+    )
+    sink._stamp_record_visibility([event])
+    # floor [7, 12] UNIONed in, floor first, deduped
+    assert event.record_visibility == [7, 12, 41, 55]
+    assert VerityDebeziumSink.envelope(event)["verity_acl"]["visibility"] == [7, 12, 41, 55]
+
+
+def test_roster_non_403_error_degrades_and_signals(capsys: pytest.CaptureFixture[str]) -> None:
+    # A non-403 roster HTTP error (User query 500) means GroupMember edges were
+    # never mirrored this cycle; the connector must degrade like the 403 path
+    # (drop all record_principals to the admin floor + set roster_degraded) so
+    # the runner emits DEGRADED_ACL_SIGNAL — never stamp on a partial roster.
+    log: list[dict] = []
+    connector = make_connector(log, roster_500=True)
+    events, _ = run_poll(connector, "2026-07-08T00:00:00.000+0000")
+    assert connector.roster_degraded is True
+    assert connector.group_edges == {}
+    assert all(
+        e.record_principals is None for e in events if isinstance(e, SalesforceFactEvent)
+    )
+
+
+def test_no_group_query_is_issued() -> None:
+    # The group token derives from the id alone; Group.Type is never needed, so
+    # no FROM Group query is issued (only GroupMember + User).
+    log: list[dict] = []
+    run_poll(make_connector(log), "2026-07-08T00:00:00.000+0000")
+    assert not any("FROM Group " in entry.get("q", "") for entry in log)
+    assert any("FROM GroupMember" in entry.get("q", "") for entry in log)
 
 
 def test_poll_from_none_has_no_where_and_full_crawl_matches() -> None:

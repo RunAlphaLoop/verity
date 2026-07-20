@@ -1,0 +1,30 @@
+{
+  "totalSize": 3,
+  "done": true,
+  "records": [
+    {
+      "attributes": {
+        "type": "GroupMember",
+        "url": "/services/data/v62.0/sobjects/GroupMember/03exx0000000001AAA"
+      },
+      "GroupId": "00Gxx0000000001EAA",
+      "UserOrGroupId": "005xx000001X8UzAAK"
+    },
+    {
+      "attributes": {
+        "type": "GroupMember",
+        "url": "/services/data/v62.0/sobjects/GroupMember/03exx0000000002AAA"
+      },
+      "GroupId": "00Gxx0000000001EAA",
+      "UserOrGroupId": "00Gxx0000000002EAA"
+    },
+    {
+      "attributes": {
+        "type": "GroupMember",
+        "url": "/services/data/v62.0/sobjects/GroupMember/03exx0000000003AAA"
+      },
+      "GroupId": "00Gxx0000000002EAA",
+      "UserOrGroupId": "00Gxx0000000001EAA"
+    }
+  ]
+}

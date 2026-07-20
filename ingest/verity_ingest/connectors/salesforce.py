@@ -36,21 +36,36 @@ defaults, the role hierarchy, sharing rules, manual/team shares, **implicit
 sharing** (parent-account access implied by child contact/opportunity/case
 access and vice versa — not represented as ``*Share`` rows the way explicit
 shares are), and territory management. This connector does **not** reconstruct
-that. What it does, best-effort:
+that; AccountShare is a strict SUBSET of effective visibility, so the enforced
+ACL stays provenance ``"approximated"`` — we over-hide, never claim "mirrored".
+What it does, per poll cycle:
 
-- For Accounts changed in a poll cycle it fetches ``AccountShare`` rows and
-  records AclEnvelope-style principal strings — ``user:<UserOrGroupId>`` for
-  005-prefixed users, ``group:<UserOrGroupId>`` for 00G-prefixed groups —
-  on the event as ``share_principals``, with ACL provenance intent
-  ``"approximated"`` (:data:`SHARE_ACL_PROVENANCE`).
-- Those share-derived principals are **ADDITIVE metadata for the future
-  identity crosswalk, not enforced visibility**. Enforcement uses the same
-  fail-closed fallback as the tier-C HubSpot connector: the constructor
-  requires an admin-assigned ``visibility_policy`` (no default), every
-  emitted event carries it, and share failures never gate facts (the fetch
-  is best-effort by construction). When the identity plane can crosswalk
-  005/00G ids to Verity principal tokens *and* the implicit-sharing/territory
-  gap is closed, these events already carry the raw material.
+- For Accounts changed in the window it fetches ``AccountShare`` rows and
+  collects each row's RAW ``UserOrGroupId`` (005 User / 00G Group) on the event
+  as ``share_principals`` (Accounts only; empty on Contact/Opportunity).
+- It CROSSWALKS those raw ids to cross-source principal STRINGS through a roster
+  built from the ``User`` and ``GroupMember`` objects: a 005 → ``user:<email
+  .lower()>`` (byte-identical to what gdrive/gmail/hubspot emit for the same
+  human — join on ``User.Email``, never ``Username``); a 00G → the stable
+  ``group:salesforce-group-<id>``. Nested ``GroupMember`` edges (a member may
+  be another 00G) are mirrored into SpiceDB via ``POST /v1/admin/groups`` — the
+  runner syncs them FIRST so a subject resolves through the group the instant
+  group-scoped facts land. The expansion is breadth-first and cycle-safe.
+- The resolved strings are materialized to int tokens by the shared sink and
+  stamped as an INLINE ``verity_acl`` (``acl_provenance: approximated``). The
+  write-path choke point applies an inline block with REPLACE semantics (it
+  wins over the connector-bound admin ``--visibility`` policy, it does not union
+  server-side), so because AccountShare is a known subset we UNION the admin
+  ``--visibility`` floor INTO the stamped token set before it ships (via the
+  event's ``union_policy_floor`` flag → :meth:`VerityDebeziumSink.
+  _stamp_record_visibility`). The inline block is therefore always a SUPERSET of
+  the admin floor: an unresolvable share id is dropped, but the record still
+  carries the full admin-policy visibility. Enforcement is fail-closed by
+  construction — the constructor requires an admin ``visibility_policy`` (no
+  default), share/roster fetch failures never gate facts, and a 403 (or any
+  other error) on the roster query trips :attr:`~SalesforceConnector.
+  roster_degraded`, dropping every record back to the admin floor and emitting
+  :data:`DEGRADED_ACL_SIGNAL`.
 
 Sink: the same :class:`~verity_ingest.connectors.hubspot.VerityDebeziumSink`
 pattern as HubSpot — one bare Debezium payload per event, ``op: "u"``,
@@ -101,9 +116,45 @@ SHARE_ACL_PROVENANCE = "approximated"
 USER_KEY_PREFIX = "005"
 GROUP_KEY_PREFIX = "00G"
 
-#: SOQL ``IN (...)`` chunk size for AccountShare lookups (keeps each query
-#: comfortably under the SOQL statement-length limit).
+#: SOQL ``IN (...)`` chunk size for AccountShare / roster lookups (keeps each
+#: query comfortably under the SOQL statement-length limit).
 SHARE_QUERY_CHUNK = 200
+
+#: Stable, machine-readable stdout token the server greps for backfill
+#: ``state=degraded_acl`` (connector-agnostic — same value HubSpot emits). A
+#: 403 on the User/Group/GroupMember roster query trips this and every record
+#: falls back to the admin-assigned ``--visibility``.
+DEGRADED_ACL_SIGNAL = "verity.backfill.degraded_acl"
+
+#: Hard backstop on the breadth-first Group/GroupMember expansion. Combined with
+#: the ``seen`` visited-set this makes a membership cycle (``A⊃B``, ``B⊃A``)
+#: terminate and caps a pathological roster.
+GROUP_EXPANSION_MAX = 5000
+
+
+def user_principal(email: str) -> str:
+    """The record-owner principal. Lowercased ``user:<email>`` so it is the SAME
+    SpiceDB object a Gmail/Drive/HubSpot subject resolves to — one human is one
+    identity across every source. Join on ``User.Email`` (lowercased), NEVER
+    ``Username`` (email-formatted but a distinct, org-unique field)."""
+    return f"user:{email.lower()}"
+
+
+def group_principal(group_id: str) -> str:
+    """The group-visibility principal, a SpiceDB group. Stable for ALL Salesforce
+    Group ``Type`` values (Regular, Queue, Role, RoleAndSubordinates, …) — a
+    Role group is represented as a group like any other. Nested GroupMember
+    edges are mirrored via ``POST /v1/admin/groups``; SpiceDB closes the graph."""
+    return f"group:salesforce-group-{group_id}"
+
+
+@dataclass(frozen=True)
+class SalesforceUserInfo:
+    """One Salesforce ``User`` (005) reduced to the crosswalk join key: the
+    lowercased login email. A user with no ``Email`` (integration/inactive)
+    yields no roster entry and its id is dropped (over-hide, fail closed)."""
+
+    email: str
 
 #: Default fields per sobject (Id and LastModifiedDate are always added).
 #: Override via the ``fields`` constructor arg.
@@ -120,14 +171,37 @@ _METADATA_FIELDS = {"Id", "LastModifiedDate", "attributes"}
 
 @dataclass
 class SalesforceFactEvent(FactEvent):
-    """A FactEvent plus the sobject type (→ Debezium ``source.table``), the
-    admin-assigned visibility policy (enforced, fail closed), and — for
-    Accounts — best-effort share-derived principals (additive metadata with
-    provenance intent :data:`SHARE_ACL_PROVENANCE`, NOT enforced)."""
+    """A FactEvent plus what CRM ingestion requires.
+
+    Visibility precedence, per record:
+    - ``share_principals`` — the RAW ``005``/``00G`` AccountShare ids for this
+      record, pre-resolution (Accounts only; empty elsewhere).
+    - ``record_principals`` — those share ids crosswalked to principal STRINGS
+      (``user:<email>`` + ``group:salesforce-group-<id>``), or ``None`` when
+      unowned / every id dropped. The shared sink reads this to resolve tokens.
+    - ``record_visibility`` — those strings resolved to int tokens (filled by
+      the sink via ``/v1/admin/principals``), UNIONed with ``visibility_policy``
+      (``union_policy_floor`` is True — see below). When set, the envelope
+      carries an inline ``verity_acl`` with ``acl_provenance: approximated``.
+    - ``visibility_policy`` — the admin-assigned fallback (``--visibility``).
+      The write path applies an inline ``verity_acl`` with REPLACE semantics
+      (it wins over the connector-bound policy, no server-side union), and
+      AccountShare is a strict SUBSET of effective Salesforce visibility, so
+      ``union_policy_floor`` makes the sink fold this floor INTO the stamped
+      token set — the inline block is always a superset of the admin floor.
+    """
 
     object_type: str
     visibility_policy: list[int]
     share_principals: list[str] = field(default_factory=list)
+    record_principals: list[str] | None = None
+    record_visibility: list[int] | None = None
+    #: Read by the shared sink: because the write path REPLACES the bound admin
+    #: policy with any inline ACL (ingest.rs ``or_else``), and AccountShare is a
+    #: known subset of effective visibility, the admin ``--visibility`` floor is
+    #: UNIONed into ``record_visibility`` before stamping so the inline block is
+    #: a superset of the floor (over-hide, never drop the floor).
+    union_policy_floor: bool = True
 
 
 def _parse_sf_timestamp(value: str) -> datetime:
@@ -185,6 +259,17 @@ class SalesforceConnector(Connector):
         self.visibility_policy = list(visibility_policy)
         self.fields = dict(DEFAULT_FIELDS, **(fields or {}))
         self.fetch_account_shares = fetch_account_shares
+        #: Filled by :meth:`poll` from the Group/GroupMember roster. Maps each
+        #: ``group:salesforce-group-<id>`` to the set of member principals
+        #: (``user:<email>`` or nested ``group:salesforce-group-<child>``) — the
+        #: SpiceDB edges the runner syncs FIRST so a subject resolves through the
+        #: group the moment group-scoped facts land. Empty when unowned/degraded.
+        self.group_edges: dict[str, set[str]] = {}
+        #: Set True by :meth:`_fetch_roster` when the User/Group/GroupMember query
+        #: 403s (the integration user lacks read on those objects). Every record
+        #: then falls back to the admin-assigned ``--visibility``; the runner
+        #: turns this into the distinct, machine-readable ``degraded_acl`` signal.
+        self.roster_degraded: bool = False
 
         my_domain = my_domain or os.environ.get(MY_DOMAIN_ENV)
         if credential is None:
@@ -259,20 +344,48 @@ class SalesforceConnector(Connector):
 
     @staticmethod
     def principal_for_share(row: Mapping[str, Any]) -> str | None:
-        """Map one AccountShare row to an AclEnvelope-style principal string.
+        """Classify one AccountShare row → its RAW ``UserOrGroupId`` id.
 
-        ``UserOrGroupId`` key-prefix 005 → ``user:<id>``, 00G → ``group:<id>``
-        (public groups, roles-as-groups, territory groups all surface as 00G).
-        Anything else contributes nothing — these principals are additive,
-        unenforced metadata, so skipping the unknown cannot widen visibility.
+        A ``005`` (User) or ``00G`` (Group) id is returned VERBATIM for the
+        per-account id list; anything else contributes nothing (skipping an
+        unknown prefix cannot widen visibility). This is a classifier, NOT a
+        token minter — the raw-id ``user:005…`` / ``group:00G…`` strings it used
+        to return were the identity gap; crosswalk to cross-source principal
+        tokens happens in :meth:`resolve_share_principals` against the roster.
         """
         user_or_group = str(row.get("UserOrGroupId") or "")
-        if user_or_group.startswith(USER_KEY_PREFIX):
-            return f"user:{user_or_group}"
-        if user_or_group.startswith(GROUP_KEY_PREFIX):
-            return f"group:{user_or_group}"
+        if user_or_group.startswith(USER_KEY_PREFIX) or user_or_group.startswith(GROUP_KEY_PREFIX):
+            return user_or_group
         logger.debug("AccountShare row with unrecognized UserOrGroupId prefix: %r", user_or_group)
         return None
+
+    @staticmethod
+    def resolve_share_principals(
+        share_ids: Iterable[str], users_by_id: Mapping[str, SalesforceUserInfo]
+    ) -> list[str] | None:
+        """Crosswalk raw AccountShare ids → cross-source principal strings.
+
+        ``005`` User → ``user:<email.lower()>`` via the roster (the token is
+        byte-identical to what gdrive/gmail/hubspot emit for the same human); a
+        ``005`` with no roster email is DROPPED (over-hide, fail closed). ``00G``
+        Group → the stable ``group:salesforce-group-<id>`` (mirrored into SpiceDB
+        by :meth:`_fetch_roster`). Deduplicated in id order. Returns ``[] → None``
+        so an unowned / all-dropped record rides the admin ``--visibility`` floor.
+        """
+        principals: list[str] = []
+        for share_id in share_ids:
+            if share_id.startswith(USER_KEY_PREFIX):
+                info = users_by_id.get(share_id)
+                if info is None or not info.email:
+                    continue  # unresolvable 005 → dropped (fail closed)
+                principal = user_principal(info.email)
+            elif share_id.startswith(GROUP_KEY_PREFIX):
+                principal = group_principal(share_id)
+            else:
+                continue
+            if principal not in principals:
+                principals.append(principal)
+        return principals or None
 
     # ---------- lanes ----------
 
@@ -289,9 +402,13 @@ class SalesforceConnector(Connector):
         epoch, no WHERE clause), ascending, following queryMore pagination.
         Returns the events and the max LastModifiedDate seen as next cursor.
 
-        Accounts changed in the window additionally get best-effort
-        ``share_principals`` from AccountShare (see the module docstring);
-        a failed share fetch logs a warning and never gates the facts.
+        Accounts changed in the window additionally get their AccountShare
+        ``005``/``00G`` ids (``share_principals``), crosswalked through the
+        User/Group roster into ``record_principals`` (``user:<email>`` /
+        ``group:salesforce-group-<id>``) and the nested GroupMember edges into
+        :attr:`group_edges` (mirrored to SpiceDB by the runner BEFORE facts land).
+        A failed share/roster fetch never gates the facts — they ride the admin
+        ``--visibility`` floor (fail closed); a 403 trips :attr:`roster_degraded`.
         """
         events: list[FactEvent | DocumentEvent] = []
         next_cursor = cursor or "1970-01-01T00:00:00+00:00"
@@ -319,6 +436,41 @@ class SalesforceConnector(Connector):
             for event in events:
                 if isinstance(event, SalesforceFactEvent) and event.object_type == "Account":
                     event.share_principals = list(shares.get(event.entity_id, []))
+
+            # Crosswalk the collected share ids → cross-source principals. The
+            # roster fetch is best-effort: a 403 degrades to admin fallback, any
+            # other HTTP error leaves records on the admin floor (fail closed).
+            user_ids = sorted(
+                {s for ids in shares.values() for s in ids if s.startswith(USER_KEY_PREFIX)}
+            )
+            group_ids = sorted(
+                {s for ids in shares.values() for s in ids if s.startswith(GROUP_KEY_PREFIX)}
+            )
+            if user_ids or group_ids:
+                try:
+                    users_by_id, self.group_edges = await self._fetch_roster(user_ids, group_ids)
+                except httpx.HTTPError as exc:
+                    # A 403 already set roster_degraded inside _fetch_roster; any
+                    # OTHER roster HTTP error (500 / timeout / reset) means the
+                    # GroupMember edges were NOT mirrored to SpiceDB this cycle, so
+                    # stamping group tokens would silently under-grant (the same
+                    # hazard the 403 path drops principals to avoid). Treat it as a
+                    # degrade: every record rides the admin --visibility floor AND
+                    # the runner emits DEGRADED_ACL_SIGNAL. Never stamp on a partial
+                    # roster.
+                    logger.warning("roster fetch failed (%s); facts ride admin policy", exc)
+                    users_by_id, self.group_edges = {}, {}
+                    self.roster_degraded = True
+                # When the roster degraded (403 or any other error), EVERY record
+                # falls back to the admin --visibility floor — group tokens resolve
+                # stably without the roster, but their edges never got mirrored, so
+                # stamping them would silently under-grant. Drop them wholesale.
+                if not self.roster_degraded:
+                    for event in events:
+                        if isinstance(event, SalesforceFactEvent) and event.share_principals:
+                            event.record_principals = self.resolve_share_principals(
+                                event.share_principals, users_by_id
+                            )
         return events, next_cursor
 
     async def full_crawl(self) -> AsyncIterator[FactEvent | DocumentEvent]:
@@ -365,6 +517,110 @@ class SalesforceConnector(Connector):
                     if principal not in principals:
                         principals.append(principal)
         return shares
+
+    async def _fetch_roster(
+        self, user_ids: Iterable[str], group_ids: Iterable[str]
+    ) -> tuple[dict[str, SalesforceUserInfo], dict[str, set[str]]]:
+        """Build the identity crosswalk roster for a set of share ids.
+
+        Two SOQL objects (reusing :meth:`_query_pages` / :meth:`_get_json` — no
+        new HTTP path). ``Group.Type`` is never needed: the token derives from
+        the id alone (:func:`group_principal`), so no ``FROM Group`` query is
+        issued — only ``GroupMember`` and ``User``.
+
+        1. ``GroupMember`` BFS over the ``group_ids`` set collects the raw
+           member ids per parent group. ``UserOrGroupId`` may be a ``005`` User
+           OR another ``00G`` Group (a NESTED edge); a child group is itself
+           expanded — breadth-first, bounded by a ``seen`` visited-set (cycles
+           terminate) and :data:`GROUP_EXPANSION_MAX`.
+        2. ``User`` → ``users_by_id[005] = SalesforceUserInfo(email.lower())``.
+           The query covers the UNION of the share-derived ``user_ids`` AND
+           every ``005`` discovered as a GroupMember — so a user who is ONLY a
+           group member (never a direct AccountShare principal, the common case
+           for group shares) still gets its ``user:<email>`` edge. Join key is
+           ``Email``, NOT ``Username``. A ``005`` with no roster email is
+           dropped (over-hide, fail closed).
+        3. ``group_edges[group:salesforce-group-<parent>]`` is assembled from
+           the collected member ids: a ``00G`` member → a nested
+           ``group:salesforce-group-<child>`` edge; a ``005`` member →
+           ``user:<email>`` (dropped if no roster email).
+
+        A **403** on any roster query means the integration user lacks read on
+        that object: degrade to EMPTY roster (every record → admin fallback),
+        loudly, rather than failing the sync — fail closed, never permissive.
+        (The caller treats ANY roster HTTPError the same way — see :meth:`poll`.)
+        Only the DIRECT ``group ⊃ member`` edges are mirrored; SpiceDB closes
+        transitivity server-side.
+        """
+        users_by_id: dict[str, SalesforceUserInfo] = {}
+        group_edges: dict[str, set[str]] = {}
+        try:
+            # (1) BFS the GroupMember graph first, capturing raw member ids per
+            # parent group so we can query EVERY member-005 email in one shot.
+            raw_members: dict[str, list[str]] = {}
+            member_user_ids: set[str] = set()
+            seen: set[str] = set()
+            frontier = [gid for gid in dict.fromkeys(group_ids)]
+            while frontier and len(seen) < GROUP_EXPANSION_MAX:
+                batch = [gid for gid in frontier if gid not in seen][
+                    : GROUP_EXPANSION_MAX - len(seen)
+                ]
+                seen.update(batch)
+                frontier = []
+                if not batch:
+                    break
+                for chunk in _chunks(batch, SHARE_QUERY_CHUNK):
+                    ids = ", ".join(f"'{gid}'" for gid in chunk)
+                    member_soql = (
+                        f"SELECT GroupId, UserOrGroupId FROM GroupMember WHERE GroupId IN ({ids})"
+                    )
+                    async for page in self._query_pages(member_soql):
+                        for row in page.get("records", []):
+                            parent = group_principal(str(row["GroupId"]))
+                            member_id = str(row.get("UserOrGroupId") or "")
+                            raw_members.setdefault(parent, []).append(member_id)
+                            group_edges.setdefault(parent, set())
+                            if member_id.startswith(GROUP_KEY_PREFIX):
+                                if member_id not in seen:
+                                    frontier.append(member_id)
+                            elif member_id.startswith(USER_KEY_PREFIX):
+                                member_user_ids.add(member_id)
+
+            # (2) One User query over the union of share-derived AND group-member
+            # 005 ids — a group-only user still gets its user:<email> edge.
+            all_user_ids = list(dict.fromkeys([*user_ids, *sorted(member_user_ids)]))
+            for chunk in _chunks(all_user_ids, SHARE_QUERY_CHUNK):
+                ids = ", ".join(f"'{uid}'" for uid in chunk)
+                soql = f"SELECT Id, Email, IsActive FROM User WHERE Id IN ({ids})"
+                async for page in self._query_pages(soql):
+                    for row in page.get("records", []):
+                        email = (row.get("Email") or "").strip().lower()
+                        if email:
+                            users_by_id[str(row["Id"])] = SalesforceUserInfo(email=email)
+
+            # (3) Resolve member ids → edge principals now that the roster is complete.
+            for parent, members in raw_members.items():
+                edge = group_edges.setdefault(parent, set())
+                for member_id in members:
+                    if member_id.startswith(GROUP_KEY_PREFIX):
+                        edge.add(group_principal(member_id))
+                    elif member_id.startswith(USER_KEY_PREFIX):
+                        info = users_by_id.get(member_id)
+                        if info is not None and info.email:
+                            edge.add(user_principal(info.email))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 403:
+                self.roster_degraded = True
+                print(
+                    "salesforce: User/Group roster query returned 403 — grant the "
+                    "integration user read on User, Group and GroupMember to "
+                    "crosswalk 005/00G share ids to cross-source principals; "
+                    "falling back to the admin-assigned --visibility for every record",
+                    file=sys.stderr,
+                )
+                return {}, {}
+            raise
+        return users_by_id, group_edges
 
     async def _get_json(self, path: str, params: Mapping[str, str] | None = None) -> dict:
         """GET with Bearer auth and the shared 401-retry-once hook (a 401
@@ -435,20 +691,38 @@ def main(argv: list[str] | None = None) -> int:
 
     sink = VerityDebeziumSink.from_env()
 
-    async def run_once() -> tuple[list[SalesforceFactEvent], str]:
+    async def run_once() -> tuple[list[SalesforceFactEvent], str, dict[str, set[str]], bool]:
         connector = SalesforceConnector(policy, fetch_account_shares=not args.no_shares)
         try:
             events, next_cursor = await connector.poll(_read_cursor(args.state_file))
-            return list(events), next_cursor  # type: ignore[arg-type]
+            # group_edges is the source of the SpiceDB edges; capture it (and the
+            # degraded flag) before the client closes.
+            return (
+                list(events),  # type: ignore[arg-type]
+                next_cursor,
+                {g: set(m) for g, m in connector.group_edges.items()},
+                connector.roster_degraded,
+            )
         finally:
             await connector.aclose()
 
-    events, next_cursor = asyncio.run(run_once())
+    events, next_cursor, group_edges, roster_degraded = asyncio.run(run_once())
+    # Sync group membership FIRST so a subject resolves through their group the
+    # moment group-scoped facts land (identical to the HubSpot runner lifecycle).
+    edges = sink.sync_group_edges(group_edges)
     # The shared sink heartbeats /v1/admin/connector-status after delivery
     # (best-effort; source rides on the events, so this reports "salesforce").
     summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
-    print(f"poll: {len(events)} fact event(s), cursor -> {next_cursor} -> {summary}")
+    scoped = sum(1 for e in events if getattr(e, "record_principals", None))
+    print(
+        f"poll: {len(events)} fact event(s) ({scoped} share-scoped, "
+        f"{edges} group edge(s)), cursor -> {next_cursor} -> {summary}"
+    )
+    if roster_degraded:
+        # Stable, machine-readable stdout token — the read-once contract the
+        # server greps for backfill state=degraded_acl (never stderr-only).
+        print(DEGRADED_ACL_SIGNAL)
     return 0
 
 

@@ -642,18 +642,24 @@ class VerityDebeziumSink:
                 if isinstance(token, int)
             }
 
-    def sync_team_edges(self, team_members: Mapping[str, set[str]]) -> int:
-        """Write the team-membership edges into SpiceDB via
-        ``POST /v1/admin/groups`` (``group:hubspot-team-<id> ⊃ user:<member>``),
-        so a subject resolves through their team to team-owned records. Eagerly
-        allocates each group's token. Deterministic order. Returns the edge
-        count. No-op (0) when the owner roster was empty (owners scope absent)."""
-        if not team_members:
+    def sync_group_edges(self, group_members: Mapping[str, set[str]]) -> int:
+        """Write group-membership edges into SpiceDB via ``POST /v1/admin/groups``
+        (``group ⊃ member``), so a subject resolves through the group to
+        group-scoped records. Eagerly allocates each group's token. Deterministic
+        order (groups sorted, members sorted within each). Returns the edge count.
+        No-op (0) on an empty map.
+
+        Source-neutral: ``group`` is any principal string and ``member`` may be a
+        ``user:<…>`` OR another ``group:<…>`` — the endpoint is nest-capable, so
+        HubSpot's flat ``group:hubspot-team-<id> ⊃ user:<email>`` edges and
+        Salesforce's NESTED ``group:salesforce-group-<parent> ⊃
+        group:salesforce-group-<child>`` edges both flow through unchanged."""
+        if not group_members:
             return 0
         written = 0
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
-            for group in sorted(team_members):
-                for member in sorted(team_members[group]):
+            for group in sorted(group_members):
+                for member in sorted(group_members[group]):
                     response = client.post(
                         f"{self.url.rstrip('/')}/v1/admin/groups",
                         json={"tenant_id": self.tenant_id, "group": group, "member": member},
@@ -663,13 +669,29 @@ class VerityDebeziumSink:
                     written += 1
         return written
 
+    #: Back-compat alias — HubSpot's flat team edges are just group edges.
+    sync_team_edges = sync_group_edges
+
     def _stamp_record_visibility(self, events: list[FactEvent]) -> None:
         """Resolve every owned record's owner/team principals to tokens in one
         round-trip and stamp ``record_visibility`` on those events. Unowned
         events are left untouched (they use the admin-assigned fallback). The
         owner principal is minted on demand, so an owned record always resolves
         to at least its owner — it can never silently degrade to the broader
-        admin fallback."""
+        admin fallback.
+
+        The write-path choke point (crates/verity-server/src/ingest.rs) applies
+        an inline ``verity_acl`` with REPLACE semantics — it wins over the
+        connector-bound admin ``?visibility=`` policy (``parse_inline_acl().
+        or_else(bound_policy)``), it does NOT union with it. So for a connector
+        whose per-record ACL is a known SUBSET of effective visibility (e.g.
+        Salesforce AccountShare, which omits OWD / role hierarchy / sharing
+        rules / implicit parent→child / territories), stamping the resolved
+        tokens alone would silently DROP the admin floor. Such an event opts in
+        via a truthy ``union_policy_floor`` attribute: its ``visibility_policy``
+        tokens are UNIONed into ``record_visibility`` so the inline block is a
+        superset of the floor (over-hide, never under-hide). HubSpot events do
+        not set the attribute and are unaffected."""
         distinct = sorted(
             {p for e in events for p in (getattr(e, "record_principals", None) or [])}
         )
@@ -681,6 +703,11 @@ class VerityDebeziumSink:
             if not principals:
                 continue
             resolved = [tokens[p] for p in principals if p in tokens]
+            if resolved and getattr(event, "union_policy_floor", False):
+                # UNION the admin floor in (dedup, floor first) so the inline
+                # REPLACE-semantics block is a superset of the bound policy.
+                floor = list(getattr(event, "visibility_policy", None) or [])
+                resolved = list(dict.fromkeys([*floor, *resolved]))
             event.record_visibility = resolved or None  # type: ignore[attr-defined]
 
     def post(self, events: list[FactEvent], cursor: str | None = None) -> dict:
