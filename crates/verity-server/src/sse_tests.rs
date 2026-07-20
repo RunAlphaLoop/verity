@@ -409,7 +409,9 @@ async fn freshness_slo_reports_sane_percentiles() {
     // Known event times: ~5s and ~1s before now.
     for (id, ts) in [(1, now_ms - 5000), (2, now_ms - 1000)] {
         // Connector-bound static visibility so the fact materializes (§5e).
-        let params = serde_json::from_value(json!({ "tenant_id": tenant, "visibility": [1] }))
+        // `visibility` is carried as a comma-separated token string on the query
+        // string (`?visibility=1`), not a JSON array — see `de_comma_tokens`.
+        let params = serde_json::from_value(json!({ "tenant_id": tenant, "visibility": "1" }))
             .expect("params");
         let Json(v) = crate::ingest_debezium(
             State(Arc::clone(&state)),
@@ -492,8 +494,10 @@ async fn erasure_preview_reports_counts_without_purging() {
     });
     // Debezium carries no native ACL; bind a static visibility policy to the
     // connector so the fact is materialized (not refused at the §5e choke point).
+    // `visibility` is a comma-separated token string on the wire (`?visibility=1`),
+    // not a JSON array — see `de_comma_tokens`.
     let params =
-        serde_json::from_value(json!({ "tenant_id": tenant, "visibility": [1] })).expect("params");
+        serde_json::from_value(json!({ "tenant_id": tenant, "visibility": "1" })).expect("params");
     let Json(v) = crate::ingest_debezium(
         State(Arc::clone(&state)),
         HeaderMap::new(),

@@ -612,6 +612,72 @@ impl Rebac {
         members.dedup();
         Ok(members)
     }
+
+    /// ADMIN PLANE ONLY (Permission Graph Endpoint 2, BUILD 4b). Never on the
+    /// recall/`get` read path.
+    ///
+    /// Path-retaining composition over the EXISTING reverse primitive
+    /// [`Self::group_users`] (= LookupSubjects): fan out each granting group to
+    /// its transitive user set, but KEEP which granting group(s) reached each
+    /// user — the "why" the who-can-see-object view highlights. This is pure
+    /// glue over public wrappers; it wraps no new SpiceDB call.
+    ///
+    /// Returns, per reachable user, the sorted+deduped list of the passed-in
+    /// `groups` that transitively contain that user (the granting group path,
+    /// one hop of it — the object's directly-granting groups). A `users_limit`
+    /// caps the total distinct users returned (fan-out guard, §6): when the
+    /// union would exceed it we stop adding NEW users and set the returned
+    /// `truncated` flag, but still attribute already-seen users to every
+    /// granting group we scan, so the "why" stays complete for what is shown.
+    pub(crate) async fn users_reachable_via_groups(
+        &self,
+        tenant: TenantId,
+        groups: &[String],
+        users_limit: usize,
+    ) -> RebacResult<(Vec<(String, Vec<String>)>, bool)> {
+        use std::collections::BTreeMap;
+        // user -> set of granting groups (BTreeSet via sorted Vec kept small).
+        let mut by_user: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut truncated = false;
+        for group in groups {
+            // `group` is a `group:<name>` principal string; resolve to a bare
+            // name for the wrapper. Non-group principals are skipped (a
+            // `user:` token grants only itself and is handled by the caller).
+            let Some((PrincipalKind::Group, name)) = parse_principal(group) else {
+                continue;
+            };
+            let users = self.group_users(tenant, name).await?;
+            for user in users {
+                let entry = by_user.get_mut(&user);
+                match entry {
+                    Some(paths) => {
+                        if !paths.contains(group) {
+                            paths.push(group.clone());
+                        }
+                    }
+                    None => {
+                        if by_user.len() >= users_limit {
+                            // At the cap: don't admit a NEW user, but note we
+                            // truncated the fan-out.
+                            truncated = true;
+                            continue;
+                        }
+                        by_user.insert(user, vec![group.clone()]);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(String, Vec<String>)> = by_user
+            .into_iter()
+            .map(|(u, mut paths)| {
+                paths.sort();
+                paths.dedup();
+                (u, paths)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((out, truncated))
+    }
 }
 
 #[cfg(test)]

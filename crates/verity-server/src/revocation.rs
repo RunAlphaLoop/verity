@@ -62,6 +62,13 @@ impl RevocationPlane {
         Self::new(window_secs)
     }
 
+    /// The configured revocation window in seconds. The Permission Graph admin
+    /// plane reads this to re-implement `subtract`'s in-window subtraction
+    /// inline (parity with the read path without sharing `scope_for`).
+    pub(crate) fn window_secs(&self) -> i64 {
+        self.window_secs
+    }
+
     /// Tokens currently inside the revocation window for this tenant.
     pub(crate) async fn windowed_tokens(
         &self,

@@ -106,6 +106,71 @@ pub struct DebugCandidate {
     pub provenance: Uuid,
 }
 
+// ---------- Permission Graph (admin/operator plane) result types ----------
+
+/// One `GROUP BY` bucket of the corpus aggregate. Exactly one of `key`
+/// (source / provenance) or `level` (confidentiality 0..3) is meaningful.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AccessGroupCount {
+    pub key: String,
+    pub level: Option<i32>,
+    pub chunks: i64,
+    pub docs: i64,
+}
+
+/// The Endpoint-1 corpus aggregate: total + three `GROUP BY` breakdowns over
+/// the enforcement pre-filter (visibility-authorized set). Counts only (NG2).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AccessCorpus {
+    pub total_chunks: i64,
+    pub total_docs: i64,
+    pub by_source: Vec<AccessGroupCount>,
+    pub by_confidentiality: Vec<AccessGroupCount>,
+    pub by_provenance: Vec<AccessGroupCount>,
+}
+
+/// One live chunk row of the Endpoint-1 documents page. Metadata only — no
+/// `content` is ever projected (NG2).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccessChunkRow {
+    pub id: Uuid,
+    pub document_id: String,
+    pub source: String,
+    pub confidentiality: i32,
+    pub valid_from: DateTime<Utc>,
+}
+
+/// Which object Endpoint 2 decodes. `Document` is cheap; `Source`/`Entity` are
+/// unbounded aggregate scans, bounded by statement_timeout + a corpus ceiling.
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectSelector<'a> {
+    Document(&'a str),
+    Source(&'a str),
+    Entity(&'a str),
+}
+
+/// The Endpoint-2 object decode: distinct visibility tokens + object metadata.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AccessObjectDecode {
+    pub tokens: Vec<PrincipalToken>,
+    pub min_confidentiality: Option<i32>,
+    pub provenance: Vec<String>,
+    /// The statement-timeout fired mid-decode: results are partial.
+    pub approximate: bool,
+    /// `source`/`entity` mode refused because the corpus exceeds the ceiling.
+    pub refused_over_ceiling: bool,
+}
+
+/// Postgres reports a `SET LOCAL statement_timeout` cancellation as SQLSTATE
+/// `57014` (query_canceled). Detect it so the admin plane degrades to an
+/// `approximate` result instead of surfacing a hard 500.
+fn is_timeout(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("57014")
+    )
+}
+
 /// One quarantined webhook payload with its lifecycle disposition (0023):
 /// `resolution` None = open, `"reingested"` (re-admitted ONLY through an
 /// admin-supplied corrected ACL mapping) or `"dismissed"` (acknowledged, never
@@ -2271,6 +2336,530 @@ impl PostgresAdapter {
                 })
             })
             .collect()
+    }
+
+    // ---------- Permission Graph (admin/operator plane, permission-graph-viz) ----------
+    //
+    // Every method below is ADMIN PLANE ONLY; never on the recall/`get` read
+    // path (same contract as `list_principals` / `debug_recall_candidates`).
+    // They may issue rich aggregate SQL and reverse token resolves the read
+    // path is forbidden — that is the point of the admin plane.
+
+    /// Resolve visibility tokens back to their principal strings (Endpoint 2,
+    /// BUILD 4a). Reverse of the string→token query `admin_group_remove` runs.
+    /// Index-backed by `principals` UNIQUE (tenant_id, token).
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn resolve_tokens(
+        &self,
+        tenant: TenantId,
+        tokens: &[PrincipalToken],
+    ) -> Result<Vec<(PrincipalToken, String)>> {
+        let rows = sqlx::query(
+            "SELECT token, principal FROM principals
+              WHERE tenant_id = $1 AND token = ANY($2)",
+        )
+        .bind(tenant)
+        .bind(tokens)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("token").map_err(db_err)?,
+                    r.try_get("principal").map_err(db_err)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Resolve principal strings to their materialized tokens (Endpoint 1
+    /// closure → tokens). Same query `admin_group_remove` runs; principals with
+    /// no materialized token simply do not appear (fail-closed: they contribute
+    /// no visibility).
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn resolve_principals(
+        &self,
+        tenant: TenantId,
+        principals: &[String],
+    ) -> Result<Vec<(String, PrincipalToken)>> {
+        let rows = sqlx::query(
+            "SELECT principal, token FROM principals
+              WHERE tenant_id = $1 AND principal = ANY($2)",
+        )
+        .bind(tenant)
+        .bind(principals)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("principal").map_err(db_err)?,
+                    r.try_get("token").map_err(db_err)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// In-window revoked tokens for a tenant, read straight from the
+    /// `revocations` table (Endpoint 1, BUILD: inline parity with the read
+    /// path's `RevocationPlane::subtract`). Re-implemented here rather than
+    /// calling `scope_for`/`RevocationPlane` — the admin plane shares no code
+    /// with the read-path helpers, but MUST apply the same subtraction so the
+    /// aggregate neither over- nor under-states real access during a window.
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn windowed_revoked_tokens(
+        &self,
+        tenant: TenantId,
+        window_secs: i64,
+    ) -> Result<Vec<PrincipalToken>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT token FROM revocations
+              WHERE tenant_id = $1 AND at > now() - make_interval(secs => $2)",
+        )
+        .bind(tenant)
+        .bind(window_secs.max(0) as f64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| r.try_get("token").map_err(db_err))
+            .collect()
+    }
+
+    /// The Endpoint-1 corpus aggregate: the visibility-authorized set — EXACTLY
+    /// what recall pre-filters to before its ANN/embedding stage. Three
+    /// `GROUP BY` counts (source / confidentiality / acl_provenance) plus a
+    /// total, over the ENFORCEMENT pre-filter predicate (T1 parity baseline):
+    ///
+    /// ```text
+    /// tenant_id = $1 AND visibility && $2 AND confidentiality <= $3 AND valid_to IS NULL
+    /// ```
+    ///
+    /// Deliberately NOT recall's ANN-returnable shaping: no `{col} IS NOT NULL`
+    /// embedding-presence filter, no entity_scope fence, no `kind` shaping —
+    /// those shape what ANN can RETURN, not what is AUTHORIZED. `$2` is the
+    /// POST-revocation token set (caller subtracts in-window revocations first).
+    ///
+    /// `include_facts` unions the identical predicate over `facts` (facts'
+    /// `visibility` is nullable — a NULL visibility never overlaps, staying
+    /// fail-closed). A `statement_timeout` is set on the transaction; on
+    /// timeout the caller treats the counts as approximate.
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    #[allow(clippy::too_many_arguments)]
+    pub async fn access_corpus_aggregate(
+        &self,
+        tenant: TenantId,
+        tokens: &[PrincipalToken],
+        max_confidentiality: i16,
+        include_facts: bool,
+        timeout_ms: i64,
+    ) -> Result<(AccessCorpus, bool)> {
+        // Fail-closed: an empty token set overlaps nothing. Skip the scan
+        // entirely and return an empty corpus (never "show everything").
+        if tokens.is_empty() {
+            return Ok((AccessCorpus::default(), false));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Bound the whole aggregate: on a low-selectivity company-wide token
+        // set the GROUP BYs can seqscan. SET LOCAL reverts at COMMIT.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL statement_timeout = '{}'",
+            timeout_ms.max(0)
+        )))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        // Facts union fragment: identical predicate; facts have no
+        // document_id, so its docs count is DISTINCT (source,entity_id,field)
+        // — but for the corpus rollup we only need chunk-vs-doc counts from
+        // chunks; facts contribute chunk-equivalent rows only. To keep the
+        // aggregate honest and simple we union facts as additional rows whose
+        // "document" identity is (source||':'||entity_id||':'||field).
+        let facts_total = if include_facts {
+            "UNION ALL SELECT source, confidentiality, acl_provenance,
+                    source || ':' || entity_id || ':' || field AS document_id
+               FROM facts
+              WHERE tenant_id = $1 AND visibility && $2
+                AND confidentiality <= $3 AND valid_to IS NULL"
+        } else {
+            ""
+        };
+
+        let base = format!(
+            "WITH rows AS (
+                 SELECT source, confidentiality, acl_provenance, document_id
+                   FROM chunks
+                  WHERE tenant_id = $1 AND visibility && $2
+                    AND confidentiality <= $3 AND valid_to IS NULL
+                 {facts_total}
+             )"
+        );
+
+        let total_row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{base}
+             SELECT count(*)::bigint AS chunks,
+                    count(DISTINCT document_id)::bigint AS docs FROM rows"
+        )))
+        .bind(tenant)
+        .bind(tokens)
+        .bind(max_confidentiality)
+        .fetch_one(&mut *tx)
+        .await;
+
+        // A statement-timeout surfaces as a DB error; treat it as "approximate"
+        // rather than a hard failure — return what we have (empty) + the flag.
+        let total_row = match total_row {
+            Ok(r) => r,
+            Err(e) if is_timeout(&e) => {
+                let _ = tx.rollback().await;
+                return Ok((AccessCorpus::default(), true));
+            }
+            Err(e) => return Err(db_err(e)),
+        };
+
+        // statement_timeout is per-statement and resets for each query, so each
+        // GROUP BY gets the full budget independently. The plain total count(*)
+        // above is the CHEAPEST query; the GROUP BY sort/hash aggregates are the
+        // ones most likely to blow the budget on the exact scenario the guard
+        // exists for (a low-selectivity company-wide token set). So a 57014 on
+        // ANY of them must degrade to `approximate` (roll back, return partial)
+        // — never surface as a hard 500 (spec §6/T8: never hang, never a hard
+        // failure for the company-wide set). `is_timeout` is only meaningful if
+        // consulted on these paths, not just on `total_row`.
+        macro_rules! grouped_or_approx {
+            ($q:expr) => {
+                match $q.fetch_all(&mut *tx).await {
+                    Ok(rows) => rows,
+                    Err(e) if is_timeout(&e) => {
+                        let _ = tx.rollback().await;
+                        return Ok((AccessCorpus::default(), true));
+                    }
+                    Err(e) => return Err(db_err(e)),
+                }
+            };
+        }
+
+        let by_source = grouped_or_approx!(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{base}
+             SELECT source AS k, count(*)::bigint AS chunks,
+                    count(DISTINCT document_id)::bigint AS docs
+               FROM rows GROUP BY source ORDER BY chunks DESC"
+        )))
+        .bind(tenant)
+        .bind(tokens)
+        .bind(max_confidentiality));
+
+        let by_conf = grouped_or_approx!(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{base}
+             SELECT confidentiality::int4 AS lvl, count(*)::bigint AS chunks,
+                    count(DISTINCT document_id)::bigint AS docs
+               FROM rows GROUP BY confidentiality ORDER BY lvl"
+        )))
+        .bind(tenant)
+        .bind(tokens)
+        .bind(max_confidentiality));
+
+        let by_prov = grouped_or_approx!(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{base}
+             SELECT acl_provenance AS k, count(*)::bigint AS chunks,
+                    count(DISTINCT document_id)::bigint AS docs
+               FROM rows GROUP BY acl_provenance ORDER BY chunks DESC"
+        )))
+        .bind(tenant)
+        .bind(tokens)
+        .bind(max_confidentiality));
+
+        match tx.commit().await {
+            Ok(()) => {}
+            Err(e) if is_timeout(&e) => return Ok((AccessCorpus::default(), true)),
+            Err(e) => return Err(db_err(e)),
+        }
+
+        let corpus = AccessCorpus {
+            total_chunks: total_row.try_get("chunks").map_err(db_err)?,
+            total_docs: total_row.try_get("docs").map_err(db_err)?,
+            by_source: by_source
+                .iter()
+                .map(|r| {
+                    Ok(AccessGroupCount {
+                        key: r.try_get("k").map_err(db_err)?,
+                        level: None,
+                        chunks: r.try_get("chunks").map_err(db_err)?,
+                        docs: r.try_get("docs").map_err(db_err)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            by_confidentiality: by_conf
+                .iter()
+                .map(|r| {
+                    Ok(AccessGroupCount {
+                        key: String::new(),
+                        level: Some(r.try_get("lvl").map_err(db_err)?),
+                        chunks: r.try_get("chunks").map_err(db_err)?,
+                        docs: r.try_get("docs").map_err(db_err)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            by_provenance: by_prov
+                .iter()
+                .map(|r| {
+                    Ok(AccessGroupCount {
+                        key: r.try_get("k").map_err(db_err)?,
+                        level: None,
+                        chunks: r.try_get("chunks").map_err(db_err)?,
+                        docs: r.try_get("docs").map_err(db_err)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        // Reaching here means all four counts completed within the timeout.
+        Ok((corpus, false))
+    }
+
+    /// Endpoint-1 documents page: raw live chunk rows on the STORED-column
+    /// `(valid_from, id)` keyset (never an aggregate keyset — a `max(valid_from)`
+    /// keyset would force a full GROUP BY re-scan of the whole visible corpus
+    /// per page). GIN `visibility &&` is the primary narrowing. Metadata only
+    /// — no `content` column is selected (NG2). The caller rolls up per-document
+    /// WITHIN the page (page-local `n_chunks`/`min_confidentiality`); the
+    /// authoritative per-document totals come from the aggregate above.
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn access_documents_page(
+        &self,
+        tenant: TenantId,
+        tokens: &[PrincipalToken],
+        max_confidentiality: i16,
+        after: Option<(DateTime<Utc>, Uuid)>,
+        chunk_page: i64,
+    ) -> Result<Vec<AccessChunkRow>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Keyset over stored (valid_from, id); a null cursor means "from the
+        // top". `(valid_from, id) < ($ts, $id)` via a lexicographic compare
+        // that also holds when the cursor is absent.
+        let (after_ts, after_id, has_after) = match after {
+            Some((ts, id)) => (ts, id, true),
+            None => (Utc::now(), Uuid::nil(), false),
+        };
+        let rows = sqlx::query(
+            "SELECT id, document_id, source, confidentiality::int4 AS confidentiality, valid_from
+               FROM chunks
+              WHERE tenant_id = $1 AND visibility && $2
+                AND confidentiality <= $3 AND valid_to IS NULL
+                AND (NOT $6 OR (valid_from, id) < ($4, $5))
+              ORDER BY valid_from DESC, id DESC
+              LIMIT $7",
+        )
+        .bind(tenant)
+        .bind(tokens)
+        .bind(max_confidentiality)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(has_after)
+        .bind(chunk_page.clamp(1, 5000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(AccessChunkRow {
+                    id: r.try_get("id").map_err(db_err)?,
+                    document_id: r.try_get("document_id").map_err(db_err)?,
+                    source: r.try_get("source").map_err(db_err)?,
+                    confidentiality: r.try_get("confidentiality").map_err(db_err)?,
+                    valid_from: r.try_get("valid_from").map_err(db_err)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Endpoint-2 object → visibility tokens decode (BUILD 4c guards). Returns
+    /// the DISTINCT visibility tokens over the object's live chunks, its
+    /// min confidentiality, and the set of granting `acl_provenance` values.
+    ///
+    /// `document_id` mode is cheap (few chunks). `source`/`entity` mode is an
+    /// UNBOUNDED FULL AGGREGATE SCAN (`source` has no index; `DISTINCT
+    /// unnest(visibility)` scans every matching row's array): those are bounded
+    /// by `SET LOCAL statement_timeout` and, above `corpus_ceiling` live chunks,
+    /// REFUSED until a supporting index exists. On timeout, returns whatever was
+    /// decoded with `approximate = true` rather than hanging a pooled connection.
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn access_object_tokens(
+        &self,
+        tenant: TenantId,
+        selector: ObjectSelector<'_>,
+        timeout_ms: i64,
+        corpus_ceiling: i64,
+    ) -> Result<AccessObjectDecode> {
+        // The predicate + bind differ by mode; document_id is exempt from the
+        // ceiling (few chunks), source/entity are gated.
+        let (pred, bind_val): (&str, &str) = match selector {
+            ObjectSelector::Document(id) => ("document_id = $2", id),
+            ObjectSelector::Source(s) => ("source = $2", s),
+            ObjectSelector::Entity(e) => ("entity_tags @> ARRAY[$2]", e),
+        };
+        let gated = !matches!(selector, ObjectSelector::Document(_));
+
+        // All scans — including the ceiling COUNT — run inside ONE transaction
+        // under `SET LOCAL statement_timeout`. Running the ceiling count outside
+        // the timeout (on `&self.pool`) would leave the exact large tenant it
+        // guards able to hang an unbounded, un-timed-out count on a full/large
+        // scan (chunks has no `(tenant_id, valid_to)` index), holding a pooled
+        // connection indefinitely — defeating the guard. Inside the tx, a 57014
+        // on the count is itself proof the corpus is too big to decode safely,
+        // so we fail closed to `refused_over_ceiling`.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL statement_timeout = '{}'",
+            timeout_ms.max(0)
+        )))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        if gated {
+            // Corpus-size ceiling: refuse the unbounded scan on a corpus larger
+            // than we can decode safely without a supporting index. Timeout on
+            // the count => the corpus is (at least) large enough to blow the
+            // budget => refuse (fail closed), never fall through to the decode.
+            let live_q =
+                sqlx::query("SELECT count(*)::bigint AS n FROM chunks WHERE tenant_id = $1 AND valid_to IS NULL")
+                    .bind(tenant)
+                    .fetch_one(&mut *tx)
+                    .await;
+            let live: i64 = match live_q {
+                Ok(r) => r.try_get("n").map_err(db_err)?,
+                Err(e) if is_timeout(&e) => {
+                    let _ = tx.rollback().await;
+                    return Ok(AccessObjectDecode {
+                        tokens: Vec::new(),
+                        min_confidentiality: None,
+                        provenance: Vec::new(),
+                        approximate: false,
+                        refused_over_ceiling: true,
+                    });
+                }
+                Err(e) => return Err(db_err(e)),
+            };
+            if live > corpus_ceiling {
+                let _ = tx.rollback().await;
+                return Ok(AccessObjectDecode {
+                    tokens: Vec::new(),
+                    min_confidentiality: None,
+                    provenance: Vec::new(),
+                    approximate: false,
+                    refused_over_ceiling: true,
+                });
+            }
+        }
+
+        let tokens_q = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT DISTINCT unnest(visibility) AS token FROM chunks
+              WHERE tenant_id = $1 AND {pred} AND valid_to IS NULL"
+        )))
+        .bind(tenant)
+        .bind(bind_val)
+        .fetch_all(&mut *tx)
+        .await;
+
+        let token_rows = match tokens_q {
+            Ok(rows) => rows,
+            Err(e) if is_timeout(&e) => {
+                let _ = tx.rollback().await;
+                return Ok(AccessObjectDecode {
+                    tokens: Vec::new(),
+                    min_confidentiality: None,
+                    provenance: Vec::new(),
+                    approximate: true,
+                    refused_over_ceiling: false,
+                });
+            }
+            Err(e) => return Err(db_err(e)),
+        };
+        let tokens: Vec<PrincipalToken> = token_rows
+            .iter()
+            .map(|r| r.try_get("token").map_err(db_err))
+            .collect::<Result<Vec<_>>>()?;
+
+        let meta = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT min(confidentiality)::int4 AS minc,
+                    array_agg(DISTINCT acl_provenance) AS provs
+               FROM chunks WHERE tenant_id = $1 AND {pred} AND valid_to IS NULL"
+        )))
+        .bind(tenant)
+        .bind(bind_val)
+        .fetch_one(&mut *tx)
+        .await;
+
+        let (min_confidentiality, provenance) = match meta {
+            Ok(r) => (
+                r.try_get::<Option<i32>, _>("minc").map_err(db_err)?,
+                r.try_get::<Option<Vec<String>>, _>("provs")
+                    .map_err(db_err)?
+                    .unwrap_or_default(),
+            ),
+            Err(e) if is_timeout(&e) => {
+                let _ = tx.rollback().await;
+                return Ok(AccessObjectDecode {
+                    tokens,
+                    min_confidentiality: None,
+                    provenance: Vec::new(),
+                    approximate: true,
+                    refused_over_ceiling: false,
+                });
+            }
+            Err(e) => return Err(db_err(e)),
+        };
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(AccessObjectDecode {
+            tokens,
+            min_confidentiality,
+            provenance,
+            approximate: false,
+            refused_over_ceiling: false,
+        })
+    }
+
+    /// Append one Permission Graph audit row (migration 0034). Append-only:
+    /// INSERT only. `result_meta` carries counts, never content (NG2).
+    ///
+    /// **Admin plane only; never on the recall/`get` path.**
+    pub async fn write_access_audit(
+        &self,
+        tenant: TenantId,
+        actor: &str,
+        endpoint: &str,
+        query_target: &str,
+        params: &serde_json::Value,
+        result_meta: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO admin_access_audit
+                 (id, tenant_id, actor, endpoint, query_target, params, result_meta)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(actor)
+        .bind(endpoint)
+        .bind(query_target)
+        .bind(params)
+        .bind(result_meta)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     // ---------- quarantine lifecycle (UI-SPEC §5 Screen 6 write surface) ----------

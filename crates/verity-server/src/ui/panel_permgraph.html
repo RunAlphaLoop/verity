@@ -1,0 +1,88 @@
+<!-- ==========================================================================
+     panel_permgraph.html — Permission graph (admin/operator plane)
+     --------------------------------------------------------------------------
+     Two read-only questions answered against the admin plane, never the read
+     path:
+
+       • "What does a person see?"  — GET /v1/admin/access/subject
+         The identity/group CLOSURE GRAPH (inline SVG, no external lib) for a
+         subject, plus the aggregate corpus this subject is authorized to
+         reach — broken down by source / confidentiality / provenance as CSS
+         bars, a grant-confidence bar, and a paginated, METADATA-ONLY document
+         list (never chunk bodies — NG2). Click a document → the granting
+         group/user path lights up in the graph (the "why").
+
+       • "Who can see this?"        — GET /v1/admin/access/object
+         The reverse: a document / source / entity → its materialized
+         visibility tokens → principals → reachable users WITH the granting
+         group path (the "why"), same inline SVG.
+
+     Both are admin-bearer ({admin:true}); both fail closed. 401 (admin token
+     required) and 503 (ReBAC unconfigured) surface verbatim with a pointer.
+     Aggregates that time out come back flagged "approximate", never silently
+     wrong. Owns ONLY this file + panel_permgraph.js; frozen theme/core classes
+     and Verity.* helpers only; panel-scoped styles below are additive.
+     ========================================================================== -->
+<section class="panel" id="panel-permgraph">
+  <h1>Permission graph</h1>
+  <div class="lede">See what a person or agent can reach across every source, or who can reach a document — and <b>why</b>. The graph is the identity/group closure the permission engine holds; the corpus is aggregated server-side (counts only, never document contents) and matches exactly what a real read would be pre-filtered to for this subject.</div>
+
+  <!-- Panel-scoped styles only — theme/core CSS is frozen, this adds nothing
+       to it. All colors come from the frozen palette vars. -->
+  <style>
+    #panel-permgraph .pg-graphwrap {
+      border: 1px solid var(--border); border-radius: var(--r-sm);
+      background: var(--panel2); overflow-x: auto; margin-top: var(--sp-2);
+    }
+    #panel-permgraph .pg-svg { display: block; min-width: 100%; }
+    #panel-permgraph .pg-node rect {
+      fill: var(--panel); stroke: var(--border); stroke-width: 1;
+      rx: 6; ry: 6; cursor: pointer;
+    }
+    #panel-permgraph .pg-node.pg-user rect { stroke: var(--accent); }
+    #panel-permgraph .pg-node.pg-group rect { stroke: var(--violet-line); }
+    #panel-permgraph .pg-node.pg-highlight rect {
+      stroke: var(--green); stroke-width: 2; fill: var(--green-soft);
+    }
+    #panel-permgraph .pg-node text { fill: var(--bright); font-size: 12px; }
+    #panel-permgraph .pg-node .pg-sub { fill: var(--dim); font-size: 10px; }
+    #panel-permgraph .pg-edge { stroke: var(--border); stroke-width: 1.5; fill: none; }
+    #panel-permgraph .pg-edge.pg-highlight { stroke: var(--green); stroke-width: 2.5; }
+    #panel-permgraph .pg-cols { display: grid; grid-template-columns: 1.35fr 1fr; gap: var(--sp-4); align-items: start; }
+    @media (max-width: 900px) { #panel-permgraph .pg-cols { grid-template-columns: 1fr; } }
+    #panel-permgraph .pg-breakrow { display: flex; align-items: center; gap: var(--sp-2); margin: 5px 0; }
+    #panel-permgraph .pg-breaklabel { min-width: 120px; font-size: var(--fs-sm); color: var(--text); }
+    #panel-permgraph .pg-breakbar {
+      flex: 1; height: 14px; background: var(--panel2);
+      border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden;
+    }
+    #panel-permgraph .pg-breakbar > i { display: block; height: 100%; }
+    #panel-permgraph .pg-breakcount { min-width: 132px; text-align: right; font-family: var(--mono); font-size: var(--fs-sm); color: var(--dim); }
+    /* grant-confidence: a single segmented bar over the four provenance lanes */
+    #panel-permgraph .pg-conf { display: flex; height: 20px; border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+    #panel-permgraph .pg-conf > span { display: block; height: 100%; }
+    #panel-permgraph .pg-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+    #panel-permgraph .pg-fill-mirrored       { background: var(--green); }
+    #panel-permgraph .pg-fill-approximated   { background: var(--amber); }
+    #panel-permgraph .pg-fill-admin-assigned { background: var(--blue); }
+    #panel-permgraph .pg-fill-quarantined    { background: var(--red); }
+    #panel-permgraph .pg-fill-conf-0 { background: var(--green); }
+    #panel-permgraph .pg-fill-conf-1 { background: var(--blue); }
+    #panel-permgraph .pg-fill-conf-2 { background: var(--amber); }
+    #panel-permgraph .pg-fill-conf-3 { background: var(--red); }
+    #panel-permgraph .pg-fill-src { background: var(--accent); }
+    #panel-permgraph tr.pg-docrow { cursor: pointer; }
+    #panel-permgraph tr.pg-docrow:hover td { background: var(--panel2); }
+    #panel-permgraph tr.pg-docrow.pg-active td { background: var(--green-soft); }
+    #panel-permgraph .pg-flag {
+      display: inline-flex; align-items: center; gap: 4px;
+      border: 1px solid var(--amber-line); background: var(--amber-soft);
+      color: var(--amber); border-radius: var(--r-pill);
+      padding: 1px 8px; font-size: var(--fs-xs); margin-left: 6px;
+    }
+    #panel-permgraph .pg-via { font-family: var(--mono); font-size: var(--fs-sm); color: var(--dim); }
+    #panel-permgraph .pg-via .pg-arrow { color: var(--faint); margin: 0 3px; }
+  </style>
+
+  <div id="permgraph-mount"></div>
+</section>

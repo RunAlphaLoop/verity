@@ -204,6 +204,24 @@ impl AdminAuth {
         self.verify_bearer(headers, expected)
     }
 
+    /// A short, non-reversible fingerprint of the presented bearer, for the
+    /// Permission Graph audit `actor` column: an HMAC-tag prefix (never the raw
+    /// token). Returns `"dev-open"` when no bearer is present (only possible on
+    /// a `check`-gated surface — the Permission Graph uses `require`, which
+    /// refuses a missing bearer, so this returns a real fingerprint there).
+    pub(crate) fn actor_fingerprint(&self, headers: &HeaderMap) -> String {
+        let Some(provided) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        else {
+            return "dev-open".to_string();
+        };
+        let tag = Self::tag(&self.key, provided.trim());
+        let hex: String = tag.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        format!("bearer:{hex}")
+    }
+
     /// Constant-time bearer verification shared by `check`/`require`. Reads the
     /// bearer ONLY from `Authorization: Bearer <token>`, never a cookie (a
     /// cookie would let a cross-site form ride the browser's ambient
@@ -1606,6 +1624,8 @@ async fn main() -> anyhow::Result<()> {
             post(admin_group_add).delete(admin_group_remove),
         )
         .route("/v1/admin/groups/members", get(admin_group_members))
+        .route("/v1/admin/access/subject", get(admin_access_subject))
+        .route("/v1/admin/access/object", get(admin_access_object))
         .route("/v1/knowledge", post(propose_learning).get(list_knowledge))
         .route("/v1/knowledge/{id}/publish", post(publish_knowledge))
         .route("/v1/admin/knowledge/{id}", get(admin_knowledge_detail))
@@ -3908,6 +3928,507 @@ fn require_rebac(state: &AppState) -> HandlerResult<&Rebac> {
     ))
 }
 
+// ==========================================================================
+//  Permission Graph — admin/operator plane (permission-graph-viz).
+//
+//  Two READ-ONLY god-view endpoints. INVARIANTS (spec §2, §5):
+//    • First line of EVERY handler: `state.admin.require(&headers)?` — the
+//      no-dev-open 401-when-unset variant (NEVER `check`).
+//    • `require_rebac(&state)?` → 503 when ReBAC is unset.
+//    • tenant_id is a mandatory leading predicate; unknown tenant 404s.
+//    • They MUST NOT call `enforce_restricted`, `current_token_set`,
+//      `scope_for`, or `storage.recall`, and are never referenced from
+//      recall/get. The in-window revocation subtraction is re-implemented
+//      INLINE (a `revocations`-table read via `windowed_revoked_tokens`) so it
+//      matches the read path WITHOUT sharing `scope_for`.
+//    • Metadata only: no chunk `content` is ever selected or returned (NG2).
+//    • Fail-closed: empty/unresolvable subject → empty token set → empty
+//      aggregate (never "show everything"); visibility={} is invisible.
+//    • Every query writes one append-only `admin_access_audit` row (0034).
+// ==========================================================================
+
+#[derive(Deserialize)]
+struct AccessSubjectQuery {
+    tenant_id: TenantId,
+    subject: String,
+    #[serde(default)]
+    max_confidentiality: Option<i16>,
+    #[serde(default)]
+    include_facts: Option<bool>,
+    #[serde(default)]
+    docs_limit: Option<i64>,
+    /// `(valid_from, id)` stored-column keyset cursor, formatted
+    /// `<rfc3339>|<uuid>` (matches `documents.next_after`).
+    #[serde(default)]
+    docs_after: Option<String>,
+}
+
+/// Parse a `<rfc3339>|<uuid>` docs cursor into the stored-column keyset.
+fn parse_docs_after(raw: &str) -> HandlerResult<(DateTime<Utc>, uuid::Uuid)> {
+    let (ts, id) = raw.split_once('|').ok_or((
+        StatusCode::BAD_REQUEST,
+        "docs_after must be \"<rfc3339>|<uuid>\"".to_string(),
+    ))?;
+    let ts = DateTime::parse_from_rfc3339(ts.trim())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "docs_after timestamp is not RFC3339".to_string(),
+            )
+        })?
+        .with_timezone(&Utc);
+    let id = uuid::Uuid::parse_str(id.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "docs_after id is not a uuid".to_string(),
+        )
+    })?;
+    Ok((ts, id))
+}
+
+/// GET /v1/admin/access/subject — "what does subject X see?" (spec §3).
+async fn admin_access_subject(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<AccessSubjectQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    // 1. Gate (no dev-open) + ReBAC + tenant existence.
+    state.admin.require(&headers)?;
+    let rebac = require_rebac(&state)?;
+    if state
+        .storage
+        .get_tenant(q.tenant_id)
+        .await
+        .map_err(storage_status)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no tenant with that id on this server".into(),
+        ));
+    }
+    let pg = state.storage.inner();
+    let max_conf = q.max_confidentiality.unwrap_or(3).clamp(0, 3);
+    let include_facts = q.include_facts.unwrap_or(true);
+    let docs_limit = q.docs_limit.unwrap_or(50).clamp(1, 200);
+    let gateway = |e: rebac::RebacError| (StatusCode::BAD_GATEWAY, format!("spicedb: {e}"));
+
+    // Parse the subject like parse_membership. Only user:/group: are valid.
+    let Some((subject_kind, subject_name)) = rebac::parse_principal(&q.subject) else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subject must be \"user:<id>\" or \"group:<name>\"".into(),
+        ));
+    };
+
+    // 2. Forward closure (live ReBAC). Build closure nodes/edges: subject +
+    //    each group it transitively belongs to, with stepwise ancestor edges.
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+    let mut edges: Vec<serde_json::Value> = Vec::new();
+    let mut closure_principals: Vec<String> = vec![q.subject.clone()];
+
+    // The subject's transitive group set.
+    let groups: Vec<String> = match subject_kind {
+        rebac::PrincipalKind::User => rebac
+            .user_groups(q.tenant_id, subject_name)
+            .await
+            .map_err(gateway)?,
+        rebac::PrincipalKind::Group => rebac
+            .group_and_ancestors(q.tenant_id, subject_name)
+            .await
+            .map_err(gateway)?,
+    };
+    for g in &groups {
+        if !closure_principals.contains(g) {
+            closure_principals.push(g.clone());
+        }
+    }
+
+    // Resolve every closure principal to a token in one query (fail-closed:
+    // principals with no materialized token simply don't appear).
+    let resolved: Vec<(String, PrincipalToken)> = pg
+        .resolve_principals(q.tenant_id, &closure_principals)
+        .await
+        .map_err(storage_status)?;
+    let token_of: std::collections::HashMap<String, PrincipalToken> =
+        resolved.iter().cloned().collect();
+    let subject_resolved = token_of.contains_key(&q.subject) || !groups.is_empty();
+
+    // Subject node.
+    nodes.push(serde_json::json!({
+        "id": q.subject,
+        "kind": subject_kind.object_type(),
+        "label": subject_name,
+        "token": token_of.get(&q.subject),
+    }));
+    // Group nodes + stepwise edges (subject → group; group → ancestor group).
+    // Bounded to CLOSURE_NODE_CAP; beyond it we collapse and flag.
+    const CLOSURE_NODE_CAP: usize = 400;
+    let mut closure_truncated = false;
+    for (i, g) in groups.iter().enumerate() {
+        if i >= CLOSURE_NODE_CAP {
+            closure_truncated = true;
+            break;
+        }
+        let name = g.strip_prefix("group:").unwrap_or(g);
+        nodes.push(serde_json::json!({
+            "id": g,
+            "kind": "group",
+            "label": name,
+            "token": token_of.get(g),
+        }));
+        edges.push(serde_json::json!({
+            "from": q.subject, "to": g, "relation": "member",
+        }));
+    }
+
+    // 3. Resolve → tokens, then subtract in-window revocations INLINE (parity
+    //    with scope_for; NOT by calling scope_for). A revocations-table read.
+    let mut tokens: Vec<PrincipalToken> = resolved.iter().map(|(_, t)| *t).collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    let revoked: Vec<PrincipalToken> = pg
+        .windowed_revoked_tokens(q.tenant_id, state.revocations.window_secs())
+        .await
+        .map_err(storage_status)?;
+    let revocation_window_active = tokens.iter().any(|t| revoked.contains(t));
+    tokens.retain(|t| !revoked.contains(t));
+
+    // 4. Corpus aggregate (3× GROUP BY + total) over the post-revocation token
+    //    set, with the enforcement pre-filter predicate. Statement-timeout
+    //    bounded; empty tokens → empty corpus (fail-closed inside the method).
+    let (corpus, approximate_counts) = pg
+        .access_corpus_aggregate(
+            q.tenant_id,
+            &tokens,
+            max_conf,
+            include_facts,
+            ACCESS_STATEMENT_TIMEOUT_MS,
+        )
+        .await
+        .map_err(storage_status)?;
+
+    // 5. Grant-confidence: normalize by_provenance chunk counts to fractions.
+    let prov_total: i64 = corpus.by_provenance.iter().map(|c| c.chunks).sum();
+    let mut grant_confidence = serde_json::Map::new();
+    for lane in ["mirrored", "approximated", "admin-assigned", "quarantined"] {
+        let n: i64 = corpus
+            .by_provenance
+            .iter()
+            .filter(|c| c.key == lane)
+            .map(|c| c.chunks)
+            .sum();
+        let frac = if prov_total > 0 {
+            n as f64 / prov_total as f64
+        } else {
+            0.0
+        };
+        grant_confidence.insert(lane.to_string(), serde_json::json!(frac));
+    }
+    grant_confidence.insert("basis".to_string(), serde_json::json!("chunks"));
+
+    // 6. Documents page (stored (valid_from,id) keyset; page-local rollup).
+    let after = match q.docs_after.as_deref() {
+        Some(raw) if !raw.is_empty() => Some(parse_docs_after(raw)?),
+        _ => None,
+    };
+    // Fetch a chunk page with fan-out headroom, then roll up per-document.
+    let chunk_page = docs_limit * 4;
+    let rows = pg
+        .access_documents_page(q.tenant_id, &tokens, max_conf, after, chunk_page)
+        .await
+        .map_err(storage_status)?;
+    let next_after = rows
+        .last()
+        .map(|r| format!("{}|{}", r.valid_from.to_rfc3339(), r.id));
+    // Page-local per-document rollup (order-preserving).
+    let mut doc_order: Vec<String> = Vec::new();
+    let mut doc_rollup: std::collections::HashMap<String, (String, i32, DateTime<Utc>, i64)> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        match doc_rollup.get_mut(&r.document_id) {
+            Some(entry) => {
+                entry.1 = entry.1.min(r.confidentiality);
+                if r.valid_from > entry.2 {
+                    entry.2 = r.valid_from;
+                }
+                entry.3 += 1;
+            }
+            None => {
+                doc_order.push(r.document_id.clone());
+                doc_rollup.insert(
+                    r.document_id.clone(),
+                    (r.source.clone(), r.confidentiality, r.valid_from, 1),
+                );
+            }
+        }
+    }
+    let doc_items: Vec<serde_json::Value> = doc_order
+        .iter()
+        .map(|id| {
+            let (source, min_conf, last_seen, n) = &doc_rollup[id];
+            serde_json::json!({
+                "document_id": id,
+                "source": source,
+                "min_confidentiality": min_conf,
+                "last_seen": last_seen.to_rfc3339(),
+                "n_chunks": n,
+                "page_local": true,
+            })
+        })
+        .collect();
+
+    // 7. Audit (counts only, NG2) then respond.
+    let params = serde_json::json!({
+        "max_confidentiality": max_conf,
+        "include_facts": include_facts,
+        "docs_limit": docs_limit,
+    });
+    let result_meta = serde_json::json!({
+        "total_chunks": corpus.total_chunks,
+        "total_docs": corpus.total_docs,
+        "closure_nodes": nodes.len(),
+        "tokens": tokens.len(),
+    });
+    pg.write_access_audit(
+        q.tenant_id,
+        &state.admin.actor_fingerprint(&headers),
+        "access/subject",
+        &q.subject,
+        &params,
+        &result_meta,
+    )
+    .await
+    .map_err(storage_status)?;
+
+    let by_source: Vec<serde_json::Value> = corpus
+        .by_source
+        .iter()
+        .map(|c| serde_json::json!({ "source": c.key, "chunks": c.chunks, "docs": c.docs }))
+        .collect();
+    let by_conf: Vec<serde_json::Value> = corpus
+        .by_confidentiality
+        .iter()
+        .map(|c| serde_json::json!({ "level": c.level, "chunks": c.chunks, "docs": c.docs }))
+        .collect();
+    let by_prov: Vec<serde_json::Value> = corpus
+        .by_provenance
+        .iter()
+        .map(|c| serde_json::json!({ "provenance": c.key, "chunks": c.chunks, "docs": c.docs }))
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "tenant_id": q.tenant_id,
+        "subject": q.subject,
+        "subject_resolved": subject_resolved,
+        "closure": { "nodes": nodes, "edges": edges },
+        "tokens": tokens,
+        "corpus": {
+            "total": { "chunks": corpus.total_chunks, "docs": corpus.total_docs },
+            "by_source": by_source,
+            "by_confidentiality": by_conf,
+            "by_provenance": by_prov,
+        },
+        "grant_confidence": grant_confidence,
+        "documents": { "items": doc_items, "next_after": next_after },
+        "flags": {
+            "approximate_counts": approximate_counts,
+            "closure_truncated": closure_truncated,
+            "revocation_window_active": revocation_window_active,
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+struct AccessObjectQuery {
+    tenant_id: TenantId,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    users_limit: Option<usize>,
+}
+
+/// GET /v1/admin/access/object — "who can see object Y?" (spec §4).
+async fn admin_access_object(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<AccessObjectQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    let rebac = require_rebac(&state)?;
+    if state
+        .storage
+        .get_tenant(q.tenant_id)
+        .await
+        .map_err(storage_status)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no tenant with that id on this server".into(),
+        ));
+    }
+    let pg = state.storage.inner();
+    let gateway = |e: rebac::RebacError| (StatusCode::BAD_GATEWAY, format!("spicedb: {e}"));
+    let users_limit = q.users_limit.unwrap_or(1000).clamp(1, 10_000);
+
+    // Exactly one selector.
+    let (selector, obj_kind, obj_id): (verity_storage::ObjectSelector, &str, String) =
+        match (&q.document_id, &q.source, &q.entity) {
+            (Some(d), None, None) if !d.is_empty() => (
+                verity_storage::ObjectSelector::Document(d),
+                "document",
+                d.clone(),
+            ),
+            (None, Some(s), None) if !s.is_empty() => (
+                verity_storage::ObjectSelector::Source(s),
+                "source",
+                s.clone(),
+            ),
+            (None, None, Some(e)) if !e.is_empty() => (
+                verity_storage::ObjectSelector::Entity(e),
+                "entity",
+                e.clone(),
+            ),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "exactly one of document_id / source / entity is required".into(),
+                ))
+            }
+        };
+
+    // 2. Object → visibility tokens decode (bounded; source/entity gated).
+    let decode = pg
+        .access_object_tokens(
+            q.tenant_id,
+            selector,
+            ACCESS_STATEMENT_TIMEOUT_MS,
+            ACCESS_OBJECT_CORPUS_CEILING,
+        )
+        .await
+        .map_err(storage_status)?;
+    if decode.refused_over_ceiling {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "source/entity mode is refused above the corpus ceiling until a supporting index exists — query by document_id".into(),
+        ));
+    }
+
+    // 3. Tokens → principal strings (BUILD 4a).
+    let resolved: Vec<(PrincipalToken, String)> = pg
+        .resolve_tokens(q.tenant_id, &decode.tokens)
+        .await
+        .map_err(storage_status)?;
+    let principals: Vec<serde_json::Value> = resolved
+        .iter()
+        .map(|(tok, p)| {
+            let kind = if p.starts_with("group:") {
+                "group"
+            } else if p.starts_with("user:") {
+                "user"
+            } else {
+                "other"
+            };
+            serde_json::json!({ "token": tok, "principal": p, "kind": kind })
+        })
+        .collect();
+
+    // 4 + 5. Group principals → reachable users, RETAINING the granting group
+    //    path (BUILD 4b). Direct user: principals are terminal.
+    let group_principals: Vec<String> = resolved
+        .iter()
+        .filter(|(_, p)| p.starts_with("group:"))
+        .map(|(_, p)| p.clone())
+        .collect();
+    let (via_users, fanout_truncated) = rebac
+        .users_reachable_via_groups(q.tenant_id, &group_principals, users_limit)
+        .await
+        .map_err(gateway)?;
+
+    // Direct users carried on the object (a user: token on the chunk).
+    let direct_users: std::collections::HashSet<String> = resolved
+        .iter()
+        .filter(|(_, p)| p.starts_with("user:"))
+        .map(|(_, p)| p.clone())
+        .collect();
+
+    let mut reachable: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (user, via_groups) in &via_users {
+        seen.insert(user.clone());
+        let via: Vec<Vec<String>> = via_groups.iter().map(|g| vec![g.clone()]).collect();
+        reachable.push(serde_json::json!({
+            "user": user,
+            "via": via,
+            "direct": direct_users.contains(user),
+        }));
+    }
+    // Direct users not reached via any group still appear (their own token).
+    for u in &direct_users {
+        if !seen.contains(u) {
+            reachable.push(serde_json::json!({
+                "user": u,
+                "via": Vec::<Vec<String>>::new(),
+                "direct": true,
+            }));
+        }
+    }
+
+    // 6. Audit (counts only) then respond.
+    let params = serde_json::json!({ "mode": obj_kind });
+    let result_meta = serde_json::json!({
+        "visibility_tokens": decode.tokens.len(),
+        "principals": principals.len(),
+        "reachable_users": reachable.len(),
+    });
+    pg.write_access_audit(
+        q.tenant_id,
+        &state.admin.actor_fingerprint(&headers),
+        "access/object",
+        &obj_id,
+        &params,
+        &result_meta,
+    )
+    .await
+    .map_err(storage_status)?;
+
+    let provenance = if decode.provenance.len() == 1 {
+        serde_json::json!(decode.provenance[0])
+    } else {
+        serde_json::json!(decode.provenance)
+    };
+
+    Ok(Json(serde_json::json!({
+        "tenant_id": q.tenant_id,
+        "object": { "kind": obj_kind, "id": obj_id },
+        "visibility_tokens": decode.tokens,
+        "confidentiality": decode.min_confidentiality,
+        "provenance": provenance,
+        "principals": principals,
+        "reachable_users": reachable,
+        "reachable_users_next_after": serde_json::Value::Null,
+        "flags": {
+            "approximate": decode.approximate,
+            "fanout_truncated": fanout_truncated,
+        },
+    })))
+}
+
+/// Bound on the Permission Graph aggregate/decode scans (BUILD ITEM 7):
+/// `SET LOCAL statement_timeout` in the same transaction, so a low-selectivity
+/// company-wide token set (or a corpus-spanning source/entity decode) degrades
+/// to an `approximate` result instead of hanging a pooled connection.
+const ACCESS_STATEMENT_TIMEOUT_MS: i64 = 4000;
+
+/// Corpus-size ceiling above which unindexed `source`/`entity` object decode is
+/// refused (§4.4/§6). `document_id` mode is exempt.
+const ACCESS_OBJECT_CORPUS_CEILING: i64 = 2_000_000;
+
 /// POST /v1/admin/groups (admin): write a membership tuple. The group's
 /// principal token is allocated eagerly so visibility sets and revocation
 /// tombstones can reference it.
@@ -5291,5 +5812,133 @@ pub(crate) fn storage_status(e: StorageError) -> (StatusCode, String) {
         StorageError::UnknownTenant(_) => (StatusCode::NOT_FOUND, e.to_string()),
         StorageError::InvalidInput(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
         StorageError::Database(_) => internal(e),
+    }
+}
+
+#[cfg(test)]
+mod permission_graph_tests {
+    //! Permission Graph plane-purity (§9 T7) + gating (§9 T7b) + cursor parse.
+    //! Pure — no socket, no DB — so they run in CI without fixtures. The
+    //! DB-backed scope-parity (T1) + fail-closed (T2) tests live in
+    //! `verity-storage/tests/access_graph_parity.rs` (VERITY_TEST_DSN-gated).
+    use super::{parse_docs_after, AdminAuth};
+    use axum::http::{header, HeaderMap, StatusCode};
+
+    /// The two new handlers' source with comment lines stripped — the T7 grep
+    /// asserts the CODE never *calls* a read-path helper. The handlers document
+    /// (in comments) that they deliberately avoid `scope_for` et al.; those
+    /// prose mentions are not references, so line-comments are removed first.
+    fn handler_src() -> String {
+        let src = include_str!("main.rs");
+        // Slice out just the two admin_access_* handlers, so the grep targets
+        // our code, not the read-path functions elsewhere in the file.
+        let start = src
+            .find("async fn admin_access_subject")
+            .expect("subject handler present");
+        let end = src
+            .find("const ACCESS_OBJECT_CORPUS_CEILING")
+            .expect("ceiling const present");
+        src[start..end]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // --- T7: plane purity (structural grep) --------------------------------
+
+    #[test]
+    fn new_handlers_do_not_touch_read_path_helpers() {
+        let body = handler_src();
+        for forbidden in [
+            "enforce_restricted",
+            "current_token_set",
+            "scope_for",
+            ".recall(",
+            "storage.recall",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "Permission Graph handler must not reference read-path helper `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_get_do_not_reference_new_handlers() {
+        let src = include_str!("main.rs");
+        // The recall handler is `async fn recall(`; assert its body (up to the
+        // next top-level `async fn`) never calls the new admin handlers.
+        let start = src
+            .find("async fn recall(")
+            .expect("recall handler present");
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\nasync fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(src.len());
+        let recall_body = &src[start..end];
+        assert!(!recall_body.contains("admin_access_subject"));
+        assert!(!recall_body.contains("admin_access_object"));
+        assert!(!recall_body.contains("access_corpus_aggregate"));
+    }
+
+    #[test]
+    fn every_new_handler_gates_with_require_not_check() {
+        let body = handler_src();
+        assert!(
+            body.matches("state.admin.require(&headers)?").count() >= 2,
+            "both handlers must gate with require() (no dev-open)"
+        );
+        // The god-view must never use the dev-open `check` on its own gate line.
+        assert!(
+            !body.contains("state.admin.check(&headers)"),
+            "Permission Graph must not use dev-open check()"
+        );
+        // And both must demand ReBAC.
+        assert!(body.matches("require_rebac(&state)?").count() >= 2);
+    }
+
+    // --- T7b: gating returns 401 when no admin token is configured ---------
+
+    #[test]
+    fn god_view_gate_refuses_without_admin_token() {
+        // `require` is the gate both handlers call first; with no configured
+        // token it 401s (unlike dev-open `check`), even on a loopback bind.
+        let auth = AdminAuth::for_test(None, None);
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer anything".parse().unwrap());
+        let err = auth.require(&h).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn actor_fingerprint_is_stable_and_non_raw() {
+        let auth = AdminAuth::for_test(Some("s3cret"), None);
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+        let fp = auth.actor_fingerprint(&h);
+        assert!(fp.starts_with("bearer:"));
+        assert!(!fp.contains("s3cret"), "must never leak the raw token");
+        // Deterministic for the same key + token.
+        assert_eq!(fp, auth.actor_fingerprint(&h));
+        // No bearer → dev-open marker.
+        assert_eq!(auth.actor_fingerprint(&HeaderMap::new()), "dev-open");
+    }
+
+    // --- cursor parse ------------------------------------------------------
+
+    #[test]
+    fn docs_after_roundtrips_and_rejects_garbage() {
+        let ts = "2026-07-01T00:00:00+00:00";
+        let id = "0190a0aa-0000-7000-8000-000000000000";
+        let (parsed_ts, parsed_id) = parse_docs_after(&format!("{ts}|{id}")).unwrap();
+        assert_eq!(parsed_ts.to_rfc3339(), ts);
+        assert_eq!(parsed_id.to_string(), id);
+        assert!(parse_docs_after("no-pipe").is_err());
+        assert!(parse_docs_after("not-a-date|not-a-uuid").is_err());
     }
 }
