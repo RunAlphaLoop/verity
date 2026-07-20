@@ -161,16 +161,16 @@
     if (mode === "subject") {
       ctl.innerHTML =
         '<div class="card"><div class="row">' +
-          '<div><label for="pg-subject">person or group (subject)</label>' +
-            '<input type="text" id="pg-subject" list="pg-subject-list" ' +
-              'placeholder="alice@corp.example  ·  or group:eng" autocomplete="off" spellcheck="false" ' +
-              'value="' + V.esc(subj.subject ? classify(subj.subject).name : "") + '"></div>' +
+          '<div class="pg-suggwrap"><label for="pg-subject">person or group (subject)</label>' +
+            '<input type="text" id="pg-subject" autocomplete="off" spellcheck="false" ' +
+              'placeholder="start typing a name — or paste user:… / group:…" ' +
+              'value="' + V.esc(subj.subject ? classify(subj.subject).name : "") + '">' +
+            '<div id="pg-subject-sug" class="pg-suggest" hidden></div></div>' +
           '<div><label for="pg-maxconf">at confidentiality up to</label>' +
             '<select id="pg-maxconf" class="field">' +
               optConf(0) + optConf(1) + optConf(2) + optConf(3) +
             "</select></div>" +
         "</div>" +
-        '<datalist id="pg-subject-list"></datalist>' +
         '<div class="note" style="margin-top:8px">A bare name becomes <span class="ref">user:&lt;name&gt;</span>; type <span class="ref">group:&lt;name&gt;</span> to ask about a group. ' +
           'The corpus shown is exactly what a real read would be pre-filtered to for this subject — after any in-window revocations are subtracted.' +
           '<span class="api-crumb"> · GET /v1/admin/access/subject</span></div>' +
@@ -179,9 +179,7 @@
         "</div></div>";
       var mc = el("pg-maxconf"); if (mc) mc.value = String(subj.max_conf);
       el("pg-run-subject").onclick = submitSubject;
-      var si = el("pg-subject");
-      si.onkeydown = function (e) { if (e.key === "Enter") submitSubject(); };
-      populateSubjectList();
+      wireSubjectTypeahead(el("pg-subject"), el("pg-subject-sug"));
     } else {
       ctl.innerHTML =
         '<div class="card"><div class="row">' +
@@ -230,19 +228,76 @@
     }
   }
 
-  /* Datalist assist for the subject box — reuses the principals directory. */
-  function populateSubjectList() {
-    var dl = el("pg-subject-list");
-    if (!dl || !tenantNow) return;
-    V.api("/v1/admin/principals?tenant_id=" + encodeURIComponent(tenantNow) + "&after_token=0&limit=1000", { admin: true })
+  /* Subject typeahead — a themed, filtered picker over the principals
+     directory (replaces the native <datalist>, which dumped the whole
+     1000-row corpus of bot senders as an unthemeable white wall). Cached
+     per tenant; shows only the top matches while the operator types. */
+  var subjectDir = null, subjectDirFor = "";
+  function loadSubjectDir() {
+    if (!tenantNow) return Promise.resolve([]);
+    if (subjectDir && subjectDirFor === tenantNow) return Promise.resolve(subjectDir);
+    return V.api("/v1/admin/principals?tenant_id=" + encodeURIComponent(tenantNow) + "&after_token=0&limit=1000", { admin: true })
       .then(function (res) {
-        var rows = (res && res.principals) || [];
-        dl.innerHTML = rows.map(function (r) {
+        subjectDir = ((res && res.principals) || []).map(function (r) {
           var c = classify(r.principal);
-          return '<option value="' + V.esc(c.kind === "group" ? "group:" + c.name : c.name) + '">';
-        }).join("");
+          var disp = c.kind === "group" ? "group:" + c.name : c.name;
+          return { kind: c.kind, disp: disp, low: disp.toLowerCase() };
+        });
+        subjectDirFor = tenantNow;
+        return subjectDir;
       })
-      .catch(function () { /* assist only — silent, the box still works */ });
+      .catch(function () { return []; });   // assist only — the box still works
+  }
+
+  function wireSubjectTypeahead(input, sug) {
+    if (!input || !sug) return;
+    var matches = [], active = -1;
+    loadSubjectDir();                        // warm the cache
+
+    function hide() { sug.hidden = true; sug.innerHTML = ""; active = -1; }
+    function pick(m) { input.value = m.disp; hide(); input.focus(); }
+    function render() {
+      if (!matches.length) { hide(); return; }
+      sug.innerHTML = matches.map(function (m, i) {
+        return '<div class="pg-sug' + (i === active ? " pg-sug-active" : "") + '" data-i="' + i + '">' +
+          '<span class="pg-sug-kind">' + (m.kind === "group" ? "group" : "user") + '</span>' +
+          '<span class="pg-sug-name">' + V.esc(m.disp) + "</span></div>";
+      }).join("");
+      sug.hidden = false;
+      Array.prototype.forEach.call(sug.querySelectorAll(".pg-sug"), function (row) {
+        // mousedown (not click) so it fires before the input's blur hides us
+        row.onmousedown = function (e) { e.preventDefault(); pick(matches[+row.getAttribute("data-i")]); };
+      });
+    }
+    function refresh() {
+      var bare = input.value.trim().toLowerCase().replace(/^(user:|group:)/, "");
+      if (bare.length < 1) { hide(); return; }
+      loadSubjectDir().then(function (dir) {
+        var pre = [], sub = [];
+        for (var i = 0; i < dir.length && pre.length + sub.length < 40; i++) {
+          var idx = dir[i].low.indexOf(bare);
+          if (idx === 0) pre.push(dir[i]); else if (idx > 0) sub.push(dir[i]);
+        }
+        matches = pre.concat(sub).slice(0, 10);
+        active = -1;
+        render();
+      });
+    }
+
+    input.oninput = refresh;
+    input.onfocus = function () { if (input.value.trim()) refresh(); };
+    input.onblur = function () { setTimeout(hide, 120); };
+    input.onkeydown = function (e) {
+      if (e.key === "Enter") {
+        if (!sug.hidden && active >= 0 && matches[active]) { e.preventDefault(); pick(matches[active]); }
+        else submitSubject();
+        return;
+      }
+      if (sug.hidden || !matches.length) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); active = (active + 1) % matches.length; render(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); active = (active - 1 + matches.length) % matches.length; render(); }
+      else if (e.key === "Escape") { hide(); }
+    };
   }
 
   /* =========================================================== idle */
