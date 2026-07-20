@@ -1814,6 +1814,7 @@ mod tests {
             rebac: None,
             revocations: crate::revocation::RevocationPlane::new(300),
             watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
+            watch_staleness_fence_secs: 900,
             folder_watchers: Arc::new(WatcherRegistry::new()),
             folder_scans: Arc::new(FolderScanPlane::new()),
             knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),

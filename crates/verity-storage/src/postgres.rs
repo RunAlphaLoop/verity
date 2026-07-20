@@ -4930,8 +4930,9 @@ impl StorageAdapter for PostgresAdapter {
 }
 
 /// The reason an ACL correction was applied, stamped on the `fact_acl_audit`
-/// row (migration 0026). Mirrors the CHECK-free `reason` vocabulary the audit
-/// table documents; kept as a Rust enum so callers cannot free-type a reason.
+/// (migration 0026) and `chunk_acl_audit` (migration 0036) rows. Mirrors the
+/// CHECK-free `reason` vocabulary those audit tables document; kept as a Rust
+/// enum so callers cannot free-type a reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclCorrectionReason {
     SourceReshare,
@@ -4952,6 +4953,55 @@ impl AclCorrectionReason {
 }
 
 impl PostgresAdapter {
+    /// The MAX confidentiality currently stamped on a fact key's live row. Used
+    /// by the retraction dispatch layer to clamp a TIGHTENING correction so it
+    /// can never DOWNGRADE an already-stricter fact (which would strip the tier-3
+    /// per-hit live recheck). `None` when the key has no current row.
+    pub async fn current_fact_confidentiality(
+        &self,
+        tenant: TenantId,
+        key: &FactKey,
+    ) -> Result<Option<Confidentiality>> {
+        let row: Option<i16> = sqlx::query_scalar(
+            "SELECT confidentiality FROM facts
+             WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4
+               AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(&key.source)
+        .bind(&key.entity_id)
+        .bind(&key.field)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(Confidentiality::from_i16))
+    }
+
+    /// The MAX confidentiality across a document's live chunk lineage (one
+    /// document fans out to many chunks, each possibly at a different class). Used
+    /// by the retraction dispatch layer to clamp a TIGHTENING correction so it
+    /// can never DOWNGRADE the strictest derived chunk. `None` when unknown.
+    pub async fn current_chunk_confidentiality(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+    ) -> Result<Option<Confidentiality>> {
+        let row: Option<i16> = sqlx::query_scalar(
+            "SELECT max(confidentiality) FROM chunks
+             WHERE tenant_id = $1 AND source = $2 AND document_id = $3
+               AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .flatten();
+        Ok(row.map(Confidentiality::from_i16))
+    }
+
     /// ACL-correction-in-place (SPEC §5e.6b, the append-only carve-out). Value
     /// changes stay append-only (valid_to + superseded_by); an ACL change does
     /// NOT — a re-share/un-share UPDATEs `visibility`/`confidentiality` across
@@ -5005,7 +5055,12 @@ impl PostgresAdapter {
                 None => (None, None, None),
             };
 
-        // In-place UPDATE across ALL rows of the key (current + superseded).
+        // In-place UPDATE across ALL rows of the key (current + superseded). The
+        // caller supplies the authoritative new confidentiality; the no-DOWNGRADE
+        // clamp for TIGHTENING corrections (un-share) lives at the dispatch layer
+        // (`dispatch_acl_correction`), which reads the current level and passes a
+        // value never below it, so a defaulted-Internal un-share can't weaken a
+        // Restricted fact. A legitimate reshare/admin correction may set any level.
         let updated = sqlx::query(
             "UPDATE facts SET visibility = $5, confidentiality = $6
              WHERE tenant_id = $1 AND source = $2 AND entity_id = $3 AND field = $4",
@@ -5045,6 +5100,115 @@ impl PostgresAdapter {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
+    }
+
+    /// ACL-correction-in-place for CHUNKS (SPEC §5e.6b) — the object-level twin
+    /// of [`correct_fact_acl`]. A source record fans out to MANY chunks: ingest
+    /// writes every chunk of one document under the SAME `(source, document_id)`
+    /// (only `seq` varies). An un-share/re-share is therefore a LINEAGE WALK over
+    /// that key — it UPDATEs `visibility`/`confidentiality` across EVERY row of
+    /// the lineage (current + superseded history) in one transaction and appends
+    /// one `chunk_acl_audit` row per current chunk. It takes effect immediately,
+    /// like a revocation tombstone: were the new ACL appended as a fresh chunk
+    /// version, the old permissive `visibility` would sit behind `valid_to IS
+    /// NULL` until the next content write — the exact §5e.6b leak. Because history
+    /// rows are touched too, a historical read (`?as_of=`) enforces NOW-ACL: an
+    /// un-shared principal cannot reach a past chunk version.
+    ///
+    /// Admin/connector plane only — reachable from admin correction handlers, the
+    /// connector-emitted `acl_change` path, and the rebac-watch DELETE path, NEVER
+    /// from an agent scope. Fail-closed: an empty `new_visibility` makes every
+    /// derived chunk invisible to scoped reads (`visibility && $tokens` is false).
+    /// Returns the number of chunk rows whose ACL was updated (0 = unknown object,
+    /// which the caller must surface as "unknown object", never as success).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn correct_chunk_acl(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        new_visibility: &[PrincipalToken],
+        new_confidentiality: Confidentiality,
+        reason: AclCorrectionReason,
+        acl_provenance: AclProvenance,
+        changed_by: Option<&str>,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Snapshot every CURRENT chunk of the lineage for the audit trail — one
+        // forensic row per current chunk (matching `fact_acl_audit`'s per-key
+        // granularity, extended to the document's fan-out). Superseded rows are
+        // rewritten too (below) but the log is keyed to the live lineage set.
+        let current = sqlx::query(
+            "SELECT id, seq, visibility, confidentiality FROM chunks
+             WHERE tenant_id = $1 AND source = $2 AND document_id = $3
+               AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        // In-place UPDATE across ALL rows of the lineage (current + superseded),
+        // NO `valid_to` predicate — the value-history carve-out. Do NOT append a
+        // new chunk version (that would leave the old permissive `visibility`
+        // behind `valid_to IS NULL` = the 5e.6b leak).
+        //
+        // The caller supplies the authoritative new confidentiality. The
+        // no-DOWNGRADE clamp for TIGHTENING corrections (un-share) lives at the
+        // dispatch layer (`dispatch_acl_correction`), which reads the current
+        // level and never passes below it — so a defaulted-Internal un-share can
+        // never weaken a Restricted chunk (which would strip its tier-3 per-hit
+        // live recheck). A legitimate reshare/admin correction may set any level.
+        let updated = sqlx::query(
+            "UPDATE chunks SET visibility = $4, confidentiality = $5
+             WHERE tenant_id = $1 AND source = $2 AND document_id = $3",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .bind(new_visibility)
+        .bind(new_confidentiality as i16)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        // One append-only audit row per snapshotted current chunk (old -> new).
+        for row in &current {
+            let chunk_id: Uuid = row.try_get("id").map_err(db_err)?;
+            let seq: i32 = row.try_get("seq").map_err(db_err)?;
+            let old_vis: Vec<i32> = row.try_get("visibility").map_err(db_err)?;
+            let old_conf: i16 = row.try_get("confidentiality").map_err(db_err)?;
+            sqlx::query(
+                "INSERT INTO chunk_acl_audit
+                    (id, tenant_id, source, document_id, seq, chunk_id,
+                     old_visibility, new_visibility, old_confidentiality, new_confidentiality,
+                     reason, acl_provenance, changed_by)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant)
+            .bind(source)
+            .bind(document_id)
+            .bind(seq)
+            .bind(chunk_id)
+            .bind(&old_vis)
+            .bind(new_visibility)
+            .bind(old_conf)
+            .bind(new_confidentiality as i16)
+            .bind(reason.as_str())
+            .bind(acl_provenance.as_str())
+            .bind(changed_by)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
 
         tx.commit().await.map_err(db_err)?;
         Ok(updated)

@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from verity_ingest.acl_diff import AclState
 from verity_ingest.connectors.hubspot import (
     DEGRADED_ACL_SIGNAL,
     HubSpotConnector,
@@ -943,3 +944,107 @@ def test_main_requires_exactly_one_mode(monkeypatch: pytest.MonkeyPatch) -> None
         hubspot_main(["--visibility", "7,12"])  # no mode
     with pytest.raises(SystemExit):
         hubspot_main(["--backfill", "--webhook-file", "x.json", "--visibility", "7,12"])
+
+
+# --- M1 connector ACL-diff lane (build #5) --------------------------------
+
+
+def _owned_event(entity_id: str, field: str, value, principals: list[str]) -> HubSpotFactEvent:
+    """An owner/team-scoped HubSpotFactEvent carrying `record_principals`."""
+    return HubSpotFactEvent(
+        source="hubspot",
+        entity_id=entity_id,
+        field_name=field,
+        value=value,
+        valid_from=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        raw_payload={},
+        object_type="contacts",
+        visibility_policy=[7, 12],
+        record_principals=list(principals),
+    )
+
+
+def _acl_lane_sink(handler) -> VerityDebeziumSink:
+    return VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        admin_token="secret-token",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_acl_diff_emits_acl_change_on_tightening(tmp_path: Path) -> None:
+    # Two syncs of one owned record. Sync 1 establishes the baseline (no emit).
+    # Sync 2 REMOVES a principal (a team un-share) → exactly one acl-change POST
+    # per derived fact key, carrying the NEW FULL resolved token set (REPLACE)
+    # and the removed principal in the audit fields.
+    token_map = {
+        "user:owner@acme.example": 3,
+        "group:hubspot-team-1": 7,
+        "group:hubspot-team-2": 9,
+    }
+    posts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content) if request.content else {}
+        if url.endswith("/v1/admin/principals"):
+            wanted = body["principals"]
+            return httpx.Response(
+                200, json={"mappings": {p: token_map[p] for p in wanted if p in token_map}}
+            )
+        if url.endswith("/v1/ingest/acl-change"):
+            posts.append(body)
+            return httpx.Response(200, json={"kind": "fact", "rows_rewritten": 1})
+        return httpx.Response(200, json={})
+
+    sink = _acl_lane_sink(handler)
+    state_file = tmp_path / "hubspot.acl.json"
+    state = AclState(state_file)
+
+    before = ["user:owner@acme.example", "group:hubspot-team-1", "group:hubspot-team-2"]
+    after = ["user:owner@acme.example", "group:hubspot-team-1"]  # team-2 un-shared
+
+    # Sync 1: baseline, no emit.
+    sync1 = [
+        _owned_event("501", "name", "Acme", before),
+        _owned_event("501", "domain", "acme.example", before),
+    ]
+    assert sink.emit_acl_changes(sync1, state) == 0
+    assert posts == []
+
+    # Sync 2: team-2 removed → one acl-change per fact key (name, domain).
+    state2 = AclState(state_file)  # reload from disk (proves persistence)
+    sync2 = [
+        _owned_event("501", "name", "Acme", after),
+        _owned_event("501", "domain", "acme.example", after),
+    ]
+    emitted = sink.emit_acl_changes(sync2, state2)
+    assert emitted == 2, "one acl-change per derived fact key of the tightened record"
+    assert len(posts) == 2
+    for body in posts:
+        assert body["source"] == "hubspot:contacts"
+        assert body["fact"]["entity_id"] == "501"
+        assert body["fact"]["field"] in {"name", "domain"}
+        # REPLACE: the NEW FULL resolved set (owner=3, team-1=7); team-2=9 gone.
+        assert body["verity_acl"]["visibility"] == [3, 7]
+        assert body["reason"] == "source_unshare"
+
+
+def test_acl_diff_grant_only_change_does_not_emit(tmp_path: Path) -> None:
+    # A record that GAINS a principal (a widening) must NOT emit — grants take
+    # effect on the next mint via the normal ingest path.
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/v1/admin/principals"):
+            return httpx.Response(200, json={"mappings": {}})
+        assert not url.endswith("/v1/ingest/acl-change"), "grant must not emit an acl-change"
+        return httpx.Response(200, json={})
+
+    sink = _acl_lane_sink(handler)
+    state = AclState(tmp_path / "hs.acl.json")
+    narrow = ["user:owner@acme.example"]
+    wide = ["user:owner@acme.example", "group:hubspot-team-1"]
+    assert sink.emit_acl_changes([_owned_event("9", "name", "X", narrow)], state) == 0
+    # Widen: adds team-1. No tightening → no emit.
+    assert sink.emit_acl_changes([_owned_event("9", "name", "X", wide)], state) == 0

@@ -49,6 +49,7 @@ async fn test_state(admin: AdminAuth) -> Option<Arc<AppState>> {
         rebac: None,
         revocations: RevocationPlane::new(300),
         watch: Arc::new(crate::rebac_watch::WatchStatus::new()),
+        watch_staleness_fence_secs: 900,
         folder_watchers: Arc::new(crate::folder_watch::WatcherRegistry::new()),
         folder_scans: Arc::new(crate::folder_watch::FolderScanPlane::new()),
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),

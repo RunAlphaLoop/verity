@@ -65,6 +65,11 @@ pub(crate) struct Metrics {
     pub(crate) revocation_subtractions: Arc<AtomicU64>,
     /// `audit_insert_drops_total` — bumped when a spawned audit insert fails.
     pub(crate) audit_insert_drops: AtomicU64,
+    /// `staleness_fence_engaged_total` — bumped each time the recall-side
+    /// staleness fence trips (Watch enabled + stale) and forces a tier-≤2 scope
+    /// into live re-resolution / fail-closed. A rising counter = the Watch is
+    /// degraded/lagging and the read path is over-hiding to stay honest.
+    pub(crate) staleness_fence_engaged: AtomicU64,
 }
 
 impl Metrics {
@@ -77,7 +82,13 @@ impl Metrics {
             exact_scan_fallback: Arc::new(AtomicU64::new(0)),
             revocation_subtractions: Arc::new(AtomicU64::new(0)),
             audit_insert_drops: AtomicU64::new(0),
+            staleness_fence_engaged: AtomicU64::new(0),
         }
+    }
+
+    /// Count one recall-side staleness-fence engagement.
+    pub(crate) fn record_staleness_fence(&self) {
+        self.staleness_fence_engaged.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A clone of the shared exact-scan counter, to wire into `PostgresAdapter`
@@ -190,6 +201,17 @@ impl Metrics {
             "audit_insert_drops_total {}",
             self.audit_insert_drops.load(Ordering::Relaxed)
         );
+
+        let _ = writeln!(
+            out,
+            "# HELP staleness_fence_engaged_total Recall-side staleness fence trips (Watch stale → tier-≤2 fail-closed / live re-resolution)."
+        );
+        let _ = writeln!(out, "# TYPE staleness_fence_engaged_total counter");
+        let _ = writeln!(
+            out,
+            "staleness_fence_engaged_total {}",
+            self.staleness_fence_engaged.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -220,10 +242,17 @@ impl WatchFreshness {
         // Only report a real lag when the consumer is enabled; a disabled
         // consumer's cursor row (if any is stale from a prior run) must not read
         // as fresh. Enabled-but-no-row (never advanced) also stays sentinel.
+        //
+        // Prefer the in-process cached gauge (the SAME lock-free signal the
+        // recall-side staleness fence keys off, so the gauge and the fence can
+        // never disagree). Fall back to the bounded DB query only when the
+        // cursor has not advanced in THIS process (cache empty) — e.g. a fresh
+        // replica reading a cursor a peer advanced — so the metric still
+        // reflects durable state rather than reading sentinel forever.
         let lag_seconds = if enabled {
-            match query_cursor_lag(state).await {
-                Some(lag) => lag,
-                None => LAG_SENTINEL,
+            match state.watch.lag_seconds_cached() {
+                Some(lag) => lag as f64,
+                None => query_cursor_lag(state).await.unwrap_or(LAG_SENTINEL),
             }
         } else {
             LAG_SENTINEL

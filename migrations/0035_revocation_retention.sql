@@ -1,0 +1,22 @@
+-- 0035_revocation_retention.sql — M1: durable tombstones outlive MAX_TTL.
+--
+-- The read-path subtraction is now HANDLE-RELATIVE (drop token t from a handle
+-- iff a tombstone for t has at >= handle.issued_at), not a fixed 300s wall-clock
+-- window. Retention contract: tombstones MUST be kept >= MAX_TTL (12h) + slack so
+-- every live handle can still see the tombstones minted after it was minted.
+-- Because verify() rejects any handle past MAX_TTL, a tombstone older than
+-- MAX_TTL+slack can never bite a still-live handle, so accumulation is bounded
+-- and O(revoked-in-tenant-in-last-13h). No reaper is added in M1 (rows may
+-- accumulate; a live handle out of the retention window is already expired).
+--
+-- The legacy (tenant_id, at DESC) index (0009) still serves the tenant-wide
+-- widened read scan (SELECT token, at WHERE tenant_id=$1 AND at > now()-13h)
+-- optimally. This migration adds a per-token cover for the admin-plane /
+-- rebac-watch dedupe per-token lookups, which now range over the wider window.
+--
+-- Design-forward (M4 HA): the durable (token, at) tombstone set with a monotonic
+-- issued_at cutoff is exactly what a future totally-ordered changelog feeds —
+-- swap "read the revocations table" for "read the changelog offsets" with no
+-- read-path rewrite.
+CREATE INDEX IF NOT EXISTS revocations_tenant_token_at_idx
+    ON revocations (tenant_id, token, at DESC);

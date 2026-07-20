@@ -171,7 +171,7 @@ pub fn parse_envelope(
 /// "acl_provenance": "approximated"}`.
 /// Absent or malformed => `None` (fall back to the bound policy, then refuse) —
 /// a malformed ACL is NEVER read as permissive.
-fn parse_inline_acl(payload: &Value) -> Option<ResolvedAcl> {
+pub(crate) fn parse_inline_acl(payload: &Value) -> Option<ResolvedAcl> {
     let block = payload.get("verity_acl")?.as_object()?;
     let visibility: Vec<PrincipalToken> = block
         .get("visibility")?

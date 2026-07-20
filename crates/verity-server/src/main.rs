@@ -61,6 +61,7 @@ mod system_tests;
 #[cfg(test)]
 mod tenants_tests;
 mod ui;
+mod watch_leader;
 mod webhooks;
 
 use std::sync::Arc;
@@ -417,6 +418,12 @@ pub(crate) struct AppState {
     /// can report `enabled: false`; the consumer only ADDS revocation
     /// tombstones — the read path never consults it.
     pub(crate) watch: Arc<rebac_watch::WatchStatus>,
+    /// Recall-side staleness-fence bound (seconds). When the Watch is enabled and
+    /// its cursor lags beyond this (or is degraded/disconnected), tier-≤2 reads
+    /// fail closed / re-resolve live. `VERITY_WATCH_STALENESS_FENCE_SECS`, default
+    /// `DEFAULT_STALENESS_FENCE_SECS` (900s ≥ the revocation window). Documented,
+    /// never a bare env default — see the M1 SLO note.
+    pub(crate) watch_staleness_fence_secs: u64,
     /// Live local-folder watchers (folder_watch.rs). Holds the OS-level watch
     /// handles keyed by watch id so add/stop can arm/disarm them at runtime;
     /// re-populated from the `folder_watches` table on boot. Ingest is
@@ -496,11 +503,77 @@ impl AppState {
     /// here so already-minted handles pick up revocations immediately.
     async fn scope_for(&self, payload: &ScopePayload) -> HandlerResult<Scope> {
         let mut scope = payload.to_scope();
+        // M1 durable-tombstone model (the read-path choke point): subtract every
+        // token whose revocation tombstone is at-or-after this handle's mint
+        // instant (`issued_at`), for the handle's FULL ≤12h life — NOT a fixed
+        // 300s wall-clock window. This is what closes the leak where a 12h handle
+        // kept tier-≤2 access ~11h55m past the legacy window. Stays a materialized
+        // pre-read step (O(revoked-in-tenant) in-memory scan over the 5s-cached
+        // tombstone set) — zero new live-ReBAC, zero per-read DB round-trip.
         scope.principals = self
             .revocations
-            .subtract(self.pool(), scope.tenant_id, &scope.principals)
+            .subtract(
+                self.pool(),
+                scope.tenant_id,
+                &scope.principals,
+                payload.issued_at,
+            )
             .await?;
+        // M1 recall-side staleness fence. The durable subtraction above only
+        // covers tombstones the local server WROTE (mint/admin/watch on THIS
+        // node). Out-of-band ReBAC deletes reach us only through the Watch
+        // stream; if that stream is degraded/lagging, the materialized set may
+        // be stale. The fence keys off the LOCAL cursor-lag gauge (an in-process
+        // atomic — no DB query, no live ReBAC on the normal path) and, only when
+        // it trips, forces tier-≤2 into live re-resolution (the ONE place a live
+        // ReBAC call is allowed, on the fenced path only). Tier-3 (Restricted)
+        // already re-resolves via `enforce_restricted` regardless. Fail closed:
+        // if we cannot re-resolve, tier-≤2 principals are emptied (over-hide).
+        self.fence_stale_scope(payload, &mut scope).await?;
         Ok(scope)
+    }
+
+    /// Apply the recall-side staleness fence to a compiled scope. No-op unless
+    /// the Watch is enabled AND stale ([`WatchStatus::is_stale`], a lock-free
+    /// local read). When stale, tier-≤2 scopes (whose reads are served straight
+    /// from the materialized visibility set with no per-item recheck) are
+    /// re-grounded against CURRENT ReBAC: the subject's groups are re-resolved
+    /// live and in-window/durable revocations re-subtracted, so a token the
+    /// caller lost out-of-band is dropped even before its tombstone reaches us.
+    /// Fail closed: a subject-less handle (or any resolution failure) empties the
+    /// principal set for tier-≤2, hiding everything rather than trusting a stale
+    /// materialized set. Restricted (tier-3) is untouched here — `recall`'s
+    /// `enforce_restricted` re-resolves it on every read already.
+    async fn fence_stale_scope(
+        &self,
+        payload: &ScopePayload,
+        scope: &mut Scope,
+    ) -> HandlerResult<()> {
+        // Only tier-≤2 rides the materialized set without a live recheck. A
+        // Restricted-ceiling scope is rechecked per hit downstream, so the fence
+        // adds nothing there and we skip the live call.
+        if scope.max_confidentiality > Confidentiality::Confidential {
+            return Ok(());
+        }
+        if !self.watch.is_stale(self.watch_staleness_fence_secs) {
+            return Ok(());
+        }
+        self.metrics.record_staleness_fence();
+        // Fenced: distrust the materialized set. Re-resolve live if we can.
+        match (&self.rebac, &payload.subject) {
+            (Some(rebac), Some(subject)) => {
+                let fresh = live_resolved_tokens(self, rebac, payload, subject).await?;
+                scope.principals = fresh;
+                Ok(())
+            }
+            // No subject to re-resolve (dev-mode principal handle) or no ReBAC:
+            // we cannot prove the materialized set is still current, so fail
+            // closed for tier-≤2 by hiding everything.
+            _ => {
+                scope.principals.clear();
+                Ok(())
+            }
+        }
     }
 
     pub(crate) async fn encode(&self, text: &str) -> HandlerResult<Option<Vec<f32>>> {
@@ -515,6 +588,48 @@ impl AppState {
             .map(Some)
             .map_err(internal)
     }
+}
+
+/// The caller's CURRENT resolved token set, re-derived LIVE from ReBAC for the
+/// staleness fence: re-resolve the subject's group membership fresh from
+/// SpiceDB, then subtract revocations relative to the handle's mint instant (the
+/// same durable-tombstone rule the normal read path applies). Used ONLY on the
+/// fenced (watch-stale) path — never on the normal read. Mirrors the recheck in
+/// `revocation::enforce_restricted`'s `current_token_set`, applied to the
+/// tier-≤2 principal set instead of per-restricted-hit.
+async fn live_resolved_tokens(
+    state: &AppState,
+    rebac: &Rebac,
+    payload: &ScopePayload,
+    subject: &str,
+) -> HandlerResult<Vec<PrincipalToken>> {
+    let (kind, name) = rebac::parse_principal(subject).ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "scope subject is not a user principal".to_string(),
+    ))?;
+    if kind != rebac::PrincipalKind::User {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "scope subject is not a user principal".to_string(),
+        ));
+    }
+    let mut principals = vec![subject.to_string()];
+    principals.extend(
+        rebac
+            .user_groups(payload.tenant_id, name)
+            .await
+            .map_err(internal)?,
+    );
+    let tokens: Vec<PrincipalToken> =
+        upsert_principal_tokens(state.pool(), payload.tenant_id, &principals)
+            .await?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+    state
+        .revocations
+        .subtract(state.pool(), payload.tenant_id, &tokens, payload.issued_at)
+        .await
 }
 
 /// Entity tags an agent writes must stay inside its scope (SPEC §7c): in an
@@ -569,6 +684,14 @@ fn plane_row(
         "start_hint": start_hint,
     })
 }
+
+/// Default recall-side staleness-fence bound (seconds). Chosen ≥ the revocation
+/// window so the fence trips only when the Watch stream is genuinely stale (a
+/// gap, disconnect, or cursor lag past this) — not on ordinary reconnect
+/// churn. Overridable via `VERITY_WATCH_STALENESS_FENCE_SECS`. The M1 SLO
+/// battery (scope_fuzz) measures source-change→invisible per lane; this bound is
+/// documented against those numbers, not left a bare env default.
+const DEFAULT_STALENESS_FENCE_SECS: u64 = 900;
 
 /// Command to bring the identity plane up (it is boot-time env, not
 /// click-startable): start SpiceDB, then restart the server with the URL set.
@@ -1434,6 +1557,10 @@ async fn main() -> anyhow::Result<()> {
         // default 900s, 0 disables). See scheduler.rs.
         resolution: scheduler::ResolutionScheduler::from_env(),
         watch: Arc::new(rebac_watch::WatchStatus::new()),
+        watch_staleness_fence_secs: std::env::var("VERITY_WATCH_STALENESS_FENCE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_STALENESS_FENCE_SECS),
         folder_watchers: Arc::new(folder_watch::WatcherRegistry::new()),
         folder_scans: Arc::new(folder_watch::FolderScanPlane::new()),
         knowledge_worker: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1500,6 +1627,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/forget", post(forget))
         .route("/v1/ingest/debezium", post(ingest_debezium))
         .route("/v1/ingest/documents", post(ingest_documents))
+        .route("/v1/ingest/acl-change", post(ingest_acl_change))
+        .route("/v1/admin/acl/correct", post(admin_correct_acl))
         .route("/v1/briefs/{entity}", get(brief))
         .route("/v1/admin/briefs/refresh", post(admin_refresh_briefs))
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
@@ -1691,27 +1820,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // SpiceDB Watch-driven revocation materialization (rebac_watch.rs, SPEC
-    // §7b). Opt-in: VERITY_SPICEDB_WATCH=1 AND ReBAC configured. The consumer
-    // only ADDS tombstones — the windowed subtraction, mint-time resolution,
-    // and restricted recheck keep enforcing regardless of watch health. A
-    // configured watch whose stream can't be opened at startup is a hard
-    // failure (same posture as ensure_schema — never silent).
-    if std::env::var("VERITY_SPICEDB_WATCH").is_ok_and(|v| v == "1") {
-        let Some(r) = &state.rebac else {
-            anyhow::bail!("VERITY_SPICEDB_WATCH=1 requires VERITY_SPICEDB_URL");
-        };
-        r.watch_probe().await.map_err(|e| {
-            anyhow::anyhow!("VERITY_SPICEDB_WATCH=1 but the SpiceDB watch stream is unusable: {e}")
-        })?;
-        state.watch.set_enabled(true);
-        tracing::info!(
-            "spicedb watch-driven revocation materialization enabled (accelerator over the windowed baseline; health at GET /v1/admin/rebac-watch)"
-        );
-        tokio::spawn(rebac_watch::run(Arc::clone(&state)));
-    } else {
-        tracing::info!(
-            "spicedb watch disabled (set VERITY_SPICEDB_WATCH=1 with VERITY_SPICEDB_URL to accelerate out-of-band revocation propagation)"
-        );
+    // §7b). M1: DEFAULT-ON whenever ReBAC is configured (VERITY_SPICEDB_URL set);
+    // VERITY_SPICEDB_WATCH=0 is the explicit opt-OUT. The consumer is now
+    // SUPERVISED (run_supervised: a panic auto-restarts with backoff, never
+    // silently ending materialization) and LEADER-ELECTED (a Postgres session
+    // advisory lock on the cursor makes it safe on >1 replica — only the leader
+    // advances the cursor, so two consumers no longer go quietly blind). The
+    // consumer only ADDS tombstones; the durable subtraction, mint-time
+    // resolution, and the recall-side staleness fence keep enforcing regardless
+    // of watch health. A configured watch whose stream can't be opened at
+    // startup is a hard failure (same posture as ensure_schema — never silent).
+    let watch_opted_out = std::env::var("VERITY_SPICEDB_WATCH").is_ok_and(|v| v == "0");
+    match (&state.rebac, watch_opted_out) {
+        (Some(r), false) => {
+            r.watch_probe().await.map_err(|e| {
+                anyhow::anyhow!("SpiceDB watch is enabled (ReBAC configured) but the watch stream is unusable: {e} — set VERITY_SPICEDB_WATCH=0 to opt out")
+            })?;
+            state.watch.set_enabled(true);
+            tracing::info!(
+                "spicedb watch-driven revocation materialization enabled (default-on, supervised, leader-elected; the recall staleness fence fails closed if the cursor lags; health at GET /v1/admin/rebac-watch)"
+            );
+            tokio::spawn(rebac_watch::run_supervised(Arc::clone(&state)));
+        }
+        (Some(_), true) => {
+            tracing::info!(
+                "spicedb watch opted out (VERITY_SPICEDB_WATCH=0); windowed/durable-tombstone baseline is the freshness guarantee"
+            );
+        }
+        (None, _) => {
+            tracing::info!(
+                "spicedb watch disabled (no VERITY_SPICEDB_URL); set it to enable supervised, leader-elected out-of-band revocation propagation"
+            );
+        }
     }
 
     // Re-establish persisted local-folder watches (folder_watch.rs): re-scan
@@ -1905,10 +2045,11 @@ async fn open_scope(
                     .into_iter()
                     .map(|(_, t)| t)
                     .collect();
-            // Resolution-time tombstone subtraction (SPEC §7b rule 3).
+            // Resolution-time tombstone subtraction (SPEC §7b rule 3): no handle
+            // exists yet, so the legacy window cutoff is correct here.
             let tokens = state
                 .revocations
-                .subtract(state.pool(), req.tenant_id, &tokens)
+                .subtract_window(state.pool(), req.tenant_id, &tokens)
                 .await?;
             (tokens, Some(subject))
         }
@@ -1929,6 +2070,7 @@ async fn open_scope(
             actor_sub: req.actor_sub,
             actor_azp: req.actor_azp,
             subject,
+            issued_at: Utc::now(),  // overwritten by mint
             expires_at: Utc::now(), // overwritten by mint
         },
         req.ttl_seconds,
@@ -3332,6 +3474,229 @@ struct IngestDocumentsRequest {
     acl_provenance: AclProvenance,
     #[serde(default)]
     valid_from: Option<DateTime<Utc>>,
+}
+
+// ---------- object-level ACL retraction (SPEC §5e.6b, M1 build #2 wiring) ----
+
+/// The object a `correct_*_acl` targets: a document lineage (→ chunks) OR a fact
+/// key (→ facts). Exactly one must be present.
+#[derive(Deserialize)]
+struct AclChangeTarget {
+    /// `{"document_id": "..."}` — rewrite every chunk of this (source, document)
+    /// lineage (`correct_chunk_acl`).
+    #[serde(default)]
+    object: Option<AclChangeObject>,
+    /// `{"entity_id": "...", "field": "..."}` — rewrite the fact key
+    /// (`correct_fact_acl`).
+    #[serde(default)]
+    fact: Option<AclChangeFact>,
+}
+
+#[derive(Deserialize)]
+struct AclChangeObject {
+    document_id: String,
+}
+
+#[derive(Deserialize)]
+struct AclChangeFact {
+    entity_id: String,
+    field: String,
+}
+
+/// Body for both `POST /v1/ingest/acl-change` and `POST /v1/admin/acl/correct`.
+/// REPLACE semantics: `verity_acl.visibility` is the NEW FULL post-tightening
+/// token set (the connector/admin diffs; the server does not). A malformed
+/// `verity_acl` is REFUSED (never read as permissive), exactly like the ingest
+/// path.
+#[derive(Deserialize)]
+struct AclChangeRequest {
+    tenant_id: TenantId,
+    source: String,
+    #[serde(flatten)]
+    target: AclChangeTarget,
+    /// Inline ACL envelope: `{"visibility":[...], "confidentiality":"...",
+    /// "acl_provenance":"..."}`. Decoded via the SAME `parse_inline_acl`
+    /// codepath as ingestion — malformed ⇒ refuse.
+    verity_acl: serde_json::Value,
+    /// Optional human-readable reason; ignored for the mapping (the route fixes
+    /// the `AclCorrectionReason`), kept for forward compatibility.
+    #[serde(default)]
+    #[allow(dead_code)]
+    reason: Option<String>,
+}
+
+/// Shared dispatch for the two ACL-correction routes. Decodes `verity_acl`
+/// fail-closed, rejects `Quarantined`, then routes to `correct_chunk_acl`
+/// (document target) or `correct_fact_acl` (fact target). Returns the number of
+/// rows rewritten; a 0 on a well-formed target is surfaced as 404 "unknown
+/// object" (fail-closed — never a silent success).
+async fn dispatch_acl_correction(
+    state: &AppState,
+    req: AclChangeRequest,
+    reason: verity_storage::AclCorrectionReason,
+    changed_by: &str,
+) -> HandlerResult<Json<serde_json::Value>> {
+    // Decode the inline ACL through the exact ingest codepath: a malformed or
+    // absent block yields None ⇒ refuse (never permissive).
+    let resolved = ingest::parse_inline_acl(&serde_json::json!({ "verity_acl": req.verity_acl }))
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "verity_acl is absent or malformed (expected {visibility:[...], confidentiality, acl_provenance}); refusing rather than defaulting permissive".to_string(),
+        ))?;
+    if resolved.provenance == AclProvenance::Quarantined {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "acl_provenance must be mirrored, approximated, or admin-assigned".into(),
+        ));
+    }
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+
+    // TIGHTENING corrections (un-share) must NEVER downgrade confidentiality: a
+    // retraction route may pass a defaulted Internal, and lowering an
+    // already-Restricted (tier-3) object to Internal would strip its per-hit live
+    // recheck for the remaining viewers — a fail-OPEN direction. Clamp the
+    // requested class UP to the object's current level for un-share only. A
+    // reshare / admin correction is an explicit relabel and may set any class.
+    let is_tightening = matches!(reason, verity_storage::AclCorrectionReason::SourceUnshare);
+
+    let (kind, id, rewritten) =
+        match (req.target.object, req.target.fact) {
+            (Some(obj), None) => {
+                let mut conf = resolved.confidentiality;
+                if is_tightening {
+                    if let Some(cur) = state
+                        .storage
+                        .inner()
+                        .current_chunk_confidentiality(req.tenant_id, &req.source, &obj.document_id)
+                        .await
+                        .map_err(storage_status)?
+                    {
+                        conf = conf.max(cur);
+                    }
+                }
+                let n = state
+                    .storage
+                    .inner()
+                    .correct_chunk_acl(
+                        req.tenant_id,
+                        &req.source,
+                        &obj.document_id,
+                        &resolved.visibility,
+                        conf,
+                        reason,
+                        resolved.provenance,
+                        Some(changed_by),
+                    )
+                    .await
+                    .map_err(storage_status)?;
+                ("document", obj.document_id, n)
+            }
+            (None, Some(f)) => {
+                let key = FactKey {
+                    source: req.source.clone(),
+                    entity_id: f.entity_id,
+                    field: f.field,
+                };
+                let mut conf = resolved.confidentiality;
+                if is_tightening {
+                    if let Some(cur) = state
+                        .storage
+                        .inner()
+                        .current_fact_confidentiality(req.tenant_id, &key)
+                        .await
+                        .map_err(storage_status)?
+                    {
+                        conf = conf.max(cur);
+                    }
+                }
+                let n = state
+                    .storage
+                    .inner()
+                    .correct_fact_acl(
+                        req.tenant_id,
+                        &key,
+                        &resolved.visibility,
+                        conf,
+                        reason,
+                        resolved.provenance,
+                        Some(changed_by),
+                    )
+                    .await
+                    .map_err(storage_status)?;
+                ("fact", format!("{}/{}", key.entity_id, key.field), n)
+            }
+            _ => return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "exactly one of `object` (document_id) or `fact` (entity_id, field) is required"
+                    .into(),
+            )),
+        };
+
+    if rewritten == 0 {
+        // Fail-closed: a well-formed correction that matched nothing is NOT a
+        // success — the caller (connector diff / admin) named an object the
+        // server does not hold. Surface it, never 200.
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no {kind} rows for {}:{} — nothing rewritten",
+                req.source, id
+            ),
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "kind": kind,
+        "source": req.source,
+        "id": id,
+        "rows_rewritten": rewritten,
+    })))
+}
+
+/// POST /v1/ingest/acl-change (admin/connector): a connector observed a source
+/// ACL TIGHTEN (a principal lost access) between syncs and emits the new full
+/// visibility set. The server rewrites the derived chunks/facts in place
+/// (`correct_chunk_acl`/`correct_fact_acl`) so the lost principal drops
+/// immediately — including behind `?as_of=` (value-history carve-out). Reason
+/// `SourceUnshare`; `changed_by = "connector:<source>"`.
+async fn ingest_acl_change(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AclChangeRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let changed_by = format!("connector:{}", req.source);
+    dispatch_acl_correction(
+        &state,
+        req,
+        verity_storage::AclCorrectionReason::SourceUnshare,
+        &changed_by,
+    )
+    .await
+}
+
+/// POST /v1/admin/acl/correct (admin): an operator directly corrects an object's
+/// or fact's ACL (re-share or un-share). Same in-place rewrite + audit as the
+/// connector path; reason `AdminCorrection`; `changed_by` = the admin actor
+/// fingerprint.
+async fn admin_correct_acl(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AclChangeRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let changed_by = state.admin.actor_fingerprint(&headers);
+    dispatch_acl_correction(
+        &state,
+        req,
+        verity_storage::AclCorrectionReason::AdminCorrection,
+        &changed_by,
+    )
+    .await
 }
 
 /// POST /v1/ingest/documents (admin): one document version in → one L0

@@ -118,6 +118,7 @@ from typing import Any, AsyncIterator, Iterable, Mapping, Protocol, Sequence
 
 import httpx
 
+from verity_ingest.acl_diff import AclDiffLane
 from verity_ingest.connector import AclEnvelope, Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
 
@@ -1421,6 +1422,7 @@ def run_once(
     sink: DocumentSink,
     state_file: Path,
     fact_sink: FactSink | None = None,
+    acl_lane: AclDiffLane | None = None,
 ) -> int:
     """One poll cycle: load cursor, poll, deliver, checkpoint. Returns the
     number of delivered requests. The cursor is checkpointed only after
@@ -1428,7 +1430,12 @@ def run_once(
 
     When ``fact_sink`` is given, the selective org/person facts accumulated over
     this poll batch (a side-effect of the document pass) are delivered AFTER the
-    documents — an additive second lane that never affects the document count."""
+    documents — an additive second lane that never affects the document count.
+
+    When ``acl_lane`` is given, each delivered document's effective principal set
+    is diffed against its last-seen set; a TIGHTENING (a reader lost access)
+    emits ``/v1/ingest/acl-change`` so the server retracts the derived chunks.
+    Purely additive — never affects the document count or the cursor."""
     cursor = _load_cursor(state_file)
     events, next_cursor = asyncio.run(connector.poll(cursor))
     delivered = 0
@@ -1441,6 +1448,19 @@ def run_once(
             continue
         sink.deliver(body)
         delivered += 1
+        # ACL-diff lane (additive): only for resolvable ACLs — an unresolvable
+        # one quarantines and confers no principals, so it has no diff baseline.
+        if acl_lane is not None and event.acl.resolvable:
+            acl_lane.observe(
+                event.document_id,
+                [*event.acl.principals, *event.acl.groups],
+                source=event.source,
+                document_id=event.document_id,
+            )
+    if acl_lane is not None:
+        acl_lane.flush()
+        if acl_lane.emitted:
+            print(f"gdrive: emitted {acl_lane.emitted} acl-change (tightening) retraction(s)")
     if skipped:
         print(f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or removed)")
     if fact_sink is not None:

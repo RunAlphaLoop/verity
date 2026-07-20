@@ -525,6 +525,78 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
     assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, XLSX_ID]
 
 
+# --- M1 connector ACL-diff lane (build #5): document-target retraction ------
+
+
+class _CollectingClient:
+    """Minimal POST-only client that records acl-change bodies."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+
+    def post(self, url, json):  # noqa: A002 — httpx kwarg name
+        self.posts.append({"url": url, "body": json})
+
+        class _Resp:
+            def raise_for_status(self_inner):
+                return None
+
+        return _Resp()
+
+
+def test_gdrive_acl_diff_lane_emits_document_retraction_on_tightening(tmp_path):
+    from verity_ingest.acl_diff import AclDiffLane, AclState
+
+    # A Drive file whose sharing tightens between two syncs: bob (a writer)
+    # loses access. The lane emits ONE acl-change targeting the DOCUMENT lineage
+    # (object.document_id → correct_chunk_acl), carrying the NEW FULL resolved
+    # token set (alice only) and bob in the removed set.
+    registry = StaticRegistry(
+        {"user:alice@corp.example": 101, "user:bob@corp.example": 202}
+    )
+    client = _CollectingClient()
+    state = AclState(tmp_path / "gdrive.acl.json")
+    lane = AclDiffLane(
+        state,
+        tenant_id=TENANT,
+        registry=registry,
+        client=client,
+        base_url="http://verity.local:7717",
+    )
+    doc = "1PlanDocXYZ"
+
+    # Sync 1: alice + bob share the file — baseline, no emit.
+    assert (
+        lane.observe(
+            doc,
+            ["user:alice@corp.example", "user:bob@corp.example"],
+            source="gdrive",
+            document_id=doc,
+        )
+        is None
+    )
+    assert client.posts == []
+
+    # Sync 2: bob un-shared → exactly one document-target acl-change.
+    change = lane.observe(
+        doc, ["user:alice@corp.example"], source="gdrive", document_id=doc
+    )
+    assert change is not None
+    assert change.removed_principals == ["user:bob@corp.example"]
+    lane.flush()
+
+    assert len(client.posts) == 1
+    body = client.posts[0]["body"]
+    assert client.posts[0]["url"].endswith("/v1/ingest/acl-change")
+    assert body["source"] == "gdrive"
+    assert body["object"] == {"document_id": doc}
+    assert "fact" not in body
+    # REPLACE: the new full resolved set is alice only (bob=202 gone).
+    assert body["verity_acl"]["visibility"] == [101]
+    assert body["reason"] == "source_unshare"
+    assert lane.emitted == 1
+
+
 # ---------------------------------------------------------------------------
 # Fact lane: selective identity-keyed org/person envelopes (§4.2, the weld)
 # ---------------------------------------------------------------------------

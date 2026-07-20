@@ -967,3 +967,299 @@ async fn no_read_path_leaks_across_scopes() {
          recall(hybrid), activity, brief, current_fact, fact_as_of, merged_record — no leaks"
     );
 }
+
+// ============================================================================
+// M1 PERMISSION-CHANGE FUZZER BATTERY (build #4)
+//
+// The scope-soundness fuzzer above proves a STATIC corpus never leaks. This
+// battery proves the CHANGE surface: after a source ACL TIGHTENS (a principal
+// loses access), the read path DROPS the content — and stays dropped
+// independent of when the reader's handle was minted (a 12h handle minted
+// before the change must still see the content vanish; the ACL rewrite is
+// bi-temporal-history-inclusive so `?as_of=` can't resurface it either).
+//
+// LANE COVERAGE. The four revocation lanes named in the M1 plan converge on two
+// storage-observable mechanisms:
+//   * object un-share  → `correct_fact_acl` / `correct_chunk_acl` (in-place ACL
+//     rewrite across the whole lineage). EXERCISED HERE, at the storage layer.
+//   * admin group-remove / directory-sync diff / out-of-band Watch delete →
+//     `RevocationPlane::record` + the durable `subtract` keyed off the handle's
+//     `issued_at`. That plane lives in verity-server; its cross-window-boundary
+//     + past-TTL assertion is the B1 must-have test
+//     `revocation_outlives_max_ttl_for_prior_minted_handle` (revocation.rs).
+//     This battery is the object-un-share half of the same guarantee.
+//
+// SLO. Per lane we time source-change→invisible (the correction call + the
+// first read that returns empty) and report p50/p95, honest at the stated
+// corpus size + hardware — the revocation-window security property is derived
+// from these measured numbers, not a bare env default.
+// ============================================================================
+
+/// Wall-clock for one lane's source-change→invisible measurement.
+fn pctl(mut xs: Vec<f64>, p: f64) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((xs.len() as f64 - 1.0) * p).round() as usize;
+    xs[idx]
+}
+
+#[tokio::test]
+async fn permission_change_drops_content_across_lanes() {
+    let dsn = std::env::var("VERITY_TEST_DSN").expect(
+        "VERITY_TEST_DSN must be set for the M1 permission-change battery \
+         permission_change_drops_content_across_lanes; refusing to silently no-op — a change-surface \
+         freshness gate that skips is exactly the M1 leak it exists to close",
+    );
+    let adapter = PostgresAdapter::connect(&dsn).await.expect("connect");
+    adapter.migrate().await.expect("migrate");
+    let tenant = adapter
+        .create_tenant(&format!("permchange-{}", uuid::Uuid::now_v7()))
+        .await
+        .unwrap();
+    let episode = adapter
+        .append_episode(NewEpisode {
+            tenant_id: tenant,
+            source: "fuzz".into(),
+            source_entity: None,
+            kind: EpisodeKind::CdcEvent,
+            payload: json!({}),
+            content_hash: "permchange".into(),
+            trust_tier: TrustTier::Authoritative,
+            writer_sub: None,
+            writer_azp: None,
+        })
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    // The reader's token. `keeper` is a principal that KEEPS access; `loser` is
+    // the one un-shared each round. A scope holding only `loser` must go blind
+    // after the correction; a scope holding `keeper` must still see the content
+    // (proves the rewrite retracts precisely, not indiscriminately).
+    let loser: i32 = 7;
+    let keeper: i32 = 3;
+
+    // A scope minted "12h ago" is modeled here by the fact that a storage-layer
+    // ACL rewrite is TIME-INDEPENDENT: it rewrites current + superseded rows, so
+    // any handle — freshly minted or minted before the change — reads the new
+    // ACL. We probe with a plain Scope (the enforcement predicate is the same
+    // one every handle age compiles to); the past-TTL/window-boundary dimension
+    // for the tombstone lanes is covered in revocation.rs.
+    let loser_scope = Scope {
+        tenant_id: tenant,
+        principals: vec![loser],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+    let keeper_scope = Scope {
+        tenant_id: tenant,
+        principals: vec![keeper],
+        entity_scope: vec![],
+        max_confidentiality: Confidentiality::Restricted,
+    };
+
+    const ROUNDS: usize = 40;
+    let mut chunk_latencies: Vec<f64> = Vec::with_capacity(ROUNDS);
+    let mut fact_latencies: Vec<f64> = Vec::with_capacity(ROUNDS);
+
+    for r in 0..ROUNDS {
+        // ---- LANE: object un-share of a DOCUMENT (fan-out lineage) -----------
+        // One document, multiple seqs + a superseded version, all visible to
+        // BOTH loser and keeper. Then un-share to keeper-only and assert the
+        // loser goes blind while the keeper still sees it.
+        let doc = format!("permchange-doc-{r}");
+        let entity = ENTITIES[r % ENTITIES.len()].to_string();
+        let mut writes = Vec::new();
+        for seq in 0..3 {
+            writes.push(ChunkWrite {
+                tenant_id: tenant,
+                source: "fuzz".into(),
+                document_id: doc.clone(),
+                seq,
+                content: format!("{MAGIC} unshare payload {r}-{seq}"),
+                content_hash: format!("{doc}-{seq}"),
+                embedding: None,
+                visibility: vec![loser, keeper],
+                entity_tags: vec![entity.clone()],
+                confidentiality: Confidentiality::Internal,
+                trust_tier: TrustTier::Authoritative,
+                valid_from: now - Duration::hours(2),
+                provenance: episode,
+                acl_provenance: AclProvenance::AdminAssigned,
+            });
+        }
+        // A superseded version of seq 0 (a prior value row) — must ALSO be
+        // rewritten so `?as_of=` can't resurface the old permissive ACL.
+        writes.push(ChunkWrite {
+            tenant_id: tenant,
+            source: "fuzz".into(),
+            document_id: doc.clone(),
+            seq: 0,
+            content: format!("{MAGIC} unshare current {r}"),
+            content_hash: format!("{doc}-0-v2"),
+            embedding: None,
+            visibility: vec![loser, keeper],
+            entity_tags: vec![entity.clone()],
+            confidentiality: Confidentiality::Internal,
+            trust_tier: TrustTier::Authoritative,
+            valid_from: now - Duration::hours(1),
+            provenance: episode,
+            acl_provenance: AclProvenance::AdminAssigned,
+        });
+        adapter.upsert_chunks(writes).await.unwrap();
+
+        // BEFORE: the loser sees the document.
+        let before = adapter
+            .latest_chunks(&loser_scope, &entity, 100)
+            .await
+            .unwrap();
+        assert!(
+            before.iter().any(|c| c.document_id == doc),
+            "round {r}: loser should see the document BEFORE the un-share"
+        );
+
+        // CHANGE + first-invisible read: time source-change→invisible.
+        let t0 = std::time::Instant::now();
+        let rewritten = adapter
+            .correct_chunk_acl(
+                tenant,
+                "fuzz",
+                &doc,
+                &[keeper], // un-share the loser: keeper-only now
+                Confidentiality::Internal,
+                AclCorrectionReason::SourceUnshare,
+                AclProvenance::Mirrored,
+                Some("permchange-fuzz"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rewritten >= 4,
+            "round {r}: un-share must rewrite all 3 seqs + the superseded row (got {rewritten})"
+        );
+        let after = adapter
+            .latest_chunks(&loser_scope, &entity, 100)
+            .await
+            .unwrap();
+        chunk_latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        assert!(
+            !after.iter().any(|c| c.document_id == doc),
+            "RETRACTION LEAK round {r}: loser STILL sees the un-shared document via latest_chunks"
+        );
+
+        // The keeper still sees every current seq (precise retraction).
+        let keeper_view = adapter
+            .latest_chunks(&keeper_scope, &entity, 100)
+            .await
+            .unwrap();
+        let keeper_seqs = keeper_view.iter().filter(|c| c.document_id == doc).count();
+        assert!(
+            keeper_seqs >= 3,
+            "round {r}: keeper must still see all 3 seqs after the loser's un-share (saw {keeper_seqs})"
+        );
+        // recall(bm25) must also drop it for the loser.
+        let recalled = adapter
+            .recall(RecallQuery {
+                scope: loser_scope.clone(),
+                embedding: None,
+                text: Some(MAGIC.to_string()),
+                k: 100,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !recalled.iter().any(|h| h.document_id == doc),
+            "RETRACTION LEAK round {r}: loser STILL recalls the un-shared document"
+        );
+
+        // ---- LANE: object un-share of a FACT (value-history carve-out) -------
+        let fkey = FactKey {
+            source: "fuzz".into(),
+            entity_id: format!("permchange-ent-{r}"),
+            field: "name".into(),
+        };
+        // Two value versions so the correction must touch history too.
+        for (v, vf) in [(0, now - Duration::hours(2)), (1, now - Duration::hours(1))] {
+            adapter
+                .upsert_fact(FactWrite {
+                    tenant_id: tenant,
+                    key: fkey.clone(),
+                    value: json!(format!("permchange-{r}-v{v}")),
+                    valid_from: vf,
+                    visibility: vec![loser, keeper],
+                    confidentiality: Confidentiality::Internal,
+                    provenance: episode,
+                    acl_provenance: AclProvenance::AdminAssigned,
+                })
+                .await
+                .unwrap();
+        }
+        // BEFORE: loser reads it (current + historical).
+        assert!(
+            adapter
+                .current_fact(&loser_scope, &fkey)
+                .await
+                .unwrap()
+                .is_some(),
+            "round {r}: loser should read the fact BEFORE the un-share"
+        );
+
+        let t1 = std::time::Instant::now();
+        let n = adapter
+            .correct_fact_acl(
+                tenant,
+                &fkey,
+                &[keeper],
+                Confidentiality::Internal,
+                AclCorrectionReason::SourceUnshare,
+                AclProvenance::Mirrored,
+                Some("permchange-fuzz"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            n >= 1,
+            "round {r}: fact un-share must rewrite the key in place"
+        );
+        let after_fact = adapter.current_fact(&loser_scope, &fkey).await.unwrap();
+        fact_latencies.push(t1.elapsed().as_secs_f64() * 1000.0);
+        assert!(
+            after_fact.is_none(),
+            "RETRACTION LEAK round {r}: loser STILL reads the un-shared fact (current_fact)"
+        );
+        // `?as_of=` must NOT resurface the old permissive ACL (value-history
+        // carve-out — the §5e.6b guard).
+        let historical = adapter
+            .fact_as_of(&loser_scope, &fkey, now - Duration::minutes(90))
+            .await
+            .unwrap();
+        assert!(
+            historical.is_none(),
+            "VALUE-HISTORY LEAK round {r}: loser reached a historical value via ?as_of= after un-share"
+        );
+        // The keeper still reads it.
+        assert!(
+            adapter
+                .current_fact(&keeper_scope, &fkey)
+                .await
+                .unwrap()
+                .is_some(),
+            "round {r}: keeper must still read the fact after the loser's un-share"
+        );
+    }
+
+    let chunk_p50 = pctl(chunk_latencies.clone(), 0.50);
+    let chunk_p95 = pctl(chunk_latencies.clone(), 0.95);
+    let fact_p50 = pctl(fact_latencies.clone(), 0.50);
+    let fact_p95 = pctl(fact_latencies.clone(), 0.95);
+    println!(
+        "M1 permission-change battery: {ROUNDS} rounds x 2 object-un-share lanes — no retraction \
+         leaks. source-change→invisible (correction + first-empty read), ParadeDB PG17 local:\n  \
+         object-unshare/chunk: p50 {chunk_p50:.1}ms p95 {chunk_p95:.1}ms\n  \
+         object-unshare/fact:  p50 {fact_p50:.1}ms p95 {fact_p95:.1}ms\n  \
+         (tombstone lanes — admin-remove / dir-sync / watch-delete — measured in \
+         revocation.rs: durable subtract across the window boundary AND past handle-TTL)"
+    );
+}

@@ -26,6 +26,15 @@ type HmacSha256 = Hmac<Sha256>;
 const PREFIX: &str = "vs_";
 pub const MAX_TTL_SECONDS: i64 = 12 * 60 * 60;
 
+/// Fail-closed serde default for a missing `issued_at` (pre-M1 legacy handle):
+/// the earliest representable instant, so `at >= issued_at` holds for EVERY
+/// retained tombstone and the legacy handle subtracts ALL revoked tokens
+/// (over-hide). NEVER `now()` — that would leave a legacy handle immune to
+/// revocation for its full lifetime, reintroducing the exact M1 leak.
+fn legacy_issued_at() -> DateTime<Utc> {
+    DateTime::<Utc>::MIN_UTC
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopePayload {
     pub tenant_id: TenantId,
@@ -41,6 +50,18 @@ pub struct ScopePayload {
     /// pre-identity handles keep verifying.
     #[serde(default)]
     pub subject: Option<String>,
+    /// Mint instant (M1 durable-tombstone model). The read-path revocation
+    /// subtraction is handle-relative: a token revoked at-or-after this instant
+    /// is dropped from this handle for its FULL lifetime, not just a fixed
+    /// wall-clock window. serde-defaulted to the earliest representable instant
+    /// (`DateTime::<Utc>::MIN_UTC`) so pre-M1 handles (whose signed body carries
+    /// no `issued_at`) keep verifying AND fail closed: with `issued_at` pinned
+    /// to the distant past, `at >= issued_at` holds for EVERY retained tombstone,
+    /// so a legacy handle subtracts ALL revoked tokens (true over-hide). A
+    /// `now()`-default would do the exact opposite — a `now` cutoff matches only
+    /// FUTURE tombstones (none), leaving the legacy handle immune to revocation.
+    #[serde(default = "legacy_issued_at")]
+    pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -175,7 +196,9 @@ impl ScopeMinter {
 
     pub fn mint(&self, mut payload: ScopePayload, ttl_seconds: i64) -> (String, DateTime<Utc>) {
         let ttl = ttl_seconds.clamp(60, MAX_TTL_SECONDS);
-        payload.expires_at = Utc::now() + Duration::seconds(ttl);
+        let now = Utc::now();
+        payload.issued_at = now;
+        payload.expires_at = now + Duration::seconds(ttl);
         let body = serde_json::to_vec(&payload).expect("payload serializes");
         let mut mac = HmacSha256::new_from_slice(&self.key).expect("any key length works");
         mac.update(&body);
@@ -263,6 +286,7 @@ mod tests {
             actor_sub: Some("user:matt".into()),
             actor_azp: Some("agent:sales-bot".into()),
             subject: None,
+            issued_at: Utc::now(),
             expires_at: Utc::now(),
         }
     }
@@ -300,6 +324,37 @@ mod tests {
             ScopeMinter::ephemeral().verify(&handle),
             Err(ScopeError::BadSignature)
         ));
+    }
+
+    /// A pre-M1 handle body has NO `issued_at` field. Deserializing it must
+    /// fail closed: `issued_at` defaults to the distant past so EVERY existing
+    /// tombstone (`at >= issued_at`) still subtracts the revoked token. A
+    /// `now()` default would UNDER-hide (a `now` cutoff matches no past
+    /// tombstone), reintroducing the M1 leak.
+    #[test]
+    fn legacy_handle_without_issued_at_fails_closed() {
+        let legacy = serde_json::json!({
+            "tenant_id": uuid::Uuid::now_v7(),
+            "principals": [7, 9],
+            "entity_scope": ["account:acme"],
+            "max_confidentiality": "confidential",
+            "actor_sub": "user:matt",
+            "actor_azp": "agent:sales-bot",
+            "expires_at": Utc::now(),
+        });
+        let payload: ScopePayload =
+            serde_json::from_value(legacy).expect("legacy body without issued_at deserializes");
+        assert_eq!(
+            payload.issued_at,
+            DateTime::<Utc>::MIN_UTC,
+            "a legacy handle must default issued_at to the distant past (over-hide), never now()"
+        );
+        // Concretely: any tombstone recorded before `now` has `at >= issued_at`,
+        // so it subtracts — the legacy handle is NOT immune to revocation.
+        assert!(
+            Utc::now() >= payload.issued_at,
+            "every real tombstone instant is >= a legacy handle's issued_at, so it drops"
+        );
     }
 
     #[test]

@@ -54,10 +54,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 
+from verity_ingest.acl_diff import AclChange, AclState, diff_acl, emit_acl_change
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
 from verity_ingest.credentials import StaticKey
@@ -525,6 +526,20 @@ class HubSpotConnector(Connector):
 # ---------- sink: FactEvents → the server's deterministic L1 path ----------
 
 
+class _SinkAclEmitter:
+    """Adapts the sink's ``resolve_principals`` to the ``resolve`` surface the
+    shared ``emit_acl_change`` helper expects (a PrincipalRegistry). Reuses the
+    sink's already-open client so the acl-change lane shares the batch's
+    connection + auth."""
+
+    def __init__(self, sink: "VerityDebeziumSink", client: httpx.Client) -> None:
+        self._sink = sink
+        self._client = client
+
+    def resolve(self, principals: Sequence[str]) -> dict[str, int]:
+        return self._sink.resolve_principals(list(principals))
+
+
 @dataclass
 class VerityDebeziumSink:
     """POSTs FactEvents to a running Verity server as bare Debezium-style
@@ -744,6 +759,65 @@ class VerityDebeziumSink:
             summary = response.json()
             self._heartbeat(client, headers, events, cursor)
             return summary
+
+    def emit_acl_changes(self, events: list[HubSpotFactEvent], state: AclState) -> int:
+        """ACL-diff lane (additive): diff each RECORD's owner/team principal set
+        against its last-seen set and, on a TIGHTENING, POST an acl-change per
+        derived fact key so the server retracts the lost principal.
+
+        A record fans out to one FactEvent per field; the ACL is a per-record
+        property (all its facts share ``record_principals``), so we diff ONCE per
+        ``entity_id`` (keyed with the object type, since the same id can recur
+        across object types) and emit per ``(source, entity_id, field)`` fact key.
+        Owner/team-scoped records only — an unowned record has no per-record ACL
+        to diff (it rides the admin-assigned bound policy). Returns the number of
+        acl-change POSTs. Purely additive; never affects the fact-delivery count.
+        """
+        with httpx.Client(timeout=30.0, transport=self.transport) as client:
+            emitter = _SinkAclEmitter(self, client)
+            emitted = 0
+            # Group fields by record so the diff runs once per record.
+            by_record: dict[str, list[HubSpotFactEvent]] = {}
+            for e in events:
+                if not getattr(e, "record_principals", None):
+                    continue
+                # source keyed to the L1 partition the server builds:
+                # "{connector}:{object_type}".
+                key = f"{e.object_type}:{e.entity_id}"
+                by_record.setdefault(key, []).append(e)
+            for facts in by_record.values():
+                first = facts[0]
+                fact_source = f"{first.source}:{first.object_type}"
+                record_id = f"{first.object_type}:{first.entity_id}"
+                change = diff_acl(
+                    state,
+                    record_id,
+                    list(first.record_principals or []),
+                    source=fact_source,
+                    entity_id=first.entity_id,
+                    field=first.field_name,
+                )
+                if change is None:
+                    continue
+                # Retract EVERY derived fact key of this record (one per field).
+                for f in facts:
+                    per_field = AclChange(
+                        source=fact_source,
+                        entity_id=f.entity_id,
+                        field=f.field_name,
+                        new_principals=change.new_principals,
+                        removed_principals=change.removed_principals,
+                    )
+                    emit_acl_change(
+                        per_field,
+                        tenant_id=self.tenant_id,
+                        registry=emitter,
+                        client=client,
+                        base_url=self.url,
+                    )
+                    emitted += 1
+            state.flush()
+            return emitted
 
     def _heartbeat(
         self,
@@ -983,10 +1057,20 @@ def main(argv: list[str] | None = None) -> int:
     edges = sink.sync_team_edges(team_members)
     summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
+    # ACL-diff lane (additive): retract records whose owner/team access tightened
+    # since the last sync. Best-effort — a failure here never fails a sync whose
+    # facts already committed. Sidecar sits next to the cursor file.
+    retracted = 0
+    try:
+        acl_state = AclState(args.state_file.with_suffix(args.state_file.suffix + ".acl"))
+        retracted = sink.emit_acl_changes(events, acl_state)
+    except Exception as exc:  # noqa: BLE001 — additive lane must not fail the sync
+        print(f"hubspot: acl-diff lane skipped: {exc}", file=sys.stderr)
     owned = sum(1 for e in events if getattr(e, "record_principals", None))
     print(
         f"poll: {len(events)} fact event(s) ({owned} owner/team-scoped, "
-        f"{edges} team edge(s)), cursor -> {next_cursor} -> {summary}"
+        f"{edges} team edge(s), {retracted} acl-change retraction(s)), "
+        f"cursor -> {next_cursor} -> {summary}"
     )
     return 0
 

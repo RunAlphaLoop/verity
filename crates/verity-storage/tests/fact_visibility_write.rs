@@ -288,3 +288,224 @@ async fn correct_fact_acl_rewrites_in_place_and_audits() {
         "principal 5 cannot reach the historical value via as_of after un-share"
     );
 }
+
+/// `correct_chunk_acl` is the object-level twin of `correct_fact_acl`: a source
+/// record fans out to MANY chunks under one `(source, document_id)` (only `seq`
+/// varies). Tightening the record must rewrite `visibility`/`confidentiality`
+/// IN PLACE across EVERY derived chunk — every seq AND every superseded history
+/// row (the value-history carve-out) — append one `chunk_acl_audit` row per
+/// current chunk, and leave a reader who lost the token unable to recall any of
+/// them. This is the leak M1 closes: before, un-share retracted nothing on the
+/// chunk side.
+#[tokio::test]
+async fn correct_chunk_acl_rewrites_lineage_and_audits() {
+    let (adapter, tenant, episode) = harness().await;
+    let source = "gdrive";
+    let document_id = "doc-lineage-1";
+    let entity = "e:acme";
+    let t0 = Utc::now() - Duration::minutes(10);
+
+    // Seed a document that fans out to 3 chunks (seq 0,1,2), all visible to {5}.
+    // seq 0 additionally gets a superseded history row (an older version), so the
+    // lineage has 4 rows total: 3 current + 1 superseded.
+    let mut writes = Vec::new();
+    // Older version of seq 0 (will be superseded by the current seq-0 write).
+    writes.push(ChunkWrite {
+        tenant_id: tenant,
+        source: source.into(),
+        document_id: document_id.into(),
+        seq: 0,
+        content: "old version of chunk zero".into(),
+        content_hash: "h0-old".into(),
+        embedding: None,
+        visibility: vec![5],
+        entity_tags: vec![entity.into()],
+        confidentiality: Confidentiality::Internal,
+        trust_tier: TrustTier::Authoritative,
+        valid_from: t0,
+        provenance: episode,
+        acl_provenance: AclProvenance::Mirrored,
+    });
+    for seq in 0..3 {
+        writes.push(ChunkWrite {
+            tenant_id: tenant,
+            source: source.into(),
+            document_id: document_id.into(),
+            seq,
+            content: format!("chunk {seq} content"),
+            content_hash: format!("h{seq}"),
+            embedding: None,
+            visibility: vec![5],
+            entity_tags: vec![entity.into()],
+            confidentiality: Confidentiality::Internal,
+            trust_tier: TrustTier::Authoritative,
+            valid_from: t0 + Duration::minutes(1),
+            provenance: episode,
+            acl_provenance: AclProvenance::Mirrored,
+        });
+    }
+    adapter.upsert_chunks(writes).await.unwrap();
+
+    // Reader 5 recalls all 3 current chunks before the correction.
+    let before = adapter
+        .latest_chunks(&scope(tenant, vec![5]), entity, 100)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 3, "reader 5 sees all 3 current chunks first");
+
+    // Un-share: revoke principal 5, grant 8, at a stricter class.
+    let rewritten = adapter
+        .correct_chunk_acl(
+            tenant,
+            source,
+            document_id,
+            &[8],
+            Confidentiality::Restricted,
+            AclCorrectionReason::SourceUnshare,
+            AclProvenance::Mirrored,
+            Some("connector:gdrive"),
+        )
+        .await
+        .unwrap();
+    // Every row of the lineage was rewritten: 3 current + 1 superseded = 4.
+    assert_eq!(
+        rewritten, 4,
+        "every derived chunk row (current + superseded) rewritten"
+    );
+
+    // The reader who LOST the token recalls NONE of the chunks now.
+    let after_5 = adapter
+        .latest_chunks(&scope(tenant, vec![5]), entity, 100)
+        .await
+        .unwrap();
+    assert!(
+        after_5.is_empty(),
+        "un-shared principal 5 no longer recalls any derived chunk"
+    );
+
+    // The new grantee sees all 3 current chunks at the new (Restricted) class.
+    let after_8 = adapter
+        .latest_chunks(&scope(tenant, vec![8]), entity, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_8.len(),
+        3,
+        "principal 8 now recalls all 3 current chunks"
+    );
+
+    // One `chunk_acl_audit` row per CURRENT chunk (3), old->new recorded.
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chunk_acl_audit
+         WHERE tenant_id = $1 AND source = $2 AND document_id = $3",
+    )
+    .bind(tenant)
+    .bind(source)
+    .bind(document_id)
+    .fetch_one(adapter.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 3, "one audit row per current chunk");
+
+    // The superseded history row was rewritten too — its `visibility` no longer
+    // carries 5, so `?as_of=` cannot resurface the old permissive ACL.
+    let stale_vis_with_5: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chunks
+         WHERE tenant_id = $1 AND source = $2 AND document_id = $3
+           AND 5 = ANY(visibility)",
+    )
+    .bind(tenant)
+    .bind(source)
+    .bind(document_id)
+    .fetch_one(adapter.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        stale_vis_with_5, 0,
+        "no chunk row (current or superseded) still carries the un-shared token 5"
+    );
+}
+
+/// The `current_chunk_confidentiality` helper the dispatch layer uses to clamp a
+/// tightening correction returns the MAX class across the live lineage, so an
+/// un-share can never be told to downgrade below the strictest derived chunk.
+#[tokio::test]
+async fn current_chunk_confidentiality_reports_lineage_max() {
+    let (adapter, tenant, episode) = harness().await;
+    let source = "gdrive";
+    let document_id = "doc-mixed-conf";
+    let t0 = Utc::now() - Duration::minutes(5);
+    for (seq, conf) in [
+        (0, Confidentiality::Internal),
+        (1, Confidentiality::Restricted),
+        (2, Confidentiality::Confidential),
+    ] {
+        adapter
+            .upsert_chunks(vec![ChunkWrite {
+                tenant_id: tenant,
+                source: source.into(),
+                document_id: document_id.into(),
+                seq,
+                content: format!("chunk {seq}"),
+                content_hash: format!("hmc{seq}"),
+                embedding: None,
+                visibility: vec![5],
+                entity_tags: vec!["e:acme".into()],
+                confidentiality: conf,
+                trust_tier: TrustTier::Authoritative,
+                valid_from: t0,
+                provenance: episode,
+                acl_provenance: AclProvenance::Mirrored,
+            }])
+            .await
+            .unwrap();
+    }
+    let max = adapter
+        .current_chunk_confidentiality(tenant, source, document_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        max,
+        Some(Confidentiality::Restricted),
+        "clamp source must report the strictest derived chunk's class"
+    );
+    // Unknown object → None (dispatch then applies no clamp).
+    let none = adapter
+        .current_chunk_confidentiality(tenant, source, "no-such-doc")
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+}
+
+/// Fail-closed on an unknown object: `correct_chunk_acl` on a document that has
+/// no chunks returns 0 (the caller must treat this as "unknown object", never as
+/// a successful retraction) and writes no audit rows.
+#[tokio::test]
+async fn correct_chunk_acl_unknown_object_returns_zero() {
+    let (adapter, tenant, _episode) = harness().await;
+    let rewritten = adapter
+        .correct_chunk_acl(
+            tenant,
+            "gdrive",
+            "doc-does-not-exist",
+            &[8],
+            Confidentiality::Restricted,
+            AclCorrectionReason::SourceUnshare,
+            AclProvenance::Mirrored,
+            Some("connector:gdrive"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rewritten, 0, "unknown object retracts nothing");
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chunk_acl_audit
+         WHERE tenant_id = $1 AND document_id = $2",
+    )
+    .bind(tenant)
+    .bind("doc-does-not-exist")
+    .fetch_one(adapter.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 0, "no audit row for an unknown object");
+}
