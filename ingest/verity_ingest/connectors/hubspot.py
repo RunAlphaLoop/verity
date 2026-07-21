@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -63,6 +64,27 @@ from verity_ingest.acl_diff import AclChange, AclState, diff_acl, emit_acl_chang
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
 from verity_ingest.credentials import StaticKey
+from verity_ingest.schema_drift import SourceSchema, detect_drift
+
+logger = logging.getLogger(__name__)
+
+#: The HubSpot v3 webhook envelope schema (SPEC §5b). ``mapped_fields`` are the
+#: keys :meth:`handle_webhook` reads; ``ignored_fields`` are the known envelope
+#: keys; a webhook carries NO ACL (tier-C), so ``acl_fields`` is empty. A key
+#: outside both sets is drift — HubSpot changed the payload shape — and is logged
+#: so the admin is notified before a silently-changed envelope corrupts L1.
+WEBHOOK_SCHEMA = SourceSchema(
+    source="hubspot",
+    mapped_fields=frozenset(
+        {"subscriptionType", "objectId", "propertyName", "propertyValue", "occurredAt"}
+    ),
+    ignored_fields=frozenset(
+        {
+            "eventId", "subscriptionId", "portalId", "appId", "attemptNumber",
+            "changeSource", "changeFlag", "sourceId", "isSensitive",
+        }
+    ),
+)
 
 SOURCE = "hubspot"
 BASE_URL = "https://api.hubapi.com"
@@ -361,6 +383,20 @@ class HubSpotConnector(Connector):
         """
         events: list[HubSpotFactEvent] = []
         for item in payload:
+            # §5b schema-drift: classify the envelope against the registered
+            # schema. A load-bearing key gone (renamed/removed) → skip this item
+            # rather than KeyError, and log so the admin remaps; new keys are
+            # surfaced too. HubSpot webhooks carry no ACL, so drift here is
+            # L1-corruption avoidance, not a leak (that path is the ACL-field rule).
+            drift = detect_drift(item, WEBHOOK_SCHEMA)
+            if drift.has_drift:
+                logger.warning(
+                    "hubspot webhook schema drift: unknown=%s missing=%s",
+                    sorted(drift.unknown_fields),
+                    sorted(drift.missing_mapped),
+                )
+            if drift.missing_mapped & {"subscriptionType", "objectId", "propertyName", "occurredAt"}:
+                continue  # required envelope key drifted away → cannot map safely
             subscription = item.get("subscriptionType", "")
             prefix, _, kind = subscription.partition(".")
             object_type = WEBHOOK_OBJECT_TYPES.get(prefix)
