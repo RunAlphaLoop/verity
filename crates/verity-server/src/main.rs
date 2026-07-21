@@ -1642,6 +1642,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/briefs/refresh", post(admin_refresh_briefs))
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
         .route("/v1/admin/reembed/cutover", post(admin_reembed_cutover))
+        .route("/v1/admin/fsck", get(admin_fsck))
         .route("/v1/admin/tenants", post(create_tenant).get(list_tenants))
         .route("/v1/admin/tenants/{tenant_id}", get(get_tenant))
         .route(
@@ -4219,6 +4220,34 @@ async fn forget(
 #[derive(Deserialize)]
 struct CreateTenantRequest {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct FsckQuery {
+    /// Scope the scan to one tenant; omit for a whole-store scan.
+    tenant_id: Option<TenantId>,
+}
+
+/// GET /v1/admin/fsck (admin): read-only cross-store integrity scan. Returns the
+/// findings + `ok` (false iff any `error`-severity finding). The `verity fsck`
+/// CLI renders this and exits non-zero when `ok` is false.
+async fn admin_fsck(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<FsckQuery>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let report = state
+        .storage
+        .inner()
+        .fsck(q.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    Ok(Json(serde_json::json!({
+        "ok": report.ok(),
+        "scanned_tenant": report.scanned_tenant,
+        "findings": report.findings,
+    })))
 }
 
 async fn create_tenant(

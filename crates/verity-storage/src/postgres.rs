@@ -189,6 +189,34 @@ pub struct QuarantineRow {
     pub resolution_note: Option<String>,
 }
 
+/// One `verity fsck` cross-store integrity finding. Most store invariants are
+/// already FK/unique-enforced (`provenance→episodes`, `superseded_by→facts`,
+/// current-fact uniqueness, tenant FKs), so fsck deliberately covers only what
+/// the schema CANNOT: value ranges, bitemporal ordering, and permission-plane
+/// observability. `severity` is `"error"` (integrity violation — non-zero exit),
+/// `"warn"` (suspect but not corrupt), or `"info"` (observability).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FsckFinding {
+    pub check: String,
+    pub severity: String,
+    pub count: i64,
+    pub detail: String,
+}
+
+/// The result of a `verity fsck` scan. `ok()` is false iff any `error` finding
+/// exists — the CLI's non-zero exit condition.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FsckReport {
+    pub scanned_tenant: Option<Uuid>,
+    pub findings: Vec<FsckFinding>,
+}
+
+impl FsckReport {
+    pub fn ok(&self) -> bool {
+        !self.findings.iter().any(|f| f.severity == "error")
+    }
+}
+
 /// One row of the console's Memories browser (`GET /v1/admin/memories`): a
 /// chunk, fact, or action projected into a common shape, tagged with its
 /// `kind` and stable `id`. Content is a PREVIEW (≤240 chars) on list reads;
@@ -2877,6 +2905,138 @@ impl PostgresAdapter {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    // ---------- verity fsck: cross-store integrity scan ----------
+
+    /// Read-only cross-store integrity scan. The schema already FK/unique-enforces
+    /// lineage (`provenance→episodes`, `superseded_by→facts`, tenant FKs) and
+    /// current-fact uniqueness, so those violations are IMPOSSIBLE and fsck does
+    /// not re-check them; it covers only what the schema cannot: value ranges,
+    /// bitemporal ordering, and permission-plane observability. Scoped to one
+    /// tenant when `Some`, else the whole store. Each check is one indexed
+    /// aggregate — O(checks) round-trips, not O(rows).
+    pub async fn fsck(&self, tenant: Option<TenantId>) -> Result<FsckReport> {
+        let mut findings = Vec::new();
+        let mut chk = |check: &str, severity: &str, count: i64, detail: &str| {
+            if count > 0 {
+                findings.push(FsckFinding {
+                    check: check.to_string(),
+                    severity: severity.to_string(),
+                    count,
+                    detail: detail.to_string(),
+                });
+            }
+        };
+
+        // ERROR: a confidentiality value the enum can't represent (data corruption;
+        // `from_i16` would fail-closed to Restricted on read, masking the bad row).
+        let bad_conf: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chunks WHERE confidentiality NOT IN (0,1,2,3) \
+             AND ($1::uuid IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "confidentiality_out_of_range",
+            "error",
+            bad_conf,
+            "chunk.confidentiality outside [0,3]",
+        );
+
+        // ERROR: bitemporal inversion — a row invalidated before it began.
+        let inv_chunks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chunks WHERE valid_to IS NOT NULL \
+             AND valid_to < valid_from AND ($1::uuid IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "bitemporal_inverted_chunks",
+            "error",
+            inv_chunks,
+            "chunk.valid_to precedes valid_from",
+        );
+        let inv_facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM facts WHERE valid_to IS NOT NULL \
+             AND valid_to < valid_from AND ($1::uuid IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "bitemporal_inverted_facts",
+            "error",
+            inv_facts,
+            "fact.valid_to precedes valid_from",
+        );
+
+        // WARN: a LIVE chunk visible to NO token — dead content (safe: over-hidden,
+        // never a leak), but a stamping/retraction smell worth surfacing.
+        let empty_vis: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chunks WHERE valid_to IS NULL \
+             AND cardinality(visibility) = 0 AND ($1::uuid IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "empty_visibility_live_chunks",
+            "warn",
+            empty_vis,
+            "live chunk visible to no token (dead/over-hidden)",
+        );
+
+        // INFO: live-chunk visibility tokens that resolve to NO principal. EXPECTED
+        // for admin-assigned floor tokens (raw `--visibility` ints are not
+        // principals); a materialization smell for connector-mirrored ACLs. Counted
+        // as distinct (tenant, token) pairs, reported for observability — NEVER an
+        // error, since a token nobody resolves to only over-hides.
+        let unresolved_tok: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT DISTINCT c.tenant_id, tok \
+               FROM chunks c, unnest(c.visibility) AS tok \
+              WHERE c.valid_to IS NULL AND ($1::uuid IS NULL OR c.tenant_id = $1) \
+                AND NOT EXISTS (SELECT 1 FROM principals p \
+                                WHERE p.tenant_id = c.tenant_id AND p.token = tok)) x",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "unresolved_visibility_tokens",
+            "info",
+            unresolved_tok,
+            "distinct live-chunk visibility tokens with no principal row \
+             (admin-floor tokens expected; a smell on mirrored ACLs)",
+        );
+
+        // INFO: open quarantine backlog (awaiting admin triage; fail-closed, unindexed).
+        let open_q: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM quarantine_preview WHERE resolution IS NULL \
+             AND ($1::uuid IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        chk(
+            "open_quarantine",
+            "info",
+            open_q,
+            "quarantined items awaiting admin triage (unindexed, fail-closed)",
+        );
+
+        Ok(FsckReport {
+            scanned_tenant: tenant,
+            findings,
+        })
     }
 
     // ---------- quarantine lifecycle (UI-SPEC §5 Screen 6 write surface) ----------

@@ -15,6 +15,7 @@ mod config;
 mod connect;
 mod dev;
 mod doctor;
+mod fsck;
 mod manifest;
 mod mcp;
 mod query;
@@ -176,6 +177,17 @@ dimension change needs a wider column (docs/EMBEDDING_MIGRATION.md)."
     },
     /// Server health, config, tenant, and the decoded scope handle.
     Status,
+    /// Read-only cross-store integrity scan (permission-plane token resolution,
+    /// confidentiality range, bitemporal ordering, quarantine backlog). Exits
+    /// non-zero on any error-severity finding — usable as a CI/cron health gate.
+    Fsck {
+        /// Scope the scan to one tenant id; omit for the whole store.
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Emit the raw JSON report instead of the rendered summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Plane-by-plane OBSERVED health of the running dev stack (identity,
     /// ReBAC watch, signing key, media tier, encoder, auto-resolve,
     /// Temporal) — the same live probes `dev` prints, re-runnable anytime.
@@ -418,6 +430,7 @@ async fn run() -> Result<()> {
             },
         },
         Command::Status => status::run(&ctx).await,
+        Command::Fsck { tenant, json } => fsck::run(&ctx, tenant.as_deref(), json).await,
         Command::Doctor => doctor::run(&ctx).await,
         Command::Backup { dir } => backup::backup(&dir).await,
         Command::Restore { file } => backup::restore(&file).await,
