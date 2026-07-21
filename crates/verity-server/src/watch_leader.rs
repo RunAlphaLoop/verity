@@ -58,6 +58,10 @@ pub(crate) struct WatchLeadership {
     /// (returning it would drop the lock). `Drop` releases it — and with it the
     /// session lock — automatically.
     conn: PoolConnection<Postgres>,
+    /// The advisory-lock key string this guard holds. `LEADER_LOCK_KEY` in
+    /// production; a process-unique key in tests so the mutual-exclusion test
+    /// isn't starved by a running dev consumer holding the shared prod key.
+    key: String,
 }
 
 impl WatchLeadership {
@@ -71,10 +75,21 @@ impl WatchLeadership {
     /// * `Err(_)` — the pool could not hand out a connection; the caller treats
     ///   this like a follower (retry later), never as leadership.
     pub(crate) async fn try_acquire(pool: &PgPool) -> Result<Option<Self>, sqlx::Error> {
+        Self::try_acquire_with_key(pool, LEADER_LOCK_KEY).await
+    }
+
+    /// `try_acquire` against a specific advisory-lock key. Production always uses
+    /// `LEADER_LOCK_KEY`; tests pass a process-unique key so the mutual-exclusion
+    /// test doesn't collide with a running dev consumer holding the prod key on
+    /// the shared dev database.
+    async fn try_acquire_with_key(
+        pool: &PgPool,
+        lock_key: &str,
+    ) -> Result<Option<Self>, sqlx::Error> {
         let mut conn = pool.acquire().await?;
         // Non-blocking, session-scoped. Held until `conn` is dropped.
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1::text))")
-            .bind(LEADER_LOCK_KEY)
+            .bind(lock_key)
             .fetch_one(conn.as_mut())
             .await?;
         if acquired {
@@ -93,7 +108,10 @@ impl WatchLeadership {
             // per-relinquish connection recycle is negligible, and it removes the
             // whole class of "lock leaked into a pooled connection" bugs.
             conn.close_on_drop();
-            Ok(Some(Self { conn }))
+            Ok(Some(Self {
+                conn,
+                key: lock_key.to_string(),
+            }))
         } else {
             // Not the leader: return the connection to the pool (no lock held).
             Ok(None)
@@ -109,7 +127,7 @@ impl WatchLeadership {
     /// leaked back into the pool.
     pub(crate) async fn release(mut self) {
         let _ = sqlx::query("SELECT pg_advisory_unlock(hashtext($1::text))")
-            .bind(LEADER_LOCK_KEY)
+            .bind(&self.key)
             .execute(self.conn.as_mut())
             .await;
         // `self` drops here; close_on_drop closes the (now-unlocked) connection.
@@ -153,17 +171,21 @@ mod tests {
             eprintln!("VERITY_TEST_DSN not set; skipping");
             return;
         };
-        // A dedicated scratch pool so the shared dev consumer can't hold the key.
         let pool = PgPool::connect(&dsn).await.expect("connect");
+        // A PROCESS-UNIQUE lock key so this mutual-exclusion test is not starved
+        // by a running dev :7717 consumer holding the shared production
+        // LEADER_LOCK_KEY on the same dev database. All three acquires below use
+        // this same key, so they still prove mutual exclusion among themselves.
+        let key = format!("verity_test_leader_lock_{}", std::process::id());
 
         // First acquirer becomes leader.
-        let leader = WatchLeadership::try_acquire(&pool)
+        let leader = WatchLeadership::try_acquire_with_key(&pool, &key)
             .await
             .expect("acquire")
             .expect("first caller leads");
 
         // Second acquirer, same database, must be a follower.
-        let follower = WatchLeadership::try_acquire(&pool)
+        let follower = WatchLeadership::try_acquire_with_key(&pool, &key)
             .await
             .expect("acquire follower");
         assert!(
@@ -177,7 +199,7 @@ mod tests {
         // A fresh acquire now succeeds. Retry briefly to absorb pool bookkeeping.
         let mut took_over = None;
         for _ in 0..50 {
-            if let Some(g) = WatchLeadership::try_acquire(&pool)
+            if let Some(g) = WatchLeadership::try_acquire_with_key(&pool, &key)
                 .await
                 .expect("reacquire")
             {
