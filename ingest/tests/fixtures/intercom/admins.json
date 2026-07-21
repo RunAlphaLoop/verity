@@ -1,0 +1,32 @@
+{
+  "type": "admin.list",
+  "admins": [
+    {
+      "type": "admin",
+      "id": "814860",
+      "name": "Ada Lovelace",
+      "email": "ADA@acme.test",
+      "team_ids": [491],
+      "away_mode_enabled": false,
+      "has_inbox_seat": true
+    },
+    {
+      "type": "admin",
+      "id": "814861",
+      "name": "Grace Hopper",
+      "email": "grace@acme.test",
+      "team_ids": [491, 492],
+      "away_mode_enabled": false,
+      "has_inbox_seat": true
+    },
+    {
+      "type": "admin",
+      "id": "814862",
+      "name": "Operator Bot",
+      "email": null,
+      "team_ids": [],
+      "away_mode_enabled": false,
+      "has_inbox_seat": false
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "type": "team.list",
+  "teams": [
+    {
+      "type": "team",
+      "id": "491",
+      "name": "Support",
+      "admin_ids": [814860, 814861, 814862]
+    },
+    {
+      "type": "team",
+      "id": "492",
+      "name": "Escalations",
+      "admin_ids": [814861]
+    }
+  ]
+}

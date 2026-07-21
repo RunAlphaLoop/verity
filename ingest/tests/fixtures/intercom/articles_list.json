@@ -1,0 +1,43 @@
+{
+  "type": "list",
+  "total_count": 3,
+  "pages": {
+    "type": "pages",
+    "page": 1,
+    "per_page": 150,
+    "total_pages": 1,
+    "next": null
+  },
+  "data": [
+    {
+      "type": "article",
+      "id": "9001",
+      "title": "How to reset your password",
+      "description": "Step-by-step password reset guide.",
+      "state": "published",
+      "author_id": 814860,
+      "created_at": 1783300000,
+      "updated_at": 1783506000
+    },
+    {
+      "type": "article",
+      "id": "9002",
+      "title": "Internal escalation runbook",
+      "description": "Draft runbook, not yet published.",
+      "state": "draft",
+      "author_id": 814861,
+      "created_at": 1783250000,
+      "updated_at": 1783505500
+    },
+    {
+      "type": "article",
+      "id": "9003",
+      "title": "Legacy article",
+      "description": "Article with an unrecognized state value.",
+      "state": "archived",
+      "author_id": 814861,
+      "created_at": 1783200000,
+      "updated_at": 1783505200
+    }
+  ]
+}

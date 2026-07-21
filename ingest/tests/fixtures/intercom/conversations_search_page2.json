@@ -1,0 +1,24 @@
+{
+  "type": "conversation.list",
+  "total_count": 3,
+  "conversations": [
+    {
+      "type": "conversation",
+      "id": "103",
+      "title": "Unassigned inquiry",
+      "state": "open",
+      "priority": "not_priority",
+      "admin_assignee_id": 0,
+      "team_assignee_id": null,
+      "created_at": 1783502500,
+      "updated_at": 1783503000
+    }
+  ],
+  "pages": {
+    "type": "pages",
+    "page": 2,
+    "per_page": 150,
+    "total_pages": 2,
+    "next": null
+  }
+}

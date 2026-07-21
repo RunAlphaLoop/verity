@@ -1,0 +1,23 @@
+{
+  "type": "list",
+  "total_count": 1,
+  "data": [
+    {
+      "type": "company",
+      "id": "531ee472cce572a6ec000006",
+      "company_id": "6",
+      "name": "Blue Sun Corp",
+      "industry": "Manufacturing",
+      "monthly_spend": 500,
+      "created_at": 1783300000,
+      "updated_at": 1783505000
+    }
+  ],
+  "pages": {
+    "type": "pages",
+    "page": 1,
+    "per_page": 150,
+    "total_pages": 1,
+    "next": null
+  }
+}

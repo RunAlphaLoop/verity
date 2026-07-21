@@ -1,0 +1,23 @@
+{
+  "type": "list",
+  "total_count": 1,
+  "data": [
+    {
+      "type": "contact",
+      "id": "5ba682d23d7cf92bef87bfd4",
+      "role": "user",
+      "name": "Carol Danvers",
+      "email": "carol@example.test",
+      "phone": "+15551234567",
+      "created_at": 1783400000,
+      "updated_at": 1783504000
+    }
+  ],
+  "pages": {
+    "type": "pages",
+    "page": 1,
+    "per_page": 150,
+    "total_pages": 1,
+    "next": null
+  }
+}

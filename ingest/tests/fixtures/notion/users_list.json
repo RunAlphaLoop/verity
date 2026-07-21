@@ -1,0 +1,29 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "user",
+      "id": "user-ada",
+      "name": "Ada Lovelace",
+      "type": "person",
+      "person": { "email": "Ada@acme.test" }
+    },
+    {
+      "object": "user",
+      "id": "user-noemail",
+      "name": "Guest Access Person",
+      "type": "person",
+      "person": {}
+    },
+    {
+      "object": "user",
+      "id": "user-bot",
+      "name": "Ingestion Bot",
+      "type": "bot",
+      "bot": {}
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false,
+  "type": "user"
+}
