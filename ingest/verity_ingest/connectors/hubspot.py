@@ -759,7 +759,13 @@ class VerityDebeziumSink:
         if not group_members:
             return 0
         written = 0
-        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+        # Auth on the CLIENT so every crosswalk.resolve_via POST to the admin-
+        # gated /v1/admin/principals carries the bearer (resolve_via itself sends
+        # no headers). Without this, owner/member resolution 401s against a real
+        # auth-gated server — invisible to fixtures, which use a fake transport.
+        with httpx.Client(
+            timeout=120.0, transport=self.transport, headers=self._headers()
+        ) as client:
             for group in sorted(group_members):
                 for member in sorted(group_members[group]):
                     canonical = self._canonicalize_member(member, client)
@@ -806,7 +812,11 @@ class VerityDebeziumSink:
             owner_id = getattr(e, "record_owner_id", None)
             if owner_id:
                 owner_ids.add(str(owner_id))
-        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+        # Auth on the CLIENT (see sync_group_edges): resolve_via sends no headers,
+        # so the admin bearer must ride the client or owner/team resolution 401s.
+        with httpx.Client(
+            timeout=120.0, transport=self.transport, headers=self._headers()
+        ) as client:
             if groups:
                 result = crosswalk.resolve_via(
                     client,

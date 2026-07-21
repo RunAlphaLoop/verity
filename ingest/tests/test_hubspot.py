@@ -583,6 +583,52 @@ def test_sink_resolves_owner_via_crosswalk_ownerid_not_email() -> None:
     assert seen == [{"tenant_id": "t", "resolvable": [{"source": "hubspot", "local_id": "77"}]}]
 
 
+def test_sink_crosswalk_resolution_carries_admin_bearer() -> None:
+    # Regression (live-org SSO-alias closure): the owner/team crosswalk-resolution
+    # client must carry the admin bearer on its POST /v1/admin/principals. It
+    # previously did NOT — only the fact-post path attached auth — so against a
+    # real auth-gated server, owner resolution 401'd the moment a record actually
+    # had an owner to resolve. Fixtures missed it because their MockTransport
+    # ignores auth AND they construct the sink with no admin_token. This asserts
+    # the Authorization header rides the resolve call itself.
+    auth_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/principals":
+            auth_seen.append(request.headers.get("Authorization"))
+            body = json.loads(request.content) if request.content else {}
+            mappings: dict[str, int] = {}
+            for owner in body.get("resolvable", []):
+                if owner == {"source": "hubspot", "local_id": "77"}:
+                    mappings["user:alice@corp.com"] = 900
+            declared = bool(body.get("resolvable") or body.get("emails"))
+            return httpx.Response(
+                200, json={"mappings": mappings, "quarantined": declared and not mappings}
+            )
+        return httpx.Response(200, json={"facts_inserted": 1})
+
+    sink = VerityDebeziumSink(
+        url="http://sink",
+        tenant_id="t",
+        transport=httpx.MockTransport(handler),
+        admin_token="secret-token",
+    )
+    event = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="H",
+        field_name="dealname",
+        value="Big deal",
+        valid_from=utc(2026, 7, 10, 12),
+        raw_payload={},
+        object_type="deals",
+        visibility_policy=POLICY,
+        record_owner_id="77",
+    )
+    sink._stamp_record_visibility([event])
+    assert event.record_visibility == [900]  # resolution succeeded...
+    assert auth_seen == ["Bearer secret-token"]  # ...because the resolve call was authed
+
+
 def test_sink_unlinked_ownerid_confers_no_visibility() -> None:
     # An ownerId with no crosswalk row → the server drops it → the record has no
     # inline ACL and rides the admin --visibility floor (never a fabricated token).
