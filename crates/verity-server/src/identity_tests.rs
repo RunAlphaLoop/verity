@@ -73,6 +73,72 @@ async fn test_state(rebac: Option<Rebac>, allow_restricted: bool) -> (Arc<AppSta
     (state, tenant)
 }
 
+/// The fixed admin bearer the `require`-gated M2 2a routes accept in-test.
+const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+/// Like `test_state`, but with a configured admin token so the `require`-gated
+/// revoke/reinstate routes return `Ok` (dev-open `expected_tag: None` would 401
+/// them). Pair with [`admin_headers`] to build the matching bearer.
+async fn test_state_admin(
+    rebac: Option<Rebac>,
+    allow_restricted: bool,
+) -> (Arc<AppState>, TenantId) {
+    let (state, tenant) = test_state(rebac, allow_restricted).await;
+    // Rebuild AppState with a token-configured AdminAuth. AppState isn't Clone,
+    // so mint a fresh one sharing the same storage handle via a fresh connect —
+    // cheaper to just swap the admin field through Arc::get_mut, which is unique
+    // here (we just created the Arc).
+    let mut state = state;
+    let app = Arc::get_mut(&mut state).expect("unique AppState");
+    app.admin = AdminAuth::for_test(Some(TEST_ADMIN_TOKEN), None);
+    (state, tenant)
+}
+
+/// The `Authorization: Bearer` header the `require`-gated routes accept when the
+/// state was built by [`test_state_admin`].
+fn admin_headers() -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {TEST_ADMIN_TOKEN}").parse().unwrap(),
+    );
+    h
+}
+
+/// Durably revoke a principal through the real `require`-gated route. Returns
+/// the JSON body (`swept_documents`, `token`, …).
+async fn revoke_principal(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    principal: &str,
+) -> HandlerResult<serde_json::Value> {
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "principal": principal,
+    }))
+    .expect("request shape");
+    let Json(v) =
+        crate::admin_principal_revoke(State(Arc::clone(state)), admin_headers(), Json(req)).await?;
+    Ok(v)
+}
+
+/// Reinstate a principal through the real `require`-gated route.
+async fn reinstate_principal(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    principal: &str,
+) -> HandlerResult<serde_json::Value> {
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "principal": principal,
+    }))
+    .expect("request shape");
+    let Json(v) =
+        crate::admin_principal_reinstate(State(Arc::clone(state)), admin_headers(), Json(req))
+            .await?;
+    Ok(v)
+}
+
 /// The ReBAC engine for a SpiceDB soundness test: HARD-ERROR when
 /// `VERITY_SPICEDB_URL` is absent. CI provides SpiceDB, so a missing engine is
 /// a misconfiguration to surface, never a class of soundness test to skip.
@@ -173,7 +239,10 @@ async fn group_change(
         "member": member,
     }))
     .expect("request shape");
-    let (state, headers) = (State(Arc::clone(state)), HeaderMap::new());
+    // Send the admin bearer: harmless under dev-open `check` (ignored when no
+    // token is configured), and required when the state carries a token
+    // (`test_state_admin`). The M1 group routes are `check`-gated.
+    let (state, headers) = (State(Arc::clone(state)), admin_headers());
     let Json(v) = if add {
         crate::admin_group_add(state, headers, Json(req)).await?
     } else {
@@ -825,4 +894,430 @@ async fn email_only_subject_confers_nothing() {
             .is_empty(),
         "an email-only non-member sees nothing"
     );
+}
+
+// ===================================================================
+// M2 2a — DIRECT-GRANT REVOCATION PLANE + MINT ACTIVE-GATE
+// ===================================================================
+
+/// Age a durable revocation's `revoked_at` into the distant past so a test can
+/// prove the subtraction is INDEFINITE — it must still bite past the ~13h M1
+/// `RETENTION_SECS` window (which only bounds the SEPARATE `revocations`
+/// tombstone table). No wall-clock waiting.
+async fn age_revocation(state: &AppState, tenant: TenantId, token: PrincipalToken, hours: i32) {
+    sqlx::query(
+        "UPDATE revoked_principal
+            SET revoked_at = now() - make_interval(hours => $3)
+          WHERE tenant_id = $1 AND token = $2",
+    )
+    .bind(tenant)
+    .bind(token)
+    .bind(hours)
+    .execute(state.pool())
+    .await
+    .expect("age revocation");
+}
+
+/// Dev-mode direct mint of a live 12h handle over caller-supplied principals
+/// (no ReBAC): the analog of a DIRECT grant handle. `issued_at` is pinned to
+/// `now` by the minter; the durable revoked-set subtraction is
+/// `issued_at`-independent, so a live handle still drops a revoked token.
+fn direct_handle(state: &AppState, tenant: TenantId, principals: Vec<PrincipalToken>) -> String {
+    let now = Utc::now();
+    let (handle, _) = state.minter.mint(
+        crate::scope::ScopePayload {
+            tenant_id: tenant,
+            principals,
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted,
+            actor_sub: None,
+            actor_azp: None,
+            subject: None,
+            issued_at: now,
+            expires_at: now, // overwritten by mint() to now + 12h
+        },
+        crate::scope::MAX_TTL_SECONDS,
+    );
+    handle
+}
+
+/// The live current visibility of a document's chunk (valid_to IS NULL).
+async fn live_visibility(state: &AppState, tenant: TenantId, doc: &str) -> Vec<PrincipalToken> {
+    sqlx::query_scalar::<_, Vec<i32>>(
+        "SELECT visibility FROM chunks
+          WHERE tenant_id = $1 AND source = 'test' AND document_id = $2
+            AND valid_to IS NULL
+          ORDER BY seq LIMIT 1",
+    )
+    .bind(tenant)
+    .bind(doc)
+    .fetch_one(state.pool())
+    .await
+    .expect("live visibility")
+}
+
+/// Count `chunk_acl_audit` rows for a document at a given reason.
+async fn audit_count(state: &AppState, tenant: TenantId, doc: &str, reason: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM chunk_acl_audit
+          WHERE tenant_id = $1 AND source = 'test' AND document_id = $2 AND reason = $3",
+    )
+    .bind(tenant)
+    .bind(doc)
+    .bind(reason)
+    .fetch_one(state.pool())
+    .await
+    .expect("audit count")
+}
+
+/// N2 (the point of 2a — DSN-only, no ReBAC): a DIRECT-granted chunk keyed to
+/// `T_A` alone (no group tuple). A 12h handle minted BEFORE revoke must, on its
+/// NEXT recall AFTER revoke — and PAST the ~13h `RETENTION_SECS` window — DROP
+/// the chunk, because the durable revoked-principal subtraction is INDEFINITE
+/// and `issued_at`-independent. Bob's direct-granted chunk is UNAFFECTED.
+#[tokio::test]
+async fn m2a_direct_grant_revocation_is_indefinite() {
+    let (state, tenant) = test_state_admin(None, true).await;
+    let t_a = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:alice@corp.example".to_string()],
+    )
+    .await
+    .expect("token")[0]
+        .1;
+    let t_b = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:bob@corp.example".to_string()],
+    )
+    .await
+    .expect("token")[0]
+        .1;
+
+    // Chunk D: a DIRECT grant to Alice only. Chunk E: a direct grant to Bob.
+    index_chunk(
+        &state,
+        tenant,
+        "doc-alice",
+        "the direct-granted narwhal memo",
+        vec![t_a],
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-bob",
+        "the direct-granted narwhal ledger",
+        vec![t_b],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // (1) A 12h handle minted for Alice BEFORE revoke sees D.
+    let handle = direct_handle(&state, tenant, vec![t_a]);
+    let docs = recall_docs(&state, &handle, "narwhal")
+        .await
+        .expect("recall");
+    assert!(
+        docs.contains(&"doc-alice".to_string()),
+        "before revoke: {docs:?}"
+    );
+
+    // (2) Admin REVOKES Alice.
+    let body = revoke_principal(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("revoke");
+    assert_eq!(body["revoked"], json!(true));
+    assert_eq!(body["token"], json!(t_a));
+    assert_eq!(
+        body["swept_documents"],
+        json!(1),
+        "only D carried T_A: {body}"
+    );
+
+    // (3) Age the revocation past RETENTION_SECS (~13h) — the durable set has NO
+    //     time bound, so the SAME live handle's next recall STILL drops D.
+    age_revocation(&state, tenant, t_a, 20).await;
+    let docs = recall_docs(&state, &handle, "narwhal")
+        .await
+        .expect("recall");
+    assert!(
+        !docs.contains(&"doc-alice".to_string()),
+        "revoked direct grant dropped past the window (indefinite): {docs:?}"
+    );
+
+    // Negative: Bob's direct grant is UNAFFECTED by Alice's revoke.
+    let bob_handle = direct_handle(&state, tenant, vec![t_b]);
+    let docs = recall_docs(&state, &bob_handle, "narwhal")
+        .await
+        .expect("recall");
+    assert!(
+        docs.contains(&"doc-bob".to_string()) && !docs.contains(&"doc-alice".to_string()),
+        "Bob unaffected: {docs:?}"
+    );
+}
+
+/// N2-sweep + N3 (DSN-only): the sweep INVALIDATES D's materialized T_A
+/// (invalidate-don't-delete + a `principal_revoke` audit row), preserving every
+/// OTHER grant on the chunk. A fresh direct handle for the reused token then
+/// sees nothing (email-reuse safety). Reinstate lets NEW grants resolve but does
+/// NOT resurrect the swept chunk.
+#[tokio::test]
+async fn m2a_sweep_retracts_token_and_reinstate_is_honest() {
+    let (state, tenant) = test_state_admin(None, true).await;
+    let t_a = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:alice@corp.example".to_string()],
+    )
+    .await
+    .expect("token")[0]
+        .1;
+    let t_b = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:bob@corp.example".to_string()],
+    )
+    .await
+    .expect("token")[0]
+        .1;
+
+    // Chunk D is DIRECTLY shared to BOTH Alice and Bob.
+    index_chunk(
+        &state,
+        tenant,
+        "doc-shared",
+        "the direct-granted okapi brief",
+        vec![t_a, t_b],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    revoke_principal(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("revoke");
+
+    // N2-sweep: T_A retracted from the LIVE chunk; Bob's T_B survives; audited.
+    let vis = live_visibility(&state, tenant, "doc-shared").await;
+    assert!(
+        !vis.contains(&t_a),
+        "T_A retracted from materialized chunk: {vis:?}"
+    );
+    assert!(vis.contains(&t_b), "T_B (Bob) preserved: {vis:?}");
+    assert!(
+        audit_count(&state, tenant, "doc-shared", "principal_revoke").await >= 1,
+        "a principal_revoke audit row exists"
+    );
+
+    // Bob (via a fresh direct handle) still sees D — the sweep is surgical.
+    let bob_handle = direct_handle(&state, tenant, vec![t_b]);
+    assert!(
+        recall_docs(&state, &bob_handle, "okapi")
+            .await
+            .expect("recall")
+            .contains(&"doc-shared".to_string()),
+        "Bob still sees the shared doc after Alice's revoke"
+    );
+
+    // N3 (email-reuse): a fresh direct handle bearing the OLD T_A sees nothing —
+    // the residual token was retracted from the chunk AND the durable set denies
+    // it — so a re-vouched human at the same email inherits nothing.
+    let reused = direct_handle(&state, tenant, vec![t_a]);
+    assert!(
+        recall_docs(&state, &reused, "okapi")
+            .await
+            .expect("recall")
+            .is_empty(),
+        "email-reuse inherits nothing (swept + durably denied)"
+    );
+
+    // Reinstate: NEW grants resolve again, but the SWEPT chunk stays invalidated
+    // (honest — 2a does not resurrect historical direct grants).
+    let body = reinstate_principal(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("reinstate");
+    assert_eq!(body["reinstated"], json!(true));
+    assert_eq!(body["was_revoked"], json!(true));
+
+    // A NEW direct grant to Alice's token now resolves (durable denial cleared).
+    index_chunk(
+        &state,
+        tenant,
+        "doc-new",
+        "the fresh okapi addendum",
+        vec![t_a],
+        Confidentiality::Internal,
+    )
+    .await;
+    let after = direct_handle(&state, tenant, vec![t_a]);
+    let docs = recall_docs(&state, &after, "okapi").await.expect("recall");
+    assert!(
+        docs.contains(&"doc-new".to_string()),
+        "new grant resolves: {docs:?}"
+    );
+    assert!(
+        !docs.contains(&"doc-shared".to_string()),
+        "already-swept chunk stays invalidated after reinstate (honest): {docs:?}"
+    );
+}
+
+/// A revoke of an as-yet-unmaterialized principal is idempotent and denies any
+/// FUTURE grant; a non-`user:` principal is 422; the route is `require`-gated.
+#[tokio::test]
+async fn m2a_revoke_edge_cases() {
+    let (state, tenant) = test_state_admin(None, true).await;
+
+    // 422: a group principal is not a deprovisionable human.
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant, "principal": "group:sales",
+    }))
+    .expect("shape");
+    let err = crate::admin_principal_revoke(State(Arc::clone(&state)), admin_headers(), Json(req))
+        .await
+        .expect_err("group principal 422");
+    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 401: the release-gate route refuses without the admin bearer.
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant, "principal": "user:ghost@corp.example",
+    }))
+    .expect("shape");
+    let err = crate::admin_principal_revoke(State(Arc::clone(&state)), HeaderMap::new(), Json(req))
+        .await
+        .expect_err("no bearer 401");
+    assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+    // Revoke a principal that never carried a token: swept 0, future grant denied.
+    let body = revoke_principal(&state, tenant, "user:ghost@corp.example")
+        .await
+        .expect("revoke ghost");
+    assert_eq!(body["swept_documents"], json!(0));
+    let ghost = body["token"].as_i64().expect("token") as i32;
+
+    // A LATER direct grant to that token is denied on the live handle.
+    index_chunk(
+        &state,
+        tenant,
+        "doc-ghost",
+        "the posthumous quokka file",
+        vec![ghost],
+        Confidentiality::Internal,
+    )
+    .await;
+    let handle = direct_handle(&state, tenant, vec![ghost]);
+    assert!(
+        recall_docs(&state, &handle, "quokka")
+            .await
+            .expect("recall")
+            .is_empty(),
+        "a grant made AFTER deprovision is still denied (durable, indefinite)"
+    );
+
+    // Reinstate a never-revoked principal reports was_revoked=false.
+    let body = reinstate_principal(&state, tenant, "user:nobody@corp.example")
+        .await
+        .expect("reinstate");
+    assert_eq!(body["was_revoked"], json!(false));
+}
+
+/// DSN + SpiceDB: the MINT ACTIVE-GATE (deliverable #4). After a deprovision,
+/// a FRESH subject-resolved mint for the same email OMITS the self-token, so the
+/// direct-granted chunk is not in scope — even though a new mint would otherwise
+/// re-prepend it. Group tokens are untouched (M1 owns those). A group-membership
+/// revoke (M1) still behaves unchanged in the same tenant.
+#[tokio::test]
+async fn m2a_mint_active_gate_omits_revoked_self_token() {
+    let rebac = require_rebac("m2a_mint_active_gate_omits_revoked_self_token");
+    rebac.ensure_schema().await.expect("schema");
+    let (state, tenant) = test_state_admin(Some(rebac), false).await;
+
+    // Alice is in group:eng; a group chunk + a DIRECT-granted chunk both exist.
+    group_change(&state, tenant, "group:eng", "user:alice@corp.example", true)
+        .await
+        .expect("add alice");
+    let t_a = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:alice@corp.example".to_string()],
+    )
+    .await
+    .expect("token")[0]
+        .1;
+    let eng = crate::upsert_principal_tokens(state.pool(), tenant, &["group:eng".to_string()])
+        .await
+        .expect("token")[0]
+        .1;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-direct",
+        "the platypus onboarding memo",
+        vec![t_a],
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-group",
+        "the platypus team roster",
+        vec![eng],
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // Before revoke, a subject mint sees BOTH (direct + group).
+    let before = mint_with_subject(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("mint");
+    let docs = recall_docs(&state, &before, "platypus")
+        .await
+        .expect("recall");
+    assert!(docs.contains(&"doc-direct".to_string()), "{docs:?}");
+    assert!(docs.contains(&"doc-group".to_string()), "{docs:?}");
+
+    // Deprovision Alice.
+    revoke_principal(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("revoke");
+
+    // A FRESH subject mint OMITS the self-token: the direct-granted chunk is
+    // gone. (The group chunk is also gone here only because the sweep + durable
+    // denial hit the direct grant; the group token itself is NOT in the durable
+    // set — verify the minted scope has the group token but NOT the self-token.)
+    let fresh = mint_with_subject(&state, tenant, "user:alice@corp.example")
+        .await
+        .expect("re-mint");
+    let payload = state.minter.verify(&fresh).expect("verifies");
+    assert!(
+        !payload.principals.contains(&t_a),
+        "mint active-gate omits the revoked self-token: {:?}",
+        payload.principals
+    );
+    assert!(
+        payload.principals.contains(&eng),
+        "group token retained (M1 owns group revocation): {:?}",
+        payload.principals
+    );
+    let docs = recall_docs(&state, &fresh, "platypus")
+        .await
+        .expect("recall");
+    assert!(
+        !docs.contains(&"doc-direct".to_string()),
+        "post-revoke mint cannot reach the direct grant: {docs:?}"
+    );
+
+    // Non-regression: a group-membership revoke (M1) still works unchanged.
+    let removed = group_change(
+        &state,
+        tenant,
+        "group:eng",
+        "user:alice@corp.example",
+        false,
+    )
+    .await
+    .expect("remove alice");
+    assert_eq!(removed["deleted"], json!(true));
 }

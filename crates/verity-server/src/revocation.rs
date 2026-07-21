@@ -85,12 +85,24 @@ pub(crate) const RETENTION_SECS: i64 = MAX_TTL_SECONDS + 3600;
 /// per physical revocation row.
 type TombstoneSet = HashMap<PrincipalToken, DateTime<Utc>>;
 
+/// Per-tenant DURABLE (indefinite) revoked-principal token set (M2 2a). Unlike
+/// `TombstoneSet` this carries NO instant — a deprovision is permanent, so the
+/// subtraction drops these tokens UNCONDITIONALLY (no `issued_at` comparison),
+/// for every handle, forever, until reinstate. Bounded by
+/// revoked-principals-in-tenant (partial `revoked_principal_active_idx`).
+type RevokedSet = std::collections::HashSet<PrincipalToken>;
+
 pub(crate) struct RevocationPlane {
     /// Per-tenant retained tombstone set (min-`at` per token within
     /// `RETENTION_SECS`). The per-handle `issued_at` cutoff is applied in-memory
     /// AFTER the cache read, so one cache entry serves every handle of the tenant
     /// regardless of mint time.
     cache: moka::sync::Cache<TenantId, Arc<TombstoneSet>>,
+    /// Per-tenant DURABLE revoked-principal set (M2 2a). A SECOND dimension beside
+    /// `cache`, mirroring its 5s-TTL memoization: the read-path `subtract` unions
+    /// this in UNCONDITIONALLY (indefinite, `issued_at`-independent) on top of the
+    /// windowed handle-relative tombstones. Invalidated on revoke/reinstate.
+    revoked: moka::sync::Cache<TenantId, Arc<RevokedSet>>,
     window_secs: i64,
     /// M0 `/metrics`: `revocation_subtractions_total`, bumped by the number of
     /// tokens actually dropped in `subtract`. `None` until the server wires the
@@ -103,6 +115,10 @@ impl RevocationPlane {
     pub(crate) fn new(window_secs: i64) -> Self {
         Self {
             cache: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(CACHE_TTL)
+                .build(),
+            revoked: moka::sync::Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(CACHE_TTL)
                 .build(),
@@ -165,12 +181,94 @@ impl RevocationPlane {
         Ok(tombstones)
     }
 
+    /// The tenant's DURABLE revoked-principal token set (M2 2a): every token
+    /// whose principal is CURRENTLY revoked (`reinstated_at IS NULL`), with NO
+    /// time bound. Served by the partial `revoked_principal_active_idx`
+    /// (O(revoked-in-tenant)), memoized 5s exactly like `retained_tombstones`.
+    /// This is what makes a direct-grant deprovision INDEFINITE: the subtract
+    /// drops these tokens for every handle regardless of `issued_at` or age.
+    pub(crate) async fn revoked_set(
+        &self,
+        pool: &PgPool,
+        tenant: TenantId,
+    ) -> HandlerResult<Arc<RevokedSet>> {
+        if let Some(hit) = self.revoked.get(&tenant) {
+            return Ok(hit);
+        }
+        let rows = sqlx::query(
+            "SELECT token FROM revoked_principal
+             WHERE tenant_id = $1 AND reinstated_at IS NULL",
+        )
+        .bind(tenant)
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?;
+        let set: Arc<RevokedSet> =
+            Arc::new(rows.iter().map(|r| r.get::<i32, _>("token")).collect());
+        self.revoked.insert(tenant, Arc::clone(&set));
+        Ok(set)
+    }
+
+    /// Durably (INDEFINITELY) revoke a principal by its token — writes the
+    /// `revoked_principal` row then invalidates the local cache so the mint gate
+    /// and read-path subtraction deny it immediately in-process. Idempotent: a
+    /// re-revoke of a previously-reinstated principal clears `reinstated_at`.
+    pub(crate) async fn revoke_principal(
+        &self,
+        pool: &PgPool,
+        tenant: TenantId,
+        principal: &str,
+        token: PrincipalToken,
+    ) -> HandlerResult<()> {
+        sqlx::query(
+            "INSERT INTO revoked_principal (tenant_id, token, principal)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (tenant_id, token)
+             DO UPDATE SET reinstated_at = NULL, revoked_at = now(),
+                           principal = EXCLUDED.principal",
+        )
+        .bind(tenant)
+        .bind(token)
+        .bind(principal)
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+        self.revoked.invalidate(&tenant);
+        Ok(())
+    }
+
+    /// Clear a durable revocation (invalidate-don't-delete: sets `reinstated_at`)
+    /// so NEW grants resolve again. Returns whether the principal WAS revoked.
+    /// Already-swept chunks stay invalidated until re-ingest — the caller must
+    /// document this (a reinstate does not resurrect the retracted materialized
+    /// token).
+    pub(crate) async fn reinstate_principal(
+        &self,
+        pool: &PgPool,
+        tenant: TenantId,
+        token: PrincipalToken,
+    ) -> HandlerResult<bool> {
+        let affected = sqlx::query(
+            "UPDATE revoked_principal SET reinstated_at = now()
+             WHERE tenant_id = $1 AND token = $2 AND reinstated_at IS NULL",
+        )
+        .bind(tenant)
+        .bind(token)
+        .execute(pool)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        self.revoked.invalidate(&tenant);
+        Ok(affected > 0)
+    }
+
     /// Subtract tokens revoked at-or-after a handle's mint instant (`issued_at`)
-    /// from that handle's principal set — the M1 handle-relative model. A token
-    /// is dropped iff SOME retained tombstone for it has `at >= issued_at`, for
-    /// the handle's full lifetime (not a fixed wall-clock window). Fail-closed by
-    /// construction: an error refuses the read rather than skipping the
-    /// subtraction.
+    /// from that handle's principal set — the M1 handle-relative model — AND drop
+    /// any token in the DURABLE revoked-principal set unconditionally (M2 2a,
+    /// indefinite). A token is dropped iff (a) its principal is durably revoked
+    /// (no `issued_at` gate — permanent), OR (b) SOME retained tombstone for it
+    /// has `at >= issued_at`. Fail-closed by construction: an error refuses the
+    /// read rather than skipping the subtraction.
     pub(crate) async fn subtract(
         &self,
         pool: &PgPool,
@@ -179,21 +277,25 @@ impl RevocationPlane {
         issued_at: DateTime<Utc>,
     ) -> HandlerResult<Vec<PrincipalToken>> {
         let tombstones = self.retained_tombstones(pool, tenant).await?;
-        if tombstones.is_empty() {
+        let revoked = self.revoked_set(pool, tenant).await?;
+        if tombstones.is_empty() && revoked.is_empty() {
             return Ok(principals.to_vec());
         }
-        // O(principals): one HashMap lookup per caller principal. A token is
-        // dropped iff its EARLIEST revocation is at-or-after this handle's mint
-        // instant. `min(at)` is sufficient — if the earliest tombstone predates
+        // O(principals): one HashMap + one HashSet lookup per caller principal
+        // (both sets 5s-cached, no per-read DB round-trip). A token drops iff:
+        //   (2a) it is in the DURABLE revoked set — indefinite, unconditional; or
+        //   (M1) its EARLIEST tombstone is at-or-after this handle's mint instant.
+        // `min(at)` is sufficient for (M1) — if the earliest tombstone predates
         // the handle no later duplicate can bite it; if it post-dates, the token
         // drops regardless of duplicates.
         let kept: Vec<PrincipalToken> = principals
             .iter()
             .copied()
             .filter(|t| {
-                tombstones
-                    .get(t)
-                    .is_none_or(|first_at| *first_at < issued_at)
+                !revoked.contains(t)
+                    && tombstones
+                        .get(t)
+                        .is_none_or(|first_at| *first_at < issued_at)
             })
             .collect();
         // M0: count the tokens actually dropped (never the whole set). Only the
@@ -544,5 +646,118 @@ mod tests {
             vec![7, 9, 11],
             "revocation older than issued_at does not retroactively bite a newer handle"
         );
+    }
+
+    /// M2 2a KEYSTONE: a DURABLE principal revocation subtracts the principal's
+    /// token INDEFINITELY — past RETENTION_SECS (~13h), for ANY handle regardless
+    /// of `issued_at`. This is the exact difference from the M1 windowed tombstone
+    /// (`revocation_outlives_max_ttl_for_prior_minted_handle`): no `issued_at`
+    /// gate, no window bound. A deprovisioned human re-minting years later stays
+    /// denied.
+    #[tokio::test]
+    async fn revoked_principal_subtraction_is_indefinite() {
+        let (pool, tenant) = test_pool().await;
+        let plane = RevocationPlane::new(300);
+
+        // A FRESH handle minted RIGHT NOW (issued_at = now). Under the M1 windowed
+        // model this handle would keep any token whose tombstone predates it — but
+        // the durable revoked set has NO issued_at gate, so token 7 must still drop.
+        let now = Utc::now();
+        assert_eq!(
+            plane
+                .subtract(&pool, tenant, &[7, 9, 11], now)
+                .await
+                .unwrap(),
+            vec![7, 9, 11],
+            "nothing revoked yet"
+        );
+
+        plane
+            .revoke_principal(&pool, tenant, "user:alice@corp.example", 7)
+            .await
+            .expect("revoke");
+
+        // Age the durable record to 20 HOURS ago — WELL past RETENTION_SECS (~13h)
+        // and past MAX_TTL. A windowed/handle-relative rule would have forgotten it.
+        sqlx::query(
+            "UPDATE revoked_principal SET revoked_at = now() - interval '20 hours'
+             WHERE tenant_id = $1 AND token = 7",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("age the durable record");
+
+        // A cold-cache plane, ANY handle instant (now, or an ancient handle) — the
+        // durable revoked token drops unconditionally.
+        let fresh = RevocationPlane::new(300);
+        assert_eq!(
+            fresh
+                .subtract(&pool, tenant, &[7, 9, 11], Utc::now())
+                .await
+                .unwrap(),
+            vec![9, 11],
+            "durably-revoked token drops for a fresh handle past RETENTION_SECS"
+        );
+        let ancient = Utc::now() - chrono::Duration::seconds(MAX_TTL_SECONDS);
+        assert_eq!(
+            fresh
+                .subtract(&pool, tenant, &[7, 9, 11], ancient)
+                .await
+                .unwrap(),
+            vec![9, 11],
+            "and for a 12h-old handle too — indefinite, issued_at-independent"
+        );
+        // subtract_window (mint/admin plane) inherits the same drop.
+        assert_eq!(
+            fresh
+                .subtract_window(&pool, tenant, &[7, 9, 11])
+                .await
+                .unwrap(),
+            vec![9, 11],
+            "the mint/admin subtract_window path omits a durably-revoked token too"
+        );
+    }
+
+    /// Reinstate clears the durable revocation so the token resolves again on the
+    /// read/mint path (already-swept chunks are a storage concern, not this set).
+    #[tokio::test]
+    async fn reinstate_clears_durable_revocation() {
+        let (pool, tenant) = test_pool().await;
+        let plane = RevocationPlane::new(300);
+
+        plane
+            .revoke_principal(&pool, tenant, "user:bob@corp.example", 42)
+            .await
+            .expect("revoke");
+        assert_eq!(
+            plane
+                .subtract(&pool, tenant, &[42, 43], Utc::now())
+                .await
+                .unwrap(),
+            vec![43],
+            "revoked token dropped"
+        );
+
+        let was_revoked = plane
+            .reinstate_principal(&pool, tenant, 42)
+            .await
+            .expect("reinstate");
+        assert!(was_revoked, "reinstate reports it was revoked");
+        assert_eq!(
+            plane
+                .subtract(&pool, tenant, &[42, 43], Utc::now())
+                .await
+                .unwrap(),
+            vec![42, 43],
+            "reinstated token resolves again (cache invalidated on reinstate)"
+        );
+
+        // Reinstating a not-currently-revoked token reports false, idempotently.
+        let again = plane
+            .reinstate_principal(&pool, tenant, 42)
+            .await
+            .expect("reinstate again");
+        assert!(!again, "second reinstate is a no-op");
     }
 }

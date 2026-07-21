@@ -4939,6 +4939,11 @@ pub enum AclCorrectionReason {
     SourceUnshare,
     AdminCorrection,
     RebacWatchDelete,
+    /// A DIRECT-grant principal deprovision (M2 2a): the chunk-visibility sweep
+    /// retracted a revoked principal's own token from a chunk it was directly
+    /// granted on. Distinct from `RebacWatchDelete` (group-membership churn) so
+    /// the forensic trail is honest about deprovision-driven retraction.
+    PrincipalRevoke,
 }
 
 impl AclCorrectionReason {
@@ -4948,6 +4953,7 @@ impl AclCorrectionReason {
             Self::SourceUnshare => "source_unshare",
             Self::AdminCorrection => "admin_correction",
             Self::RebacWatchDelete => "rebac_watch_delete",
+            Self::PrincipalRevoke => "principal_revoke",
         }
     }
 }
@@ -5212,6 +5218,167 @@ impl PostgresAdapter {
 
         tx.commit().await.map_err(db_err)?;
         Ok(updated)
+    }
+
+    /// CHUNK-VISIBILITY SWEEP (M2 2a, deliverable #3) — the TOKEN-axis dual of
+    /// [`correct_chunk_acl`]. On a DIRECT-grant principal deprovision the sweep
+    /// must find EVERY chunk in the tenant whose `visibility` CONTAINS the revoked
+    /// principal's own token — spanning arbitrarily many `(source, document_id)`
+    /// lineages — and strip JUST that token, preserving every OTHER grant on the
+    /// chunk (a chunk `{T_A, T_B}` becomes `{T_B}`, never blanked). This is why
+    /// `correct_chunk_acl` cannot be called directly: it keys by object identity,
+    /// REPLACES the whole array, and rewrites confidentiality. Here the axis is the
+    /// token (GIN-narrowed via `chunks_visibility_idx`), the rewrite is surgical
+    /// (`array_remove`), and confidentiality is UNTOUCHED.
+    ///
+    /// Reuses `correct_chunk_acl`'s invariants verbatim: the single `begin()`…
+    /// `commit()` transaction frame, the per-CURRENT-chunk `chunk_acl_audit`
+    /// granularity, and — critically — the NO-`valid_to`-predicate rewrite so
+    /// SUPERSEDED history rows are stripped too. That last point is the value-
+    /// history carve-out (§5e.6b): a re-vouched human minting the reused email
+    /// cannot reach the chunk even via `?as_of=`, because the residual token is
+    /// gone from the history rows, not just the live row.
+    ///
+    /// Fail-closed / belt-and-suspenders: the AUTHORITATIVE denial is the durable
+    /// revoked-principal subtraction on the read path + the mint active-gate (both
+    /// written BEFORE this sweep runs). If this transaction aborts, `array_remove`
+    /// never commits, so the token stays materialized — but reads are ALREADY
+    /// denied by the durable subtraction. A partial sweep therefore over-hides,
+    /// never under-hides. Batches by `id` for large token fan-out, each batch its
+    /// own transaction and independently fail-closed.
+    ///
+    /// Returns the number of DISTINCT documents swept (for the admin response).
+    pub async fn retract_token_from_chunks(
+        &self,
+        tenant: TenantId,
+        token: PrincipalToken,
+        reason: AclCorrectionReason,
+        changed_by: &str,
+    ) -> Result<u64> {
+        /// Max chunk rows rewritten per transaction. A direct personal grant
+        /// touches few chunks; the batched loop only matters for an over-granted
+        /// token. Each batch is its own fail-closed transaction.
+        const SWEEP_BATCH: i64 = 5000;
+
+        // DISTINCT documents whose CURRENT chunks carry the token, counted ONCE up
+        // front with a bounded aggregate — NOT by accumulating every swept
+        // (source, document_id) in an in-memory set for the whole sweep (which is
+        // unbounded for an over-granted token spanning millions of docs and defeats
+        // the per-batch memory bound). The count is a snapshot of the pre-sweep
+        // current-visibility fan-out, which is exactly what the admin response
+        // reports ("documents that lost the token"). GIN-driven via
+        // `chunks_visibility_idx`; superseded rows excluded (valid_to IS NULL) so it
+        // matches the audited (current-only) rewrites.
+        let swept_documents: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT (source, document_id))
+               FROM chunks
+              WHERE tenant_id = $1
+                AND valid_to IS NULL
+                AND visibility @> ARRAY[$2]::int[]",
+        )
+        .bind(tenant)
+        .bind(token)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // Cursor over `chunks.id` (uuid v7, monotonic) so batches never revisit a
+        // rewritten row: after a batch strips the token, the same rows no longer
+        // match `visibility @> ARRAY[$token]`, but ordering by id + a `> last`
+        // bound keeps progress deterministic even mid-fan-out.
+        let mut last_id: Option<Uuid> = None;
+
+        loop {
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+            // Snapshot the next batch of rows (current + superseded) carrying the
+            // token, ordered by id, FOR UPDATE. `@> ARRAY[$token]` is GIN-index
+            // driven (`chunks_visibility_idx`). We snapshot BOTH current and
+            // superseded so the rewrite covers history, but only CURRENT rows get
+            // an audit row (mirroring `correct_chunk_acl`).
+            let rows = sqlx::query(
+                "SELECT id, source, document_id, seq, visibility, confidentiality,
+                        (valid_to IS NULL) AS is_current
+                   FROM chunks
+                  WHERE tenant_id = $1
+                    AND visibility @> ARRAY[$2]::int[]
+                    AND ($3::uuid IS NULL OR id > $3)
+                  ORDER BY id
+                  FOR UPDATE
+                  LIMIT $4",
+            )
+            .bind(tenant)
+            .bind(token)
+            .bind(last_id)
+            .bind(SWEEP_BATCH)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
+            if rows.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                break;
+            }
+
+            for row in &rows {
+                let chunk_id: Uuid = row.try_get("id").map_err(db_err)?;
+                let source: String = row.try_get("source").map_err(db_err)?;
+                let document_id: String = row.try_get("document_id").map_err(db_err)?;
+                let seq: i32 = row.try_get("seq").map_err(db_err)?;
+                let old_vis: Vec<i32> = row.try_get("visibility").map_err(db_err)?;
+                let conf: i16 = row.try_get("confidentiality").map_err(db_err)?;
+                let is_current: bool = row.try_get("is_current").map_err(db_err)?;
+
+                // Surgical strip of JUST the revoked token; every OTHER grant
+                // survives. In-place UPDATE by chunk id (this specific row, current
+                // OR superseded) — no `valid_to` predicate = value-history carve-out.
+                let new_vis: Vec<i32> = old_vis.iter().copied().filter(|t| *t != token).collect();
+                sqlx::query("UPDATE chunks SET visibility = $2 WHERE id = $1")
+                    .bind(chunk_id)
+                    .bind(&new_vis)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+
+                // One forensic audit row per CURRENT rewritten chunk (confidentiality
+                // echoed unchanged both sides — a revoke never touches the class).
+                if is_current {
+                    sqlx::query(
+                        "INSERT INTO chunk_acl_audit
+                            (id, tenant_id, source, document_id, seq, chunk_id,
+                             old_visibility, new_visibility, old_confidentiality,
+                             new_confidentiality, reason, acl_provenance, changed_by)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    )
+                    .bind(Uuid::now_v7())
+                    .bind(tenant)
+                    .bind(&source)
+                    .bind(&document_id)
+                    .bind(seq)
+                    .bind(chunk_id)
+                    .bind(&old_vis)
+                    .bind(&new_vis)
+                    .bind(conf)
+                    .bind(conf)
+                    .bind(reason.as_str())
+                    .bind(AclProvenance::AdminAssigned.as_str())
+                    .bind(changed_by)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                }
+
+                last_id = Some(chunk_id);
+            }
+
+            tx.commit().await.map_err(db_err)?;
+
+            // If the batch was short, the token is fully swept.
+            if (rows.len() as i64) < SWEEP_BATCH {
+                break;
+            }
+        }
+
+        Ok(swept_documents.max(0) as u64)
     }
 
     /// The ONE L0 episode insert path (SPEC §8a): every episode row — agent

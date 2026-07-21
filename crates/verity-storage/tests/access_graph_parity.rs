@@ -19,7 +19,7 @@ use sqlx::Row;
 
 use verity_core::adapter::StorageAdapter;
 use verity_core::types::*;
-use verity_storage::{ObjectSelector, PostgresAdapter};
+use verity_storage::{AclCorrectionReason, ObjectSelector, PostgresAdapter};
 
 async fn setup() -> (PostgresAdapter, TenantId) {
     let dsn = std::env::var("VERITY_TEST_DSN").expect(
@@ -242,6 +242,112 @@ async fn t1_revoke_in_window_drops_docs() {
         after.total_docs,
         enforcement_docs(&a, tenant, &post, 3).await
     );
+}
+
+/// M2 2a sweep oracle: the chunk-visibility sweep (`retract_token_from_chunks`)
+/// strips JUST the revoked token from every carrying chunk — the doc granted ONLY
+/// by that token vanishes from the enforcement pre-filter, a co-granted doc keeps
+/// its OTHER grant, an audit row is written per swept current chunk, and the
+/// value-history carve-out holds (a superseded row cannot resurface the token via
+/// `?as_of=`). Fail-closed direction: the swept token never re-admits a chunk.
+#[tokio::test]
+async fn m2a_sweep_retracts_token_and_audits_preserving_other_grants() {
+    let (a, tenant) = setup().await;
+    // 10 = Alice's DIRECT-grant token (T_A); 11 = Bob's (T_B).
+    seed_chunk(
+        &a,
+        tenant,
+        "d/alice-only",
+        "gdrive",
+        vec![10],
+        Confidentiality::Internal,
+        AclProvenance::Mirrored,
+    )
+    .await;
+    seed_chunk(
+        &a,
+        tenant,
+        "d/shared",
+        "gdrive",
+        vec![10, 11],
+        Confidentiality::Internal,
+        AclProvenance::Mirrored,
+    )
+    .await;
+    seed_chunk(
+        &a,
+        tenant,
+        "d/bob-only",
+        "gdrive",
+        vec![11],
+        Confidentiality::Internal,
+        AclProvenance::Mirrored,
+    )
+    .await;
+
+    // Before: {10} sees both alice-only and shared.
+    assert_eq!(enforcement_docs(&a, tenant, &[10], 3).await, 2);
+
+    let swept = a
+        .retract_token_from_chunks(
+            tenant,
+            10,
+            AclCorrectionReason::PrincipalRevoke,
+            "admin:test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(swept, 2, "alice-only + shared carried token 10");
+
+    // After: token 10 admits NOTHING (alice-only blanked to {}, shared -> {11}).
+    assert_eq!(
+        enforcement_docs(&a, tenant, &[10], 3).await,
+        0,
+        "revoked token re-admits no chunk"
+    );
+    // Bob (11) is UNAFFECTED: still sees shared + bob-only.
+    assert_eq!(enforcement_docs(&a, tenant, &[11], 3).await, 2);
+
+    // No LIVE chunk row still carries token 10 (current + superseded stripped).
+    let residual: i64 = sqlx::query(
+        "SELECT count(*)::bigint AS n FROM chunks
+          WHERE tenant_id = $1 AND visibility @> ARRAY[10]::int[]",
+    )
+    .bind(tenant)
+    .fetch_one(a.pool())
+    .await
+    .unwrap()
+    .try_get("n")
+    .unwrap();
+    assert_eq!(
+        residual, 0,
+        "value-history carve-out: no row retains the token"
+    );
+
+    // Audit trail: one principal_revoke row per swept current chunk.
+    let audited: i64 = sqlx::query(
+        "SELECT count(*)::bigint AS n FROM chunk_acl_audit
+          WHERE tenant_id = $1 AND reason = 'principal_revoke'",
+    )
+    .bind(tenant)
+    .fetch_one(a.pool())
+    .await
+    .unwrap()
+    .try_get("n")
+    .unwrap();
+    assert_eq!(audited, 2, "one audit row per swept current chunk");
+
+    // Idempotent re-sweep of an already-swept token touches nothing.
+    let again = a
+        .retract_token_from_chunks(
+            tenant,
+            10,
+            AclCorrectionReason::PrincipalRevoke,
+            "admin:test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, 0);
 }
 
 #[tokio::test]

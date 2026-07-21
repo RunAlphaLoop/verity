@@ -1746,6 +1746,15 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/principals",
             post(admin_principals).get(admin_list_principals),
         )
+        // DIRECT-GRANT REVOCATION PLANE (M2 2a). Deprovision a human principal:
+        // durably (INDEFINITELY) revoke `user:<verified-email>` and sweep the
+        // residual token out of every materialized chunk. `require`-gated (the
+        // security release gate — no dev-open), unlike the group routes.
+        .route("/v1/admin/principals/revoke", post(admin_principal_revoke))
+        .route(
+            "/v1/admin/principals/reinstate",
+            post(admin_principal_reinstate),
+        )
         .route("/v1/admin/rebac-watch", get(rebac_watch::admin_status))
         // "What's running" — observed infrastructure-plane status for the
         // console System panel (admin-gated like every other /v1/admin read).
@@ -2037,7 +2046,38 @@ async fn open_scope(
                     ));
                 }
             };
-            let mut principal_strings = vec![subject.clone()];
+            // MINT-TIME ACTIVE-GATE (M2 2a). Resolve the subject's own token
+            // FIRST and, if that principal is DURABLY revoked (deprovisioned),
+            // OMIT the self-token from the minted scope entirely — a
+            // re-provisioned/reused email must not inherit the old human's
+            // DIRECT grants. Groups stay: M1's membership-delete path owns
+            // group-token revocation, and a still-active group grant is
+            // legitimate for whoever is currently in the group. This is a cheap
+            // durable-set lookup at MINT (not on the read path — invariant b),
+            // fail-closed: a lookup error omits the self-token (over-hide).
+            let self_token = upsert_principal_tokens(
+                state.pool(),
+                req.tenant_id,
+                std::slice::from_ref(&subject),
+            )
+            .await?[0]
+                .1;
+            let subject_revoked = match state
+                .revocations
+                .revoked_set(state.pool(), req.tenant_id)
+                .await
+            {
+                Ok(revoked) => revoked.contains(&self_token),
+                // Fail closed: if the durable set can't be read, treat the
+                // subject as revoked and drop the self-token rather than risk
+                // minting a deprovisioned principal's own powers.
+                Err(_) => true,
+            };
+            let mut principal_strings = if subject_revoked {
+                Vec::new()
+            } else {
+                vec![subject.clone()]
+            };
             principal_strings.extend(groups);
             let tokens: Vec<PrincipalToken> =
                 upsert_principal_tokens(state.pool(), req.tenant_id, &principal_strings)
@@ -4545,12 +4585,25 @@ async fn admin_access_subject(
         resolved.iter().cloned().collect();
     let subject_resolved = token_of.contains_key(&q.subject) || !groups.is_empty();
 
+    // DURABLE (indefinite) revoked-principal set — the same set scope_for /
+    // RevocationPlane::subtract consults with NO time bound (revocation.rs). Fetch
+    // it before the subject node so the graph reflects a deprovisioned principal
+    // as revoked and matches enforcement.
+    let durable_revoked = state
+        .revocations
+        .revoked_set(state.pool(), q.tenant_id)
+        .await?;
+    let subject_durably_revoked = token_of
+        .get(&q.subject)
+        .is_some_and(|t| durable_revoked.contains(t));
+
     // Subject node.
     nodes.push(serde_json::json!({
         "id": q.subject,
         "kind": subject_kind.object_type(),
         "label": subject_name,
         "token": token_of.get(&q.subject),
+        "durably_revoked": subject_durably_revoked,
     }));
     // Group nodes + stepwise edges (subject → group; group → ancestor group).
     // Bounded to CLOSURE_NODE_CAP; beyond it we collapse and flag.
@@ -4582,8 +4635,15 @@ async fn admin_access_subject(
         .windowed_revoked_tokens(q.tenant_id, state.revocations.window_secs())
         .await
         .map_err(storage_status)?;
+    // `durable_revoked` (fetched above for the subject node) is the DURABLE
+    // (indefinite) revoked-principal set — scope_for / RevocationPlane::subtract
+    // drops these tokens for every handle with NO time bound (revocation.rs).
+    // Without this the graph over-reports a deprovisioned principal's access once
+    // the ~window lapses (its self-token would re-appear), diverging from
+    // enforcement. Union both into the retain filter.
     let revocation_window_active = tokens.iter().any(|t| revoked.contains(t));
-    tokens.retain(|t| !revoked.contains(t));
+    let durable_revocation_active = tokens.iter().any(|t| durable_revoked.contains(t));
+    tokens.retain(|t| !revoked.contains(t) && !durable_revoked.contains(t));
 
     // 4. Corpus aggregate (3× GROUP BY + total) over the post-revocation token
     //    set, with the enforcement pre-filter predicate. Statement-timeout
@@ -4726,6 +4786,10 @@ async fn admin_access_subject(
             "approximate_counts": approximate_counts,
             "closure_truncated": closure_truncated,
             "revocation_window_active": revocation_window_active,
+            // The subject (or a closure principal) is in the DURABLE revoked set
+            // — its self/group token is subtracted INDEFINITELY, matching
+            // scope_for/subtract. Distinct from the windowed flag above.
+            "durable_revocation_active": durable_revocation_active,
         },
     })))
 }
@@ -5035,6 +5099,150 @@ async fn admin_group_remove(
         "tombstones": tombstones,
         "revoked_principals": lost_tokens.iter().map(|(p, _)| p).collect::<Vec<_>>(),
         "affected_members": affected,
+    })))
+}
+
+/// Request body for the M2 2a principal revoke/reinstate routes: a single
+/// canonical human principal `user:<verified-email>`.
+#[derive(Deserialize)]
+struct PrincipalRevokeRequest {
+    tenant_id: TenantId,
+    /// Canonical `user:<verified-email>` — a group principal is rejected (422);
+    /// group-membership revocation is the separate M1 `/v1/admin/groups` route.
+    principal: String,
+}
+
+/// Resolve+validate a revoke/reinstate request into its `(user-principal,
+/// token)`. Rejects a non-`user:` principal (422) and, for reinstate, an
+/// as-yet-unmaterialized principal (nothing was ever granted, so nothing to
+/// reinstate). Shared by both handlers.
+fn require_user_principal(principal: &str) -> HandlerResult<()> {
+    match rebac::parse_principal(principal) {
+        Some((rebac::PrincipalKind::User, _)) => Ok(()),
+        _ => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "principal must be a user principal: \"user:<verified-email>\" \
+             (group-membership revocation is /v1/admin/groups)"
+                .into(),
+        )),
+    }
+}
+
+/// POST /v1/admin/principals/revoke (admin, `require`-gated — the security
+/// release gate, NO dev-open). Permanently deprovisions a human principal:
+///
+///  1. Writes the DURABLE (indefinite) `revoked_principal` record FIRST — the
+///     fail-closed gate. From this instant the read-path subtraction and the
+///     mint active-gate deny the principal's own token forever (past the ~13h
+///     M1 tombstone window), on every handle regardless of `issued_at`.
+///  2. THEN fires the chunk-visibility SWEEP: strips the residual token out of
+///     every materialized chunk (current + superseded, value-history carve-out
+///     preserved), leaving a `chunk_acl_audit` trail so a later re-vouched human
+///     at the SAME email inherits nothing (email-reuse safety, invalidate-don't
+///     -delete).
+///
+/// Durable-first ordering (mirrors `admin_group_remove`): if the sweep fails
+/// AFTER the record commits, reads are ALREADY denied by (1) — over-hide, never
+/// under-hide. Idempotent: re-revoking clears any prior `reinstated_at`.
+async fn admin_principal_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PrincipalRevokeRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    require_user_principal(&req.principal)?;
+
+    // Materialize the principal's token (allocates one if it was never granted —
+    // still correct: the durable record then denies any FUTURE grant to it).
+    let token = upsert_principal_tokens(
+        state.pool(),
+        req.tenant_id,
+        std::slice::from_ref(&req.principal),
+    )
+    .await?[0]
+        .1;
+
+    // 1. DURABLE record FIRST — the authoritative, indefinite fail-closed gate.
+    state
+        .revocations
+        .revoke_principal(state.pool(), req.tenant_id, &req.principal, token)
+        .await?;
+
+    // 2. THEN the belt-and-suspenders materialized sweep. A failure here returns
+    //    5xx (admin retries) but reads are already denied by (1).
+    let swept_documents = state
+        .storage
+        .inner()
+        .retract_token_from_chunks(
+            req.tenant_id,
+            token,
+            verity_storage::AclCorrectionReason::PrincipalRevoke,
+            &req.principal,
+        )
+        .await
+        .map_err(storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "revoked": true,
+        "principal": req.principal,
+        "token": token,
+        "swept_documents": swept_documents,
+    })))
+}
+
+/// POST /v1/admin/principals/reinstate (admin, `require`-gated). Clears the
+/// durable revocation (invalidate-don't-delete: sets `reinstated_at`) so NEW
+/// grants to `user:<verified-email>` resolve again and the mint active-gate
+/// stops omitting its self-token.
+///
+/// HONEST LIMITATION: already-swept chunks stay invalidated until re-ingest — a
+/// reinstate does NOT resurrect the retracted materialized token. This is
+/// deliberate: the swept chunks lost the token on purpose (email-reuse safety),
+/// and 2a does not re-grant historical direct grants.
+async fn admin_principal_reinstate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PrincipalRevokeRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    require_user_principal(&req.principal)?;
+
+    // If the principal never materialized a token it can't be revoked — nothing
+    // to reinstate (was_revoked = false). Don't allocate one gratuitously.
+    let existing: Option<i32> =
+        sqlx::query_scalar("SELECT token FROM principals WHERE tenant_id = $1 AND principal = $2")
+            .bind(req.tenant_id)
+            .bind(&req.principal)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(internal)?;
+
+    let was_revoked = match existing {
+        Some(token) => {
+            state
+                .revocations
+                .reinstate_principal(state.pool(), req.tenant_id, token)
+                .await?
+        }
+        None => false,
+    };
+
+    Ok(Json(serde_json::json!({
+        "reinstated": true,
+        "principal": req.principal,
+        "was_revoked": was_revoked,
     })))
 }
 
