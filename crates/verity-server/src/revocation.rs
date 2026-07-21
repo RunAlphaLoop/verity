@@ -1,5 +1,11 @@
-//! Revocation tombstones (SPEC §7b rule 3, v0.1 contract) and the
-//! restricted-class recheck (SPEC §7b rule 4, v0.1 approximation).
+//! Revocation tombstones (SPEC §7b rule 3, v0.1 contract).
+//!
+//! M3 removed the per-read restricted-class recheck (SPEC §7b rule 4): Restricted
+//! (tier-3) now rides the SAME materialized `visibility && (baked − tombstones)`
+//! pre-filter as every tier, fenced on watch-staleness, with zero live ReBAC on
+//! the read path. The recheck existed only to compensate for stale tokens before
+//! the durable-tombstone freshness engine (below) made the materialized set
+//! trustworthy on its own.
 //!
 //! ## The v0.1 revocation contract, stated honestly
 //!
@@ -56,16 +62,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use verity_core::types::{ChunkId, Confidentiality, PrincipalToken, RecallHit, TenantId};
+use verity_core::types::{PrincipalToken, TenantId};
 
-use crate::rebac::Rebac;
-use crate::scope::{ScopePayload, MAX_TTL_SECONDS};
-use crate::{internal, AppState, HandlerResult};
+use crate::scope::MAX_TTL_SECONDS;
+use crate::{internal, HandlerResult};
 
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const DEFAULT_WINDOW_SECS: i64 = 300;
@@ -356,135 +360,6 @@ impl RevocationPlane {
         self.cache.invalidate(&tenant);
         Ok(inserted)
     }
-}
-
-// ---------- restricted-class recheck (SPEC §7b rule 4, v0.1 approximation) ----------
-
-/// Enforce the restricted-class contract on a hit list (recall and the
-/// latest_chunks/brief path):
-///
-/// - ReBAC enabled: each restricted hit's visibility tokens must still
-///   overlap the caller's CURRENT resolved set — the subject's groups are
-///   re-resolved fresh from SpiceDB (bounded k ≤ 100 hits) and in-window
-///   revocations subtracted. This approximates the §7b live BatchCheck until
-///   per-item tuples exist. Handles minted from caller-supplied principals
-///   (no subject) recheck against their minted set minus revocations.
-/// - ReBAC disabled: restricted hits are DROPPED unless
-///   `VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC=1` — fail closed: without an
-///   authorization engine nobody gets pricing-class content by default.
-///
-/// Any resolution failure drops the restricted hits (never the whole
-/// response, never a permissive pass-through).
-pub(crate) async fn enforce_restricted(
-    state: &AppState,
-    payload: &ScopePayload,
-    hits: Vec<RecallHit>,
-) -> HandlerResult<Vec<RecallHit>> {
-    // Scopes below the Restricted ceiling can never have restricted hits —
-    // the index pre-filter already excluded them.
-    if hits.is_empty() || payload.max_confidentiality < Confidentiality::Restricted {
-        return Ok(hits);
-    }
-    let ids: Vec<ChunkId> = hits.iter().map(|h| h.chunk_id).collect();
-    let restricted = restricted_visibility(state.pool(), &ids).await?;
-    if restricted.is_empty() {
-        return Ok(hits);
-    }
-
-    let current: Option<Vec<PrincipalToken>> = match &state.rebac {
-        None => {
-            if state.allow_restricted_without_rebac {
-                tracing::warn!(
-                    "serving restricted-class hits without ReBAC (VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC=1)"
-                );
-                return Ok(hits);
-            }
-            None // drop all restricted hits
-        }
-        Some(rebac) => match current_token_set(state, rebac, payload).await {
-            Ok(tokens) => Some(tokens),
-            Err(e) => {
-                tracing::warn!(
-                    "restricted recheck failed, dropping restricted hits: {}",
-                    e.1
-                );
-                None
-            }
-        },
-    };
-
-    Ok(hits
-        .into_iter()
-        .filter(
-            |h| match restricted.iter().find(|(id, _)| *id == h.chunk_id) {
-                None => true, // not restricted
-                Some((_, visibility)) => match &current {
-                    None => false,
-                    Some(current) => visibility.iter().any(|t| current.contains(t)),
-                },
-            },
-        )
-        .collect())
-}
-
-/// (chunk_id, visibility) for the restricted subset of the given hits.
-async fn restricted_visibility(
-    pool: &PgPool,
-    ids: &[ChunkId],
-) -> HandlerResult<Vec<(ChunkId, Vec<PrincipalToken>)>> {
-    let rows =
-        sqlx::query("SELECT id, visibility FROM chunks WHERE id = ANY($1) AND confidentiality = 3")
-            .bind(ids)
-            .fetch_all(pool)
-            .await
-            .map_err(internal)?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<Uuid, _>("id"), r.get::<Vec<i32>, _>("visibility")))
-        .collect())
-}
-
-/// The caller's CURRENT resolved token set: fresh SpiceDB resolution when the
-/// handle carries a subject, else the minted set; in-window revocations
-/// subtracted either way.
-async fn current_token_set(
-    state: &AppState,
-    rebac: &Rebac,
-    payload: &ScopePayload,
-) -> HandlerResult<Vec<PrincipalToken>> {
-    let tokens = match &payload.subject {
-        Some(subject) => {
-            let (kind, name) = crate::rebac::parse_principal(subject).ok_or((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "scope subject is not a user principal".to_string(),
-            ))?;
-            if kind != crate::rebac::PrincipalKind::User {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "scope subject is not a user principal".to_string(),
-                ));
-            }
-            let mut principals = vec![subject.clone()];
-            principals.extend(
-                rebac
-                    .user_groups(payload.tenant_id, name)
-                    .await
-                    .map_err(internal)?,
-            );
-            crate::upsert_principal_tokens(state.pool(), payload.tenant_id, &principals)
-                .await?
-                .into_iter()
-                .map(|(_, t)| t)
-                .collect()
-        }
-        None => payload.principals.clone(),
-    };
-    // Read-path recheck: use the handle's own mint instant so tombstones
-    // recorded after this handle was minted are subtracted for its full life.
-    state
-        .revocations
-        .subtract(state.pool(), payload.tenant_id, &tokens, payload.issued_at)
-        .await
 }
 
 #[cfg(test)]

@@ -56,7 +56,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::audit::spawn_audit;
-use crate::revocation;
 use crate::scope::ScopePayload;
 use crate::AppState;
 use verity_core::adapter::StorageAdapter;
@@ -679,11 +678,9 @@ async fn execute_search(
         .map_err(crate::internal)
         .map_err(err_internal)?;
     let read_ms = elapsed_ms(t_read);
-    let t_enforce = Instant::now();
-    let hits = revocation::enforce_restricted(state, payload, hits)
-        .await
-        .map_err(err_internal)?;
-    let enforce_ms = elapsed_ms(t_enforce);
+    // M3: Restricted (tier-3) is filtered by the same materialized scope
+    // pre-filter as every tier — no per-hit recheck step remains.
+    let enforce_ms = 0.0;
     spawn_audit(
         state,
         payload,

@@ -505,6 +505,17 @@ impl AppState {
     /// here so already-minted handles pick up revocations immediately.
     async fn scope_for(&self, payload: &ScopePayload) -> HandlerResult<Scope> {
         let mut scope = payload.to_scope();
+        // M3: without a permissions engine there is no authority to enforce
+        // Restricted (tier-3), so clamp the read ceiling to Confidential — no
+        // tier-3 hit is ever returned. Applied at THIS read-path choke so it covers
+        // EVERY handle, including a direct `minter.mint` (dev-mode) that bypasses
+        // `open_scope`'s mint-time clamp. Pure: a ceiling comparison, no live ReBAC.
+        // Overridable via VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC (fail closed by
+        // default). Replaces the deleted read-time `enforce_restricted` no-ReBAC drop.
+        if self.rebac.is_none() && !self.allow_restricted_without_rebac {
+            scope.max_confidentiality =
+                scope.max_confidentiality.min(Confidentiality::Confidential);
+        }
         // M1 durable-tombstone model (the read-path choke point): subtract every
         // token whose revocation tombstone is at-or-after this handle's mint
         // instant (`issued_at`), for the handle's FULL ≤12h life — NOT a fixed
@@ -527,10 +538,11 @@ impl AppState {
         // stream; if that stream is degraded/lagging, the materialized set may
         // be stale. The fence keys off the LOCAL cursor-lag gauge (an in-process
         // atomic — no DB query, no live ReBAC on the normal path) and, only when
-        // it trips, forces tier-≤2 into live re-resolution (the ONE place a live
-        // ReBAC call is allowed, on the fenced path only). Tier-3 (Restricted)
-        // already re-resolves via `enforce_restricted` regardless. Fail closed:
-        // if we cannot re-resolve, tier-≤2 principals are emptied (over-hide).
+        // it trips, forces live re-resolution (the ONE place a live ReBAC call is
+        // allowed, on the fenced path only) for ALL tiers — M3 folded Restricted
+        // (tier-3) onto this same materialized path, so it too rides the fence
+        // instead of a per-read recheck. Fail closed: if we cannot re-resolve,
+        // principals are emptied (over-hide).
         self.fence_stale_scope(payload, &mut scope).await?;
         Ok(scope)
     }
@@ -543,20 +555,15 @@ impl AppState {
     /// live and in-window/durable revocations re-subtracted, so a token the
     /// caller lost out-of-band is dropped even before its tombstone reaches us.
     /// Fail closed: a subject-less handle (or any resolution failure) empties the
-    /// principal set for tier-≤2, hiding everything rather than trusting a stale
-    /// materialized set. Restricted (tier-3) is untouched here — `recall`'s
-    /// `enforce_restricted` re-resolves it on every read already.
+    /// principal set, hiding everything rather than trusting a stale materialized
+    /// set. Applies to ALL tiers including Restricted (M3): tier-3 no longer does a
+    /// per-read live recheck — it rides the same materialized set (baked − durable
+    /// tombstones) and this fence is its ONLY live-ReBAC path, on the stale branch.
     async fn fence_stale_scope(
         &self,
         payload: &ScopePayload,
         scope: &mut Scope,
     ) -> HandlerResult<()> {
-        // Only tier-≤2 rides the materialized set without a live recheck. A
-        // Restricted-ceiling scope is rechecked per hit downstream, so the fence
-        // adds nothing there and we skip the live call.
-        if scope.max_confidentiality > Confidentiality::Confidential {
-            return Ok(());
-        }
         if !self.watch.is_stale(self.watch_staleness_fence_secs) {
             return Ok(());
         }
@@ -2013,6 +2020,15 @@ async fn open_scope(
             ));
         }
     }
+    // M3: without a permissions engine there is no authority to enforce
+    // Restricted (tier-3) content, so clamp the ceiling to Confidential AT MINT —
+    // no tier-3 hit is ever returned and recall stays pure. This replaces the
+    // deleted read-time `enforce_restricted` no-ReBAC drop; the same
+    // `VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC` override lifts it (fail closed by
+    // default: nobody gets pricing-class content without an authz engine).
+    if state.rebac.is_none() && !state.allow_restricted_without_rebac {
+        max_confidentiality = max_confidentiality.min(Confidentiality::Confidential);
+    }
     // Identity plane (task 10): with ReBAC enabled, a `subject` is resolved
     // server-side into the user's principal token plus its transitive group
     // closure. Self-asserted principals are rejected alongside a subject —
@@ -2273,10 +2289,11 @@ async fn recall(
         k: req.k.min(100),
     };
     let summary = query.text.clone();
+    // M3: no per-hit recheck. Restricted (tier-3) is filtered by the SAME
+    // materialized `visibility && (baked − tombstones)` pre-filter as every tier
+    // (`scope_for` above already subtracted durable revocations and fenced on
+    // watch-staleness) — the read path is now purely index-served for all tiers.
     let hits = state.storage.recall(query).await.map_err(internal)?;
-    // Restricted-class recheck (SPEC §7b rule 4, v0.1 approximation): live
-    // re-resolution when ReBAC is on, fail-closed drop when it is off.
-    let hits = revocation::enforce_restricted(&state, &payload, hits).await?;
     spawn_audit(
         &state,
         &payload,
@@ -5980,9 +5997,8 @@ async fn brief(
         })
     );
     let memory = memory.map_err(internal)?;
-    // Restricted-class recheck applies to the brief's memory leg exactly as
-    // to recall (SPEC §7b rule 4).
-    let memory = revocation::enforce_restricted(&state, &payload, memory).await?;
+    // M3: the brief's memory leg is filtered by the same materialized scope
+    // pre-filter as recall — no per-hit Restricted recheck.
     let actions = actions.map_err(internal)?;
 
     // Derived-scope inheritance gate on the cached summary (SPEC §2): the

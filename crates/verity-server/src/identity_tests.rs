@@ -558,6 +558,62 @@ async fn restricted_recheck_follows_live_membership() {
 /// each recall result is checked equal to the oracle's admit set. Deterministic
 /// (no seed can hide a regression) and non-skippable (hard-errors without
 /// DSN+SpiceDB).
+/// M3 load-bearing guard: because Restricted (tier-3) now rides the SAME
+/// materialized set as tier-≤2 (no per-read live recheck), it MUST also enter the
+/// staleness fence. A subject-less tier-3 handle serves its doc while the watch is
+/// fresh (materialized set trusted), but is EMPTIED once the watch goes stale
+/// (fail closed). If a regression re-exempts tier-3 from `fence_stale_scope`, the
+/// stale read would still serve the doc and this fails — the tripwire on the one
+/// change that makes deleting the recheck safe.
+#[tokio::test]
+async fn restricted_tier3_enters_the_staleness_fence() {
+    let rebac = require_rebac("restricted_tier3_enters_the_staleness_fence");
+    rebac.ensure_schema().await.expect("schema");
+    let (state, tenant) = test_state(Some(rebac), false).await;
+    index_chunk(
+        &state,
+        tenant,
+        "doc-restricted",
+        "the obsidian pricing dossier",
+        vec![41],
+        Confidentiality::Restricted,
+    )
+    .await;
+    // Dev-mode subject-less handle at the Restricted ceiling (principals baked).
+    let (handle, _) = state.minter.mint(
+        crate::scope::ScopePayload {
+            tenant_id: tenant,
+            principals: vec![41],
+            entity_scope: vec![],
+            max_confidentiality: Confidentiality::Restricted,
+            actor_sub: None,
+            actor_azp: None,
+            subject: None,
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+        },
+        300,
+    );
+    // Watch fresh (disabled) → materialized set is trusted → tier-3 doc served.
+    let fresh = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    assert!(
+        fresh.contains(&"doc-restricted".to_string()),
+        "fresh watch serves tier-3 from the materialized set: {fresh:?}"
+    );
+    // Watch enabled + never advanced → STALE → fence fires → subject-less handle
+    // is emptied (fail closed), so the tier-3 doc is dropped WITHOUT any recheck.
+    state.watch.set_enabled(true);
+    let stale = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    assert!(
+        !stale.contains(&"doc-restricted".to_string()),
+        "a stale watch must fence tier-3 (fail closed), not serve it: {stale:?}"
+    );
+}
+
 #[tokio::test]
 async fn restricted_tier3_and_post_revocation_vs_oracle() {
     let rebac = require_rebac("restricted_tier3_and_post_revocation_vs_oracle");
