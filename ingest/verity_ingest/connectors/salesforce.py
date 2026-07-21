@@ -43,15 +43,23 @@ What it does, per poll cycle:
 - For Accounts changed in the window it fetches ``AccountShare`` rows and
   collects each row's RAW ``UserOrGroupId`` (005 User / 00G Group) on the event
   as ``share_principals`` (Accounts only; empty on Contact/Opportunity).
-- It CROSSWALKS those raw ids to cross-source principal STRINGS through a roster
-  built from the ``User`` and ``GroupMember`` objects: a 005 → ``user:<email
-  .lower()>`` (byte-identical to what gdrive/gmail/hubspot emit for the same
-  human — join on ``User.Email``, never ``Username``); a 00G → the stable
-  ``group:salesforce-group-<id>``. Nested ``GroupMember`` edges (a member may
-  be another 00G) are mirrored into SpiceDB via ``POST /v1/admin/groups`` — the
-  runner syncs them FIRST so a subject resolves through the group the instant
-  group-scoped facts land. The expansion is breadth-first and cycle-safe.
-- The resolved strings are materialized to int tokens by the shared sink and
+- It CROSSWALKS those raw ids to cross-source principals through a roster built
+  from the ``User`` and ``GroupMember`` objects. M2 2b — a 005 User resolves via
+  its ``FederationIdentifier`` (the SSO subject), matched server-side against a
+  directory-declared ``principal_sso_alias`` → the ONE canonical
+  ``user:<primaryEmail.lower()>`` the directory vouched. The join key is
+  ``FederationIdentifier``, NEVER ``User.Email``: a divergent login
+  (``User.Email = alice.n@corp.sf`` vs a vouched primary ``alice@corp.com``)
+  must not be invisible or welded to the wrong human. A 005 with no
+  ``FederationIdentifier`` — or no alias match, or ``IsActive=false`` — confers
+  NOTHING (over-hide; ``email_fallback`` is OFF for SF, so it is never rescued
+  by ``User.Email`` — the admin must publish an ``admin_explicit`` crosswalk
+  link). A 00G → the stable ``group:salesforce-group-<id>``. Nested
+  ``GroupMember`` edges (a member may be another 00G) are mirrored into SpiceDB
+  via ``POST /v1/admin/groups`` — the runner syncs them FIRST so a subject
+  resolves through the group the instant group-scoped facts land. The expansion
+  is breadth-first and cycle-safe.
+- The resolved principals are materialized to int tokens by the shared sink and
   stamped as an INLINE ``verity_acl`` (``acl_provenance: approximated``). The
   write-path choke point applies an inline block with REPLACE semantics (it
   wins over the connector-bound admin ``--visibility`` policy, it does not union
@@ -92,6 +100,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import httpx
 
+from verity_ingest import crosswalk
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.hubspot import VerityDebeziumSink
 from verity_ingest.credentials import ClientCredentials, Credential, request_with_auth_retry
@@ -116,6 +125,14 @@ SHARE_ACL_PROVENANCE = "approximated"
 USER_KEY_PREFIX = "005"
 GROUP_KEY_PREFIX = "00G"
 
+#: Marker prefix for a group-member 005's FederationIdentifier SSO subject in the
+#: ``group_edges`` map (M2 2b). A ``fed:<subject>`` member is NOT a canonical
+#: principal — the sink resolves it through the registry ``emails`` gate to the
+#: canonical ``user:<primaryEmail>`` before mirroring the group edge, so a group
+#: member is never welded to a blind ``user:<sourceEmail>``. Shared with the sink
+#: (defined in ``verity_ingest.crosswalk``).
+FEDERATION_SUBJECT_PREFIX = crosswalk.FEDERATION_MEMBER_PREFIX
+
 #: SOQL ``IN (...)`` chunk size for AccountShare / roster lookups (keeps each
 #: query comfortably under the SOQL statement-length limit).
 SHARE_QUERY_CHUNK = 200
@@ -132,14 +149,6 @@ DEGRADED_ACL_SIGNAL = "verity.backfill.degraded_acl"
 GROUP_EXPANSION_MAX = 5000
 
 
-def user_principal(email: str) -> str:
-    """The record-owner principal. Lowercased ``user:<email>`` so it is the SAME
-    SpiceDB object a Gmail/Drive/HubSpot subject resolves to — one human is one
-    identity across every source. Join on ``User.Email`` (lowercased), NEVER
-    ``Username`` (email-formatted but a distinct, org-unique field)."""
-    return f"user:{email.lower()}"
-
-
 def group_principal(group_id: str) -> str:
     """The group-visibility principal, a SpiceDB group. Stable for ALL Salesforce
     Group ``Type`` values (Regular, Queue, Role, RoleAndSubordinates, …) — a
@@ -150,11 +159,20 @@ def group_principal(group_id: str) -> str:
 
 @dataclass(frozen=True)
 class SalesforceUserInfo:
-    """One Salesforce ``User`` (005) reduced to the crosswalk join key: the
-    lowercased login email. A user with no ``Email`` (integration/inactive)
-    yields no roster entry and its id is dropped (over-hide, fail closed)."""
+    """One Salesforce ``User`` (005) reduced to what identity resolution needs.
+
+    M2 2b — the join key is ``FederationIdentifier`` (the SSO subject), matched
+    against a declared ``principal_sso_alias`` server-side, NEVER ``User.Email``:
+    a divergent login (``User.Email = alice.n@corp.sf`` while the directory-vouched
+    primary is ``alice@corp.com``) would otherwise be invisible or, worse, welded
+    to the wrong human. ``email`` is retained for observability/logging only — it
+    is never a resolution key. A user with no ``FederationIdentifier`` (or
+    ``IsActive=false``) yields nothing to resolve → dropped (over-hide, fail
+    closed); no ``User.Email`` fallback (``email_fallback`` is OFF for SF)."""
 
     email: str
+    federation_identifier: str | None = None
+    is_active: bool = True
 
 #: Default fields per sobject (Id and LastModifiedDate are always added).
 #: Override via the ``fields`` constructor arg.
@@ -176,13 +194,19 @@ class SalesforceFactEvent(FactEvent):
     Visibility precedence, per record:
     - ``share_principals`` — the RAW ``005``/``00G`` AccountShare ids for this
       record, pre-resolution (Accounts only; empty elsewhere).
-    - ``record_principals`` — those share ids crosswalked to principal STRINGS
-      (``user:<email>`` + ``group:salesforce-group-<id>``), or ``None`` when
-      unowned / every id dropped. The shared sink reads this to resolve tokens.
-    - ``record_visibility`` — those strings resolved to int tokens (filled by
-      the sink via ``/v1/admin/principals``), UNIONed with ``visibility_policy``
-      (``union_policy_floor`` is True — see below). When set, the envelope
-      carries an inline ``verity_acl`` with ``acl_provenance: approximated``.
+    - ``record_principals`` — the already-canonical group strings this record's
+      access mirrors (``group:salesforce-group-<id>``), or ``None`` when unowned.
+      The shared sink resolves these via the ``principals`` field.
+    - ``record_owner_emails`` — M2 2b: the ``FederationIdentifier`` SSO subjects
+      of the record's 005 owners. The shared sink resolves these through the
+      registry ``emails`` gate (``idp_subject``/``principal_sso_alias`` match) to
+      the canonical ``user:<primaryEmail>`` token — NEVER ``User.Email``. An
+      unvouched/unmatched subject is dropped (fail closed).
+    - ``record_visibility`` — the union of the resolved group + owner tokens
+      (filled by the sink via ``/v1/admin/principals``), UNIONed with
+      ``visibility_policy`` (``union_policy_floor`` is True — see below). When
+      set, the envelope carries an inline ``verity_acl`` with
+      ``acl_provenance: approximated``.
     - ``visibility_policy`` — the admin-assigned fallback (``--visibility``).
       The write path applies an inline ``verity_acl`` with REPLACE semantics
       (it wins over the connector-bound policy, no server-side union), and
@@ -195,6 +219,9 @@ class SalesforceFactEvent(FactEvent):
     visibility_policy: list[int]
     share_principals: list[str] = field(default_factory=list)
     record_principals: list[str] | None = None
+    #: M2 2b — the ``FederationIdentifier`` SSO subjects of this record's 005
+    #: owners, resolved through the registry ``emails`` gate (NOT ``User.Email``).
+    record_owner_emails: list[str] | None = None
     record_visibility: list[int] | None = None
     #: Read by the shared sink: because the write path REPLACES the bound admin
     #: policy with any inline ACL (ingest.rs ``or_else``), and AccountShare is a
@@ -362,30 +389,37 @@ class SalesforceConnector(Connector):
     @staticmethod
     def resolve_share_principals(
         share_ids: Iterable[str], users_by_id: Mapping[str, SalesforceUserInfo]
-    ) -> list[str] | None:
-        """Crosswalk raw AccountShare ids → cross-source principal strings.
+    ) -> tuple[list[str] | None, list[str] | None]:
+        """Crosswalk raw AccountShare ids → (group principals, owner subjects).
 
-        ``005`` User → ``user:<email.lower()>`` via the roster (the token is
-        byte-identical to what gdrive/gmail/hubspot emit for the same human); a
-        ``005`` with no roster email is DROPPED (over-hide, fail closed). ``00G``
-        Group → the stable ``group:salesforce-group-<id>`` (mirrored into SpiceDB
-        by :meth:`_fetch_roster`). Deduplicated in id order. Returns ``[] → None``
-        so an unowned / all-dropped record rides the admin ``--visibility`` floor.
+        M2 2b — a ``005`` User resolves NOT to ``user:<email>`` but to its
+        ``FederationIdentifier`` SSO subject, which the shared sink sends through
+        the registry ``emails`` gate (``idp_subject``/``principal_sso_alias``
+        match → the canonical ``user:<primaryEmail>`` token). A ``005`` with no
+        ``FederationIdentifier`` — or ``IsActive=false``, or absent from the
+        roster — is DROPPED (over-hide, fail closed; ``User.Email`` is NEVER a
+        fallback for SF). A ``00G`` Group → the already-canonical
+        ``group:salesforce-group-<id>`` string (mirrored into SpiceDB by
+        :meth:`_fetch_roster`), resolved via the ``principals`` field.
+
+        Returns ``(groups, owner_emails)`` — each ``[] → None`` — so an unowned /
+        all-dropped record rides the admin ``--visibility`` floor.
         """
-        principals: list[str] = []
+        groups: list[str] = []
+        owner_emails: list[str] = []
         for share_id in share_ids:
             if share_id.startswith(USER_KEY_PREFIX):
                 info = users_by_id.get(share_id)
-                if info is None or not info.email:
-                    continue  # unresolvable 005 → dropped (fail closed)
-                principal = user_principal(info.email)
+                if info is None or not info.is_active or not info.federation_identifier:
+                    continue  # unresolvable 005 (no SSO subject / inactive) → dropped
+                subject = info.federation_identifier.strip().lower()
+                if subject and subject not in owner_emails:
+                    owner_emails.append(subject)
             elif share_id.startswith(GROUP_KEY_PREFIX):
                 principal = group_principal(share_id)
-            else:
-                continue
-            if principal not in principals:
-                principals.append(principal)
-        return principals or None
+                if principal not in groups:
+                    groups.append(principal)
+        return (groups or None, owner_emails or None)
 
     # ---------- lanes ----------
 
@@ -468,9 +502,11 @@ class SalesforceConnector(Connector):
                 if not self.roster_degraded:
                     for event in events:
                         if isinstance(event, SalesforceFactEvent) and event.share_principals:
-                            event.record_principals = self.resolve_share_principals(
+                            groups, owner_emails = self.resolve_share_principals(
                                 event.share_principals, users_by_id
                             )
+                            event.record_principals = groups
+                            event.record_owner_emails = owner_emails
         return events, next_cursor
 
     async def full_crawl(self) -> AsyncIterator[FactEvent | DocumentEvent]:
@@ -533,17 +569,20 @@ class SalesforceConnector(Connector):
            OR another ``00G`` Group (a NESTED edge); a child group is itself
            expanded — breadth-first, bounded by a ``seen`` visited-set (cycles
            terminate) and :data:`GROUP_EXPANSION_MAX`.
-        2. ``User`` → ``users_by_id[005] = SalesforceUserInfo(email.lower())``.
-           The query covers the UNION of the share-derived ``user_ids`` AND
-           every ``005`` discovered as a GroupMember — so a user who is ONLY a
-           group member (never a direct AccountShare principal, the common case
-           for group shares) still gets its ``user:<email>`` edge. Join key is
-           ``Email``, NOT ``Username``. A ``005`` with no roster email is
-           dropped (over-hide, fail closed).
+        2. ``User`` → ``users_by_id[005] = SalesforceUserInfo(email,
+           federation_identifier, is_active)``. The query covers the UNION of the
+           share-derived ``user_ids`` AND every ``005`` discovered as a
+           GroupMember — so a user who is ONLY a group member (the common case
+           for group shares) still gets an edge. M2 2b — the join key is
+           ``FederationIdentifier`` (the SSO subject), NOT ``User.Email`` and NOT
+           ``Username``. A ``005`` with no ``FederationIdentifier`` (or inactive)
+           confers nothing (over-hide, fail closed; no ``User.Email`` fallback).
         3. ``group_edges[group:salesforce-group-<parent>]`` is assembled from
            the collected member ids: a ``00G`` member → a nested
-           ``group:salesforce-group-<child>`` edge; a ``005`` member →
-           ``user:<email>`` (dropped if no roster email).
+           ``group:salesforce-group-<child>`` edge; a ``005`` member → its
+           ``fed:<FederationIdentifier>`` subject marker, which the sink
+           canonicalizes through the registry ``emails`` gate before mirroring
+           the edge (dropped if inactive / no SSO subject / no alias match).
 
         A **403** on any roster query means the integration user lacks read on
         that object: degrade to EMPTY roster (every record → admin fallback),
@@ -587,18 +626,33 @@ class SalesforceConnector(Connector):
                                 member_user_ids.add(member_id)
 
             # (2) One User query over the union of share-derived AND group-member
-            # 005 ids — a group-only user still gets its user:<email> edge.
+            # 005 ids — a group-only user still gets its edge. M2 2b: SELECT the
+            # FederationIdentifier SSO subject (the join key) + IsActive; Email is
+            # kept for logging only, Username for the honest "not the join key"
+            # note. A user with no FederationIdentifier / inactive confers nothing.
             all_user_ids = list(dict.fromkeys([*user_ids, *sorted(member_user_ids)]))
             for chunk in _chunks(all_user_ids, SHARE_QUERY_CHUNK):
                 ids = ", ".join(f"'{uid}'" for uid in chunk)
-                soql = f"SELECT Id, Email, IsActive FROM User WHERE Id IN ({ids})"
+                soql = (
+                    "SELECT Id, Email, Username, FederationIdentifier, IsActive "
+                    f"FROM User WHERE Id IN ({ids})"
+                )
                 async for page in self._query_pages(soql):
                     for row in page.get("records", []):
                         email = (row.get("Email") or "").strip().lower()
-                        if email:
-                            users_by_id[str(row["Id"])] = SalesforceUserInfo(email=email)
+                        fed = (row.get("FederationIdentifier") or "").strip().lower() or None
+                        users_by_id[str(row["Id"])] = SalesforceUserInfo(
+                            email=email,
+                            federation_identifier=fed,
+                            is_active=bool(row.get("IsActive", True)),
+                        )
 
             # (3) Resolve member ids → edge principals now that the roster is complete.
+            # A 00G member is an already-canonical nested group. A 005 member is
+            # emitted as its FederationIdentifier SSO subject wrapped as
+            # ``fed:<subject>`` so the sink canonicalizes it through the registry
+            # ``emails`` gate before mirroring the edge (NEVER a blind user:<email>
+            # weld); an inactive / subject-less 005 confers no edge (fail closed).
             for parent, members in raw_members.items():
                 edge = group_edges.setdefault(parent, set())
                 for member_id in members:
@@ -606,8 +660,8 @@ class SalesforceConnector(Connector):
                         edge.add(group_principal(member_id))
                     elif member_id.startswith(USER_KEY_PREFIX):
                         info = users_by_id.get(member_id)
-                        if info is not None and info.email:
-                            edge.add(user_principal(info.email))
+                        if info is not None and info.is_active and info.federation_identifier:
+                            edge.add(f"{FEDERATION_SUBJECT_PREFIX}{info.federation_identifier}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 403:
                 self.roster_degraded = True

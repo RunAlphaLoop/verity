@@ -1321,3 +1321,477 @@ async fn m2a_mint_active_gate_omits_revoked_self_token() {
     .expect("remove alice");
     assert_eq!(removed["deleted"], json!(true));
 }
+
+// ==== M2 2b — CANONICAL-PRINCIPAL REGISTRY + CROSSWALK (end-to-end conformance) ====
+//
+// These are the BUILD #3 release tests: the full ingest → mint → recall
+// acceptance trace and its negatives, proven through the REAL server sink
+// (`admin_principals`) and the crosswalk resolvers — NOT by hand-stamping the
+// canonical token on a chunk (spike trap #4). Every chunk's visibility token is
+// obtained by resolving a SOURCE-LOCAL owner id (Drive grant email / SF
+// FederationIdentifier / HubSpot ownerId) through the crosswalk, then stamping
+// exactly what the resolver returned. If the resolver ever produced a token that
+// differs from the one `open_scope` mints for `user:alice@corp.com`, recall would
+// come up empty — so a passing recall is the disjoint-space proof.
+//
+// Hard-error without DSN is inherited from `test_state`/`test_state_admin`.
+
+/// The source-local owner a connector would emit for a chunk, tagged by the
+/// registry path it resolves through. NO variant carries a canonical string.
+#[allow(clippy::enum_variant_names)]
+enum Owner<'a> {
+    /// Drive grant `emailAddress` / Gmail header address → `resolve_idp_subject`.
+    DriveEmail(&'a str),
+    /// SF `FederationIdentifier` matched against `principal_sso_alias.alias`
+    /// (reuses `resolve_idp_subject`); `User.Email` is NEVER passed.
+    SfFederation(&'a str),
+    /// HubSpot `ownerId` → `resolve_crosswalk` (admin_explicit link).
+    HubspotOwner(&'a str),
+}
+
+/// The NAMED populate that closes spike trap #2 (empty crosswalk): a fixture
+/// gdirectory reconcile writing `canonical_principal` + `principal_sso_alias`
+/// rows + a self `principal_crosswalk (gdirectory,<dir-id>)` — all through the
+/// real B1.4 admin routes. `aliases` are the SSO subjects (SF FederationIdentifier
+/// targets) the admin declared for this human.
+async fn seed_directory_reconcile(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    primary_email: &str,
+    aliases: &[&str],
+) {
+    let canonical = format!("user:{primary_email}");
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "principals": [{ "canonical": canonical, "kind": "user", "idp_subject": primary_email }],
+    }))
+    .expect("canonical shape");
+    let Json(v) =
+        crate::admin_registry_canonical(State(Arc::clone(state)), admin_headers(), Json(req))
+            .await
+            .expect("seed canonical");
+    assert_eq!(
+        v["upserted"].as_array().unwrap().len(),
+        1,
+        "the fixture reconcile registered the canonical (crosswalk is NOT empty)"
+    );
+
+    if !aliases.is_empty() {
+        let alias_rows: Vec<_> = aliases
+            .iter()
+            .map(|a| json!({ "canonical": canonical, "alias": a, "source": "google_customschema" }))
+            .collect();
+        let req = serde_json::from_value(json!({
+            "tenant_id": tenant,
+            "aliases": alias_rows,
+        }))
+        .expect("alias shape");
+        let Json(_) =
+            crate::admin_registry_alias(State(Arc::clone(state)), admin_headers(), Json(req))
+                .await
+                .expect("seed aliases");
+    }
+
+    // Self crosswalk (gdirectory, <dir-id>) → canonical, directory_vouched.
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "source": "gdirectory",
+        "local_id": format!("dir-{primary_email}"),
+        "canonical": canonical,
+        "link_method": "directory_vouched",
+    }))
+    .expect("self-crosswalk shape");
+    let Json(_) = crate::admin_crosswalk_link(State(Arc::clone(state)), admin_headers(), Json(req))
+        .await
+        .expect("seed self crosswalk");
+}
+
+/// Register an admin_explicit `(source, local_id) → user:<email>` link (HubSpot).
+async fn seed_admin_crosswalk(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    source: &str,
+    local_id: &str,
+    primary_email: &str,
+) {
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "source": source,
+        "local_id": local_id,
+        "canonical": format!("user:{primary_email}"),
+        "link_method": "admin_explicit",
+    }))
+    .expect("crosswalk shape");
+    let Json(_) = crate::admin_crosswalk_link(State(Arc::clone(state)), admin_headers(), Json(req))
+        .await
+        .expect("seed admin crosswalk");
+}
+
+/// Resolve a source-local owner id through the REAL sink and return the tokens
+/// the connector would stamp. Empty `Vec` == the server quarantined (all owners
+/// dropped, fail closed). NO canonical string is named here — the caller only
+/// ever hands us the source-local id.
+async fn resolve_owner_tokens(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    owner: &Owner<'_>,
+) -> Vec<PrincipalToken> {
+    let body = match owner {
+        Owner::DriveEmail(email) | Owner::SfFederation(email) => json!({
+            "tenant_id": tenant,
+            "emails": [email],
+        }),
+        Owner::HubspotOwner(id) => json!({
+            "tenant_id": tenant,
+            "resolvable": [{ "source": "hubspot", "local_id": id }],
+        }),
+    };
+    let req = serde_json::from_value(body).expect("principals request shape");
+    let Json(v) = crate::admin_principals(State(Arc::clone(state)), admin_headers(), Json(req))
+        .await
+        .expect("admin_principals");
+    if v["quarantined"] == json!(true) {
+        return vec![];
+    }
+    v["mappings"]
+        .as_object()
+        .expect("mappings object")
+        .values()
+        .map(|t| t.as_i64().expect("token int") as PrincipalToken)
+        .collect()
+}
+
+/// Index a chunk whose visibility is obtained by resolving a SOURCE-LOCAL owner
+/// id through the crosswalk (the real ingest path). Returns the stamped tokens
+/// so a test can assert WHICH token was used (e.g. ≠ token("user:<sf-email>")).
+async fn index_chunk_via_crosswalk(
+    state: &Arc<AppState>,
+    tenant: TenantId,
+    doc: &str,
+    content: &str,
+    owner: Owner<'_>,
+    confidentiality: Confidentiality,
+) -> Vec<PrincipalToken> {
+    let visibility = resolve_owner_tokens(state, tenant, &owner).await;
+    // Fail-closed: an all-dropped owner leaves visibility empty; the chunk is
+    // indexed with NO principal (invisible), never permissively.
+    index_chunk(
+        state,
+        tenant,
+        doc,
+        content,
+        visibility.clone(),
+        confidentiality,
+    )
+    .await;
+    visibility
+}
+
+/// THE GATE (invariant a): ingest D (Drive email), A (SF FederationIdentifier,
+/// User.Email divergent), H (HubSpot ownerId) — all resolved through the REAL
+/// crosswalk — then mint `user:alice@corp.com` and recall ALL THREE. No test
+/// line stamps the canonical token on a chunk (trap #4 avoided): each chunk's
+/// token came from resolving a source-local owner id at the sink.
+#[tokio::test]
+async fn m2b_acceptance_trace_d_a_h_via_canonical() {
+    // Subject-based mint requires ReBAC (open_scope rejects a `subject` in dev
+    // mode). The subject `user:alice@corp.com` resolves to its self-token even
+    // with no group tuples; the crosswalk join is pure Postgres either way.
+    let (state, tenant) =
+        test_state_admin(Some(require_rebac("m2b_acceptance_trace")), false).await;
+
+    // Named populate (trap #2 closed): Alice's canonical + the SSO alias the SF
+    // FederationIdentifier will match + her self crosswalk.
+    seed_directory_reconcile(&state, tenant, "alice@corp.com", &["alice@corp.com"]).await;
+    // HubSpot has no SSO subject → admin_explicit link on ownerId 77.
+    seed_admin_crosswalk(&state, tenant, "hubspot", "77", "alice@corp.com").await;
+
+    // D — Drive doc shared with grant emailAddress alice@corp.com.
+    let d_tokens = index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-D",
+        "obsidian roadmap shared on drive",
+        Owner::DriveEmail("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    // A — SF Account owned via FederationIdentifier=alice@corp.com; the roster's
+    // User.Email is alice.n@corp.sf and is NEVER passed to the resolver.
+    let a_tokens = index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-A",
+        "obsidian account in salesforce",
+        Owner::SfFederation("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    // H — HubSpot deal owned by ownerId 77.
+    let h_tokens = index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-H",
+        "obsidian deal in hubspot",
+        Owner::HubspotOwner("77"),
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // All three resolved to the SAME canonical token (byte-exact overlap).
+    assert_eq!(d_tokens.len(), 1, "D resolved to exactly one token");
+    assert_eq!(
+        a_tokens, d_tokens,
+        "A's SF-Federation token == D's Drive token"
+    );
+    assert_eq!(
+        h_tokens, d_tokens,
+        "H's HubSpot-owner token == D's Drive token"
+    );
+
+    // Trap #3 proof: the SF chunk was NOT keyed on User.Email. The token for the
+    // divergent login string is DIFFERENT from what A was stamped with.
+    let sf_email_token =
+        crate::upsert_principal_tokens(state.pool(), tenant, &["user:alice.n@corp.sf".to_string()])
+            .await
+            .expect("sf-email token")[0]
+            .1;
+    assert!(
+        !a_tokens.contains(&sf_email_token),
+        "SF visibility must NOT derive from User.Email (alice.n@corp.sf)"
+    );
+
+    // Mint for the DIRECTORY-VERIFIED primary email — the same string that
+    // upsert_principal_tokens keyed the chunks on — and recall all three.
+    let handle = mint_with_subject(&state, tenant, "user:alice@corp.com")
+        .await
+        .expect("mint alice");
+    let docs = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    for d in ["doc-D", "doc-A", "doc-H"] {
+        assert!(
+            docs.contains(&d.to_string()),
+            "acceptance trace: {d} must be visible to user:alice@corp.com via the canonical crosswalk, got {docs:?}"
+        );
+    }
+}
+
+/// N1: Bob resolves to a DIFFERENT canonical token, so the same D/A/H corpus is
+/// invisible to him (pure static-int disjointness — no registry read on recall).
+#[tokio::test]
+async fn m2b_bob_sees_none() {
+    let (state, tenant) = test_state_admin(Some(require_rebac("m2b_bob_sees_none")), false).await;
+    seed_directory_reconcile(&state, tenant, "alice@corp.com", &["alice@corp.com"]).await;
+    seed_admin_crosswalk(&state, tenant, "hubspot", "77", "alice@corp.com").await;
+    seed_directory_reconcile(&state, tenant, "bob@corp.com", &["bob@corp.com"]).await;
+
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-D",
+        "obsidian roadmap",
+        Owner::DriveEmail("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-A",
+        "obsidian account",
+        Owner::SfFederation("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-H",
+        "obsidian deal",
+        Owner::HubspotOwner("77"),
+        Confidentiality::Internal,
+    )
+    .await;
+
+    let handle = mint_with_subject(&state, tenant, "user:bob@corp.com")
+        .await
+        .expect("mint bob");
+    let docs = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    assert!(
+        docs.is_empty(),
+        "Bob's canonical token overlaps none of Alice's D/A/H: {docs:?}"
+    );
+}
+
+/// N2 / T3 (needs SpiceDB): a DEPROVISIONED Alice sees none. The deprovision
+/// route flips `canonical_principal.active=false` AND fires the 2a durable
+/// revoke; a FRESH mint drops the self-token, and the denial is durable across
+/// the 20h aging window.
+#[tokio::test]
+async fn m2b_deprovisioned_alice_sees_none() {
+    let (state, tenant) =
+        test_state_admin(Some(require_rebac("m2b_deprovisioned_alice")), false).await;
+    seed_directory_reconcile(&state, tenant, "alice@corp.com", &["alice@corp.com"]).await;
+    seed_admin_crosswalk(&state, tenant, "hubspot", "77", "alice@corp.com").await;
+
+    let d_tokens = index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-D",
+        "obsidian roadmap",
+        Owner::DriveEmail("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-A",
+        "obsidian account",
+        Owner::SfFederation("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-H",
+        "obsidian deal",
+        Owner::HubspotOwner("77"),
+        Confidentiality::Internal,
+    )
+    .await;
+    let t_a = d_tokens[0];
+
+    // Before deprovision: Alice sees all three.
+    let handle = mint_with_subject(&state, tenant, "user:alice@corp.com")
+        .await
+        .expect("mint alice");
+    let docs = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    assert_eq!(docs.len(), 3, "pre-deprovision Alice sees D/A/H: {docs:?}");
+
+    // Deprovision through the B1.5 route (the gdirectory-suspend path).
+    let req = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "principal": "user:alice@corp.com",
+    }))
+    .expect("deprovision shape");
+    let Json(v) = crate::admin_deprovision(State(Arc::clone(&state)), admin_headers(), Json(req))
+        .await
+        .expect("deprovision");
+    assert_eq!(v["deprovisioned"], json!(true));
+
+    // canonical flipped inactive.
+    let active: bool =
+        sqlx::query_scalar("SELECT active FROM canonical_principal WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+    assert!(
+        !active,
+        "deprovision flipped canonical_principal.active=false"
+    );
+
+    // 2a durable revoke fired: the token is in the revoked set.
+    let revoked = state
+        .revocations
+        .revoked_set(state.pool(), tenant)
+        .await
+        .expect("revoked set");
+    assert!(
+        revoked.contains(&t_a),
+        "deprovision fired 2a durable revoke"
+    );
+
+    // A FRESH mint drops the self-token → recall empty.
+    let fresh = mint_with_subject(&state, tenant, "user:alice@corp.com")
+        .await
+        .expect("re-mint");
+    let docs = recall_docs(&state, &fresh, "obsidian")
+        .await
+        .expect("recall");
+    assert!(docs.is_empty(), "deprovisioned Alice sees none: {docs:?}");
+
+    // T3b durability: age the durable record 20h; a re-mint STILL sees none.
+    age_revocation(&state, tenant, t_a, 20).await;
+    let fresh2 = mint_with_subject(&state, tenant, "user:alice@corp.com")
+        .await
+        .expect("re-mint aged");
+    let docs = recall_docs(&state, &fresh2, "obsidian")
+        .await
+        .expect("recall");
+    assert!(
+        docs.is_empty(),
+        "deprovision denial is durable across 20h: {docs:?}"
+    );
+}
+
+/// N4 / T5 (no false weld): a SECOND SF User presents a DIFFERENT
+/// FederationIdentifier but the SAME Email attribute (alice@corp.com). The email
+/// weld MUST be refused — the second Federation subject, having no declared
+/// alias, resolves to NOTHING (its chunk indexes invisible); meanwhile the
+/// established `user:alice@corp.com` is untouched and still recalls its doc.
+#[tokio::test]
+async fn m2b_no_false_weld_sf_twin() {
+    let (state, tenant) =
+        test_state_admin(Some(require_rebac("m2b_no_false_weld_sf_twin")), false).await;
+    // Established Alice: primary alice@corp.com, SSO alias alice@corp.com.
+    seed_directory_reconcile(&state, tenant, "alice@corp.com", &["alice@corp.com"]).await;
+
+    // Alice's own SF-owned doc (Federation matches her declared alias).
+    let a_tokens = index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-A",
+        "obsidian alice account",
+        Owner::SfFederation("alice@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+    assert_eq!(a_tokens.len(), 1, "Alice's SF owner resolves");
+
+    // The TWIN: a DIFFERENT human whose SF FederationIdentifier is a distinct SSO
+    // subject (twin-sso@corp.com) that no admin ever declared — even though this
+    // SF row's Email attribute happens to read alice@corp.com. The resolver keys
+    // ONLY on the FederationIdentifier alias, which is unvouched → quarantine.
+    let twin_tokens =
+        resolve_owner_tokens(&state, tenant, &Owner::SfFederation("twin-sso@corp.com")).await;
+    assert!(
+        twin_tokens.is_empty(),
+        "an undeclared FederationIdentifier confers NO visibility — no email weld: {twin_tokens:?}"
+    );
+
+    // The twin's chunk therefore indexes invisible.
+    index_chunk_via_crosswalk(
+        &state,
+        tenant,
+        "doc-TWIN",
+        "obsidian twin account",
+        Owner::SfFederation("twin-sso@corp.com"),
+        Confidentiality::Internal,
+    )
+    .await;
+
+    // The established principal is unaffected: Alice still recalls her own doc,
+    // and never the twin's (they never welded into one canonical).
+    let handle = mint_with_subject(&state, tenant, "user:alice@corp.com")
+        .await
+        .expect("mint alice");
+    let docs = recall_docs(&state, &handle, "obsidian")
+        .await
+        .expect("recall");
+    assert!(
+        docs.contains(&"doc-A".to_string()),
+        "established canonical untouched — Alice still recalls doc-A: {docs:?}"
+    );
+    assert!(
+        !docs.contains(&"doc-TWIN".to_string()),
+        "the twin's chunk is invisible (no weld): {docs:?}"
+    );
+}

@@ -8,3 +8,6 @@ __pycache__/
 bench-results/
 ingest/.verity/
 ingest/*.log
+
+# stray dev server log (not source)
+server-*.log

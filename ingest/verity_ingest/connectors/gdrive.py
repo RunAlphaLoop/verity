@@ -118,6 +118,7 @@ from typing import Any, AsyncIterator, Iterable, Mapping, Protocol, Sequence
 
 import httpx
 
+from verity_ingest import crosswalk
 from verity_ingest.acl_diff import AclDiffLane
 from verity_ingest.connector import AclEnvelope, Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
@@ -574,10 +575,18 @@ class HttpRegistry:
     """Resolves via the Verity server's admin principals endpoint.
 
     Contract (server as built — ``admin_principals`` in verity-server):
-    ``POST {base}/v1/admin/principals`` with ``{"tenant_id": "<uuid>",
-    "principals": [...]}`` → ``{"mappings": {"<principal>": <int token>,
-    ...}}``. Null/absent/non-int → unresolved (fail-closed). The upsert is
-    idempotent server-side; existing principals keep their token forever.
+    ``POST {base}/v1/admin/principals`` → ``{"mappings": {"<canonical>": <int
+    token>, ...}, "quarantined": <bool>}``. Null/absent/non-int → unresolved
+    (fail-closed). The upsert is idempotent; existing principals keep their token.
+
+    M2 2b — the identity crosswalk (fail-closed, no blind ``user:<email>``):
+    a Google-native ``user:<email>`` grant is routed through the request's
+    ``emails`` field so the server resolves it against the directory-vouched
+    ``idp_subject`` (an UNVOUCHED address resolves to nothing — no implicit
+    weld). Its canonical is ``user:<email>`` BY IDENTITY, so the server echoes
+    the same string back keyed by canonical and :meth:`resolve` still returns
+    ``{input_string: token}``. ``group:``/``domain:`` principals are already
+    canonical and ride the ``principals`` field unchanged.
     """
 
     def __init__(
@@ -593,18 +602,17 @@ class HttpRegistry:
         self._tenant_id = tenant_id
 
     def resolve(self, principals: Sequence[str]) -> dict[str, int]:
+        """Resolve principal strings → int tokens, routing ``user:<email>``
+        grants through the registry ``emails`` gate (fail-closed on an unvouched
+        address). Returns ``{canonical_string: token}``; for Google-native users
+        canonical == the input string, so callers key back on their input."""
         if not principals:
             return {}
-        response = self._client.post(
-            f"{self._base_url}{PRINCIPALS_PATH}",
-            json={"tenant_id": self._tenant_id, "principals": list(principals)},
-        )
-        response.raise_for_status()
-        return {
-            principal: token
-            for principal, token in response.json().get("mappings", {}).items()
-            if isinstance(token, int)
-        }
+        emails, others = crosswalk.split_google_principals(principals)
+        request = crosswalk.ResolveRequest(principals=others, emails=emails)
+        return crosswalk.resolve_via(
+            self._client, self._base_url, self._tenant_id, request
+        ).mappings
 
 
 # ---------------------------------------------------------------------------

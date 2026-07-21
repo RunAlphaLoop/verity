@@ -21,6 +21,8 @@ mod console_later_tests;
 mod consolidation;
 #[cfg(test)]
 mod consolidation_tests;
+#[cfg(test)]
+mod crosswalk_tests;
 mod directory_worker;
 #[cfg(test)]
 mod entity_resolution_tests;
@@ -1755,6 +1757,17 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/principals/reinstate",
             post(admin_principal_reinstate),
         )
+        // CANONICAL-PRINCIPAL REGISTRY + CROSSWALK (M2 2b). gdirectory publishes
+        // the registry each reconcile; connectors resolve owners through it at
+        // ingest (via POST /v1/admin/principals `resolvable`/`emails`). Deprovision
+        // flips the canonical inactive AND fires the 2a revoke. All require-gated.
+        .route(
+            "/v1/admin/registry/canonical",
+            post(admin_registry_canonical),
+        )
+        .route("/v1/admin/registry/alias", post(admin_registry_alias))
+        .route("/v1/admin/crosswalk", post(admin_crosswalk_link))
+        .route("/v1/admin/deprovision", post(admin_deprovision))
         .route("/v1/admin/rebac-watch", get(rebac_watch::admin_status))
         // "What's running" — observed infrastructure-plane status for the
         // console System panel (admin-gated like every other /v1/admin read).
@@ -4277,10 +4290,132 @@ async fn list_tenants(
     })))
 }
 
+/// A source-local owner id that must be resolved through the crosswalk (M2 2b):
+/// SF `005…` UserId, HubSpot `ownerId`, gdirectory user id, etc.
+#[derive(Deserialize)]
+struct CrosswalkOwner {
+    source: String,
+    local_id: String,
+}
+
 #[derive(Deserialize)]
 struct PrincipalsRequest {
     tenant_id: TenantId,
+    /// Already-canonical principal strings (Google-native connectors + groups):
+    /// stamped as-is, no crosswalk resolution.
+    #[serde(default)]
     principals: Vec<String>,
+    /// (source, local_id) owners needing a `principal_crosswalk` resolution
+    /// (SF `005…`/HubSpot `ownerId`). A miss/inactive row → dropped (fail closed).
+    #[serde(default)]
+    resolvable: Vec<CrosswalkOwner>,
+    /// Google-native emails / SF `FederationIdentifier`s needing an `idp_subject`
+    /// or SSO-alias match. An unvouched value → dropped (no implicit weld).
+    #[serde(default)]
+    emails: Vec<String>,
+}
+
+/// Resolve source-local owner ids to canonical principal strings at the INGEST
+/// boundary (M2 2b). Returns one entry per input `local_id`, aligned by index.
+///
+/// `Some(canonical)` iff a LIVE `principal_crosswalk` row `(tenant, source,
+/// local_id)` exists AND its `canonical_principal` is itself active. Any miss OR
+/// `active=false` on EITHER row → `None` → the owner confers NO visibility (fail
+/// closed — a source-local id with no live link is invisible, never an implicit
+/// email weld). Pure read (registry tables only): zero ReBAC, zero LLM. Runs at
+/// ingest/mint only — never on the recall/get hot path (read-path purity).
+pub(crate) async fn resolve_crosswalk(
+    pool: &sqlx::PgPool,
+    tenant_id: TenantId,
+    source: &str,
+    local_ids: &[String],
+) -> HandlerResult<Vec<Option<String>>> {
+    use sqlx::Row;
+    if local_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Batch: one query keyed by = ANY, then map back into input order. The join
+    // requires BOTH the crosswalk row and the canonical_principal to be active.
+    let rows = sqlx::query(
+        "SELECT x.local_id, cp.canonical
+           FROM principal_crosswalk x
+           JOIN canonical_principal cp
+             ON cp.tenant_id = x.tenant_id AND cp.canonical = x.canonical
+          WHERE x.tenant_id = $1 AND x.source = $2
+            AND x.local_id = ANY($3::text[])
+            AND x.active AND cp.active",
+    )
+    .bind(tenant_id)
+    .bind(source)
+    .bind(local_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    let mut by_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        by_local.insert(
+            row.get::<String, _>("local_id"),
+            row.get::<String, _>("canonical"),
+        );
+    }
+    Ok(local_ids
+        .iter()
+        .map(|id| by_local.get(id).cloned())
+        .collect())
+}
+
+/// Resolve a Google-native email / SF `FederationIdentifier` to its canonical,
+/// via a directory-vouched `idp_subject` OR a declared `principal_sso_alias`
+/// (M2 2b). Returns one entry per input, aligned by index.
+///
+/// `Some(canonical)` iff the value matches an ACTIVE `canonical_principal`
+/// `idp_subject`, or a `principal_sso_alias.alias` whose canonical is active.
+/// Any miss → `None` → the address confers NO visibility (an email/subject the
+/// directory never vouched is NOT auto-welded to a fresh token). The SF connector
+/// sends its `FederationIdentifier` value here so the one alias-match code path
+/// serves both Google-native emails and SF SSO subjects. Registry-only read.
+pub(crate) async fn resolve_idp_subject(
+    pool: &sqlx::PgPool,
+    tenant_id: TenantId,
+    subjects: &[String],
+) -> HandlerResult<Vec<Option<String>>> {
+    use sqlx::Row;
+    if subjects.is_empty() {
+        return Ok(Vec::new());
+    }
+    // idp_subject direct match ∪ SSO-alias match, active canonicals only. A
+    // subject can only map to one canonical (UNIQUE idp_subject / UNIQUE alias),
+    // so COALESCE(direct, alias) is unambiguous.
+    let rows = sqlx::query(
+        "SELECT s.subject,
+                COALESCE(cp_direct.canonical, cp_alias.canonical) AS canonical
+           FROM unnest($2::text[]) AS s(subject)
+           LEFT JOIN canonical_principal cp_direct
+             ON cp_direct.tenant_id = $1 AND cp_direct.idp_subject = s.subject
+            AND cp_direct.active
+           LEFT JOIN principal_sso_alias a
+             ON a.tenant_id = $1 AND a.alias = s.subject
+           LEFT JOIN canonical_principal cp_alias
+             ON cp_alias.tenant_id = $1 AND cp_alias.canonical = a.canonical
+            AND cp_alias.active",
+    )
+    .bind(tenant_id)
+    .bind(subjects)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    let mut by_subject: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        if let Some(canon) = row.get::<Option<String>, _>("canonical") {
+            by_subject.insert(row.get::<String, _>("subject"), canon);
+        }
+    }
+    Ok(subjects
+        .iter()
+        .map(|s| by_subject.get(s).cloned())
+        .collect())
 }
 
 /// Map principal strings to materialized int tokens, allocating where absent.
@@ -4339,7 +4474,22 @@ pub(crate) async fn upsert_principal_tokens(
     Ok(mappings)
 }
 
-/// POST /v1/admin/principals (admin): connector-facing principal→token upsert.
+/// POST /v1/admin/principals (admin): connector-facing principal→token upsert,
+/// with M2-2b crosswalk resolution at the ingest boundary.
+///
+/// Already-canonical `principals` pass straight through. `resolvable` (SF/HubSpot
+/// source-local owner ids) resolve via `resolve_crosswalk`; `emails` (Google-native
+/// addresses / SF `FederationIdentifier`) via `resolve_idp_subject`. Every `None`
+/// (crosswalk miss OR `active=false` OR unvouched subject) is DROPPED — never
+/// stamped, never guessed into an email weld (fail closed). The surviving
+/// canonical strings feed the UNCHANGED `upsert_principal_tokens` on the identical
+/// `(tenant, "user:<email>")` key the subject side hits in `open_scope`, so the
+/// recall pre-filter is a pure token-equality overlap (read-path purity).
+///
+/// FAIL-CLOSED QUARANTINE: if the caller declared owners to resolve (`resolvable`
+/// or `emails` non-empty) but NONE survived, the response carries
+/// `"quarantined": true` and no mappings — the client must quarantine the
+/// envelope rather than index it open. `principals`-only callers never quarantine.
 async fn admin_principals(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -4352,13 +4502,57 @@ async fn admin_principals(
         .ensure_tenant(req.tenant_id)
         .await
         .map_err(storage_status)?;
+
+    let had_resolvable = !req.resolvable.is_empty() || !req.emails.is_empty();
+
+    let mut resolved: Vec<String> = req.principals.clone();
+
+    // Crosswalk-resolved owners (SF/HubSpot local ids), grouped by source so each
+    // source is one batched query. Every None is dropped (fail closed).
+    let mut by_source: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for owner in &req.resolvable {
+        by_source
+            .entry(owner.source.as_str())
+            .or_default()
+            .push(owner.local_id.clone());
+    }
+    for (source, ids) in by_source {
+        resolved.extend(
+            resolve_crosswalk(state.pool(), req.tenant_id, source, &ids)
+                .await?
+                .into_iter()
+                .flatten(),
+        );
+    }
+
+    // Google-native emails (Drive/Gmail) + SF FederationIdentifier. Unvouched → None → dropped.
+    resolved.extend(
+        resolve_idp_subject(state.pool(), req.tenant_id, &req.emails)
+            .await?
+            .into_iter()
+            .flatten(),
+    );
+
+    // Fail-closed quarantine signal: owners were declared to resolve but none
+    // survived — the record has empty visibility and must not index open.
+    if resolved.is_empty() && had_resolvable {
+        return Ok(Json(serde_json::json!({
+            "mappings": serde_json::Map::new(),
+            "quarantined": true,
+        })));
+    }
+
     let mappings: serde_json::Map<String, serde_json::Value> =
-        upsert_principal_tokens(state.pool(), req.tenant_id, &req.principals)
+        upsert_principal_tokens(state.pool(), req.tenant_id, &resolved)
             .await?
             .into_iter()
             .map(|(p, t)| (p, serde_json::json!(t)))
             .collect();
-    Ok(Json(serde_json::json!({ "mappings": mappings })))
+    Ok(Json(serde_json::json!({
+        "mappings": mappings,
+        "quarantined": false,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -5243,6 +5437,392 @@ async fn admin_principal_reinstate(
         "reinstated": true,
         "principal": req.principal,
         "was_revoked": was_revoked,
+    })))
+}
+
+// ==== M2 slice 2b — CANONICAL-PRINCIPAL REGISTRY WRITE ROUTES ====
+//
+// gdirectory (the sole registry authority) POSTs to these each reconcile to
+// publish the canonical registry + SSO aliases + self crosswalk rows. Explicit
+// admin links (HubSpot ownerId, SF admin_explicit) use /v1/admin/crosswalk.
+// Deprovision flips the canonical inactive AND fires the 2a revocation plane.
+// All `require`-gated (the security release gate — no dev-open), audited.
+
+/// One canonical-principal registry row (POST /v1/admin/registry/canonical).
+#[derive(Deserialize)]
+struct CanonicalPrincipalRow {
+    canonical: String,
+    kind: String,
+    idp_subject: String,
+    #[serde(default = "default_true")]
+    active: bool,
+    #[serde(default = "default_epoch")]
+    epoch: i32,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_epoch() -> i32 {
+    1
+}
+
+#[derive(Deserialize)]
+struct CanonicalRegistryRequest {
+    tenant_id: TenantId,
+    principals: Vec<CanonicalPrincipalRow>,
+}
+
+/// POST /v1/admin/registry/canonical (admin, `require`-gated). Upsert canonical
+/// registry rows keyed `(tenant, canonical)`. The `UNIQUE(tenant, idp_subject)`
+/// no-weld firewall is enforced honestly: a row whose `idp_subject` is already
+/// bound to a DIFFERENT canonical is REJECTED (that link quarantines, pending
+/// admin), the established principal untouched. Returns per-row disposition.
+async fn admin_registry_canonical(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CanonicalRegistryRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+
+    let mut upserted = Vec::new();
+    let mut quarantined = Vec::new();
+    for row in &req.principals {
+        // Reject a non-user:/group: canonical (fail closed, mirrors 2a).
+        if rebac::parse_principal(&row.canonical).is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "canonical must be \"user:<email>\" or \"group:<name>\": {}",
+                    row.canonical
+                ),
+            ));
+        }
+        let subject = row.idp_subject.to_lowercase();
+        // No-weld: if this idp_subject is already bound to a different canonical,
+        // quarantine THIS link, leave the established principal untouched.
+        let conflict: Option<String> = sqlx::query_scalar(
+            "SELECT canonical FROM canonical_principal
+              WHERE tenant_id = $1 AND idp_subject = $2 AND canonical <> $3",
+        )
+        .bind(req.tenant_id)
+        .bind(&subject)
+        .bind(&row.canonical)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(internal)?;
+        if conflict.is_some() {
+            quarantined.push(serde_json::json!({
+                "canonical": row.canonical,
+                "idp_subject": subject,
+                "reason": "idp_subject_already_bound",
+            }));
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO canonical_principal
+                 (tenant_id, canonical, kind, idp_subject, active, epoch)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_id, canonical)
+             DO UPDATE SET kind = EXCLUDED.kind, idp_subject = EXCLUDED.idp_subject,
+                           active = EXCLUDED.active, epoch = EXCLUDED.epoch",
+        )
+        .bind(req.tenant_id)
+        .bind(&row.canonical)
+        .bind(&row.kind)
+        .bind(&subject)
+        .bind(row.active)
+        .bind(row.epoch)
+        .execute(state.pool())
+        .await
+        .map_err(internal)?;
+        upserted.push(row.canonical.clone());
+    }
+
+    state
+        .storage
+        .inner()
+        .write_access_audit(
+            req.tenant_id,
+            &state.admin.actor_fingerprint(&headers),
+            "registry/canonical",
+            "registry",
+            &serde_json::json!({ "count": req.principals.len() }),
+            &serde_json::json!({ "upserted": upserted.len(), "quarantined": quarantined.len() }),
+        )
+        .await
+        .map_err(storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "upserted": upserted,
+        "quarantined": quarantined,
+    })))
+}
+
+/// One SSO-alias row (POST /v1/admin/registry/alias).
+#[derive(Deserialize)]
+struct SsoAliasRow {
+    canonical: String,
+    alias: String,
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct SsoAliasRequest {
+    tenant_id: TenantId,
+    aliases: Vec<SsoAliasRow>,
+}
+
+/// POST /v1/admin/registry/alias (admin, `require`-gated). Upsert SSO-alias rows
+/// (the SF `FederationIdentifier` match targets). `UNIQUE(tenant, alias)` is the
+/// under-merge guard: an alias already bound to a DIFFERENT canonical is REJECTED
+/// (quarantine-pending), never silently re-pointed.
+async fn admin_registry_alias(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SsoAliasRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+
+    let mut upserted = Vec::new();
+    let mut quarantined = Vec::new();
+    for row in &req.aliases {
+        if rebac::parse_principal(&row.canonical).is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "canonical must be \"user:<email>\"/\"group:<name>\": {}",
+                    row.canonical
+                ),
+            ));
+        }
+        let alias = row.alias.to_lowercase();
+        // Insert only if the alias is free OR already maps to this canonical.
+        let affected = sqlx::query(
+            "INSERT INTO principal_sso_alias (tenant_id, canonical, alias, source)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id, alias) DO UPDATE
+                 SET source = EXCLUDED.source
+                 WHERE principal_sso_alias.canonical = EXCLUDED.canonical",
+        )
+        .bind(req.tenant_id)
+        .bind(&row.canonical)
+        .bind(&alias)
+        .bind(&row.source)
+        .execute(state.pool())
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if affected == 0 {
+            quarantined.push(serde_json::json!({
+                "alias": alias,
+                "canonical": row.canonical,
+                "reason": "alias_already_bound",
+            }));
+        } else {
+            upserted.push(alias);
+        }
+    }
+
+    state
+        .storage
+        .inner()
+        .write_access_audit(
+            req.tenant_id,
+            &state.admin.actor_fingerprint(&headers),
+            "registry/alias",
+            "registry",
+            &serde_json::json!({ "count": req.aliases.len() }),
+            &serde_json::json!({ "upserted": upserted.len(), "quarantined": quarantined.len() }),
+        )
+        .await
+        .map_err(storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "upserted": upserted,
+        "quarantined": quarantined,
+    })))
+}
+
+/// POST /v1/admin/crosswalk (admin, `require`-gated). Explicit
+/// `(source, local_id) → canonical` link (design deliverable 5) — the honest
+/// populate path for HubSpot `ownerId`, SF `admin_explicit`, and gdirectory self
+/// rows. Audited. 422 on a non-`user:`/`group:` canonical.
+#[derive(Deserialize)]
+struct CrosswalkLinkRequest {
+    tenant_id: TenantId,
+    source: String,
+    local_id: String,
+    canonical: String,
+    #[serde(default = "default_link_method")]
+    link_method: String,
+}
+
+fn default_link_method() -> String {
+    "admin_explicit".to_string()
+}
+
+async fn admin_crosswalk_link(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CrosswalkLinkRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    if rebac::parse_principal(&req.canonical).is_none() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "canonical must be \"user:<email>\" or \"group:<name>\": {}",
+                req.canonical
+            ),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO principal_crosswalk
+             (tenant_id, source, local_id, canonical, link_method, active)
+         VALUES ($1, $2, $3, $4, $5, true)
+         ON CONFLICT (tenant_id, source, local_id)
+         DO UPDATE SET canonical = EXCLUDED.canonical,
+                       link_method = EXCLUDED.link_method, active = true",
+    )
+    .bind(req.tenant_id)
+    .bind(&req.source)
+    .bind(&req.local_id)
+    .bind(&req.canonical)
+    .bind(&req.link_method)
+    .execute(state.pool())
+    .await
+    .map_err(internal)?;
+
+    state
+        .storage
+        .inner()
+        .write_access_audit(
+            req.tenant_id,
+            &state.admin.actor_fingerprint(&headers),
+            "crosswalk/link",
+            &format!("{}:{}", req.source, req.local_id),
+            &serde_json::json!({ "canonical": req.canonical, "link_method": req.link_method }),
+            &serde_json::json!({ "linked": true }),
+        )
+        .await
+        .map_err(storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "linked": true,
+        "source": req.source,
+        "local_id": req.local_id,
+        "canonical": req.canonical,
+    })))
+}
+
+/// POST /v1/admin/deprovision (admin, `require`-gated). The gdirectory
+/// suspend/archive sink: flips `canonical_principal.active=false` (+ its crosswalk
+/// rows) AND fires the 2a `RevocationPlane::revoke_principal`, in FAIL-CLOSED
+/// order — durable revoke FIRST (mint gate + read-path subtract deny from that
+/// instant), THEN the chunk sweep. A sweep failure over-hides, never under-hides.
+/// `open_scope` is untouched: its existing 2a active-gate reads `revoked_set` and
+/// drops the self-token for the now-revoked subject.
+async fn admin_deprovision(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PrincipalRevokeRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.require(&headers)?;
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    require_user_principal(&req.principal)?;
+
+    let token = upsert_principal_tokens(
+        state.pool(),
+        req.tenant_id,
+        std::slice::from_ref(&req.principal),
+    )
+    .await?[0]
+        .1;
+
+    // 1. Registry inactive (invalidate-don't-delete) — both the canonical and any
+    //    crosswalk rows pointing at it. This gates the mint self-token (via the
+    //    registry-active check) and stops future connector resolution.
+    sqlx::query(
+        "UPDATE canonical_principal SET active = false
+          WHERE tenant_id = $1 AND canonical = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(&req.principal)
+    .execute(state.pool())
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "UPDATE principal_crosswalk SET active = false
+          WHERE tenant_id = $1 AND canonical = $2",
+    )
+    .bind(req.tenant_id)
+    .bind(&req.principal)
+    .execute(state.pool())
+    .await
+    .map_err(internal)?;
+
+    // 2. DURABLE revoke FIRST (2a) — indefinite mint gate + read-path subtract.
+    state
+        .revocations
+        .revoke_principal(state.pool(), req.tenant_id, &req.principal, token)
+        .await?;
+
+    // 3. THEN the chunk sweep (residual token strip / email-reuse safety).
+    let swept_documents = state
+        .storage
+        .inner()
+        .retract_token_from_chunks(
+            req.tenant_id,
+            token,
+            verity_storage::AclCorrectionReason::PrincipalRevoke,
+            &req.principal,
+        )
+        .await
+        .map_err(storage_status)?;
+
+    state
+        .storage
+        .inner()
+        .write_access_audit(
+            req.tenant_id,
+            &state.admin.actor_fingerprint(&headers),
+            "deprovision",
+            &req.principal,
+            &serde_json::json!({ "token": token }),
+            &serde_json::json!({ "swept_documents": swept_documents }),
+        )
+        .await
+        .map_err(storage_status)?;
+
+    Ok(Json(serde_json::json!({
+        "deprovisioned": true,
+        "principal": req.principal,
+        "token": token,
+        "swept_documents": swept_documents,
     })))
 }
 

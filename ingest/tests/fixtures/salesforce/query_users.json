@@ -8,7 +8,9 @@
         "url": "/services/data/v62.0/sobjects/User/005xx000001X8UzAAK"
       },
       "Id": "005xx000001X8UzAAK",
-      "Email": "Ae@Acme.test",
+      "Email": "Ae.Divergent@Acme.sf",
+      "Username": "ae@acme.test.sf",
+      "FederationIdentifier": "Ae@Acme.test",
       "IsActive": true
     },
     {
@@ -18,6 +20,8 @@
       },
       "Id": "005xx000001X9IntAAK",
       "Email": null,
+      "Username": "int@acme.test.sf",
+      "FederationIdentifier": null,
       "IsActive": false
     }
   ]

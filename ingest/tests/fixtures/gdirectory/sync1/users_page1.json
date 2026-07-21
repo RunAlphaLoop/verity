@@ -1,7 +1,7 @@
 {
   "kind": "admin#directory#users",
   "users": [
-    {"id": "100000000000000000001", "primaryEmail": "Alice@corp.example", "suspended": false, "archived": false},
+    {"id": "100000000000000000001", "primaryEmail": "Alice@corp.example", "suspended": false, "archived": false, "externalIds": [{"type": "custom", "customType": "sso", "value": "Alice.SSO@corp.example"}, {"type": "organization", "value": "ignored-org@corp.example"}]},
     {"id": "100000000000000000002", "primaryEmail": "bob@corp.example", "suspended": false, "archived": false},
     {"id": "100000000000000000003", "primaryEmail": "mallory@corp.example", "suspended": true, "archived": false}
   ],

@@ -307,20 +307,48 @@ def test_http_registry_contract():
     resolved = registry.resolve(
         ["user:alice@corp.example", "group:eng-leads@corp.example", "user:nobody@corp.example"]
     )
+    # M2 2b — user:<email> grants route through the `emails` gate (so an unvouched
+    # address fails closed, never mints a fresh token); groups stay canonical.
     assert seen == {
         "method": "POST",
         "path": PRINCIPALS_PATH,
         "body": {
             "tenant_id": "8b1c8d7e-0a63-4a1a-9d1e-000000000001",
-            "principals": [
-                "user:alice@corp.example",
-                "group:eng-leads@corp.example",
-                "user:nobody@corp.example",
-            ],
+            "principals": ["group:eng-leads@corp.example"],
+            "emails": ["alice@corp.example", "nobody@corp.example"],
         },
     }
-    # Null token = unresolved: contributes no visibility (fail-closed).
+    # Null token = unresolved: contributes no visibility (fail-closed). The server
+    # keys mappings by canonical (== the user:<email> string for Google-native).
     assert resolved == {"user:alice@corp.example": 101, "group:eng-leads@corp.example": 202}
+
+
+def test_http_registry_unvouched_email_quarantines_body():
+    # M2 2b — an email the directory never vouched resolves to NOTHING (the server
+    # `emails` gate returns no mapping). A doc whose only ACL entry is that email
+    # therefore quarantines (no visibility), never a blind user:<email> stamp.
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        # The server vouches no email → empty mappings + quarantined signal.
+        return httpx.Response(200, json={"mappings": {}, "quarantined": bool(body.get("emails"))})
+
+    registry = HttpRegistry(
+        "http://verity.local:8080",
+        tenant_id="8b1c8d7e-0a63-4a1a-9d1e-000000000001",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert registry.resolve(["user:ghost@corp.example"]) == {}
+    _, events, _ = _poll("387")  # a normal resolvable Drive doc
+    body = build_document_request(events[0], registry=registry, tenant_id=TENANT)
+    assert body["acl_provenance"] == "quarantined"
+    assert "visibility" not in body
+
+
+def test_permission_id_is_never_the_join_key():
+    # A user grant with NO emailAddress (only an opaque permission id) quarantines
+    # the whole envelope; the permission.id is never used as an identity key.
+    perms = [{"type": "user", "id": "AVERYlongOPAQUEpermissionID", "role": "reader"}]
+    assert map_permissions(perms) == AclEnvelope(resolvable=False)
 
 
 # ---------------------------------------------------------------------------

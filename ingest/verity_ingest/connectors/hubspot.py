@@ -58,6 +58,7 @@ from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 
+from verity_ingest import crosswalk
 from verity_ingest.acl_diff import AclChange, AclState, diff_acl, emit_acl_change
 from verity_ingest.connector import Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
@@ -140,10 +141,20 @@ class OwnerInfo:
     team_ids: tuple[str, ...]
 
 
+#: Group-edge member markers, shared with the Salesforce connector (M2 2b): a
+#: HubSpot team member is carried as ``hubspot-owner:<ownerId>``, a Salesforce
+#: group-member 005 as ``fed:<FederationIdentifier>``; the sink canonicalizes both
+#: through the registry before mirroring the edge.
+CROSSWALK_MEMBER_PREFIX = crosswalk.CROSSWALK_MEMBER_PREFIX
+FEDERATION_MEMBER_PREFIX = crosswalk.FEDERATION_MEMBER_PREFIX
+
+
 def owner_principal(email: str) -> str:
-    """The record-owner principal. Lowercased ``user:<email>`` so it is the SAME
-    SpiceDB object a Gmail/Drive subject resolves to — a person owning a HubSpot
-    deal and appearing in Drive/Gmail is ONE identity across sources."""
+    """DEPRECATED (M2 2b): the blind ``user:<email>`` stamp — an owner's email is
+    NO LONGER a resolution key. HubSpot owners resolve via the
+    ``(hubspot, ownerId)`` crosswalk (``admin_explicit``), never their mutable
+    email (``email_fallback`` is OFF). Retained only for observability/logging
+    (e.g. an operator dumping which email an ownerId maps to)."""
     return f"user:{email.lower()}"
 
 
@@ -164,13 +175,18 @@ class HubSpotFactEvent(FactEvent):
     ``source.table``) and the resolved visibility for this record.
 
     Visibility precedence, per record:
-    - ``record_principals`` — the owner+team principal STRINGS this record's
-      access mirrors (``user:<owner>`` + ``group:hubspot-team-<id>``), or
-      ``None`` when the record is unowned. Computed at map time from the owner
-      roster; source of truth for the SpiceDB team edges too.
-    - ``record_visibility`` — those strings resolved to int tokens (filled by
-      the runner via ``/v1/admin/principals``). When set, the envelope carries
-      an inline ``verity_acl`` with ``acl_provenance: approximated``.
+    - ``record_principals`` — the already-canonical TEAM group strings this
+      record's access mirrors (``group:hubspot-team-<id>``), or ``None`` when
+      unowned/teamless. Resolved via the ``principals`` field.
+    - ``record_owner_id`` — M2 2b: the HubSpot ``ownerId`` (NOT the owner email).
+      Resolved through the ``(hubspot, ownerId)`` crosswalk (an ``admin_explicit``
+      link an admin published) to the canonical ``user:<primaryEmail>`` token.
+      HubSpot's Owners API exposes no SSO subject, so ``ownerId`` is the ONLY
+      honest join key; ``email_fallback`` is OFF (an unlinked ownerId confers
+      nothing — the record rides the admin floor). Never a blind ``user:<email>``.
+    - ``record_visibility`` — the union of the resolved team + owner tokens
+      (filled by the runner via ``/v1/admin/principals``). When set, the envelope
+      carries an inline ``verity_acl`` with ``acl_provenance: approximated``.
     - ``visibility_policy`` — the admin-assigned fallback (``--visibility``).
       Used for unowned records (and the webhook lane, which has no owner
       context): delivered as the connector-bound policy, ``admin-assigned``.
@@ -179,6 +195,8 @@ class HubSpotFactEvent(FactEvent):
     object_type: str
     visibility_policy: list[int]
     record_principals: list[str] | None = None
+    #: M2 2b — the HubSpot ownerId, resolved via the (hubspot, ownerId) crosswalk.
+    record_owner_id: str | None = None
     record_visibility: list[int] | None = None
 
 
@@ -257,30 +275,34 @@ class HubSpotConnector(Connector):
     # ---------- deterministic mapping (pure; exercised by conformance tests) ----------
 
     @staticmethod
-    def record_principals(
+    def record_access(
         record: dict, owner_map: Mapping[str, OwnerInfo] | None
-    ) -> list[str] | None:
-        """The owner+team principal strings this record's access mirrors, or
-        ``None`` when the record is unowned or its owner is unknown (→ the
-        admin-assigned fallback applies; never a permissive default).
+    ) -> tuple[str | None, list[str] | None]:
+        """The record's ``(owner_id, team_groups)`` access, or ``(None, None)``
+        when unowned/unknown (→ the admin-assigned fallback; never permissive).
 
-        ``user:<owner>`` first (deterministic), then one ``group:hubspot-team-``
-        per team the owner belongs to, deduplicated, order preserved.
+        M2 2b — the owner is carried as its raw HubSpot ``ownerId`` (NOT a
+        ``user:<email>`` string): the sink resolves it through the
+        ``(hubspot, ownerId)`` crosswalk to the canonical ``user:<primaryEmail>``
+        token. HubSpot's Owners API has no SSO subject, so ``ownerId`` is the only
+        honest join key; an unlinked ownerId confers nothing (``email_fallback``
+        OFF). Team groups are already-canonical ``group:hubspot-team-<id>``
+        strings, deduped, order preserved.
         """
         if not owner_map:
-            return None
+            return (None, None)
         owner_id = (record.get("properties", {}) or {}).get(OWNER_ID_PROPERTY)
         if not owner_id:
-            return None
+            return (None, None)
         owner = owner_map.get(str(owner_id))
-        if owner is None or not owner.email:
-            return None
-        principals = [owner_principal(owner.email)]
+        if owner is None:
+            return (None, None)
+        teams: list[str] = []
         for team_id in owner.team_ids:
             principal = team_principal(team_id)
-            if principal not in principals:
-                principals.append(principal)
-        return principals
+            if principal not in teams:
+                teams.append(principal)
+        return (str(owner_id), teams or None)
 
     @classmethod
     def events_from_search_page(
@@ -295,15 +317,16 @@ class HubSpotConnector(Connector):
         One event per non-null property, sorted by property name for
         determinism; metadata properties (pk mirror, last-modified, owner id)
         are excluded — the last-modified timestamp becomes ``valid_from`` and
-        the owner id drives the ACL. Each event carries the record's owner+team
-        principals (``record_principals``) when ``owner_map`` resolves them.
+        the owner id drives the ACL. Each event carries the record's owner id +
+        team groups (``record_owner_id`` / ``record_principals``) when
+        ``owner_map`` resolves them.
         """
         events: list[HubSpotFactEvent] = []
         for record in page.get("results", []):
             props = record.get("properties", {})
             modified = props.get(LAST_MODIFIED_PROPERTY[object_type]) or record.get("updatedAt")
             valid_from = _parse_hs_timestamp(modified)
-            principals = cls.record_principals(record, owner_map)
+            owner_id, teams = cls.record_access(record, owner_map)
             for name in sorted(props):
                 value = props[name]
                 if name in _METADATA_PROPERTIES or value is None:
@@ -318,7 +341,8 @@ class HubSpotConnector(Connector):
                         raw_payload=record,
                         object_type=object_type,
                         visibility_policy=list(visibility_policy),
-                        record_principals=list(principals) if principals else None,
+                        record_principals=list(teams) if teams else None,
+                        record_owner_id=owner_id,
                     )
                 )
         return events
@@ -507,14 +531,16 @@ class HubSpotConnector(Connector):
     @staticmethod
     def _team_members(owner_map: Mapping[str, OwnerInfo]) -> dict[str, set[str]]:
         """Invert the owner roster into SpiceDB team edges: each
-        ``group:hubspot-team-<id>`` → the ``user:<email>`` of every owner on
-        that team (primary or secondary). This is what lets a subject resolve
-        through their team to a team-owned record."""
+        ``group:hubspot-team-<id>`` → every team member, keyed by their HubSpot
+        ``ownerId`` as a ``hubspot-owner:<id>`` crosswalk marker (M2 2b). The
+        sink resolves each marker through the ``(hubspot, ownerId)`` crosswalk to
+        the canonical ``user:<primaryEmail>`` before mirroring the edge — NEVER a
+        blind ``user:<email>`` weld; an unlinked ownerId confers no edge (fail
+        closed). This is what lets a subject resolve through their team to a
+        team-owned record."""
         members: dict[str, set[str]] = {}
-        for owner in owner_map.values():
-            if not owner.email:
-                continue
-            member = owner_principal(owner.email)
+        for owner_id, owner in owner_map.items():
+            member = f"{CROSSWALK_MEMBER_PREFIX}{owner_id}"
             for team_id in owner.team_ids:
                 members.setdefault(team_principal(team_id), set()).add(member)
         return members
@@ -527,17 +553,35 @@ class HubSpotConnector(Connector):
 
 
 class _SinkAclEmitter:
-    """Adapts the sink's ``resolve_principals`` to the ``resolve`` surface the
-    shared ``emit_acl_change`` helper expects (a PrincipalRegistry). Reuses the
-    sink's already-open client so the acl-change lane shares the batch's
-    connection + auth."""
+    """Adapts the sink to the ``resolve`` surface the shared ``emit_acl_change``
+    helper expects (a PrincipalRegistry). Reuses the sink's already-open client
+    so the acl-change lane shares the batch's connection + auth.
+
+    M2 2b — crosswalk-aware: a ``hubspot-owner:<ownerId>`` / ``fed:<subject>``
+    access-signature MARKER is resolved through the registry crosswalk (the same
+    gate ingest uses), so the retracted acl-change carries the canonical
+    ``user:<primaryEmail>`` token, never a blind ``user:<sourceEmail>``. Returns
+    ``{input_string: token}`` keyed on the ORIGINAL input (marker or canonical),
+    so ``emit_acl_change`` maps each ``new_principal`` back to its token."""
 
     def __init__(self, sink: "VerityDebeziumSink", client: httpx.Client) -> None:
         self._sink = sink
         self._client = client
 
     def resolve(self, principals: Sequence[str]) -> dict[str, int]:
-        return self._sink.resolve_principals(list(principals))
+        out: dict[str, int] = {}
+        canonical: list[str] = []
+        for principal in principals:
+            if principal.startswith(FEDERATION_MEMBER_PREFIX) or principal.startswith(
+                CROSSWALK_MEMBER_PREFIX
+            ):
+                token = self._sink._canonicalize_member_token(principal, self._client)
+                if token is not None:
+                    out[principal] = token
+            else:
+                canonical.append(principal)
+        out.update(self._sink.resolve_principals(canonical))
+        return out
 
 
 @dataclass
@@ -657,6 +701,46 @@ class VerityDebeziumSink:
                 if isinstance(token, int)
             }
 
+    @staticmethod
+    def _marker_request(member: str) -> "crosswalk.ResolveRequest | None":
+        """The typed resolve for a group-edge MARKER, or ``None`` if the member is
+        already canonical. ``fed:<subject>`` → the ``emails`` gate;
+        ``hubspot-owner:<id>`` → the ``(hubspot, ownerId)`` crosswalk."""
+        if member.startswith(FEDERATION_MEMBER_PREFIX):
+            return crosswalk.ResolveRequest(emails=[member[len(FEDERATION_MEMBER_PREFIX) :]])
+        if member.startswith(CROSSWALK_MEMBER_PREFIX):
+            return crosswalk.ResolveRequest(
+                resolvable=[
+                    crosswalk.CrosswalkOwner(
+                        source=SOURCE, local_id=member[len(CROSSWALK_MEMBER_PREFIX) :]
+                    )
+                ]
+            )
+        return None
+
+    def _canonicalize_member(self, member: str, client: httpx.Client) -> str | None:
+        """Resolve a group-edge member to its canonical principal STRING (M2 2b).
+
+        An already-canonical ``user:``/``group:``/``domain:`` member passes
+        through. A ``fed:``/``hubspot-owner:`` marker resolves through the
+        crosswalk to its canonical. An unresolved marker → ``None`` (the edge is
+        dropped, fail closed — never a blind ``user:<sourceEmail>`` weld)."""
+        request = self._marker_request(member)
+        if request is None:
+            return member  # already canonical (user:/group:/domain:)
+        result = crosswalk.resolve_via(client, self.url, self.tenant_id, request)
+        return next(iter(result.mappings), None)
+
+    def _canonicalize_member_token(self, member: str, client: httpx.Client) -> int | None:
+        """Resolve a ``fed:``/``hubspot-owner:`` marker directly to its canonical
+        int TOKEN (M2 2b — the acl-diff lane path). An unresolved marker →
+        ``None`` (fail closed)."""
+        request = self._marker_request(member)
+        if request is None:
+            return None
+        result = crosswalk.resolve_via(client, self.url, self.tenant_id, request)
+        return next(iter(result.mappings.values()), None)
+
     def sync_group_edges(self, group_members: Mapping[str, set[str]]) -> int:
         """Write group-membership edges into SpiceDB via ``POST /v1/admin/groups``
         (``group ⊃ member``), so a subject resolves through the group to
@@ -664,20 +748,26 @@ class VerityDebeziumSink:
         order (groups sorted, members sorted within each). Returns the edge count.
         No-op (0) on an empty map.
 
-        Source-neutral: ``group`` is any principal string and ``member`` may be a
-        ``user:<…>`` OR another ``group:<…>`` — the endpoint is nest-capable, so
-        HubSpot's flat ``group:hubspot-team-<id> ⊃ user:<email>`` edges and
-        Salesforce's NESTED ``group:salesforce-group-<parent> ⊃
-        group:salesforce-group-<child>`` edges both flow through unchanged."""
+        M2 2b — a member may be a crosswalk MARKER (``fed:<subject>`` for a
+        Salesforce group-member 005, ``hubspot-owner:<id>`` for a HubSpot team
+        member); it is canonicalized through the registry before the edge is
+        written (an unresolved marker DROPS the edge, fail closed — never a blind
+        ``user:<sourceEmail>``). Source-neutral otherwise: ``group`` is any
+        principal string and a canonical ``member`` may be a ``user:<…>`` OR
+        another ``group:<…>`` (the endpoint is nest-capable), so HubSpot's flat
+        team edges and Salesforce's NESTED group edges both flow through."""
         if not group_members:
             return 0
         written = 0
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
             for group in sorted(group_members):
                 for member in sorted(group_members[group]):
+                    canonical = self._canonicalize_member(member, client)
+                    if canonical is None:
+                        continue  # unresolved crosswalk marker → drop the edge
                     response = client.post(
                         f"{self.url.rstrip('/')}/v1/admin/groups",
-                        json={"tenant_id": self.tenant_id, "group": group, "member": member},
+                        json={"tenant_id": self.tenant_id, "group": group, "member": canonical},
                         headers=self._headers(),
                     )
                     response.raise_for_status()
@@ -687,13 +777,79 @@ class VerityDebeziumSink:
     #: Back-compat alias — HubSpot's flat team edges are just group edges.
     sync_team_edges = sync_group_edges
 
+    def _resolve_crosswalk_inputs(self, events: list[FactEvent]) -> dict[tuple[str, str], int]:
+        """Batch-resolve every event's typed owner inputs → an ``(kind, value) ->
+        token`` map (M2 2b). Three input kinds, each routed through the registry's
+        typed resolve so a SOURCE-LOCAL owner is never stamped blind:
+
+        - ``("principal", "group:hubspot-team-10")`` — already-canonical group
+          strings (``record_principals``): resolved via the ``principals`` field
+          (canonical == input, so the token is keyed back on the string).
+        - ``("email", "alice@corp.com")`` — Salesforce ``FederationIdentifier``
+          SSO subjects (``record_owner_emails``): resolved via the ``emails`` gate
+          (``idp_subject``/SSO-alias match). Unvouched → absent → dropped.
+        - ``("owner", "77")`` — HubSpot ``ownerId`` (``record_owner_id``):
+          resolved via the ``(hubspot, ownerId)`` crosswalk. Unlinked → dropped.
+
+        Emails and owner ids are resolved ONE value per request so the single
+        returned token is unambiguously attributed to that input (the server keys
+        ``mappings`` by canonical, not by the source-local input)."""
+        resolved: dict[tuple[str, str], int] = {}
+        groups: set[str] = set()
+        emails: set[str] = set()
+        owner_ids: set[str] = set()
+        for e in events:
+            for g in getattr(e, "record_principals", None) or []:
+                groups.add(g)
+            for m in getattr(e, "record_owner_emails", None) or []:
+                emails.add(m)
+            owner_id = getattr(e, "record_owner_id", None)
+            if owner_id:
+                owner_ids.add(str(owner_id))
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            if groups:
+                result = crosswalk.resolve_via(
+                    client,
+                    self.url,
+                    self.tenant_id,
+                    crosswalk.ResolveRequest(principals=sorted(groups)),
+                )
+                for g in groups:
+                    if g in result.mappings:
+                        resolved[("principal", g)] = result.mappings[g]
+            for email in sorted(emails):
+                result = crosswalk.resolve_via(
+                    client, self.url, self.tenant_id, crosswalk.ResolveRequest(emails=[email])
+                )
+                token = next(iter(result.mappings.values()), None)
+                if token is not None:
+                    resolved[("email", email)] = token
+            for owner_id in sorted(owner_ids):
+                result = crosswalk.resolve_via(
+                    client,
+                    self.url,
+                    self.tenant_id,
+                    crosswalk.ResolveRequest(
+                        resolvable=[crosswalk.CrosswalkOwner(source=SOURCE, local_id=owner_id)]
+                    ),
+                )
+                token = next(iter(result.mappings.values()), None)
+                if token is not None:
+                    resolved[("owner", owner_id)] = token
+        return resolved
+
     def _stamp_record_visibility(self, events: list[FactEvent]) -> None:
-        """Resolve every owned record's owner/team principals to tokens in one
-        round-trip and stamp ``record_visibility`` on those events. Unowned
-        events are left untouched (they use the admin-assigned fallback). The
-        owner principal is minted on demand, so an owned record always resolves
-        to at least its owner — it can never silently degrade to the broader
-        admin fallback.
+        """Resolve every owned record's owner/team access to tokens through the
+        identity crosswalk (M2 2b) and stamp ``record_visibility``. Unowned events
+        are left untouched (they use the admin-assigned fallback).
+
+        Each event's visibility is the union of its resolved team-group tokens
+        (``record_principals``), its Salesforce ``FederationIdentifier`` owner
+        tokens (``record_owner_emails``), and its HubSpot ``ownerId`` token
+        (``record_owner_id``) — each routed through the crosswalk, NEVER stamped
+        blind. An owner/team that does not resolve (unvouched email, unlinked
+        ownerId, inactive) contributes nothing; if NOTHING resolves the event
+        falls back to the admin floor (fail closed, over-hide).
 
         The write-path choke point (crates/verity-server/src/ingest.rs) applies
         an inline ``verity_acl`` with REPLACE semantics — it wins over the
@@ -707,23 +863,32 @@ class VerityDebeziumSink:
         tokens are UNIONed into ``record_visibility`` so the inline block is a
         superset of the floor (over-hide, never under-hide). HubSpot events do
         not set the attribute and are unaffected."""
-        distinct = sorted(
-            {p for e in events for p in (getattr(e, "record_principals", None) or [])}
-        )
-        if not distinct:
+        resolved_inputs = self._resolve_crosswalk_inputs(events)
+        if not resolved_inputs:
             return
-        tokens = self.resolve_principals(distinct)
         for event in events:
-            principals = getattr(event, "record_principals", None)
-            if not principals:
+            tokens: list[int] = []
+            for g in getattr(event, "record_principals", None) or []:
+                token = resolved_inputs.get(("principal", g))
+                if token is not None and token not in tokens:
+                    tokens.append(token)
+            for m in getattr(event, "record_owner_emails", None) or []:
+                token = resolved_inputs.get(("email", m))
+                if token is not None and token not in tokens:
+                    tokens.append(token)
+            owner_id = getattr(event, "record_owner_id", None)
+            if owner_id:
+                token = resolved_inputs.get(("owner", str(owner_id)))
+                if token is not None and token not in tokens:
+                    tokens.append(token)
+            if not tokens:
                 continue
-            resolved = [tokens[p] for p in principals if p in tokens]
-            if resolved and getattr(event, "union_policy_floor", False):
+            if getattr(event, "union_policy_floor", False):
                 # UNION the admin floor in (dedup, floor first) so the inline
                 # REPLACE-semantics block is a superset of the bound policy.
                 floor = list(getattr(event, "visibility_policy", None) or [])
-                resolved = list(dict.fromkeys([*floor, *resolved]))
-            event.record_visibility = resolved or None  # type: ignore[attr-defined]
+                tokens = list(dict.fromkeys([*floor, *tokens]))
+            event.record_visibility = tokens or None  # type: ignore[attr-defined]
 
     def post(self, events: list[FactEvent], cursor: str | None = None) -> dict:
         """POST a batch; returns the server's write summary.
@@ -760,18 +925,37 @@ class VerityDebeziumSink:
             self._heartbeat(client, headers, events, cursor)
             return summary
 
+    @staticmethod
+    def _record_access_signature(event: HubSpotFactEvent) -> list[str]:
+        """The record's FULL access set as stable strings for the ACL-diff lane
+        (M2 2b): the ``hubspot-owner:<ownerId>`` crosswalk marker (if owned) plus
+        every already-canonical team ``group:`` string. Diffing on this set still
+        catches an owner REASSIGNMENT or a team change as a tightening — the M1
+        acl-diff lane is not weakened by moving the owner off ``record_principals``
+        into ``record_owner_id``. The marker is canonicalized to a token by the
+        emitter's crosswalk-aware resolve when an acl-change actually POSTs."""
+        access: list[str] = []
+        owner_id = getattr(event, "record_owner_id", None)
+        if owner_id:
+            access.append(f"{CROSSWALK_MEMBER_PREFIX}{owner_id}")
+        access.extend(getattr(event, "record_principals", None) or [])
+        return access
+
     def emit_acl_changes(self, events: list[HubSpotFactEvent], state: AclState) -> int:
-        """ACL-diff lane (additive): diff each RECORD's owner/team principal set
+        """ACL-diff lane (additive): diff each RECORD's owner/team access set
         against its last-seen set and, on a TIGHTENING, POST an acl-change per
         derived fact key so the server retracts the lost principal.
 
         A record fans out to one FactEvent per field; the ACL is a per-record
-        property (all its facts share ``record_principals``), so we diff ONCE per
+        property (all its facts share the same owner+teams), so we diff ONCE per
         ``entity_id`` (keyed with the object type, since the same id can recur
         across object types) and emit per ``(source, entity_id, field)`` fact key.
-        Owner/team-scoped records only — an unowned record has no per-record ACL
-        to diff (it rides the admin-assigned bound policy). Returns the number of
-        acl-change POSTs. Purely additive; never affects the fact-delivery count.
+        M2 2b — the diffed set is the FULL access signature (owner MARKER + team
+        groups); the marker is crosswalk-resolved to the canonical token when the
+        acl-change POSTs. Owner/team-scoped records only — an unowned record has
+        no per-record ACL to diff (it rides the admin-assigned bound policy).
+        Returns the number of acl-change POSTs. Purely additive; never affects the
+        fact-delivery count.
         """
         with httpx.Client(timeout=30.0, transport=self.transport) as client:
             emitter = _SinkAclEmitter(self, client)
@@ -779,7 +963,7 @@ class VerityDebeziumSink:
             # Group fields by record so the diff runs once per record.
             by_record: dict[str, list[HubSpotFactEvent]] = {}
             for e in events:
-                if not getattr(e, "record_principals", None):
+                if not self._record_access_signature(e):
                     continue
                 # source keyed to the L1 partition the server builds:
                 # "{connector}:{object_type}".
@@ -792,7 +976,7 @@ class VerityDebeziumSink:
                 change = diff_acl(
                     state,
                     record_id,
-                    list(first.record_principals or []),
+                    self._record_access_signature(first),
                     source=fact_source,
                     entity_id=first.entity_id,
                     field=first.field_name,

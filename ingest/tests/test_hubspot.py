@@ -499,48 +499,115 @@ OWNER_MAP = {
 }
 
 
-def test_record_principals_owner_first_then_teams_deduped() -> None:
+def test_record_access_owner_id_and_teams_deduped() -> None:
+    # M2 2b — the owner is carried as its raw ownerId (resolved via the
+    # (hubspot, ownerId) crosswalk by the sink), NOT a blind user:<email>. Teams
+    # are already-canonical group strings.
     record = {"properties": {"hubspot_owner_id": "77"}}
-    assert HubSpotConnector.record_principals(record, OWNER_MAP) == [
-        "user:rep.one@acme.test",  # owner first, deterministic
-        "group:hubspot-team-10",
-        "group:hubspot-team-20",
-    ]
+    owner_id, teams = HubSpotConnector.record_access(record, OWNER_MAP)
+    assert owner_id == "77"
+    assert teams == ["group:hubspot-team-10", "group:hubspot-team-20"]
 
 
-def test_record_principals_none_when_unowned_or_unknown_or_no_map() -> None:
+def test_record_access_none_when_unowned_or_unknown_or_no_map() -> None:
     # No owner map (owners scope absent) → fallback for everything.
-    assert HubSpotConnector.record_principals({"properties": {}}, None) is None
+    assert HubSpotConnector.record_access({"properties": {}}, None) == (None, None)
     # Owner id absent/blank → unowned → fallback.
-    assert HubSpotConnector.record_principals({"properties": {}}, OWNER_MAP) is None
-    assert (
-        HubSpotConnector.record_principals(
-            {"properties": {"hubspot_owner_id": None}}, OWNER_MAP
-        )
-        is None
-    )
+    assert HubSpotConnector.record_access({"properties": {}}, OWNER_MAP) == (None, None)
+    assert HubSpotConnector.record_access(
+        {"properties": {"hubspot_owner_id": None}}, OWNER_MAP
+    ) == (None, None)
     # Owner id present but not in the roster → fail closed (fallback), never a
     # fabricated principal.
-    assert (
-        HubSpotConnector.record_principals(
-            {"properties": {"hubspot_owner_id": "does-not-exist"}}, OWNER_MAP
-        )
-        is None
-    )
+    assert HubSpotConnector.record_access(
+        {"properties": {"hubspot_owner_id": "does-not-exist"}}, OWNER_MAP
+    ) == (None, None)
 
 
-def test_team_members_inverts_roster_lowercasing_and_dropping_emailless() -> None:
+def test_team_members_inverts_roster_keyed_by_owner_id_marker() -> None:
+    # M2 2b — team members are keyed by their ownerId as a hubspot-owner:<id>
+    # crosswalk marker (the sink canonicalizes to user:<primaryEmail> before
+    # mirroring the edge); the owner's email is NO LONGER a group-edge member.
     owners = HubSpotConnector._team_members(
         {
             "77": OwnerInfo(email="rep.one@acme.test", team_ids=("10", "20")),
             "88": OwnerInfo(email="rep.two@acme.test", team_ids=("10",)),
-            "99": OwnerInfo(email="", team_ids=("10",)),  # emailless queue → dropped
         }
     )
     assert owners == {
-        "group:hubspot-team-10": {"user:rep.one@acme.test", "user:rep.two@acme.test"},
-        "group:hubspot-team-20": {"user:rep.one@acme.test"},
+        "group:hubspot-team-10": {"hubspot-owner:77", "hubspot-owner:88"},
+        "group:hubspot-team-20": {"hubspot-owner:77"},
     }
+
+
+# --- M2 2b: ownerId crosswalk (admin_explicit), email_fallback OFF ------------
+
+
+def test_sink_resolves_owner_via_crosswalk_ownerid_not_email() -> None:
+    # The sink sends (hubspot, ownerId) through `resolvable` — NOT owner.email
+    # via `principals`/`emails`. The record's owner email is irrelevant to the
+    # token it gets; the admin_explicit crosswalk row (77 → canonical) decides.
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if request.url.path == "/v1/admin/principals":
+            seen.append(body)
+            mappings: dict[str, int] = {}
+            for owner in body.get("resolvable", []):
+                if owner == {"source": "hubspot", "local_id": "77"}:
+                    mappings["user:alice@corp.com"] = 900  # the canonical, not the email
+            declared = bool(body.get("resolvable") or body.get("emails"))
+            return httpx.Response(
+                200, json={"mappings": mappings, "quarantined": declared and not mappings}
+            )
+        return httpx.Response(200, json={"facts_inserted": 1})
+
+    sink = VerityDebeziumSink(
+        url="http://sink", tenant_id="t", transport=httpx.MockTransport(handler)
+    )
+    event = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="H",
+        field_name="dealname",
+        value="Big deal",
+        valid_from=utc(2026, 7, 10, 12),
+        raw_payload={},
+        object_type="deals",
+        visibility_policy=POLICY,
+        record_owner_id="77",  # the ownerId — NOT owner.email
+    )
+    sink._stamp_record_visibility([event])
+    assert event.record_visibility == [900]
+    # The request carried the ownerId via `resolvable`; no blind email/principal.
+    assert seen == [{"tenant_id": "t", "resolvable": [{"source": "hubspot", "local_id": "77"}]}]
+
+
+def test_sink_unlinked_ownerid_confers_no_visibility() -> None:
+    # An ownerId with no crosswalk row → the server drops it → the record has no
+    # inline ACL and rides the admin --visibility floor (never a fabricated token).
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/principals":
+            return httpx.Response(200, json={"mappings": {}, "quarantined": True})
+        return httpx.Response(200, json={"facts_inserted": 1})
+
+    sink = VerityDebeziumSink(
+        url="http://sink", tenant_id="t", transport=httpx.MockTransport(handler)
+    )
+    event = HubSpotFactEvent(
+        source="hubspot",
+        entity_id="H",
+        field_name="dealname",
+        value="v",
+        valid_from=utc(2026, 7, 10, 12),
+        raw_payload={},
+        object_type="deals",
+        visibility_policy=POLICY,
+        record_owner_id="unlinked",
+    )
+    sink._stamp_record_visibility([event])
+    assert event.record_visibility is None  # no inline ACL → admin floor
+    assert "verity_acl" not in VerityDebeziumSink.envelope(event)
 
 
 def owned_contacts_mock(log: list[dict], owners: dict) -> httpx.MockTransport:
@@ -574,24 +641,23 @@ def test_poll_mirrors_owner_and_team_acl_and_builds_edges() -> None:
 
     events, _ = asyncio.run(run())
 
-    # Record 401 (owner 77 → teams 10,20): its facts carry owner + both teams.
+    # M2 2b — Record 401 (owner 77 → teams 10,20): the owner is its ownerId (the
+    # sink resolves it via the (hubspot, 77) crosswalk), teams are canonical.
     e401 = next(e for e in events if e.entity_id == "401")
-    assert e401.record_principals == [
-        "user:rep.one@acme.test",  # owner email lowercased from "Rep.One@acme.test"
-        "group:hubspot-team-10",
-        "group:hubspot-team-20",
-    ]
+    assert e401.record_owner_id == "77"
+    assert e401.record_principals == ["group:hubspot-team-10", "group:hubspot-team-20"]
     # Record 402 (owner 88 → team 10 only).
     e402 = next(e for e in events if e.entity_id == "402")
-    assert e402.record_principals == ["user:rep.two@acme.test", "group:hubspot-team-10"]
+    assert e402.record_owner_id == "88"
+    assert e402.record_principals == ["group:hubspot-team-10"]
     # Record 403 (unowned) → no per-record ACL → admin fallback.
     e403 = next(e for e in events if e.entity_id == "403")
-    assert e403.record_principals is None
+    assert e403.record_owner_id is None and e403.record_principals is None
 
-    # Team edges inverted from the FULL roster (owner 99 is emailless → dropped).
+    # Team edges inverted from the FULL roster, keyed by ownerId marker.
     assert connector.team_members == {
-        "group:hubspot-team-10": {"user:rep.one@acme.test", "user:rep.two@acme.test"},
-        "group:hubspot-team-20": {"user:rep.one@acme.test"},
+        "group:hubspot-team-10": {"hubspot-owner:77", "hubspot-owner:88"},
+        "group:hubspot-team-20": {"hubspot-owner:77"},
     }
 
 
@@ -664,13 +730,15 @@ def test_sink_resolves_owned_records_and_falls_back_for_unowned() -> None:
         body = json.loads(request.content) if request.content else {}
         seen.append({"path": path, "url": str(request.url), "body": body})
         if path == "/v1/admin/principals":
-            # Deterministic materialization of the owner/team strings.
-            table = {
-                "user:rep.one@acme.test": 31,
-                "group:hubspot-team-10": 32,
-            }
+            # Already-canonical team group; ownerId 77 resolves via the crosswalk.
+            table = {"group:hubspot-team-10": 32}
+            mappings = {p: table[p] for p in body.get("principals", []) if p in table}
+            for owner in body.get("resolvable", []):
+                if owner.get("source") == "hubspot" and owner.get("local_id") == "77":
+                    mappings["user:rep.one@acme.test"] = 31
+            declared = bool(body.get("resolvable") or body.get("emails"))
             return httpx.Response(
-                200, json={"mappings": {p: table[p] for p in body["principals"] if p in table}}
+                200, json={"mappings": mappings, "quarantined": declared and not mappings}
             )
         if path == "/v1/ingest/debezium":
             return httpx.Response(
@@ -694,7 +762,8 @@ def test_sink_resolves_owned_records_and_falls_back_for_unowned() -> None:
         raw_payload={},
         object_type="contacts",
         visibility_policy=POLICY,
-        record_principals=["user:rep.one@acme.test", "group:hubspot-team-10"],
+        record_principals=["group:hubspot-team-10"],
+        record_owner_id="77",
     )
     unowned = HubSpotFactEvent(
         source="hubspot",
@@ -713,8 +782,8 @@ def test_sink_resolves_owned_records_and_falls_back_for_unowned() -> None:
     )
     sink.post([owned, unowned])
 
-    # The owned event got its owner/team principals resolved and stamped.
-    assert owned.record_visibility == [31, 32]
+    # The owned event got its team group (32) + crosswalked owner (31) stamped.
+    assert owned.record_visibility == [32, 31]
     assert unowned.record_visibility is None
     # The batch still carries the admin-assigned fallback for the unowned record.
     ingest = next(s for s in seen if s["path"] == "/v1/ingest/debezium")
@@ -722,7 +791,7 @@ def test_sink_resolves_owned_records_and_falls_back_for_unowned() -> None:
     bodies = ingest["body"]
     owned_env = next(b for b in bodies if b["after"]["id"] == "401")
     assert owned_env["verity_acl"] == {
-        "visibility": [31, 32],
+        "visibility": [32, 31],
         "confidentiality": "internal",
         "acl_provenance": "approximated",
     }
@@ -812,16 +881,28 @@ def _backfill_sink(seen: list[dict]) -> VerityDebeziumSink:
         body = json.loads(request.content) if request.content else {}
         seen.append({"path": path, "body": body})
         if path == "/v1/admin/principals":
-            table = {
-                "user:rep.one@acme.test": 31,
-                "user:rep.two@acme.test": 33,
+            # Already-canonical strings (team groups).
+            principal_table = {
                 "group:hubspot-team-10": 32,
                 "group:hubspot-team-20": 34,
             }
-            return httpx.Response(
-                200,
-                json={"mappings": {p: table[p] for p in body.get("principals", []) if p in table}},
-            )
+            # M2 2b — the crosswalk: (hubspot, ownerId) → canonical user token.
+            owner_table = {
+                "77": ("user:rep.one@acme.test", 31),
+                "88": ("user:rep.two@acme.test", 33),
+            }
+            mappings: dict[str, int] = {
+                p: principal_table[p]
+                for p in body.get("principals", [])
+                if p in principal_table
+            }
+            declared = bool(body.get("resolvable") or body.get("emails"))
+            for owner in body.get("resolvable", []):
+                if owner.get("source") == "hubspot" and owner.get("local_id") in owner_table:
+                    canon, token = owner_table[owner["local_id"]]
+                    mappings[canon] = token
+            quarantined = declared and not mappings
+            return httpx.Response(200, json={"mappings": mappings, "quarantined": quarantined})
         if path == "/v1/ingest/debezium":
             return httpx.Response(200, json={"facts_inserted": len(body)})
         return httpx.Response(200, json={})  # groups, connector-status, backfill

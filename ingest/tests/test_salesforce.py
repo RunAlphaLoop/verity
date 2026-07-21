@@ -272,20 +272,55 @@ def test_principal_for_share_classifies_raw_ids() -> None:
 def test_resolve_share_principals_crosswalk() -> None:
     from verity_ingest.connectors.salesforce import SalesforceUserInfo
 
-    roster = {"005xx000001X8UzAAK": SalesforceUserInfo(email="ae@acme.test")}
-    # (a) User → lowercased cross-source token; Group → stable salesforce token.
+    # M2 2b — the 005 resolves via FederationIdentifier (the SSO subject), NOT
+    # User.Email. resolve_share_principals returns (groups, owner_subjects); the
+    # SINK sends owner_subjects through the `emails` gate to the canonical token.
+    roster = {
+        "005xx000001X8UzAAK": SalesforceUserInfo(
+            email="ae.divergent@acme.sf",  # divergent login — NEVER a join key
+            federation_identifier="ae@acme.test",
+            is_active=True,
+        )
+    }
+    # (a) User → its FederationIdentifier subject; Group → stable salesforce group.
     assert SalesforceConnector.resolve_share_principals(
         ["005xx000001X8UzAAK", "00Gxx0000000001EAA"], roster
-    ) == ["user:ae@acme.test", "group:salesforce-group-00Gxx0000000001EAA"]
-    # unresolvable 005 (not in roster / no email) is DROPPED → None (fail closed)
-    assert SalesforceConnector.resolve_share_principals(["005xx000009ZZZAAK"], roster) is None
-    assert SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], {}) is None
-    # all-dropped / empty → None so the record rides the admin --visibility floor
-    assert SalesforceConnector.resolve_share_principals([], roster) is None
+    ) == (["group:salesforce-group-00Gxx0000000001EAA"], ["ae@acme.test"])
+    # The divergent User.Email is NEVER emitted as a resolution value.
+    _, subjects = SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], roster)
+    assert subjects == ["ae@acme.test"]
+    assert "ae.divergent@acme.sf" not in (subjects or [])
+    # unresolvable 005 (not in roster / no federation id / inactive) → dropped
+    assert SalesforceConnector.resolve_share_principals(["005xx000009ZZZAAK"], roster) == (
+        None,
+        None,
+    )
+    assert SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], {}) == (None, None)
+    # a 005 present but with no FederationIdentifier is dropped (no User.Email fallback)
+    no_fed = {
+        "005xx000001X8UzAAK": SalesforceUserInfo(email="x@acme.sf", federation_identifier=None)
+    }
+    assert SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], no_fed) == (
+        None,
+        None,
+    )
+    # an inactive 005 (IsActive=false) is dropped even with a federation id
+    inactive = {
+        "005xx000001X8UzAAK": SalesforceUserInfo(
+            email="x@acme.sf", federation_identifier="x@acme.test", is_active=False
+        )
+    }
+    assert SalesforceConnector.resolve_share_principals(["005xx000001X8UzAAK"], inactive) == (
+        None,
+        None,
+    )
+    # all-dropped / empty → (None, None) so the record rides the admin floor
+    assert SalesforceConnector.resolve_share_principals([], roster) == (None, None)
     # a group id alone still resolves (no roster dependency)
-    assert SalesforceConnector.resolve_share_principals(["00Gxx0000000001EAA"], {}) == [
-        "group:salesforce-group-00Gxx0000000001EAA"
-    ]
+    assert SalesforceConnector.resolve_share_principals(["00Gxx0000000001EAA"], {}) == (
+        ["group:salesforce-group-00Gxx0000000001EAA"],
+        None,
+    )
 
 
 # ---------- sink conformance: FactEvent → exact Debezium envelope ----------
@@ -348,8 +383,11 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
     # roster queries fired for the collected share ids
     queries = [entry["q"] for entry in data_requests]
     user_soql = next(q for q in queries if "FROM User " in q)
+    # M2 2b — the roster SELECT carries the FederationIdentifier join key (+ keeps
+    # Email/Username/IsActive). Email is NEVER the crosswalk key.
     assert user_soql == (
-        "SELECT Id, Email, IsActive FROM User WHERE Id IN ('005xx000001X8UzAAK')"
+        "SELECT Id, Email, Username, FederationIdentifier, IsActive FROM User "
+        "WHERE Id IN ('005xx000001X8UzAAK')"
     )
     assert any("FROM GroupMember" in q and "'00Gxx0000000001EAA'" in q for q in queries)
 
@@ -370,23 +408,38 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
         if isinstance(e, SalesforceFactEvent) and e.object_type != "Account"
     )
 
-    # share ids crosswalked → cross-source principal strings (005 → lowercased
-    # user:<email>; 00G → stable group token). Non-Account events untouched.
-    by_account_principals = {
+    # M2 2b — share ids crosswalked: a 005 owner becomes its FederationIdentifier
+    # SSO subject in record_owner_emails (the sink resolves it via the `emails`
+    # gate — NEVER User.Email); a 00G becomes an already-canonical group string in
+    # record_principals. Non-Account events untouched.
+    by_account_groups = {
         e.entity_id: e.record_principals
         for e in events
         if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
     }
-    assert by_account_principals == {
-        "001xx000003DGb1AAG": [
-            "user:ae@acme.test",
-            "group:salesforce-group-00Gxx0000000001EAA",
-        ],
-        "001xx000003DGb2AAG": ["user:ae@acme.test"],
+    by_account_owners = {
+        e.entity_id: e.record_owner_emails
+        for e in events
+        if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
+    }
+    assert by_account_groups == {
+        "001xx000003DGb1AAG": ["group:salesforce-group-00Gxx0000000001EAA"],
+        "001xx000003DGb2AAG": None,  # user-only share → no group
         "001xx000003DGb3AAG": None,  # no shares → admin --visibility floor
     }
+    assert by_account_owners == {
+        "001xx000003DGb1AAG": ["ae@acme.test"],  # the federation subject, not the email
+        "001xx000003DGb2AAG": ["ae@acme.test"],
+        "001xx000003DGb3AAG": None,
+    }
+    # The divergent User.Email is NEVER used as an owner value.
     assert all(
-        e.record_principals is None
+        "ae.divergent@acme.sf" not in (e.record_owner_emails or [])
+        for e in events
+        if isinstance(e, SalesforceFactEvent)
+    )
+    assert all(
+        e.record_principals is None and e.record_owner_emails is None
         for e in events
         if isinstance(e, SalesforceFactEvent) and e.object_type != "Account"
     )
@@ -448,10 +501,12 @@ def test_poll_builds_nested_cycle_safe_group_edges() -> None:
 
     # Direct edges only (SpiceDB closes transitivity). Nesting preserved: a
     # 00G member becomes a group:salesforce-group-<child> edge. The mutual
-    # reference (1⊃2, 2⊃1) terminates via the visited-set (no hang).
+    # reference (1⊃2, 2⊃1) terminates via the visited-set (no hang). M2 2b — a
+    # 005 group member is emitted as its `fed:<FederationIdentifier>` marker; the
+    # sink canonicalizes it through the registry `emails` gate before mirroring.
     assert connector.group_edges == {
         "group:salesforce-group-00Gxx0000000001EAA": {
-            "user:ae@acme.test",
+            "fed:ae@acme.test",
             "group:salesforce-group-00Gxx0000000002EAA",
         },
         "group:salesforce-group-00Gxx0000000002EAA": {
@@ -462,9 +517,9 @@ def test_poll_builds_nested_cycle_safe_group_edges() -> None:
 
 def test_group_only_member_user_is_fetched_and_edged() -> None:
     # A user (005) that is ONLY a GroupMember — never a direct AccountShare
-    # principal — must still be queried for its email and edged into the group.
-    # This is the common case for group shares; the User query covers the UNION
-    # of share-derived AND group-member 005 ids.
+    # principal — must still be queried for its FederationIdentifier and edged
+    # into the group. This is the common case for group shares; the User query
+    # covers the UNION of share-derived AND group-member 005 ids.
     GROUP = "00Gxx0000000009EAA"
     MEMBER = "005xx000009MEMBER1"
 
@@ -492,7 +547,14 @@ def test_group_only_member_user_is_fetched_and_edged() -> None:
                 json={
                     "totalSize": 1,
                     "done": True,
-                    "records": [{"Id": MEMBER, "Email": "member1@acme.test", "IsActive": True}],
+                    "records": [
+                        {
+                            "Id": MEMBER,
+                            "Email": "member1.divergent@acme.sf",
+                            "FederationIdentifier": "member1@acme.test",
+                            "IsActive": True,
+                        }
+                    ],
                 },
             )
         raise AssertionError(f"unexpected SOQL: {soql}")
@@ -511,13 +573,13 @@ def test_group_only_member_user_is_fetched_and_edged() -> None:
     async def run():
         try:
             # NO share-derived user_ids — the member 005 is discovered purely via
-            # the group. It must still land in the edge as user:<email>.
+            # the group. It must land as its `fed:<FederationIdentifier>` marker.
             return await connector._fetch_roster([], [GROUP])
         finally:
             await connector.aclose()
 
     _users, group_edges = asyncio.run(run())
-    assert group_edges == {"group:salesforce-group-00Gxx0000000009EAA": {"user:member1@acme.test"}}
+    assert group_edges == {"group:salesforce-group-00Gxx0000000009EAA": {"fed:member1@acme.test"}}
 
 
 def test_sync_group_edges_posts_sorted_and_nest_capable() -> None:
@@ -597,13 +659,23 @@ def test_stamp_unions_admin_floor_into_resolved_visibility() -> None:
     # the sink must UNION the admin --visibility floor (POLICY = [7, 12]) into
     # the resolved record_visibility, floor first, so the inline block is a
     # SUPERSET of the floor — the record can never LOSE its admin floor.
+    #
+    # M2 2b — the owner is resolved via its FederationIdentifier through the
+    # `emails` gate (→ canonical user:ae@acme.test / token 41); the group is
+    # resolved as an already-canonical principal (token 55). The server keys
+    # `mappings` by canonical, so the FederationIdentifier request echoes the
+    # canonical string back.
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/admin/principals":
             body = json.loads(request.content)
-            table = {"user:ae@acme.test": 41, "group:salesforce-group-00Gxx0000000001EAA": 55}
-            return httpx.Response(
-                200, json={"mappings": {p: table[p] for p in body["principals"] if p in table}}
-            )
+            mappings: dict[str, int] = {}
+            # FederationIdentifier ae@acme.test → canonical user:ae@acme.test (41)
+            if "ae@acme.test" in body.get("emails", []):
+                mappings["user:ae@acme.test"] = 41
+            for p in body.get("principals", []):
+                if p == "group:salesforce-group-00Gxx0000000001EAA":
+                    mappings[p] = 55
+            return httpx.Response(200, json={"mappings": mappings, "quarantined": False})
         raise AssertionError(request.url.path)
 
     sink = VerityDebeziumSink(
@@ -618,12 +690,57 @@ def test_stamp_unions_admin_floor_into_resolved_visibility() -> None:
         raw_payload={},
         object_type="Account",
         visibility_policy=POLICY,
-        record_principals=["user:ae@acme.test", "group:salesforce-group-00Gxx0000000001EAA"],
+        record_principals=["group:salesforce-group-00Gxx0000000001EAA"],
+        record_owner_emails=["ae@acme.test"],  # the FederationIdentifier, NOT User.Email
     )
     sink._stamp_record_visibility([event])
-    # floor [7, 12] UNIONed in, floor first, deduped
-    assert event.record_visibility == [7, 12, 41, 55]
-    assert VerityDebeziumSink.envelope(event)["verity_acl"]["visibility"] == [7, 12, 41, 55]
+    # floor [7, 12] UNIONed in, floor first, deduped; owner (41) + group (55)
+    assert event.record_visibility == [7, 12, 55, 41]
+    assert VerityDebeziumSink.envelope(event)["verity_acl"]["visibility"] == [7, 12, 55, 41]
+
+
+def test_federation_absent_confers_no_visibility_never_email_fallback() -> None:
+    # M2 2b — a 005 whose FederationIdentifier does not match any declared SSO
+    # alias resolves to NOTHING at the sink (the `emails` gate returns no
+    # mapping). The record has no inline ACL and rides the admin floor; the
+    # divergent User.Email is NEVER used as a fallback join key.
+    from verity_ingest.connectors.salesforce import SalesforceUserInfo
+
+    roster = {
+        "005xx000001X8UzAAK": SalesforceUserInfo(
+            email="ae.divergent@acme.sf", federation_identifier="unmatched@acme.test"
+        )
+    }
+    groups, owner_emails = SalesforceConnector.resolve_share_principals(
+        ["005xx000001X8UzAAK"], roster
+    )
+    assert groups is None and owner_emails == ["unmatched@acme.test"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/admin/principals":
+            body = json.loads(request.content)
+            # No declared alias for unmatched@acme.test → nothing resolves.
+            assert "ae.divergent@acme.sf" not in body.get("emails", [])
+            return httpx.Response(200, json={"mappings": {}, "quarantined": True})
+        raise AssertionError(request.url.path)
+
+    sink = VerityDebeziumSink(
+        url="http://sink", tenant_id="t", transport=httpx.MockTransport(handler)
+    )
+    event = SalesforceFactEvent(
+        source="salesforce",
+        entity_id="A",
+        field_name="Name",
+        value="Acme",
+        valid_from=utc(2026, 7, 8, 18, 4, 57),
+        raw_payload={},
+        object_type="Account",
+        visibility_policy=POLICY,
+        record_owner_emails=list(owner_emails or []),
+    )
+    sink._stamp_record_visibility([event])
+    assert event.record_visibility is None  # no inline ACL → admin floor
+    assert "verity_acl" not in VerityDebeziumSink.envelope(event)
 
 
 def test_roster_non_403_error_degrades_and_signals(capsys: pytest.CaptureFixture[str]) -> None:

@@ -25,15 +25,22 @@ import pytest
 
 from verity_ingest.connectors.gdirectory import (
     CONNECTOR_STATUS_PATH,
+    CROSSWALK_PATH,
+    DEPROVISION_PATH,
     GROUPS_PATH,
     PRINCIPALS_PATH,
+    REGISTRY_ALIAS_PATH,
+    REGISTRY_CANONICAL_PATH,
     AdminOp,
     DirectorySnapshot,
+    DirectoryUser,
     DryRunAdminSink,
     GDirectoryConfig,
     GDirectoryConnector,
+    SsoAlias,
     VerityAdminSink,
     build_admin_ops,
+    build_registry_ops,
     diff_snapshots,
     load_directory_credentials,
     map_member,
@@ -71,6 +78,23 @@ SYNC1_MEMBERSHIPS = [
 ]
 
 SYNC1_PRINCIPALS = sorted({ALICE, BOB, CAROL, ALL, ENG, LEADS, LOOP_A, LOOP_B, DOMAIN})
+
+# M2 2b — the active-user registry records the reconcile populates (sorted by
+# primary email). Alice carries an admin-declared SSO alias from a custom-typed
+# externalId (lowercased); Bob/Carol carry none. mallory (suspended) is absent.
+SYNC1_DIRECTORY_USERS = [
+    DirectoryUser(
+        directory_id="100000000000000000001",
+        primary_email="alice@corp.example",
+        aliases=(SsoAlias(alias="alice.sso@corp.example", source="google_externalid"),),
+    ),
+    DirectoryUser(directory_id="100000000000000000002", primary_email="bob@corp.example"),
+    DirectoryUser(directory_id="100000000000000000004", primary_email="carol@corp.example"),
+]
+
+# The registry ops that lead every populate cycle: canonical rows → alias rows →
+# self-crosswalk rows (in that order — canonical must exist before its refs).
+SYNC1_REGISTRY_OPS = build_registry_ops(SYNC1_DIRECTORY_USERS, TENANT)
 
 
 def _config() -> GDirectoryConfig:
@@ -226,12 +250,87 @@ def test_closure_treats_domain_principal_as_opaque():
 def test_first_sync_ops_exact():
     snapshot = GDirectoryConnector(_sync1_transport(), _config()).reconcile()
     ops = build_admin_ops(diff_snapshots(DirectorySnapshot(), snapshot), TENANT)
-    assert ops[0] == AdminOp(
+    n_reg = len(SYNC1_REGISTRY_OPS)
+    # M2 2b — registry populate leads the cycle (canonical → alias → crosswalk).
+    assert ops[:n_reg] == SYNC1_REGISTRY_OPS
+    assert ops[n_reg] == AdminOp(
         "POST", PRINCIPALS_PATH, {"tenant_id": TENANT, "principals": SYNC1_PRINCIPALS}
     )
-    assert ops[1:] == [
+    assert ops[n_reg + 1 :] == [
         AdminOp("POST", GROUPS_PATH, {"tenant_id": TENANT, "group": g, "member": m})
         for g, m in sorted(SYNC1_MEMBERSHIPS)
+    ]
+
+
+def test_reconcile_populates_directory_users_with_aliases():
+    snapshot = GDirectoryConnector(_sync1_transport(), _config()).reconcile()
+    # M2 2b — full active-user records for the registry populate, aliases from the
+    # custom-typed externalId only (organization-typed id is ignored), lowercased.
+    assert snapshot.directory_users == SYNC1_DIRECTORY_USERS
+
+
+def test_registry_ops_order_canonical_then_alias_then_crosswalk():
+    # canonical rows first (one batched POST), then aliases (one batched POST for
+    # the users that HAVE aliases), then a self-crosswalk POST per user.
+    assert [(op.method, op.path) for op in SYNC1_REGISTRY_OPS] == [
+        ("POST", REGISTRY_CANONICAL_PATH),
+        ("POST", REGISTRY_ALIAS_PATH),
+        ("POST", CROSSWALK_PATH),  # alice
+        ("POST", CROSSWALK_PATH),  # bob
+        ("POST", CROSSWALK_PATH),  # carol
+    ]
+    canonical = SYNC1_REGISTRY_OPS[0].body
+    assert canonical["principals"][0] == {
+        "canonical": ALICE,
+        "kind": "user",
+        "idp_subject": "alice@corp.example",
+        "active": True,
+    }
+    # Exactly one alias row (alice's SSO externalId); bob/carol have none.
+    assert SYNC1_REGISTRY_OPS[1].body["aliases"] == [
+        {"canonical": ALICE, "alias": "alice.sso@corp.example", "source": "google_externalid"}
+    ]
+    # The self-crosswalk keys the directory id → canonical, directory_vouched.
+    assert SYNC1_REGISTRY_OPS[2].body == {
+        "tenant_id": TENANT,
+        "source": "gdirectory",
+        "local_id": "100000000000000000001",
+        "canonical": ALICE,
+        "link_method": "directory_vouched",
+    }
+
+
+def test_custom_schema_alias_read_under_projection_custom():
+    # With an alias_schema configured, projection=custom + customFieldMask are
+    # sent, and customSchemas values become google_customschema aliases.
+    fixture_user = {
+        "id": "100000000000000000009",
+        "primaryEmail": "dave@corp.example",
+        "customSchemas": {"verity": {"samlSubject": "dave.saml@corp.example"}},
+    }
+
+    class OneUserTransport:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, path, params):
+            self.calls.append((path, dict(params)))
+            if path == "users":
+                return {"users": [fixture_user]}
+            return {}  # no groups
+
+    transport = OneUserTransport()
+    config = GDirectoryConfig(tenant_id=TENANT, domain="corp.example", alias_schema="verity")
+    snapshot = GDirectoryConnector(transport, config).reconcile()
+    user_params = next(p for path, p in transport.calls if path == "users")
+    assert user_params["projection"] == "custom"
+    assert user_params["customFieldMask"] == "verity"
+    assert snapshot.directory_users == [
+        DirectoryUser(
+            directory_id="100000000000000000009",
+            primary_email="dave@corp.example",
+            aliases=(SsoAlias(alias="dave.saml@corp.example", source="google_customschema"),),
+        )
     ]
 
 
@@ -247,31 +346,52 @@ def test_second_sync_diff_emits_single_tombstoning_delete(tmp_path):
     ]
 
 
-def test_suspension_between_syncs_removes_every_membership():
+def test_suspension_between_syncs_removes_every_membership_and_deprovisions():
+    bob_user = DirectoryUser(directory_id="002", primary_email="bob@corp.example")
+    alice_user = DirectoryUser(directory_id="001", primary_email="alice@corp.example")
     before = DirectorySnapshot(
         users=[ALICE, BOB],
         memberships=sorted([(ENG, BOB), (LOOP_B, BOB), (ENG, ALICE)]),
+        directory_users=[alice_user, bob_user],
     )
-    after = DirectorySnapshot(users=[ALICE], memberships=[(ENG, ALICE)])
+    after = DirectorySnapshot(
+        users=[ALICE], memberships=[(ENG, ALICE)], directory_users=[alice_user]
+    )
     diff = diff_snapshots(before, after)
     assert diff.added_principals == [] and diff.added_memberships == []
-    # Deprovision ⇒ all tuples removed (tombstoned server-side); the bare
-    # user: token stays allocated but grants nothing (no retire endpoint).
+    # Deprovision ⇒ all tuples removed (tombstoned server-side) AND bob fires a
+    # /v1/admin/deprovision op (canonical inactive + durable 2a revoke).
     assert diff.removed_memberships == [(ENG, BOB), (LOOP_B, BOB)]
+    assert diff.deprovisioned == ["bob@corp.example"]
+    assert diff.registry_users == []  # alice unchanged → no re-populate
+    ops = build_admin_ops(diff, TENANT)
+    assert ops[-1] == AdminOp(
+        "POST", DEPROVISION_PATH, {"tenant_id": TENANT, "principal": BOB}
+    )
 
 
-def test_ops_order_principals_then_adds_then_removals():
+def test_ops_order_registry_then_principals_then_adds_then_removals_then_deprovision():
+    new_bob = DirectoryUser(directory_id="002", primary_email="bob@corp.example")
+    gone_carol = DirectoryUser(directory_id="004", primary_email="carol@corp.example")
     diff = diff_snapshots(
-        DirectorySnapshot(users=[ALICE], memberships=[(ENG, ALICE)]),
-        DirectorySnapshot(users=[ALICE, BOB], memberships=[(ENG, BOB)]),
+        DirectorySnapshot(
+            users=[ALICE, CAROL], memberships=[(ENG, ALICE)], directory_users=[gone_carol]
+        ),
+        DirectorySnapshot(
+            users=[ALICE, BOB], memberships=[(ENG, BOB)], directory_users=[new_bob]
+        ),
     )
     ops = build_admin_ops(diff, TENANT)
     assert [(op.method, op.path) for op in ops] == [
+        ("POST", REGISTRY_CANONICAL_PATH),  # populate new bob
+        ("POST", CROSSWALK_PATH),
         ("POST", PRINCIPALS_PATH),
         ("POST", GROUPS_PATH),
         ("DELETE", GROUPS_PATH),
+        ("POST", DEPROVISION_PATH),  # carol went active→absent
     ]
-    assert ops[0].body == {"tenant_id": TENANT, "principals": [BOB]}
+    assert ops[2].body == {"tenant_id": TENANT, "principals": [BOB]}
+    assert ops[-1].body == {"tenant_id": TENANT, "principal": CAROL}
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +469,19 @@ def test_run_once_first_cycle_applies_all_then_second_cycle_deletes_one(tmp_path
         state_file,
         now="2026-07-11T08:00:00Z",
     )
-    assert applied == 1 + len(SYNC1_MEMBERSHIPS)  # principals POST + 9 adds
+    # M2 2b — registry ops + principals POST + 9 membership adds.
+    assert applied == len(SYNC1_REGISTRY_OPS) + 1 + len(SYNC1_MEMBERSHIPS)
     state = json.loads(state_file.read_text())
     assert state["last_reconcile_at"] == "2026-07-11T08:00:00Z"
     assert state["snapshot"]["users"] == [ALICE, BOB, CAROL]
     assert [tuple(m) for m in state["snapshot"]["memberships"]] == sorted(SYNC1_MEMBERSHIPS)
+    # The active-user registry records are checkpointed so the next cycle can
+    # diff for changes/deprovisions.
+    assert [u["primary_email"] for u in state["snapshot"]["directory_users"]] == [
+        "alice@corp.example",
+        "bob@corp.example",
+        "carol@corp.example",
+    ]
 
     sink = DryRunAdminSink(stream=io.StringIO())
     applied = run_once(
@@ -385,7 +513,7 @@ def test_dry_run_does_not_persist_snapshot(tmp_path):
         now="2026-07-11T08:00:00Z",
         persist=False,
     )
-    assert applied == 1 + len(SYNC1_MEMBERSHIPS)
+    assert applied == len(SYNC1_REGISTRY_OPS) + 1 + len(SYNC1_MEMBERSHIPS)
     assert not state_file.exists(), "a dry run must leave no snapshot behind"
 
     # The following REAL sync starts clean and applies EVERYTHING, not zero.
@@ -395,7 +523,8 @@ def test_dry_run_does_not_persist_snapshot(tmp_path):
         state_file,
         now="2026-07-11T08:01:00Z",
     )
-    assert applied_real == 1 + len(SYNC1_MEMBERSHIPS), "real sync after a dry run must not no-op"
+    expected = len(SYNC1_REGISTRY_OPS) + 1 + len(SYNC1_MEMBERSHIPS)
+    assert applied_real == expected, "real sync after a dry run must not no-op"
     assert state_file.exists(), "a real sync persists the snapshot"
 
 
@@ -440,7 +569,7 @@ def test_run_once_crash_before_checkpoint_replays_cycle(tmp_path):
 
     sink = DryRunAdminSink(stream=io.StringIO())
     applied = run_once(GDirectoryConnector(_sync1_transport(), _config()), sink, state_file)
-    assert applied == 1 + len(SYNC1_MEMBERSHIPS)  # full replay, safely idempotent
+    assert applied == len(SYNC1_REGISTRY_OPS) + 1 + len(SYNC1_MEMBERSHIPS)  # full replay
 
 
 # ---------------------------------------------------------------------------

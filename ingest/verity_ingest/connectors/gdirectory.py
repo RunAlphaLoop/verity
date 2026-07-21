@@ -62,19 +62,31 @@ Unlike a content ACL there is no envelope to poison: each unmappable member
 simply confers no visibility (§6b), which only ever *narrows* what the group
 grants.
 
-Deprovisioning: a user suspended, archived, or deleted in Workspace drops out
-of the desired snapshot, so the diff removes every membership tuple that
-referenced them — each removal via ``DELETE /v1/admin/groups``, which writes
-durable revocation tombstones BEFORE the SpiceDB tuple delete (fail-closed:
-over-hides for the revocation window, never under-hides). There is no server
-endpoint to retire the bare ``user:`` principal itself — principal tokens are
-append-only — so the token stays allocated but grants nothing once no
-tuple/ACL references it. Stated per the honest-limitations doctrine, not
-hidden.
+Registry populate (M2 2b): each reconcile writes, per ACTIVE user, a
+``canonical_principal`` row (``canonical = user:<primaryEmail>``,
+``idp_subject = <primaryEmail>``, ``active=true``), any admin-declared
+``principal_sso_alias`` rows (the SF ``FederationIdentifier`` / SAML NameID
+match targets, read from ``externalIds``/``customSchemas`` — Google vouches no
+SSO subject itself, so this is an ADMIN-authored surface), and a self
+``principal_crosswalk (gdirectory, <dir id>) → canonical``. These are diffed
+per user (only new/changed records emit ops) and ordered FIRST in the cycle so a
+crosswalk-mediated connector write resolves against a populated registry.
 
-Diff-and-apply ordering (per cycle): upsert added principals → membership
-ADDS → membership REMOVALS, each removal one tuple at a time (never a bulk
-truncate-and-reload — every delete carries per-tuple revocation semantics).
+Deprovisioning (M2 2b): a user suspended, archived, or deleted drops out of the
+desired active set, so (a) the diff removes every membership tuple that
+referenced them (``DELETE /v1/admin/groups``, tombstones before the SpiceDB
+delete), AND (b) a ``POST /v1/admin/deprovision`` flips
+``canonical_principal.active=false`` and fires the 2a durable
+``RevocationPlane::revoke_principal`` — the direct-grant sweep + mint-time
+active-gate that closes the deprovision leak (a re-mint for the suspended
+subject drops its self-token, and its direct-grant chunks are swept). Fail-closed
+ordering: the durable revoke lands before the chunk sweep, so a replay over-hides
+for the revocation window, never under-hides.
+
+Diff-and-apply ordering (per cycle): registry populate → upsert added principals
+→ membership ADDS → membership REMOVALS → deprovisions, each removal/deprovision
+one at a time (never a bulk truncate-and-reload — every delete carries per-tuple
+revocation semantics).
 Adds are idempotent (token upsert is keyed; re-writing an existing SpiceDB
 tuple is a no-op) and re-running a removal only re-tombstones (over-hiding,
 safe), so the whole cycle is at-least-once: the snapshot is checkpointed only
@@ -138,10 +150,29 @@ CONNECTOR_STATUS_PATH = "/v1/admin/connector-status"
 
 SOURCE_NAME = "gdirectory"
 
-# Field masks: ask Google for exactly what we consume, nothing more.
-_USERS_FIELDS = "nextPageToken,users(id,primaryEmail,suspended,archived)"
+# Field masks: ask Google for exactly what we consume, nothing more. M2 2b adds
+# externalIds + customSchemas to the user mask so the registry can collect an
+# admin-declared SSO alias (the SF FederationIdentifier match target) — these
+# are returned ONLY under projection=custom + customFieldMask (or full).
+_USERS_FIELDS = (
+    "nextPageToken,users(id,primaryEmail,suspended,archived,externalIds,customSchemas)"
+)
 _GROUPS_FIELDS = "nextPageToken,groups(id,email,name,directMembersCount)"
 _MEMBERS_FIELDS = "nextPageToken,members(id,email,role,type,status)"
+
+# The registry / crosswalk / deprovision server routes (M2 2b, built by B1).
+REGISTRY_CANONICAL_PATH = "/v1/admin/registry/canonical"
+REGISTRY_ALIAS_PATH = "/v1/admin/registry/alias"
+CROSSWALK_PATH = "/v1/admin/crosswalk"
+DEPROVISION_PATH = "/v1/admin/deprovision"
+
+#: externalIds types that may carry an SSO / login subject worth aliasing. Google
+#: exposes NO SAML/federation type natively (types are account/custom/customer/
+#: login_id/network/organization), so only these admin-authored types are read;
+#: the authoritative alias path is an admin-declared customSchema (see
+#: GDirectoryConfig.alias_schema). Honest-limitations doctrine: Google does not
+#: vouch an SSO subject — an admin declares it.
+_ALIAS_EXTERNAL_ID_TYPES = frozenset({"custom", "login_id"})
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +194,13 @@ class GDirectoryConfig:
     delegated_subject: str | None = None
     user_page_size: int = 500  # users.list maxResults cap
     group_page_size: int = 200  # groups.list / members.list maxResults cap
+    # M2 2b — the admin-declared custom schema holding each user's SSO subject
+    # (e.g. the SF FederationIdentifier / SAML NameID). customSchemas are returned
+    # ONLY when projection=custom + customFieldMask names the schema. When unset,
+    # the registry still writes canonical_principal + a self-crosswalk each
+    # reconcile, but no customSchema-sourced aliases (externalIds still read).
+    # Google vouches NO SSO subject itself — this is an admin-authored surface.
+    alias_schema: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +260,32 @@ def load_directory_credentials(delegated_subject: str | None):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SsoAlias:
+    """One admin-declared SSO alias for a user (M2 2b): ``alias`` (the SSO subject
+    / SAML NameID, lowercased) → this user's canonical, with its ``source``
+    (``google_customschema`` or ``google_externalid`` — both ADMIN-authored;
+    Google vouches no SSO subject itself)."""
+
+    alias: str
+    source: str
+
+
+@dataclass(frozen=True)
+class DirectoryUser:
+    """One active directory user reduced to what the registry needs (M2 2b): the
+    lowercased primary email (the canonical/idp_subject), the directory id (the
+    self-crosswalk local_id), and any admin-declared SSO aliases."""
+
+    directory_id: str
+    primary_email: str
+    aliases: tuple[SsoAlias, ...] = ()
+
+    @property
+    def canonical(self) -> str:
+        return f"user:{self.primary_email}"
+
+
 @dataclass
 class DirectorySnapshot:
     """Canonical desired state for one reconcile cycle.
@@ -231,10 +295,15 @@ class DirectorySnapshot:
     drives deprovision removals in the diff. ``memberships`` are DIRECT
     ``(group, member)`` edges (sorted), where member is ``user:...``,
     ``group:...`` (nested) or ``domain:...``.
+
+    ``directory_users`` (M2 2b) are the full active-user records the registry
+    populate writes each reconcile (canonical_principal + SSO aliases + a self
+    crosswalk). Keyed-sorted by primary email for determinism.
     """
 
     users: list[str] = field(default_factory=list)
     memberships: list[tuple[str, str]] = field(default_factory=list)
+    directory_users: list[DirectoryUser] = field(default_factory=list)
 
     def principals(self) -> list[str]:
         """Every principal string this snapshot references, sorted."""
@@ -297,8 +366,14 @@ class GDirectoryConnector:
 
     def reconcile(self) -> DirectorySnapshot:
         """One full reconcile: page users, groups, and every group's direct
-        members into a canonical :class:`DirectorySnapshot`."""
-        active, suspended = self._list_users()
+        members into a canonical :class:`DirectorySnapshot`.
+
+        M2 2b — the active-user records (email + admin-declared SSO aliases +
+        directory id) ride along in ``directory_users`` so the diff can POPULATE
+        the registry (canonical_principal + principal_sso_alias + a self
+        crosswalk) and DEPROVISION (active→suspended) each cycle."""
+        active_users, suspended = self._list_users()
+        active = frozenset(active_users)
         groups = self._list_groups()
         known_groups = frozenset(groups)
         memberships: set[tuple[str, str]] = set()
@@ -312,6 +387,7 @@ class GDirectoryConnector:
         return DirectorySnapshot(
             users=sorted(f"user:{email}" for email in active),
             memberships=sorted(memberships),
+            directory_users=[active_users[email] for email in sorted(active_users)],
         )
 
     def _pages(self, path: str, params: dict[str, str]) -> Iterable[dict]:
@@ -326,17 +402,28 @@ class GDirectoryConnector:
             if not page_token:
                 return
 
-    def _list_users(self) -> tuple[frozenset[str], frozenset[str]]:
-        """(active emails, suspended-or-archived emails), lowercased."""
-        active: set[str] = set()
+    def _list_users(self) -> tuple[dict[str, DirectoryUser], frozenset[str]]:
+        """(active users keyed by lowercased email, suspended/archived emails).
+
+        M2 2b — active users are returned as full :class:`DirectoryUser` records
+        (id + email + admin-declared SSO aliases) so the registry can be
+        populated. ``projection=custom`` + ``customFieldMask`` is required for
+        customSchemas; when no ``alias_schema`` is configured we stay on
+        ``projection=full`` to still read ``externalIds`` (Google returns
+        customSchemas/externalIds under ``full`` too, without a field mask)."""
+        active: dict[str, DirectoryUser] = {}
         suspended: set[str] = set()
         params = {
             "customer": "my_customer",
             "maxResults": str(self.config.user_page_size),
-            "projection": "basic",
             "showDeleted": "false",
             "fields": _USERS_FIELDS,
         }
+        if self.config.alias_schema:
+            params["projection"] = "custom"
+            params["customFieldMask"] = self.config.alias_schema
+        else:
+            params["projection"] = "full"
         for page in self._pages("users", params):
             for user in page.get("users", []):
                 email = (user.get("primaryEmail") or "").lower()
@@ -345,8 +432,49 @@ class GDirectoryConnector:
                 if user.get("suspended") or user.get("archived"):
                     suspended.add(email)
                 else:
-                    active.add(email)
-        return frozenset(active), frozenset(suspended)
+                    active[email] = DirectoryUser(
+                        directory_id=str(user.get("id") or ""),
+                        primary_email=email,
+                        aliases=self._collect_aliases(user),
+                    )
+        return active, frozenset(suspended)
+
+    def _collect_aliases(self, user: Mapping[str, Any]) -> tuple[SsoAlias, ...]:
+        """Collect a user's admin-declared SSO aliases (M2 2b), lowercased, deduped.
+
+        Two admin-authored surfaces — Google vouches NO SSO subject itself:
+        - ``externalIds`` of a login-ish type (``custom``/``login_id``);
+        - the configured ``alias_schema`` custom schema's field values.
+        The primary email itself is never re-emitted as an alias (it is already
+        the canonical/idp_subject). An empty/unparseable value confers nothing."""
+        aliases: list[SsoAlias] = []
+        seen: set[str] = set()
+
+        def add(value: Any, source: str) -> None:
+            alias = str(value or "").strip().lower()
+            if not alias or alias == user.get("primaryEmail", "").lower() or alias in seen:
+                return
+            seen.add(alias)
+            aliases.append(SsoAlias(alias=alias, source=source))
+
+        for ext in user.get("externalIds") or []:
+            if isinstance(ext, Mapping) and ext.get("type") in _ALIAS_EXTERNAL_ID_TYPES:
+                add(ext.get("value"), "google_externalid")
+        schemas = user.get("customSchemas")
+        if self.config.alias_schema and isinstance(schemas, Mapping):
+            schema = schemas.get(self.config.alias_schema)
+            if isinstance(schema, Mapping):
+                for value in schema.values():
+                    # A multi-value custom field returns a list of {value: ...}.
+                    if isinstance(value, list):
+                        for entry in value:
+                            add(
+                                entry.get("value") if isinstance(entry, Mapping) else entry,
+                                "google_customschema",
+                            )
+                    else:
+                        add(value, "google_customschema")
+        return tuple(aliases)
 
     def _list_groups(self) -> list[str]:
         params = {
@@ -423,9 +551,21 @@ class SyncDiff:
     added_principals: list[str] = field(default_factory=list)
     added_memberships: list[tuple[str, str]] = field(default_factory=list)
     removed_memberships: list[tuple[str, str]] = field(default_factory=list)
+    # M2 2b — active users whose registry record is new/changed since the last
+    # snapshot (POPULATE the canonical_principal + SSO aliases + self crosswalk),
+    # and users that went active→suspended (DEPROVISION: canonical inactive + 2a
+    # revoke). Re-runs are no-ops: an unchanged user emits no registry op.
+    registry_users: list[DirectoryUser] = field(default_factory=list)
+    deprovisioned: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.added_principals or self.added_memberships or self.removed_memberships)
+        return bool(
+            self.added_principals
+            or self.added_memberships
+            or self.removed_memberships
+            or self.registry_users
+            or self.deprovisioned
+        )
 
 
 def diff_snapshots(previous: DirectorySnapshot, desired: DirectorySnapshot) -> SyncDiff:
@@ -435,14 +575,32 @@ def diff_snapshots(previous: DirectorySnapshot, desired: DirectorySnapshot) -> S
     user held, because such users are absent from the desired snapshot
     entirely. Principals are never removed — the server's registry is
     append-only; a token with no tuples/ACLs grants nothing.
+
+    M2 2b — registry POPULATE is diffed per user (only new/changed
+    :class:`DirectoryUser` records emit ops, so re-runs are no-ops); DEPROVISION
+    is the active→suspended transition: an email present in the previous active
+    set but ABSENT from the desired one (suspended, archived, or deleted) fires a
+    ``/v1/admin/deprovision`` op (canonical inactive + durable 2a revoke).
     """
     prev_members = set(previous.memberships)
     want_members = set(desired.memberships)
     prev_principals = set(previous.principals())
+
+    prev_users = {u.primary_email: u for u in previous.directory_users}
+    desired_emails = {u.primary_email for u in desired.directory_users}
+    # Populate rows only for users whose record changed (new alias, new id, …).
+    registry_users = [
+        u for u in desired.directory_users if prev_users.get(u.primary_email) != u
+    ]
+    # Deprovision: previously-active users no longer in the desired active set.
+    deprovisioned = sorted(set(prev_users) - desired_emails)
+
     return SyncDiff(
         added_principals=sorted(set(desired.principals()) - prev_principals),
         added_memberships=sorted(want_members - prev_members),
         removed_memberships=sorted(prev_members - want_members),
+        registry_users=registry_users,
+        deprovisioned=deprovisioned,
     )
 
 
@@ -455,13 +613,72 @@ class AdminOp:
     body: Mapping[str, Any]
 
 
-def build_admin_ops(diff: SyncDiff, tenant_id: str) -> list[AdminOp]:
-    """Turn a diff into ordered admin ops: principals upsert → adds →
-    removals. Removals go LAST and one tuple at a time — each DELETE writes
-    revocation tombstones before the tuple delete server-side, so ordering is
-    fail-closed (a crash mid-cycle leaves extra grants pending re-run of the
-    adds, never a lost tombstone)."""
+def build_registry_ops(users: Sequence[DirectoryUser], tenant_id: str) -> list[AdminOp]:
+    """The M2 2b registry-populate ops for a set of active users, ordered so the
+    canonical exists before its aliases/crosswalk reference it: canonical rows →
+    SSO-alias rows → self-crosswalk rows. Idempotent server-side (keyed upserts);
+    a re-run of an unchanged user is a no-op.
+
+    These MUST precede the crosswalk-mediated connector writes (a source-local
+    owner only resolves once its canonical + alias exist), which is why
+    :func:`build_admin_ops` places them FIRST in the cycle."""
     ops: list[AdminOp] = []
+    if not users:
+        return ops
+    ops.append(
+        AdminOp(
+            "POST",
+            REGISTRY_CANONICAL_PATH,
+            {
+                "tenant_id": tenant_id,
+                "principals": [
+                    {
+                        "canonical": u.canonical,
+                        "kind": "user",
+                        "idp_subject": u.primary_email,
+                        "active": True,
+                    }
+                    for u in users
+                ],
+            },
+        )
+    )
+    aliases = [
+        {"canonical": u.canonical, "alias": a.alias, "source": a.source}
+        for u in users
+        for a in u.aliases
+    ]
+    if aliases:
+        ops.append(
+            AdminOp("POST", REGISTRY_ALIAS_PATH, {"tenant_id": tenant_id, "aliases": aliases})
+        )
+    for u in users:
+        if u.directory_id:
+            ops.append(
+                AdminOp(
+                    "POST",
+                    CROSSWALK_PATH,
+                    {
+                        "tenant_id": tenant_id,
+                        "source": SOURCE_NAME,
+                        "local_id": u.directory_id,
+                        "canonical": u.canonical,
+                        "link_method": "directory_vouched",
+                    },
+                )
+            )
+    return ops
+
+
+def build_admin_ops(diff: SyncDiff, tenant_id: str) -> list[AdminOp]:
+    """Turn a diff into ordered admin ops: registry populate → principals upsert
+    → membership adds → membership removals → deprovisions. Registry ops go FIRST
+    (a crosswalk-mediated connector write only resolves once the canonical +
+    alias exist). Removals + deprovisions go LAST and one at a time — each writes
+    revocation tombstones before the tuple/token change server-side, so ordering
+    is fail-closed (a crash mid-cycle leaves extra grants pending re-run of the
+    adds, never a lost tombstone)."""
+    ops: list[AdminOp] = build_registry_ops(diff.registry_users, tenant_id)
     if diff.added_principals:
         ops.append(
             AdminOp(
@@ -478,6 +695,16 @@ def build_admin_ops(diff: SyncDiff, tenant_id: str) -> list[AdminOp]:
         ops.append(
             AdminOp(
                 "DELETE", GROUPS_PATH, {"tenant_id": tenant_id, "group": group, "member": member}
+            )
+        )
+    # DEPROVISION last: flips canonical_principal.active=false AND fires the 2a
+    # durable revoke (the direct-grant sweep). Over-hides on replay, never under.
+    for email in diff.deprovisioned:
+        ops.append(
+            AdminOp(
+                "POST",
+                DEPROVISION_PATH,
+                {"tenant_id": tenant_id, "principal": f"user:{email}"},
             )
         )
     return ops
@@ -564,9 +791,21 @@ def _load_snapshot(state_file: Path) -> DirectorySnapshot:
     if not state_file.exists():
         return DirectorySnapshot()
     raw = json.loads(state_file.read_text()).get("snapshot", {})
+    directory_users = [
+        DirectoryUser(
+            directory_id=str(u.get("directory_id", "")),
+            primary_email=str(u.get("primary_email", "")),
+            aliases=tuple(
+                SsoAlias(alias=str(a.get("alias", "")), source=str(a.get("source", "")))
+                for a in u.get("aliases", [])
+            ),
+        )
+        for u in raw.get("directory_users", [])
+    ]
     return DirectorySnapshot(
         users=list(raw.get("users", [])),
         memberships=[(g, m) for g, m in raw.get("memberships", [])],
+        directory_users=directory_users,
     )
 
 
@@ -579,6 +818,16 @@ def _save_snapshot(state_file: Path, snapshot: DirectorySnapshot, reconciled_at:
                 "snapshot": {
                     "users": snapshot.users,
                     "memberships": [list(pair) for pair in snapshot.memberships],
+                    "directory_users": [
+                        {
+                            "directory_id": u.directory_id,
+                            "primary_email": u.primary_email,
+                            "aliases": [
+                                {"alias": a.alias, "source": a.source} for a in u.aliases
+                            ],
+                        }
+                        for u in snapshot.directory_users
+                    ],
                 },
             },
             indent=2,
@@ -658,10 +907,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="reconcile interval in seconds (without --once); this interval IS "
         "the group-membership freshness bound in the ACL-sync SLO (§6a)",
     )
+    parser.add_argument(
+        "--alias-schema",
+        default=os.environ.get("GADMIN_ALIAS_SCHEMA"),
+        help="admin-declared customSchema name holding each user's SSO subject "
+        "(the SF FederationIdentifier / SAML NameID) — read via projection=custom "
+        "+ customFieldMask. Unset: only externalIds aliases are collected. Google "
+        "vouches no SSO subject natively; this is an admin-authored surface.",
+    )
     args = parser.parse_args(argv)
 
     config = GDirectoryConfig(
-        tenant_id=args.tenant_id, domain=args.domain, delegated_subject=args.subject
+        tenant_id=args.tenant_id,
+        domain=args.domain,
+        delegated_subject=args.subject,
+        alias_schema=args.alias_schema,
     )
     credentials = load_directory_credentials(config.delegated_subject)
     connector = GDirectoryConnector(HttpDirectoryTransport(credentials), config)
