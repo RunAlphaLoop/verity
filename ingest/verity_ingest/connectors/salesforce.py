@@ -137,6 +137,14 @@ FEDERATION_SUBJECT_PREFIX = crosswalk.FEDERATION_MEMBER_PREFIX
 #: query comfortably under the SOQL statement-length limit).
 SHARE_QUERY_CHUNK = 200
 
+#: The synthetic group carrying org-wide View All Data / Modify All Data (SPEC
+#: §14.3 completeness). Those profile/permission-set grants let a user read EVERY
+#: record regardless of sharing, and they are NOT expressed as AccountShare rows —
+#: so the connector mirrors them as a group whose members are the view-all users'
+#: ``fed:`` subjects, stamped on every emitted record. Measured over-hide-only:
+#: adding it can never widen visibility beyond what Salesforce itself grants.
+VIEW_ALL_GROUP = "group:salesforce-view-all-data"
+
 #: Stable, machine-readable stdout token the server greps for backfill
 #: ``state=degraded_acl`` (connector-agnostic — same value HubSpot emits). A
 #: 403 on the User/Group/GroupMember roster query trips this and every record
@@ -281,11 +289,15 @@ class SalesforceConnector(Connector):
         fields: dict[str, list[str]] | None = None,
         client: httpx.AsyncClient | None = None,
         fetch_account_shares: bool = True,
+        mirror_view_all: bool = True,
         token_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.visibility_policy = list(visibility_policy)
         self.fields = dict(DEFAULT_FIELDS, **(fields or {}))
         self.fetch_account_shares = fetch_account_shares
+        #: Mirror org-wide View All Data / Modify All Data as :data:`VIEW_ALL_GROUP`
+        #: stamped on every record (SPEC §14.3 completeness; over-hide-only).
+        self.mirror_view_all = mirror_view_all
         #: Filled by :meth:`poll` from the Group/GroupMember roster. Maps each
         #: ``group:salesforce-group-<id>`` to the set of member principals
         #: (``user:<email>`` or nested ``group:salesforce-group-<child>``) — the
@@ -507,7 +519,76 @@ class SalesforceConnector(Connector):
                             )
                             event.record_principals = groups
                             event.record_owner_emails = owner_emails
+
+        # ORG-WIDE VIEW ALL DATA / MODIFY ALL DATA (SPEC §14.3 completeness). These
+        # profile/permission-set grants let a user read EVERY record regardless of
+        # sharing and are NOT AccountShare rows, so the connector over-hides such
+        # users today (measured: the fidelity audit's `view-all-data` cause). Mirror
+        # them as VIEW_ALL_GROUP whose members are the view-all users' fed subjects,
+        # stamped on every record. Over-hide-only by construction: it can only ADD
+        # visibility Salesforce itself already grants. A 403/error on the query →
+        # empty set → no stamp (stays over-hidden; fail closed, never a leak).
+        if self.mirror_view_all:
+            view_all_subjects = await self._fetch_view_all_subjects()
+            if view_all_subjects:
+                self.group_edges[VIEW_ALL_GROUP] = {
+                    f"{FEDERATION_SUBJECT_PREFIX}{s}" for s in sorted(view_all_subjects)
+                }
+                for event in events:
+                    if isinstance(event, SalesforceFactEvent):
+                        principals = list(event.record_principals or [])
+                        if VIEW_ALL_GROUP not in principals:
+                            principals.append(VIEW_ALL_GROUP)
+                        event.record_principals = principals
         return events, next_cursor
+
+    async def _fetch_view_all_subjects(self) -> set[str]:
+        """FederationIdentifier subjects of active users with org-wide View All
+        Data or Modify All Data.
+
+        One join covers both profile- and permission-set-granted view-all: a
+        Profile is a ``PermissionSet`` with ``IsOwnedByProfile=true``, so
+        ``PermissionSetAssignment`` where the assigned set has
+        ``PermissionsViewAllData``/``PermissionsModifyAllData`` enumerates every
+        such user. Then one ``User`` query resolves their FederationIdentifier —
+        the same join key as everywhere else; a user with no fed id / inactive
+        confers nothing (over-hide, fail closed; no ``User.Email`` fallback).
+
+        ANY HTTP error (403 lacking read on the permission objects, or a transient
+        fault) degrades to the EMPTY set — records simply stay over-hidden for
+        view-all users, which is safe. Never raises into the poll: mirroring
+        view-all is additive, and failing it must never drop the base sync.
+        """
+        try:
+            assignees: set[str] = set()
+            soql = (
+                "SELECT AssigneeId FROM PermissionSetAssignment WHERE "
+                "PermissionSet.PermissionsViewAllData = true OR "
+                "PermissionSet.PermissionsModifyAllData = true"
+            )
+            async for page in self._query_pages(soql):
+                for row in page.get("records", []):
+                    aid = str(row.get("AssigneeId") or "")
+                    if aid.startswith(USER_KEY_PREFIX):
+                        assignees.add(aid)
+            subjects: set[str] = set()
+            for chunk in _chunks(sorted(assignees), SHARE_QUERY_CHUNK):
+                ids = ", ".join(f"'{uid}'" for uid in chunk)
+                async for page in self._query_pages(
+                    f"SELECT Id, FederationIdentifier, IsActive FROM User WHERE Id IN ({ids})"
+                ):
+                    for row in page.get("records", []):
+                        fed = (row.get("FederationIdentifier") or "").strip().lower()
+                        if fed and bool(row.get("IsActive", True)):
+                            subjects.add(fed)
+            return subjects
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "salesforce: View-All query failed (%s); records over-hide view-all "
+                "users this cycle (fail closed, never a leak)",
+                exc,
+            )
+            return set()
 
     async def full_crawl(self) -> AsyncIterator[FactEvent | DocumentEvent]:
         """Reconciliation crawl: identical to a poll from epoch. (Deleted-

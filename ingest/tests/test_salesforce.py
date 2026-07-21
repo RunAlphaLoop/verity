@@ -28,6 +28,7 @@ import pytest
 
 from verity_ingest.connectors.hubspot import VerityDebeziumSink
 from verity_ingest.connectors.salesforce import (
+    VIEW_ALL_GROUP,
     SalesforceConnector,
     SalesforceFactEvent,
     _read_cursor,
@@ -60,6 +61,8 @@ def make_mock_salesforce(
     shares_fail: bool = False,
     roster_fail: bool = False,
     roster_500: bool = False,
+    view_all_assignees: list[dict] | None = None,
+    view_all_fail: bool = False,
 ) -> httpx.MockTransport:
     """Routes the token endpoint and SOQL queries to fixtures. Tokens mint as
     ``sf-token-1``, ``sf-token-2``, ... With ``reject_first_query`` the very
@@ -97,6 +100,10 @@ def make_mock_salesforce(
         # Roster queries — matched most-specific first (GroupMember before
         # User / Account so substrings don't collide). No FROM Group query is
         # issued: the group token derives from the id alone.
+        if "FROM PermissionSetAssignment" in soql:
+            if view_all_fail:
+                return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
+            return httpx.Response(200, json={"records": view_all_assignees or []})
         if "FROM GroupMember" in soql:
             if roster_fail:
                 return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
@@ -513,6 +520,69 @@ def test_poll_builds_nested_cycle_safe_group_edges() -> None:
             "group:salesforce-group-00Gxx0000000001EAA",
         },
     }
+
+
+def test_poll_mirrors_org_wide_view_all_as_a_group_on_every_record() -> None:
+    # SPEC §14.3 completeness: a user with profile/permission-set View All Data
+    # reads EVERY record regardless of sharing — not an AccountShare row, so the
+    # connector over-hid them (measured live). Now mirrored as VIEW_ALL_GROUP whose
+    # members are the view-all users' fed subjects, stamped on every record.
+    log: list[dict] = []
+    connector = make_connector(
+        log,
+        view_all_assignees=[
+            {"AssigneeId": "005xx000001X8UzAAK"},  # active, fed Ae@Acme.test
+            {"AssigneeId": "005xx000001X9IntAAK"},  # inactive + no fed → dropped
+        ],
+    )
+    events, _ = run_poll(connector, "2026-07-08T00:00:00.000+0000")
+    # the group carries only the active, fed-bearing subject (lowercased)
+    assert connector.group_edges[VIEW_ALL_GROUP] == {"fed:ae@acme.test"}
+    # every emitted Salesforce record (Account, Contact, Opportunity) carries it
+    sf_events = [e for e in events if isinstance(e, SalesforceFactEvent)]
+    assert sf_events
+    assert all(VIEW_ALL_GROUP in (e.record_principals or []) for e in sf_events)
+
+
+def test_view_all_query_403_over_hides_never_leaks() -> None:
+    # A 403 (integration user lacks read on PermissionSetAssignment) degrades to
+    # NO view-all stamp: view-all users stay over-hidden (safe), never a leak, and
+    # the base sync never crashes.
+    log: list[dict] = []
+    connector = make_connector(
+        log, view_all_fail=True, view_all_assignees=[{"AssigneeId": "005xx000001X8UzAAK"}]
+    )
+    events, _ = run_poll(connector, "2026-07-08T00:00:00.000+0000")
+    assert VIEW_ALL_GROUP not in connector.group_edges
+    assert all(
+        VIEW_ALL_GROUP not in (e.record_principals or [])
+        for e in events
+        if isinstance(e, SalesforceFactEvent)
+    )
+
+
+def test_mirror_view_all_false_skips_query_and_stamp() -> None:
+    log: list[dict] = []
+    transport = make_mock_salesforce(
+        log, view_all_assignees=[{"AssigneeId": "005xx000001X8UzAAK"}]
+    )
+    connector = SalesforceConnector(
+        POLICY,
+        my_domain="acme",
+        client_id="consumer-key",
+        client_secret="consumer-secret",
+        client=httpx.AsyncClient(base_url="https://acme.my.salesforce.com", transport=transport),
+        token_client=httpx.AsyncClient(transport=transport),
+        mirror_view_all=False,
+    )
+    events, _ = run_poll(connector, "2026-07-08T00:00:00.000+0000")
+    assert VIEW_ALL_GROUP not in connector.group_edges
+    assert not any("FROM PermissionSetAssignment" in e.get("q", "") for e in log)
+    assert all(
+        VIEW_ALL_GROUP not in (e.record_principals or [])
+        for e in events
+        if isinstance(e, SalesforceFactEvent)
+    )
 
 
 def test_group_only_member_user_is_fetched_and_edged() -> None:
