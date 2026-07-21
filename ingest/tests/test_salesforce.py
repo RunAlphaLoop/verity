@@ -123,6 +123,9 @@ def make_mock_salesforce(
             if shares_fail:
                 return httpx.Response(500, json=[{"errorCode": "UNKNOWN_EXCEPTION"}])
             return httpx.Response(200, json=fixture("query_accountshare.json"))
+        if "FROM OpportunityShare" in soql:
+            # No Opportunity sharing in the base fixtures → opps ride the floor.
+            return httpx.Response(200, json={"records": []})
         if "FROM Account" in soql:
             return httpx.Response(200, json=fixture("query_accounts_page1.json"))
         if "FROM Contact" in soql:
@@ -387,7 +390,7 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
     )
     share_soql = next(q for entry in data_requests if "FROM AccountShare" in (q := entry["q"]))
     assert share_soql.startswith(
-        "SELECT AccountId, UserOrGroupId, AccountAccessLevel, RowCause FROM AccountShare"
+        "SELECT AccountId, UserOrGroupId, RowCause FROM AccountShare"
     )
     for account_id in ("001xx000003DGb1AAG", "001xx000003DGb2AAG", "001xx000003DGb3AAG"):
         assert f"'{account_id}'" in share_soql
@@ -450,10 +453,22 @@ def test_poll_paginates_attaches_shares_and_advances_cursor() -> None:
         for e in events
         if isinstance(e, SalesforceFactEvent)
     )
+    # Contact (Controlled by Parent) INHERITS its parent Account's resolved
+    # principals: the fixture contact hangs off DGb1AAG (group + owner resolved).
+    contacts = [
+        e for e in events if isinstance(e, SalesforceFactEvent) and e.object_type == "Contact"
+    ]
+    assert contacts and all(
+        e.record_principals == ["group:salesforce-group-00Gxx0000000001EAA"]
+        and e.record_owner_emails == ["ae@acme.test"]
+        for e in contacts
+    )
+    # Opportunity has no OpportunityShare in the fixture → still rides the floor
+    # (it does NOT inherit from its Account — Opportunities have their own shares).
     assert all(
         e.record_principals is None and e.record_owner_emails is None
         for e in events
-        if isinstance(e, SalesforceFactEvent) and e.object_type != "Account"
+        if isinstance(e, SalesforceFactEvent) and e.object_type == "Opportunity"
     )
 
 
@@ -607,9 +622,9 @@ def _connector_with(handler) -> SalesforceConnector:
     )
 
 
-async def _fetch_hierarchy(conn: SalesforceConnector, account_ids):
+async def _fetch_hierarchy(conn: SalesforceConnector, account_ids, object_type="Account"):
     try:
-        return await conn._fetch_role_hierarchy(account_ids)
+        return await conn._fetch_role_hierarchy(object_type, account_ids)
     finally:
         await conn.aclose()
 
@@ -689,6 +704,57 @@ def test_role_hierarchy_403_over_hides_never_leaks() -> None:
 
     per_account, edges = asyncio.run(_fetch_hierarchy(_connector_with(handler), ["A1"]))
     assert per_account == {} and edges == {}
+
+
+def test_poll_resolves_opportunity_shares() -> None:
+    # An Opportunity resolves its OWN OpportunityShare (owner) through the roster —
+    # the same crosswalk as Account, a different share object.
+    def handler(request: httpx.Request) -> httpx.Response:
+        soql = request.url.params.get("q", "")
+        if "FROM AccountShare" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM OpportunityShare" in soql:
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"OpportunityId": "006OPP", "UserOrGroupId": "005OWN", "RowCause": "Owner"}
+                ]},
+            )
+        if "FROM UserRole" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM PermissionSetAssignment" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM GroupMember" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM User" in soql:
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"Id": "005OWN", "Email": "o@x.test", "Username": "o",
+                     "FederationIdentifier": "Owner@Fed", "IsActive": True}
+                ]},
+            )
+        if "FROM Contact" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM Opportunity" in soql:  # main object query (Share already matched)
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"Id": "006OPP", "Name": "Big", "StageName": "Won", "Amount": 1,
+                     "CloseDate": "2026-01-01", "AccountId": "001A",
+                     "LastModifiedDate": "2026-07-08T00:00:00.000+0000"}
+                ]},
+            )
+        if "FROM Account" in soql:  # main object query
+            return httpx.Response(200, json={"records": []})
+        raise AssertionError(f"unexpected SOQL: {soql}")
+
+    events, _ = run_poll(_connector_with(handler), None)
+    opps = [e for e in events if isinstance(e, SalesforceFactEvent) and e.object_type == "Opportunity"]
+    assert opps
+    # resolved on FederationIdentifier (lowercased), NOT User.Email
+    assert all(e.record_owner_emails == ["owner@fed"] for e in opps)
+    assert all(e.record_principals is None for e in opps)  # owner-only share → no group
 
 
 def test_group_only_member_user_is_fetched_and_edged() -> None:

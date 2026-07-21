@@ -46,6 +46,7 @@ from typing import Iterable, Mapping, Sequence
 from verity_ingest.connectors.salesforce import (
     API_VERSION,
     GROUP_KEY_PREFIX,
+    SHARE_OBJECTS,
     USER_KEY_PREFIX,
     SalesforceConnector,
     SalesforceUserInfo,
@@ -286,24 +287,24 @@ def _view_all_user_ids(oracle: SalesforceOracle) -> set[str]:
     return {r["AssigneeId"] for r in rows}
 
 
-def _account_grant_subjects(
-    oracle: SalesforceOracle, account_ids: Sequence[str]
+def _object_grant_subjects(
+    oracle: SalesforceOracle, object_type: str, record_ids: Sequence[str]
 ) -> dict[str, set[str]]:
-    """Replicate the connector's Account visibility derivation on live data:
-    AccountShare 005/00G → (owner fed subjects ∪ group-member fed subjects),
-    keyed on FederationIdentifier exactly as :func:`resolve_share_principals`."""
-    if not account_ids:
+    """Replicate the connector's share-based visibility for Account or Opportunity
+    on live data: ``<Object>Share`` 005/00G → (owner fed subjects ∪ group-member
+    fed subjects), keyed on FederationIdentifier exactly as the connector's
+    :func:`resolve_share_principals`. (Contacts inherit their parent Account; see
+    :func:`audit`.)"""
+    if not record_ids:
         return {}
-    ids = "','".join(account_ids)
-    shares = oracle.query(
-        "SELECT AccountId, UserOrGroupId FROM AccountShare "
-        f"WHERE AccountId IN ('{ids}')"
-    )
+    share_object, key = SHARE_OBJECTS[object_type]
+    ids = "','".join(record_ids)
+    shares = oracle.query(f"SELECT {key}, UserOrGroupId FROM {share_object} WHERE {key} IN ('{ids}')")
     per_account: dict[str, list[str]] = {}
     for row in shares:
         uog = str(row.get("UserOrGroupId") or "")
         if uog.startswith(USER_KEY_PREFIX) or uog.startswith(GROUP_KEY_PREFIX):
-            per_account.setdefault(row["AccountId"], []).append(uog)
+            per_account.setdefault(row[key], []).append(uog)
 
     # Roster: fed id for every share-005 AND every group member-005 (one hop of
     # GroupMember expansion covers the flat case; the connector's SpiceDB closure
@@ -350,14 +351,14 @@ def _account_grant_subjects(
 
 
 def _role_hierarchy_subjects(
-    oracle: SalesforceOracle, account_ids: Sequence[str]
+    oracle: SalesforceOracle, object_type: str, record_ids: Sequence[str]
 ) -> dict[str, set[str]]:
-    """Per-account fed subjects gained via IMPLICIT role hierarchy — mirrors the
+    """Per-record fed subjects gained via IMPLICIT role hierarchy — mirrors the
     connector's `_fetch_role_hierarchy`: a record owned in role R is visible to
     every user in an ANCESTOR role of R. Modelling it here keeps the harness an
     accurate oracle once the connector reconstructs hierarchy (else it would
     forever mis-flag managers as over-hide)."""
-    if not account_ids:
+    if not record_ids:
         return {}
     parent: dict[str, str | None] = {}
     for row in oracle.query("SELECT Id, ParentRoleId FROM UserRole"):
@@ -375,10 +376,10 @@ def _role_hierarchy_subjects(
             cur = parent.get(cur)
         return out
 
-    ids = "','".join(account_ids)
+    ids = "','".join(record_ids)
     owner_of = {
         str(r["Id"]): str(r.get("OwnerId") or "")
-        for r in oracle.query(f"SELECT Id, OwnerId FROM Account WHERE Id IN ('{ids}')")
+        for r in oracle.query(f"SELECT Id, OwnerId FROM {object_type} WHERE Id IN ('{ids}')")
         if str(r.get("OwnerId") or "").startswith(USER_KEY_PREFIX)
     }
     owner_ids = sorted(set(owner_of.values()))
@@ -410,11 +411,12 @@ def audit(
     include_view_all_fix: bool = False,
     include_role_hierarchy: bool = False,
 ) -> FidelityReport:
-    """Run the live floor-vs-oracle audit over Accounts (the objects the connector
-    resolves per-record). ``include_view_all_fix`` / ``include_role_hierarchy``
-    fold those reconstructions' subjects into each record's stamped set — set True
-    to measure the RESIDUAL gap after that reconstruction lands (both default on in
-    the connector, so pass both True to audit the connector's real behaviour)."""
+    """Run the live floor-vs-oracle audit over Account, Opportunity, and Contact —
+    the objects the connector resolves per-record (Account/Opportunity via their
+    share objects + role hierarchy; Contact by inheriting its parent Account under
+    Controlled-by-Parent). ``include_view_all_fix`` / ``include_role_hierarchy``
+    fold those reconstructions' subjects in — both default on in the connector, so
+    pass both True to audit the connector's real behaviour."""
     users_rows = oracle.query(
         "SELECT Id, Name, FederationIdentifier FROM User WHERE IsActive = true"
     )
@@ -427,9 +429,33 @@ def audit(
     }
     view_all = _view_all_user_ids(oracle)
 
-    account_rows = oracle.query(f"SELECT Id FROM Account LIMIT {int(sample_accounts)}")
-    account_ids = [r["Id"] for r in account_rows]
-    grants = _account_grant_subjects(oracle, account_ids)
+    lim = int(sample_accounts)
+    account_ids = [r["Id"] for r in oracle.query(f"SELECT Id FROM Account LIMIT {lim}")]
+    opp_ids = [r["Id"] for r in oracle.query(f"SELECT Id FROM Opportunity LIMIT {lim}")]
+    contact_rows = oracle.query(f"SELECT Id, AccountId FROM Contact LIMIT {lim}")
+    contact_parent = {r["Id"]: r.get("AccountId") for r in contact_rows}
+    contact_ids = list(contact_parent)
+
+    # Account + Opportunity share-based grants. Account grants also cover contact
+    # parents (some parents may not be in the sampled account page) for inheritance.
+    parent_ids = {a for a in contact_parent.values() if a}
+    account_grants = _object_grant_subjects(oracle, "Account", sorted(set(account_ids) | parent_ids))
+    grants: dict[str, set[str]] = {a: account_grants.get(a, set()) for a in account_ids}
+    grants.update(_object_grant_subjects(oracle, "Opportunity", opp_ids))
+    # Contact inherits its parent Account's grant set (Controlled by Parent).
+    for cid, acct in contact_parent.items():
+        grants[cid] = set(account_grants.get(acct, set())) if acct else set()
+
+    if include_role_hierarchy:
+        acct_hier = _role_hierarchy_subjects(oracle, "Account", sorted(set(account_ids) | parent_ids))
+        for rid, subjects in acct_hier.items():
+            if rid in grants:
+                grants[rid].update(subjects)
+        for rid, subjects in _role_hierarchy_subjects(oracle, "Opportunity", opp_ids).items():
+            grants.setdefault(rid, set()).update(subjects)
+        for cid, acct in contact_parent.items():  # contacts inherit parent hierarchy
+            if acct:
+                grants[cid].update(acct_hier.get(acct, set()))
 
     if include_view_all_fix:
         va_subjects = {
@@ -440,23 +466,13 @@ def audit(
         for rid in grants:
             grants[rid] |= va_subjects  # type: ignore[arg-type]
 
-    if include_role_hierarchy:
-        for rid, subjects in _role_hierarchy_subjects(oracle, account_ids).items():
-            grants.setdefault(rid, set()).update(subjects)
-
+    all_ids = account_ids + opp_ids + contact_ids
     oracle_read: dict[tuple[str, str], bool] = {}
     for uid in users:
-        for rid, has in oracle.has_read(uid, account_ids).items():
+        for rid, has in oracle.has_read(uid, all_ids).items():
             oracle_read[(uid, rid)] = has
 
-    report = summarize(users, grants, oracle_read, view_all)
-    # Objects the connector does not resolve per-record today (honest note).
-    for obj in ("Contact", "Opportunity"):
-        n = oracle.query(f"SELECT COUNT(Id) c FROM {obj}")
-        cnt = n[0].get("c") if n else 0
-        if cnt:
-            report.unresolved_object_records[obj] = int(cnt)
-    return report
+    return summarize(users, grants, oracle_read, view_all)
 
 
 # ---------------------------------------------------------------------------

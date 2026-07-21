@@ -137,6 +137,17 @@ FEDERATION_SUBJECT_PREFIX = crosswalk.FEDERATION_MEMBER_PREFIX
 #: query comfortably under the SOQL statement-length limit).
 SHARE_QUERY_CHUNK = 200
 
+#: Standard objects whose per-record visibility comes from a dedicated share
+#: object (``<Object>Share`` with an ``<Object>Id`` key + ``UserOrGroupId``).
+#: Account and Opportunity both expose owner/manual/rule/hierarchy grants this
+#: way; Contact under the common "Controlled by Parent" OWD has NO share rows —
+#: its access is the parent Account's, so it is resolved by INHERITANCE (via
+#: ``Contact.AccountId``), not through this map.
+SHARE_OBJECTS = {
+    "Account": ("AccountShare", "AccountId"),
+    "Opportunity": ("OpportunityShare", "OpportunityId"),
+}
+
 #: The synthetic group carrying org-wide View All Data / Modify All Data (SPEC
 #: §14.3 completeness). Those profile/permission-set grants let a user read EVERY
 #: record regardless of sharing, and they are NOT expressed as AccountShare rows —
@@ -275,6 +286,17 @@ def _mydomain_host(my_domain: str) -> str:
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _merge_principals(existing: Sequence[str] | None, extra: Iterable[str]) -> list[str] | None:
+    """Union ``extra`` into ``existing`` preserving order + dedup (existing first).
+    Returns None only if the merged set is empty (so an unowned record stays on the
+    admin floor rather than carrying an empty inline ACL)."""
+    out = list(existing or [])
+    for principal in extra:
+        if principal not in out:
+            out.append(principal)
+    return out or None
 
 
 class SalesforceConnector(Connector):
@@ -475,7 +497,8 @@ class SalesforceConnector(Connector):
         """
         events: list[FactEvent | DocumentEvent] = []
         next_cursor = cursor or "1970-01-01T00:00:00+00:00"
-        changed_accounts: list[str] = []
+        records_by_type: dict[str, list[str]] = {}
+        contact_parent: dict[str, str] = {}
         for sobject in self.object_types:
             async for page in self._query_pages(self._soql(sobject, cursor)):
                 events.extend(self.events_from_query_page(sobject, page, self.visibility_policy))
@@ -485,57 +508,17 @@ class SalesforceConnector(Connector):
                         next_cursor
                     ):
                         next_cursor = modified
-                    if sobject == "Account" and record["Id"] not in changed_accounts:
-                        changed_accounts.append(record["Id"])
+                    records_by_type.setdefault(sobject, []).append(str(record["Id"]))
+                    if sobject == "Contact":
+                        parent = record.get("AccountId")
+                        if isinstance(parent, str) and parent:
+                            contact_parent[str(record["Id"])] = parent
 
-        if changed_accounts and self.fetch_account_shares:
-            try:
-                shares = await self._account_share_principals(changed_accounts)
-            except httpx.HTTPError as exc:
-                # Best-effort by construction: share principals are additive
-                # metadata; the admin-assigned policy already protects the facts.
-                logger.warning("AccountShare fetch failed (%s); facts proceed without", exc)
-                shares = {}
-            for event in events:
-                if isinstance(event, SalesforceFactEvent) and event.object_type == "Account":
-                    event.share_principals = list(shares.get(event.entity_id, []))
-
-            # Crosswalk the collected share ids → cross-source principals. The
-            # roster fetch is best-effort: a 403 degrades to admin fallback, any
-            # other HTTP error leaves records on the admin floor (fail closed).
-            user_ids = sorted(
-                {s for ids in shares.values() for s in ids if s.startswith(USER_KEY_PREFIX)}
-            )
-            group_ids = sorted(
-                {s for ids in shares.values() for s in ids if s.startswith(GROUP_KEY_PREFIX)}
-            )
-            if user_ids or group_ids:
-                try:
-                    users_by_id, self.group_edges = await self._fetch_roster(user_ids, group_ids)
-                except httpx.HTTPError as exc:
-                    # A 403 already set roster_degraded inside _fetch_roster; any
-                    # OTHER roster HTTP error (500 / timeout / reset) means the
-                    # GroupMember edges were NOT mirrored to SpiceDB this cycle, so
-                    # stamping group tokens would silently under-grant (the same
-                    # hazard the 403 path drops principals to avoid). Treat it as a
-                    # degrade: every record rides the admin --visibility floor AND
-                    # the runner emits DEGRADED_ACL_SIGNAL. Never stamp on a partial
-                    # roster.
-                    logger.warning("roster fetch failed (%s); facts ride admin policy", exc)
-                    users_by_id, self.group_edges = {}, {}
-                    self.roster_degraded = True
-                # When the roster degraded (403 or any other error), EVERY record
-                # falls back to the admin --visibility floor — group tokens resolve
-                # stably without the roster, but their edges never got mirrored, so
-                # stamping them would silently under-grant. Drop them wholesale.
-                if not self.roster_degraded:
-                    for event in events:
-                        if isinstance(event, SalesforceFactEvent) and event.share_principals:
-                            groups, owner_emails = self.resolve_share_principals(
-                                event.share_principals, users_by_id
-                            )
-                            event.record_principals = groups
-                            event.record_owner_emails = owner_emails
+        # Per-record ACL reconstruction (shares + role hierarchy + Contact
+        # parent-inheritance) across Account/Opportunity/Contact. Best-effort and
+        # fail-closed throughout: a failed fetch leaves records on the admin floor.
+        if self.fetch_account_shares:
+            await self._resolve_visibility(events, records_by_type, contact_parent)
 
         # ORG-WIDE VIEW ALL DATA / MODIFY ALL DATA (SPEC §14.3 completeness). These
         # profile/permission-set grants let a user read EVERY record regardless of
@@ -557,54 +540,137 @@ class SalesforceConnector(Connector):
                         if VIEW_ALL_GROUP not in principals:
                             principals.append(VIEW_ALL_GROUP)
                         event.record_principals = principals
-
-        # ROLE HIERARCHY (SPEC §14.3 completeness). A manager reads records owned
-        # BELOW them in the role tree; this grant is IMPLICIT (never an AccountShare
-        # row), so shares alone over-hide every manager (measured: the fidelity
-        # audit's role-hierarchy cause). Reconstruct it: stamp each Account with the
-        # role group of every ANCESTOR of its owner's role; those roles' members
-        # resolve through it. Accounts only (matches the connector's per-record
-        # resolution scope). Over-hide-only; any query error → no stamp (fail closed).
-        if self.mirror_role_hierarchy:
-            account_ids = sorted(
-                {
-                    e.entity_id
-                    for e in events
-                    if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
-                }
-            )
-            hierarchy_groups, hierarchy_edges = await self._fetch_role_hierarchy(account_ids)
-            self.group_edges.update(hierarchy_edges)
-            if hierarchy_groups:
-                for event in events:
-                    if isinstance(event, SalesforceFactEvent) and event.object_type == "Account":
-                        extra = hierarchy_groups.get(event.entity_id)
-                        if extra:
-                            principals = list(event.record_principals or [])
-                            for g in extra:
-                                if g not in principals:
-                                    principals.append(g)
-                            event.record_principals = principals
         return events, next_cursor
 
-    async def _fetch_role_hierarchy(
-        self, account_ids: Sequence[str]
-    ) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
-        """Reconstruct implicit role-hierarchy read access for a set of Accounts.
+    async def _resolve_visibility(
+        self,
+        events: list[FactEvent | DocumentEvent],
+        records_by_type: Mapping[str, list[str]],
+        contact_parent: Mapping[str, str],
+    ) -> None:
+        """Reconstruct per-record visibility for Account/Opportunity/Contact.
 
-        Returns ``(per_account, edges)``:
-        - ``per_account[account_id]`` = the :func:`role_principal` strings to stamp
-          — one per ANCESTOR role of the account owner's role that has members.
+        - **Account, Opportunity** — resolve their ``<Object>Share`` rows (owner +
+          manual/rule/group shares) through the roster, plus implicit role-hierarchy
+          (ancestor-role groups). One shared roster fetch covers every object's
+          share ids so nested group edges are mirrored once.
+        - **Contact** — under the common "Controlled by Parent" OWD a contact has NO
+          share rows; its access IS the parent Account's, so it INHERITS the parent
+          Account's fully-resolved principals (owner + shares + hierarchy) via
+          ``Contact.AccountId``.
+
+        Fail-closed: a share-fetch error leaves those records on the admin floor; a
+        roster error degrades EVERYTHING to the floor (never stamp on a partial
+        roster). Mutates the events + :attr:`group_edges` in place."""
+        # (A) records needing a share lookup, by object; contacts pull in their
+        # parent Accounts so inheritance has a resolved parent to copy.
+        account_ids = set(records_by_type.get("Account", []))
+        account_ids |= set(contact_parent.values())
+        share_ids: dict[str, list[str]] = {
+            "Account": sorted(account_ids),
+            "Opportunity": sorted(set(records_by_type.get("Opportunity", []))),
+        }
+
+        # (B) fetch <Object>Share rows (best-effort; additive metadata).
+        shares: dict[str, list[str]] = {}
+        for object_type, ids in share_ids.items():
+            if not ids:
+                continue
+            try:
+                shares.update(await self._object_share_principals(object_type, ids))
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "%sShare fetch failed (%s); those records ride admin floor",
+                    object_type,
+                    exc,
+                )
+        for event in events:
+            if isinstance(event, SalesforceFactEvent) and event.object_type in SHARE_OBJECTS:
+                event.share_principals = list(shares.get(event.entity_id, []))
+
+        # (C) ONE roster fetch over every object's share ids → users + group edges.
+        user_ids = sorted({s for v in shares.values() for s in v if s.startswith(USER_KEY_PREFIX)})
+        group_ids = sorted({s for v in shares.values() for s in v if s.startswith(GROUP_KEY_PREFIX)})
+        users_by_id: dict[str, SalesforceUserInfo] = {}
+        if user_ids or group_ids:
+            try:
+                users_by_id, self.group_edges = await self._fetch_roster(user_ids, group_ids)
+            except httpx.HTTPError as exc:
+                # 403 already set roster_degraded; any other error means the
+                # GroupMember edges never reached SpiceDB — stamping would
+                # under-grant. Drop everything to the floor (fail closed).
+                logger.warning("roster fetch failed (%s); facts ride admin policy", exc)
+                users_by_id, self.group_edges = {}, {}
+                self.roster_degraded = True
+        if self.roster_degraded:
+            return
+
+        # (D) resolve every Account (incl. contact parents) once — the source of
+        # both Account-event stamps and Contact inheritance.
+        account_resolved: dict[str, tuple[list[str] | None, list[str] | None]] = {
+            acct: self.resolve_share_principals(shares.get(acct, []), users_by_id)
+            for acct in account_ids
+        }
+        # (E) stamp Account + Opportunity events from their own shares.
+        for event in events:
+            if isinstance(event, SalesforceFactEvent) and event.object_type in SHARE_OBJECTS:
+                groups, owner_emails = self.resolve_share_principals(
+                    event.share_principals or [], users_by_id
+                )
+                event.record_principals = groups
+                event.record_owner_emails = owner_emails
+
+        # (F) role hierarchy per share-object; fold Account hierarchy groups into
+        # account_resolved so contacts inherit their parent's managers too.
+        if self.mirror_role_hierarchy:
+            for object_type in SHARE_OBJECTS:
+                hier_groups, hier_edges = await self._fetch_role_hierarchy(
+                    object_type, share_ids[object_type]
+                )
+                self.group_edges.update(hier_edges)
+                if not hier_groups:
+                    continue
+                for event in events:
+                    if isinstance(event, SalesforceFactEvent) and event.object_type == object_type:
+                        extra = hier_groups.get(event.entity_id)
+                        if extra:
+                            event.record_principals = _merge_principals(
+                                event.record_principals, extra
+                            )
+                if object_type == "Account":
+                    for acct, extra in hier_groups.items():
+                        groups, owners = account_resolved.get(acct, (None, None))
+                        account_resolved[acct] = (_merge_principals(groups, extra), owners)
+
+        # (G) Contact inheritance (Controlled by Parent): copy the parent Account's
+        # resolved principals onto the contact.
+        for event in events:
+            if isinstance(event, SalesforceFactEvent) and event.object_type == "Contact":
+                parent = contact_parent.get(event.entity_id)
+                if parent and parent in account_resolved:
+                    groups, owner_emails = account_resolved[parent]
+                    event.record_principals = list(groups) if groups else None
+                    event.record_owner_emails = list(owner_emails) if owner_emails else None
+
+    async def _fetch_role_hierarchy(
+        self, object_type: str, record_ids: Sequence[str]
+    ) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+        """Reconstruct implicit role-hierarchy read access for a set of records of
+        ``object_type`` (Account or Opportunity — any object with an ``OwnerId``).
+
+        Returns ``(per_record, edges)``:
+        - ``per_record[record_id]`` = the :func:`role_principal` strings to stamp
+          — one per ANCESTOR role of the record owner's role that has members.
         - ``edges[role_group]`` = the ``fed:<subject>`` members of that ancestor
           role (the managers), for :meth:`sync_group_edges` to mirror into SpiceDB.
 
-        Four read-only queries: Account owners, the full UserRole tree, the owners'
-        roles, and the ancestor roles' members (fed id + active). A user with no
-        FederationIdentifier / inactive confers nothing (over-hide, fail closed).
-        ANY HTTP error degrades to empty — managers stay over-hidden (safe), and the
-        base sync never fails on an additive completeness source.
+        Four read-only queries: the record owners, the full UserRole tree, the
+        owners' roles, and the ancestor roles' members (fed id + active). A user
+        with no FederationIdentifier / inactive confers nothing (over-hide, fail
+        closed). ANY HTTP error degrades to empty — managers stay over-hidden
+        (safe), and the base sync never fails on an additive completeness source.
         """
-        if not account_ids:
+        if not record_ids:
             return {}, {}
         try:
             # (1) the full role tree FIRST -> parent map. An org with NO roles (the
@@ -617,12 +683,12 @@ class SalesforceConnector(Connector):
             if not parent:
                 return {}, {}
 
-            # (2) account -> owner 005
+            # (2) record -> owner 005
             owner_of: dict[str, str] = {}
-            for chunk in _chunks(list(account_ids), SHARE_QUERY_CHUNK):
+            for chunk in _chunks(list(record_ids), SHARE_QUERY_CHUNK):
                 ids = ", ".join(f"'{a}'" for a in chunk)
                 async for page in self._query_pages(
-                    f"SELECT Id, OwnerId FROM Account WHERE Id IN ({ids})"
+                    f"SELECT Id, OwnerId FROM {object_type} WHERE Id IN ({ids})"
                 ):
                     for row in page.get("records", []):
                         owner = str(row.get("OwnerId") or "")
@@ -768,22 +834,28 @@ class SalesforceConnector(Connector):
             page = await self._get_json(page["nextRecordsUrl"])
             yield page
 
-    async def _account_share_principals(self, account_ids: Iterable[str]) -> dict[str, list[str]]:
-        """AccountShare rows for the changed accounts → per-account principal
-        strings (deduplicated, in row order). Chunked ``IN (...)`` queries."""
+    async def _object_share_principals(
+        self, object_type: str, record_ids: Iterable[str]
+    ) -> dict[str, list[str]]:
+        """``<Object>Share`` rows for the given records → per-record RAW share ids
+        (005/00G, deduped, in row order). Chunked ``IN (...)`` queries.
+
+        Generic over :data:`SHARE_OBJECTS` (Account, Opportunity): the share object
+        and its foreign-key column differ per object, but the row shape — a
+        ``UserOrGroupId`` classified by :meth:`principal_for_share` — is identical,
+        so owner/manual/rule shares resolve through the same crosswalk regardless
+        of which object they protect."""
+        share_object, key = SHARE_OBJECTS[object_type]
         shares: dict[str, list[str]] = {}
-        for chunk in _chunks(list(account_ids), SHARE_QUERY_CHUNK):
-            ids = ", ".join(f"'{account_id}'" for account_id in chunk)
-            soql = (
-                "SELECT AccountId, UserOrGroupId, AccountAccessLevel, RowCause "
-                f"FROM AccountShare WHERE AccountId IN ({ids})"
-            )
+        for chunk in _chunks(list(record_ids), SHARE_QUERY_CHUNK):
+            ids = ", ".join(f"'{rid}'" for rid in chunk)
+            soql = f"SELECT {key}, UserOrGroupId, RowCause FROM {share_object} WHERE {key} IN ({ids})"
             async for page in self._query_pages(soql):
                 for row in page.get("records", []):
                     principal = self.principal_for_share(row)
                     if principal is None:
                         continue
-                    principals = shares.setdefault(row["AccountId"], [])
+                    principals = shares.setdefault(row[key], [])
                     if principal not in principals:
                         principals.append(principal)
         return shares
