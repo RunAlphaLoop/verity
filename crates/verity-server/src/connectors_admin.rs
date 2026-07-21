@@ -50,7 +50,7 @@ pub(crate) struct SourceSpec {
 /// Fixed registry, alphabetical-ish by affinity: the zero-credential local
 /// path first, then content, directory, CRM. `folder` is the aggregate of
 /// every `folder:<name>` watch (the server IS that worker, in-process).
-pub(crate) const SOURCES: [SourceSpec; 6] = [
+pub(crate) const SOURCES: [SourceSpec; 8] = [
     SourceSpec {
         source: "folder",
         label: "Local folders",
@@ -80,6 +80,16 @@ pub(crate) const SOURCES: [SourceSpec; 6] = [
         source: "salesforce",
         label: "Salesforce",
         kind: "crm",
+    },
+    SourceSpec {
+        source: "notion",
+        label: "Notion",
+        kind: "content",
+    },
+    SourceSpec {
+        source: "intercom",
+        label: "Intercom",
+        kind: "support",
     },
 ];
 
@@ -116,7 +126,7 @@ pub(crate) enum CredentialClass {
 /// and — fail closed — for any unknown source (never a fabricated tier).
 pub(crate) fn credential_class(source: &str) -> CredentialClass {
     match source {
-        "hubspot" | "salesforce" => CredentialClass::TierC,
+        "hubspot" | "salesforce" | "notion" | "intercom" => CredentialClass::TierC,
         "gdrive" => CredentialClass::Google {
             subject_required: false,
         },
@@ -136,6 +146,8 @@ pub(crate) fn env_precedence_vars(source: &str) -> &'static [&'static str] {
     match source {
         "hubspot" => &["HUBSPOT_SERVICE_KEY", "HUBSPOT_PRIVATE_APP_TOKEN"],
         "salesforce" => &["SF_CLIENT_ID", "SF_CLIENT_SECRET"],
+        "notion" => &["NOTION_TOKEN"],
+        "intercom" => &["INTERCOM_ACCESS_TOKEN"],
         "gdrive" | "gmail" | "gdirectory" => &["GOOGLE_APPLICATION_CREDENTIALS"],
         _ => &[],
     }
@@ -1853,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_the_six_sources_with_their_kinds() {
+    fn registry_lists_the_sources_with_their_kinds() {
         let got: Vec<(&str, &str)> = SOURCES.iter().map(|s| (s.source, s.kind)).collect();
         assert_eq!(
             got,
@@ -1864,11 +1876,15 @@ mod tests {
                 ("gdirectory", "directory"),
                 ("hubspot", "crm"),
                 ("salesforce", "crm"),
+                ("notion", "content"),
+                ("intercom", "support"),
             ]
         );
         assert_eq!(source_spec("hubspot").expect("known").label, "HubSpot");
+        assert_eq!(source_spec("notion").expect("known").label, "Notion");
+        assert_eq!(source_spec("intercom").expect("known").label, "Intercom");
         // Fail closed: an unknown source resolves to nothing, never a row.
-        assert!(source_spec("notion").is_none());
+        assert!(source_spec("zendesk").is_none());
         assert!(source_spec("folder:notes").is_none());
     }
 
@@ -2147,9 +2163,12 @@ mod tests {
                 }
             );
         }
+        // Notion + Intercom are pasted-bearer tier-C sources like HubSpot.
+        assert_eq!(credential_class("notion"), CredentialClass::TierC);
+        assert_eq!(credential_class("intercom"), CredentialClass::TierC);
         // folder + any unknown source classify as None (no secret intake).
         assert_eq!(credential_class("folder"), CredentialClass::None);
-        assert_eq!(credential_class("notion"), CredentialClass::None);
+        assert_eq!(credential_class("zendesk"), CredentialClass::None);
     }
 
     #[test]
