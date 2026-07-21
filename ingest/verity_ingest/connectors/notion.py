@@ -631,6 +631,28 @@ def _write_cursor(state_file: Path, cursor: str) -> None:
     state_file.write_text(cursor + "\n")
 
 
+def _read_credential_file(path: Path) -> str:
+    """Read the bearer token from a 0600 credential file (server-materialized).
+
+    The token is the file body (never argv/env — argv is world-visible via
+    ``/proc``). Trailing newline is stripped. The token is NEVER echoed or
+    logged. Enforces owner-only 0600 permissions (fail closed on a laxer mode —
+    a decrypted bearer must not be group/world-readable). An empty file is
+    rejected here so the error is attributable to the flag, not a downstream
+    missing-env message.
+    """
+    st = path.stat()
+    if st.st_mode & 0o077:
+        raise PermissionError(
+            f"--credential-file {path} must be 0600 (owner-only); "
+            f"found mode {st.st_mode & 0o777:o}"
+        )
+    token = path.read_text().rstrip("\n")
+    if not token.strip():
+        raise ValueError(f"--credential-file {path} is empty (no bearer token)")
+    return token
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m verity_ingest.connectors.notion",
@@ -645,6 +667,15 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated principal tokens — the admin-assigned visibility "
         "policy enforced on every event (required, no default; Notion has no "
         "per-record share audience, so this IS the enforced ACL — SPEC §5e.2)",
+    )
+    parser.add_argument(
+        "--credential-file",
+        type=Path,
+        default=None,
+        help="read the Notion bearer token from this 0600 file (the file BODY, "
+        "trailing newline stripped) — PREFERRED over NOTION_TOKEN env so a "
+        "server spawn never puts the token in argv or the child environment; "
+        "never echoed or logged",
     )
     parser.add_argument(
         "--state-file",
@@ -668,10 +699,14 @@ def main(argv: list[str] | None = None) -> int:
     if not policy:
         parser.error("--visibility must name at least one principal token (fail closed)")
 
+    cred_token: str | None = None
+    if args.credential_file is not None:
+        cred_token = _read_credential_file(args.credential_file)
+
     sink = VerityDebeziumSink.from_env()
 
     async def run_once() -> tuple[list[FactEvent | DocumentEvent], str, int, bool]:
-        connector = NotionConnector(policy, with_content=args.with_content)
+        connector = NotionConnector(policy, token=cred_token, with_content=args.with_content)
         try:
             events, next_cursor = await connector.poll(_read_cursor(args.state_file))
             return list(events), next_cursor, connector.quarantined, connector.users_degraded

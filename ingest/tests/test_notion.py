@@ -31,6 +31,7 @@ from verity_ingest.connectors.hubspot import VerityDebeziumSink
 from verity_ingest.connectors.notion import (
     NotionConnector,
     NotionFactEvent,
+    _read_credential_file,
     _read_cursor,
     _write_cursor,
     group_principal,
@@ -430,6 +431,45 @@ def test_env_token_flows_into_bearer_header(monkeypatch: pytest.MonkeyPatch) -> 
     connector = NotionConnector(POLICY)
     assert connector._client.headers["Authorization"] == "Bearer secret-tok"
     assert connector._client.headers["Notion-Version"] == "2022-06-28"
+    asyncio.run(connector.aclose())
+
+
+# ---------- --credential-file (server spawn channel; token is the file body) ----------
+
+
+def _write_cred(tmp_path: Path, token: str, mode: int = 0o600) -> Path:
+    p = tmp_path / "bearer.token"
+    p.write_text(token)
+    p.chmod(mode)
+    return p
+
+
+def test_credential_file_reads_body_and_strips_trailing_newline(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "notion-tok-from-file\n")
+    assert _read_credential_file(p) == "notion-tok-from-file"
+
+
+def test_credential_file_rejects_non_0600_mode(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "notion-tok-secret\n", mode=0o644)
+    with pytest.raises(PermissionError, match="0600"):
+        _read_credential_file(p)
+
+
+def test_credential_file_rejects_empty(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "\n")
+    with pytest.raises(ValueError, match="empty"):
+        _read_credential_file(p)
+
+
+def test_credential_file_token_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file body is PREFERRED over NOTION_TOKEN — a server spawn never needs
+    # the token in the child environment.
+    monkeypatch.setenv("NOTION_TOKEN", "notion-tok-from-env")
+    p = _write_cred(tmp_path, "notion-tok-from-file\n")
+    connector = NotionConnector(POLICY, token=_read_credential_file(p))
+    assert connector._client.headers["Authorization"] == "Bearer notion-tok-from-file"
     asyncio.run(connector.aclose())
 
 

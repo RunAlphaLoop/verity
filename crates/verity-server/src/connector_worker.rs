@@ -179,6 +179,14 @@ pub(crate) fn is_backfillable(source: &str) -> bool {
     matches!(source, "gdrive" | "gmail" | "hubspot")
 }
 
+/// The single-static-bearer tier-C family: one pasted token, stored as one
+/// encrypted `bearer`, delivered to the child via a 0600 `--credential-file`.
+/// EXCLUDES salesforce (multi-part client-credentials OAuth: client_id +
+/// secret + my_domain — no single bearer to materialize).
+pub(crate) fn is_single_bearer(source: &str) -> bool {
+    matches!(source, "hubspot" | "notion" | "intercom")
+}
+
 /// Whether a source supports a continuous-sync `--once` incremental poll cycle:
 /// `gdrive` / `gmail` / `hubspot` (all have a `--once` CLI branch + a persisted
 /// cursor). `gdirectory` has its OWN continuous directory plane (not a `--once`
@@ -252,9 +260,10 @@ pub(crate) enum BackfillIdentity {
         sa_key_path: PathBuf,
         subject: Option<String>,
     },
-    /// hubspot: the decrypted bearer bytes (materialized to a 0600 temp file at
-    /// spawn) + the tier-C visibility policy resolved from the store.
-    HubSpot {
+    /// single-bearer tier-C (hubspot/notion/intercom): the decrypted bearer
+    /// bytes (materialized to a 0600 temp file at spawn) + the tier-C visibility
+    /// policy resolved from the store.
+    SingleBearer {
         bearer: zeroize::Zeroizing<Vec<u8>>,
         visibility: Vec<i32>,
     },
@@ -281,12 +290,27 @@ pub(crate) fn assemble_spec(
     cred_file: Option<&Path>,
     state_file: Option<&Path>,
 ) -> Result<BackfillSpec, SpawnError> {
-    if !is_backfillable(source) {
-        return Err(SpawnError::NoConfig(format!(
-            "{source} has no browser-triggered backfill — only gdrive, gmail, and hubspot \
-             support a full crawl (folder is a local watch, gdirectory is the directory worker, \
-             salesforce is fixtures-only until a test org lands)"
-        )));
+    // The eligible-source gate is MODE-specific: a full-crawl --backfill needs
+    // `is_backfillable`; a --once poll needs `is_pollable`. These sets DIFFER —
+    // notion/intercom are pollable (a --once cursor) but NOT backfillable (no
+    // --backfill CLI branch; --once is required=True). Gating a poll on
+    // is_backfillable would wrongly reject them; gating a backfill on is_pollable
+    // would wrongly accept them into an argparse crash. Fail closed per mode.
+    match mode {
+        SpawnMode::Backfill if !is_backfillable(source) => {
+            return Err(SpawnError::NoConfig(format!(
+                "{source} has no browser-triggered backfill — only gdrive, gmail, and hubspot \
+                 support a full crawl (folder is a local watch, gdirectory is the directory \
+                 worker, salesforce is fixtures-only until a test org lands)"
+            )));
+        }
+        SpawnMode::PollOnce if !is_pollable(source) => {
+            return Err(SpawnError::NoConfig(format!(
+                "{source} has no --once poll cursor — continuous sync is not wired for it \
+                 (folder / gdirectory / salesforce have no incremental cursor)"
+            )));
+        }
+        _ => {}
     }
 
     // A --once poll cycle MUST carry a per-(tenant,source) --state-file (the
@@ -311,20 +335,18 @@ pub(crate) fn assemble_spec(
     // HubSpot (tier-C): NO --verity-url / --tenant-id (the CLI reads those from
     // env); a required --visibility policy + a --credential-file path whose FILE
     // BODY is the bearer (never a token literal in argv).
-    if source == "hubspot" {
+    if is_single_bearer(source) {
         let visibility = visibility.filter(|v| !v.is_empty()).ok_or_else(|| {
-            SpawnError::NoConfig(
-                "hubspot sync needs a non-empty --visibility policy (tier-C requires a \
-                 sharing scope) — store a HubSpot credential with a visibility policy first"
-                    .to_string(),
-            )
+            SpawnError::NoConfig(format!(
+                "{source} sync needs a non-empty --visibility policy (tier-C requires a \
+                 sharing scope) — store a {source} credential with a visibility policy first"
+            ))
         })?;
         let cred_file = cred_file.ok_or_else(|| {
-            SpawnError::NoConfig(
-                "hubspot sync needs a server-materialized --credential-file (the decrypted \
+            SpawnError::NoConfig(format!(
+                "{source} sync needs a server-materialized --credential-file (the decrypted \
                  bearer) — a resolvable stored bearer is required"
-                    .to_string(),
-            )
+            ))
         })?;
         let vis = visibility
             .iter()
@@ -524,6 +546,8 @@ pub(crate) const POLL_STATE_DIR_ENV: &str = "VERITY_POLL_STATE_DIR";
 pub(crate) fn poll_cursor_basename(source: &str) -> Option<&'static str> {
     match source {
         "hubspot" => Some("hubspot_cursor"),
+        "notion" => Some("notion_cursor"),
+        "intercom" => Some("intercom_cursor"),
         "gdrive" => Some("gdrive_cursor.json"),
         "gmail" => Some("gmail_cursor.json"),
         _ => None,
@@ -1185,7 +1209,7 @@ pub(crate) fn spawn(
                 state_file.as_deref(),
             )?
         }
-        BackfillIdentity::HubSpot { bearer, visibility } => {
+        BackfillIdentity::SingleBearer { bearer, visibility } => {
             // Materialize the decrypted bearer to a fresh O_CREAT|O_EXCL 0600 file
             // in the 0700 runtime dir (outside the repo). Its PATH — never the
             // token — becomes the --credential-file argv value.
@@ -1208,8 +1232,9 @@ pub(crate) fn spawn(
                     return Err(e);
                 }
             };
-            // The hubspot CLI reads tenant/url/admin-token from env (no flags);
-            // the SINK identity comes from these, the bearer only from the file.
+            // The single-bearer CLI (hubspot/notion/intercom) reads tenant/url/
+            // admin-token from env (no flags); the SINK identity comes from these,
+            // the bearer only from the file.
             extra_env.push(("VERITY_TENANT_ID".to_string(), tenant_id.to_string()));
             extra_env.push(("VERITY_URL".to_string(), base_url.to_string()));
             cred_file_path = Some(cred);
@@ -1712,9 +1737,185 @@ mod tests {
         assert!(is_pollable("gdrive"));
         assert!(is_pollable("gmail"));
         assert!(is_pollable("hubspot"));
+        // The single-bearer family notion/intercom is now pollable (bare-file
+        // cursors), matching their NOTION_STATE_FILE / INTERCOM_STATE_FILE defaults.
+        assert!(is_pollable("notion"));
+        assert!(is_pollable("intercom"));
+        assert_eq!(poll_cursor_basename("notion"), Some("notion_cursor"));
+        assert_eq!(poll_cursor_basename("intercom"), Some("intercom_cursor"));
         // gdirectory has its own directory plane; folder/salesforce have no cursor.
         for s in ["folder", "gdirectory", "salesforce", "bogus"] {
             assert!(!is_pollable(s), "{s} must not be pollable");
+        }
+    }
+
+    #[test]
+    fn notion_intercom_are_pollable_but_not_backfillable() {
+        // The is_backfillable ≠ is_pollable split: notion/intercom have a --once
+        // poll cursor but NO --backfill CLI branch (--once is required=True), so
+        // adding them to is_backfillable would spawn an argparse crash. Lock it in.
+        for s in ["notion", "intercom"] {
+            assert!(is_pollable(s), "{s} must be pollable");
+            assert!(!is_backfillable(s), "{s} must NOT be backfillable");
+        }
+    }
+
+    #[test]
+    fn single_bearer_family_is_hubspot_notion_intercom() {
+        for s in ["hubspot", "notion", "intercom"] {
+            assert!(is_single_bearer(s), "{s} must be single-bearer");
+        }
+        // Salesforce is multi-part OAuth, NOT a single bearer — the exclusion guard.
+        for s in [
+            "salesforce",
+            "gdrive",
+            "gmail",
+            "gdirectory",
+            "folder",
+            "bogus",
+        ] {
+            assert!(!is_single_bearer(s), "{s} must NOT be single-bearer");
+        }
+    }
+
+    #[test]
+    fn notion_once_argv_carries_visibility_credential_and_state_file() {
+        let cred = Path::new("/run/verity-connector-creds/n.cred");
+        let cursor = Path::new("/var/verity/poll/tn/notion_cursor");
+        let spec = assemble_spec(
+            "notion",
+            SpawnMode::PollOnce,
+            "http://host:7717",
+            t(),
+            None,
+            Some(&[1, 2, 3]),
+            Some(cred),
+            Some(cursor),
+        )
+        .expect("notion --once ok");
+        assert_eq!(spec.module, "verity_ingest.connectors.notion");
+        assert_eq!(spec.log_name, "notion-poll.log");
+        assert_eq!(
+            spec.argv,
+            vec![
+                "-m",
+                "verity_ingest.connectors.notion",
+                "--once",
+                "--visibility",
+                "1,2,3",
+                "--credential-file",
+                "/run/verity-connector-creds/n.cred",
+                "--state-file",
+                "/var/verity/poll/tn/notion_cursor",
+            ]
+        );
+        // Single-bearer CLI takes tenant/url from env, never flags; no token literal.
+        assert!(!spec.argv.iter().any(|a| a == "--verity-url"));
+        assert!(!spec.argv.iter().any(|a| a == "--tenant-id"));
+        assert!(!spec.argv.iter().any(|a| a.contains("Bearer")));
+    }
+
+    #[test]
+    fn intercom_once_argv_carries_visibility_credential_and_state_file() {
+        let cred = Path::new("/run/verity-connector-creds/i.cred");
+        let cursor = Path::new("/var/verity/poll/ti/intercom_cursor");
+        let spec = assemble_spec(
+            "intercom",
+            SpawnMode::PollOnce,
+            "http://host:7717",
+            t(),
+            None,
+            Some(&[5]),
+            Some(cred),
+            Some(cursor),
+        )
+        .expect("intercom --once ok");
+        assert_eq!(spec.module, "verity_ingest.connectors.intercom");
+        assert_eq!(spec.log_name, "intercom-poll.log");
+        assert_eq!(
+            spec.argv,
+            vec![
+                "-m",
+                "verity_ingest.connectors.intercom",
+                "--once",
+                "--visibility",
+                "5",
+                "--credential-file",
+                "/run/verity-connector-creds/i.cred",
+                "--state-file",
+                "/var/verity/poll/ti/intercom_cursor",
+            ]
+        );
+        assert!(!spec.argv.iter().any(|a| a == "--verity-url"));
+        assert!(!spec.argv.iter().any(|a| a == "--tenant-id"));
+    }
+
+    #[test]
+    fn notion_once_fail_closed_without_visibility_or_credential() {
+        let cred = Path::new("/run/n.cred");
+        let cursor = Path::new("/var/verity/poll/tn/notion_cursor");
+        // No visibility → NoConfig.
+        let err = assemble_spec(
+            "notion",
+            SpawnMode::PollOnce,
+            "http://h",
+            t(),
+            None,
+            None,
+            Some(cred),
+            Some(cursor),
+        )
+        .err()
+        .expect("no visibility must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+        // Empty visibility is treated as absent.
+        let err = assemble_spec(
+            "notion",
+            SpawnMode::PollOnce,
+            "http://h",
+            t(),
+            None,
+            Some(&[]),
+            Some(cred),
+            Some(cursor),
+        )
+        .err()
+        .expect("empty visibility must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+        // No credential-file path → NoConfig.
+        let err = assemble_spec(
+            "notion",
+            SpawnMode::PollOnce,
+            "http://h",
+            t(),
+            None,
+            Some(&[7]),
+            None,
+            Some(cursor),
+        )
+        .err()
+        .expect("no credential-file must fail");
+        assert!(matches!(err, SpawnError::NoConfig(_)));
+    }
+
+    #[test]
+    fn notion_backfill_is_no_config() {
+        // notion/intercom have no --backfill CLI branch; a Backfill spawn must
+        // fail closed at assemble time (locks in the is_backfillable exclusion).
+        for s in ["notion", "intercom"] {
+            let err = assemble_spec(
+                s,
+                SpawnMode::Backfill,
+                "http://h",
+                t(),
+                None,
+                Some(&[7]),
+                Some(Path::new("/run/x.cred")),
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{s} backfill must fail closed"));
+            assert!(matches!(err, SpawnError::NoConfig(_)), "{s}");
         }
     }
 
@@ -1834,7 +2035,7 @@ mod tests {
             t(),
             "hubspot",
             None,
-            BackfillIdentity::HubSpot {
+            BackfillIdentity::SingleBearer {
                 bearer: zeroize::Zeroizing::new(b"pat-secret".to_vec()),
                 visibility: vec![7],
             },

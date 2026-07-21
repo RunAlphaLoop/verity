@@ -1408,8 +1408,8 @@ pub(crate) async fn resolve_connector_identity(
     tenant_id: Uuid,
     source: &str,
 ) -> Result<connector_worker::BackfillIdentity, (StatusCode, String)> {
-    if source == "hubspot" {
-        resolve_hubspot_identity(state, tenant_id).await
+    if connector_worker::is_single_bearer(source) {
+        resolve_single_bearer_identity(state, tenant_id, source).await
     } else {
         // Google (gdrive/gmail): stored path (+ subject) XOR the server env SA key.
         let stored = state
@@ -1427,12 +1427,14 @@ pub(crate) async fn resolve_connector_identity(
     }
 }
 
-/// Resolve the HubSpot tier-C backfill identity: the DECRYPTED bearer + the
-/// stored visibility policy, applying the fail-closed preconditions in order.
+/// Resolve a single-bearer tier-C backfill identity (hubspot/notion/intercom):
+/// the DECRYPTED bearer + the stored visibility policy, applying the fail-closed
+/// preconditions in order.
 ///
-/// - env-vs-store disambiguation: a server `HUBSPOT_SERVICE_KEY` /
-///   `HUBSPOT_PRIVATE_APP_TOKEN` AND a stored bearer both present → 409 (never
-///   silently pick one — the same precedence rule the credential store uses).
+/// - env-vs-store disambiguation: a server env credential (e.g.
+///   `HUBSPOT_SERVICE_KEY` / `NOTION_TOKEN` / `INTERCOM_ACCESS_TOKEN`) AND a
+///   stored bearer both present → 409 (never silently pick one — the same
+///   precedence rule the credential store uses).
 /// - a resolvable bearer: neither stored nor env → 422 with the exact fix.
 /// - a stored non-empty visibility policy: tier-C requires a sharing scope, so
 ///   an absent/empty stored visibility → 422 (memory nobody can read is never a
@@ -1441,17 +1443,20 @@ pub(crate) async fn resolve_connector_identity(
 /// It then materializes the bearer (decrypt-on-demand under the tenant DEK). The
 /// bearer bytes are wrapped in `Zeroizing` so they scrub on drop; `spawn` writes
 /// them to a 0600 `--credential-file` and unlinks it on child exit — the token
-/// never touches argv/env/logs.
-async fn resolve_hubspot_identity(
+/// never touches argv/env/logs. EXCLUDES salesforce (multi-part OAuth, not a
+/// single bearer — it never routes here).
+async fn resolve_single_bearer_identity(
     state: &AppState,
     tenant_id: Uuid,
+    source: &str,
 ) -> Result<connector_worker::BackfillIdentity, (StatusCode, String)> {
-    let env_bearer_present = env_precedence_hit("hubspot", |k| std::env::var(k).ok()).is_some();
+    let env_bearer_present = env_precedence_hit(source, |k| std::env::var(k).ok()).is_some();
+    let env_vars = env_precedence_vars(source).join(" / ");
 
     // The non-secret stored status tells us kind + visibility WITHOUT decrypting.
     let status = state
         .storage
-        .get_connector_credential_status(tenant_id, "hubspot")
+        .get_connector_credential_status(tenant_id, source)
         .await
         .map_err(credential_status)?;
     let stored_bearer_present = status
@@ -1462,20 +1467,22 @@ async fn resolve_hubspot_identity(
     if env_bearer_present && stored_bearer_present {
         return Err((
             StatusCode::CONFLICT,
-            "the hubspot bearer is provided BOTH by a stored connector credential AND the \
-             server's HUBSPOT_SERVICE_KEY / HUBSPOT_PRIVATE_APP_TOKEN env — refusing to guess \
-             which is authoritative; unset the env var or revoke the stored credential so \
-             exactly one remains, then retry"
-                .to_string(),
+            format!(
+                "the {source} bearer is provided BOTH by a stored connector credential AND the \
+                 server's {env_vars} env — refusing to guess which is authoritative; unset the \
+                 env var or revoke the stored credential so exactly one remains, then retry"
+            ),
         ));
     }
     if !env_bearer_present && !stored_bearer_present {
+        let first_env_var = env_precedence_vars(source).first().copied().unwrap_or("");
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "no hubspot bearer to back fill with — store a HubSpot credential with a visibility \
-             policy first (POST /v1/admin/connectors/hubspot/credential {token, visibility}), or \
-             set HUBSPOT_SERVICE_KEY on the server, then retry"
-                .to_string(),
+            format!(
+                "no {source} bearer to back fill with — store a credential with a visibility \
+                 policy first (POST /v1/admin/connectors/{source}/credential {{token, \
+                 visibility}}), or set {first_env_var} on the server, then retry"
+            ),
         ));
     }
 
@@ -1488,18 +1495,19 @@ async fn resolve_hubspot_identity(
         .filter(|v| !v.is_empty())
         .ok_or((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "store a HubSpot credential with a visibility policy first — a tier-C backfill \
-             coarsens every record to the admin-assigned visibility, so an empty/absent policy \
-             would ingest memory no reader can act under (POST \
-             /v1/admin/connectors/hubspot/credential {token, visibility})"
-                .to_string(),
+            format!(
+                "store a {source} credential with a visibility policy first — a tier-C backfill \
+                 coarsens every record to the admin-assigned visibility, so an empty/absent \
+                 policy would ingest memory no reader can act under (POST \
+                 /v1/admin/connectors/{source}/credential {{token, visibility}})"
+            ),
         ))?;
 
     // Decrypt-on-demand under the tenant DEK (inherits the KEK-unset fail-closed
     // refusal). None here would be a store/status race; fail closed, never spawn.
     let bearer = match state
         .storage
-        .materialize_connector_bearer(tenant_id, "hubspot")
+        .materialize_connector_bearer(tenant_id, source)
         .await
         .map_err(credential_status)?
     {
@@ -1507,14 +1515,15 @@ async fn resolve_hubspot_identity(
         None => {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "no stored hubspot bearer to materialize — store a HubSpot credential with a \
-                 visibility policy first"
-                    .to_string(),
+                format!(
+                    "no stored {source} bearer to materialize — store a credential with a \
+                     visibility policy first"
+                ),
             ))
         }
     };
 
-    Ok(connector_worker::BackfillIdentity::HubSpot {
+    Ok(connector_worker::BackfillIdentity::SingleBearer {
         bearer: zeroize::Zeroizing::new(bearer),
         visibility,
     })
@@ -2381,7 +2390,7 @@ mod tests {
     fn resolve_refuses_non_backfillable_sources() {
         // resolve_backfill is the GOOGLE (path/subject) resolver. hubspot is
         // backfillable but takes a DIFFERENT (bearer/visibility) path, resolved by
-        // resolve_hubspot_identity — never routed through here. These are the
+        // resolve_single_bearer_identity — never routed through here. These are the
         // sources with no browser-triggered backfill at all.
         for s in ["folder", "gdirectory", "salesforce", "bogus"] {
             let err = resolve_backfill(s, None, Some(Path::new("/srv/sa.json")))
@@ -2599,9 +2608,32 @@ mod tests {
         assert!(sync_eligible("gdrive"));
         assert!(sync_eligible("gmail"));
         assert!(sync_eligible("hubspot"));
+        // notion/intercom are now pollable → sync-eligible (single-bearer poll).
+        assert!(sync_eligible("notion"));
+        assert!(sync_eligible("intercom"));
         // gdirectory has its own plane; folder/salesforce have no --once cycle.
+        // Salesforce stays INELIGIBLE — it never joined the pollable/bearer family.
         for s in ["gdirectory", "folder", "salesforce", "bogus"] {
             assert!(!sync_eligible(s), "{s} must not be sync-eligible");
+        }
+    }
+
+    #[test]
+    fn single_bearer_family_excludes_salesforce() {
+        // The bearer resolver routes hubspot/notion/intercom; salesforce (multi-
+        // part OAuth) must NEVER route into the single-bearer path.
+        for s in ["hubspot", "notion", "intercom"] {
+            assert!(connector_worker::is_single_bearer(s), "{s}");
+        }
+        for s in [
+            "salesforce",
+            "gdrive",
+            "gmail",
+            "gdirectory",
+            "folder",
+            "bogus",
+        ] {
+            assert!(!connector_worker::is_single_bearer(s), "{s}");
         }
     }
 

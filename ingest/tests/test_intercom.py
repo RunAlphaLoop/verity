@@ -35,6 +35,7 @@ from verity_ingest.connectors.intercom import (
     DEGRADED_ACL_SIGNAL,
     IntercomConnector,
     IntercomFactEvent,
+    _read_credential_file,
     _read_cursor,
     _write_cursor,
     group_principal,
@@ -166,6 +167,45 @@ def test_credential_comes_from_env_and_is_required(monkeypatch: pytest.MonkeyPat
     connector = IntercomConnector(POLICY)
     assert connector._client.headers["Authorization"] == "Bearer env-token"
     assert connector._client.headers["Intercom-Version"] == "2.11"
+    asyncio.run(connector.aclose())
+
+
+# ---------- --credential-file (server spawn channel; token is the file body) ----------
+
+
+def _write_cred(tmp_path: Path, token: str, mode: int = 0o600) -> Path:
+    p = tmp_path / "bearer.token"
+    p.write_text(token)
+    p.chmod(mode)
+    return p
+
+
+def test_credential_file_reads_body_and_strips_trailing_newline(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "intercom-tok-from-file\n")
+    assert _read_credential_file(p) == "intercom-tok-from-file"
+
+
+def test_credential_file_rejects_non_0600_mode(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "intercom-tok-secret\n", mode=0o644)
+    with pytest.raises(PermissionError, match="0600"):
+        _read_credential_file(p)
+
+
+def test_credential_file_rejects_empty(tmp_path: Path) -> None:
+    p = _write_cred(tmp_path, "\n")
+    with pytest.raises(ValueError, match="empty"):
+        _read_credential_file(p)
+
+
+def test_credential_file_token_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file body is PREFERRED over INTERCOM_ACCESS_TOKEN — a server spawn
+    # never needs the token in the child environment.
+    monkeypatch.setenv("INTERCOM_ACCESS_TOKEN", "intercom-tok-from-env")
+    p = _write_cred(tmp_path, "intercom-tok-from-file\n")
+    connector = IntercomConnector(POLICY, token=_read_credential_file(p))
+    assert connector._client.headers["Authorization"] == "Bearer intercom-tok-from-file"
     asyncio.run(connector.aclose())
 
 
