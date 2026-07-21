@@ -165,6 +165,18 @@ def group_principal(group_id: str) -> str:
     return f"group:salesforce-group-{group_id}"
 
 
+def role_principal(role_id: str) -> str:
+    """The visibility group for one UserRole (SPEC §14.3 role-hierarchy
+    completeness). Salesforce grants a manager access to records owned BELOW them
+    in the role tree, and this access is IMPLICIT — it is not an AccountShare row,
+    so the connector cannot see it from shares alone. The connector reconstructs
+    it: a record owned by a user in role R is stamped with the role group of each
+    ANCESTOR role of R, whose members (the managers up the chain) then resolve
+    through it. Distinct namespace from :func:`group_principal` so a role group and
+    a public Group with the same raw id never collide."""
+    return f"group:salesforce-role-{role_id}"
+
+
 @dataclass(frozen=True)
 class SalesforceUserInfo:
     """One Salesforce ``User`` (005) reduced to what identity resolution needs.
@@ -290,6 +302,7 @@ class SalesforceConnector(Connector):
         client: httpx.AsyncClient | None = None,
         fetch_account_shares: bool = True,
         mirror_view_all: bool = True,
+        mirror_role_hierarchy: bool = True,
         token_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.visibility_policy = list(visibility_policy)
@@ -298,6 +311,10 @@ class SalesforceConnector(Connector):
         #: Mirror org-wide View All Data / Modify All Data as :data:`VIEW_ALL_GROUP`
         #: stamped on every record (SPEC §14.3 completeness; over-hide-only).
         self.mirror_view_all = mirror_view_all
+        #: Reconstruct implicit role-hierarchy access — a record owned in role R is
+        #: stamped with the role group of each ANCESTOR role (SPEC §14.3; Accounts,
+        #: over-hide-only). Salesforce never materializes this as a share row.
+        self.mirror_role_hierarchy = mirror_role_hierarchy
         #: Filled by :meth:`poll` from the Group/GroupMember roster. Maps each
         #: ``group:salesforce-group-<id>`` to the set of member principals
         #: (``user:<email>`` or nested ``group:salesforce-group-<child>``) — the
@@ -540,7 +557,143 @@ class SalesforceConnector(Connector):
                         if VIEW_ALL_GROUP not in principals:
                             principals.append(VIEW_ALL_GROUP)
                         event.record_principals = principals
+
+        # ROLE HIERARCHY (SPEC §14.3 completeness). A manager reads records owned
+        # BELOW them in the role tree; this grant is IMPLICIT (never an AccountShare
+        # row), so shares alone over-hide every manager (measured: the fidelity
+        # audit's role-hierarchy cause). Reconstruct it: stamp each Account with the
+        # role group of every ANCESTOR of its owner's role; those roles' members
+        # resolve through it. Accounts only (matches the connector's per-record
+        # resolution scope). Over-hide-only; any query error → no stamp (fail closed).
+        if self.mirror_role_hierarchy:
+            account_ids = sorted(
+                {
+                    e.entity_id
+                    for e in events
+                    if isinstance(e, SalesforceFactEvent) and e.object_type == "Account"
+                }
+            )
+            hierarchy_groups, hierarchy_edges = await self._fetch_role_hierarchy(account_ids)
+            self.group_edges.update(hierarchy_edges)
+            if hierarchy_groups:
+                for event in events:
+                    if isinstance(event, SalesforceFactEvent) and event.object_type == "Account":
+                        extra = hierarchy_groups.get(event.entity_id)
+                        if extra:
+                            principals = list(event.record_principals or [])
+                            for g in extra:
+                                if g not in principals:
+                                    principals.append(g)
+                            event.record_principals = principals
         return events, next_cursor
+
+    async def _fetch_role_hierarchy(
+        self, account_ids: Sequence[str]
+    ) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+        """Reconstruct implicit role-hierarchy read access for a set of Accounts.
+
+        Returns ``(per_account, edges)``:
+        - ``per_account[account_id]`` = the :func:`role_principal` strings to stamp
+          — one per ANCESTOR role of the account owner's role that has members.
+        - ``edges[role_group]`` = the ``fed:<subject>`` members of that ancestor
+          role (the managers), for :meth:`sync_group_edges` to mirror into SpiceDB.
+
+        Four read-only queries: Account owners, the full UserRole tree, the owners'
+        roles, and the ancestor roles' members (fed id + active). A user with no
+        FederationIdentifier / inactive confers nothing (over-hide, fail closed).
+        ANY HTTP error degrades to empty — managers stay over-hidden (safe), and the
+        base sync never fails on an additive completeness source.
+        """
+        if not account_ids:
+            return {}, {}
+        try:
+            # (1) the full role tree FIRST -> parent map. An org with NO roles (the
+            # common case) short-circuits here after one cheap query — no hierarchy
+            # to reconstruct, nothing more to fetch.
+            parent: dict[str, str | None] = {}
+            async for page in self._query_pages("SELECT Id, ParentRoleId FROM UserRole"):
+                for row in page.get("records", []):
+                    parent[str(row["Id"])] = row.get("ParentRoleId") or None
+            if not parent:
+                return {}, {}
+
+            # (2) account -> owner 005
+            owner_of: dict[str, str] = {}
+            for chunk in _chunks(list(account_ids), SHARE_QUERY_CHUNK):
+                ids = ", ".join(f"'{a}'" for a in chunk)
+                async for page in self._query_pages(
+                    f"SELECT Id, OwnerId FROM Account WHERE Id IN ({ids})"
+                ):
+                    for row in page.get("records", []):
+                        owner = str(row.get("OwnerId") or "")
+                        if owner.startswith(USER_KEY_PREFIX):
+                            owner_of[str(row["Id"])] = owner
+            if not owner_of:
+                return {}, {}
+
+            def ancestors(role_id: str | None) -> list[str]:
+                out: list[str] = []
+                seen: set[str] = set()
+                cur = parent.get(role_id) if role_id else None
+                while cur and cur not in seen:
+                    seen.add(cur)
+                    out.append(cur)
+                    cur = parent.get(cur)
+                return out
+
+            # (3) owners' roles
+            owner_ids = sorted(set(owner_of.values()))
+            role_of_owner: dict[str, str | None] = {}
+            for chunk in _chunks(owner_ids, SHARE_QUERY_CHUNK):
+                ids = ", ".join(f"'{u}'" for u in chunk)
+                async for page in self._query_pages(
+                    f"SELECT Id, UserRoleId FROM User WHERE Id IN ({ids})"
+                ):
+                    for row in page.get("records", []):
+                        role_of_owner[str(row["Id"])] = row.get("UserRoleId") or None
+
+            # per account -> the ancestor roles whose members should see it
+            acct_ancestors: dict[str, list[str]] = {}
+            needed_roles: set[str] = set()
+            for acct, owner in owner_of.items():
+                anc = ancestors(role_of_owner.get(owner))
+                if anc:
+                    acct_ancestors[acct] = anc
+                    needed_roles.update(anc)
+            if not needed_roles:
+                return {}, {}
+
+            # (4) members (fed subjects) of every needed ancestor role
+            role_members: dict[str, set[str]] = {}
+            for chunk in _chunks(sorted(needed_roles), SHARE_QUERY_CHUNK):
+                ids = ", ".join(f"'{r}'" for r in chunk)
+                async for page in self._query_pages(
+                    "SELECT Id, FederationIdentifier, IsActive, UserRoleId "
+                    f"FROM User WHERE UserRoleId IN ({ids})"
+                ):
+                    for row in page.get("records", []):
+                        fed = (row.get("FederationIdentifier") or "").strip().lower()
+                        if fed and bool(row.get("IsActive", True)):
+                            role_members.setdefault(str(row["UserRoleId"]), set()).add(fed)
+
+            edges: dict[str, set[str]] = {
+                role_principal(r): {f"{FEDERATION_SUBJECT_PREFIX}{s}" for s in members}
+                for r, members in role_members.items()
+                if members
+            }
+            per_account: dict[str, list[str]] = {}
+            for acct, anc in acct_ancestors.items():
+                groups = [role_principal(r) for r in anc if role_members.get(r)]
+                if groups:
+                    per_account[acct] = groups
+            return per_account, edges
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "salesforce: role-hierarchy query failed (%s); managers over-hide "
+                "this cycle (fail closed, never a leak)",
+                exc,
+            )
+            return {}, {}
 
     async def _fetch_view_all_subjects(self) -> set[str]:
         """FederationIdentifier subjects of active users with org-wide View All

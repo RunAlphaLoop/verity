@@ -34,6 +34,7 @@ from verity_ingest.connectors.salesforce import (
     _read_cursor,
     _soql_datetime,
     _write_cursor,
+    role_principal,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "salesforce"
@@ -104,6 +105,10 @@ def make_mock_salesforce(
             if view_all_fail:
                 return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
             return httpx.Response(200, json={"records": view_all_assignees or []})
+        if "FROM UserRole" in soql:
+            # No role hierarchy by default → role-hierarchy reconstruction
+            # short-circuits after this one query (existing tests unaffected).
+            return httpx.Response(200, json={"records": []})
         if "FROM GroupMember" in soql:
             if roster_fail:
                 return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
@@ -583,6 +588,107 @@ def test_mirror_view_all_false_skips_query_and_stamp() -> None:
         for e in events
         if isinstance(e, SalesforceFactEvent)
     )
+
+
+def _connector_with(handler) -> SalesforceConnector:
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(TOKEN_PATH):
+            return httpx.Response(200, json={"access_token": "t", "token_type": "Bearer"})
+        return handler(request)
+
+    transport = httpx.MockTransport(wrapped)
+    return SalesforceConnector(
+        POLICY,
+        my_domain="acme",
+        client_id="k",
+        client_secret="s",
+        client=httpx.AsyncClient(base_url="https://acme.my.salesforce.com", transport=transport),
+        token_client=httpx.AsyncClient(transport=transport),
+    )
+
+
+async def _fetch_hierarchy(conn: SalesforceConnector, account_ids):
+    try:
+        return await conn._fetch_role_hierarchy(account_ids)
+    finally:
+        await conn.aclose()
+
+
+def test_role_hierarchy_reconstructs_ancestor_role_groups() -> None:
+    # A1 owned by a rep in REPROLE, under MGRROLE, under VPROLE. Role-hierarchy
+    # access is IMPLICIT in Salesforce (no AccountShare row), so the connector
+    # reconstructs it: A1 is stamped with the role group of EACH ancestor
+    # (manager, VP), whose members resolve through it. An inactive ancestor
+    # member confers nothing (fail closed).
+    def handler(request: httpx.Request) -> httpx.Response:
+        soql = request.url.params.get("q", "")
+        if "FROM UserRole" in soql:
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        {"Id": "REPROLE", "ParentRoleId": "MGRROLE"},
+                        {"Id": "MGRROLE", "ParentRoleId": "VPROLE"},
+                        {"Id": "VPROLE", "ParentRoleId": None},
+                    ]
+                },
+            )
+        if "OwnerId FROM Account" in soql:
+            return httpx.Response(200, json={"records": [{"Id": "A1", "OwnerId": "005REP"}]})
+        if "FROM User" in soql and "WHERE UserRoleId IN" in soql:  # ancestor members
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        {"Id": "005MGR", "FederationIdentifier": "Mgr@Acme.test",
+                         "IsActive": True, "UserRoleId": "MGRROLE"},
+                        {"Id": "005VP", "FederationIdentifier": "Vp@Acme.test",
+                         "IsActive": True, "UserRoleId": "VPROLE"},
+                        {"Id": "005OFF", "FederationIdentifier": "off@acme.test",
+                         "IsActive": False, "UserRoleId": "MGRROLE"},  # inactive → dropped
+                    ]
+                },
+            )
+        if "FROM User" in soql and "WHERE Id IN" in soql:  # owner's role
+            return httpx.Response(200, json={"records": [{"Id": "005REP", "UserRoleId": "REPROLE"}]})
+        raise AssertionError(f"unexpected SOQL: {soql}")
+
+    per_account, edges = asyncio.run(_fetch_hierarchy(_connector_with(handler), ["A1"]))
+    # both ancestors stamped (manager first, then VP — ancestor order up the tree)
+    assert per_account == {"A1": [role_principal("MGRROLE"), role_principal("VPROLE")]}
+    assert edges == {
+        role_principal("MGRROLE"): {"fed:mgr@acme.test"},  # inactive member excluded
+        role_principal("VPROLE"): {"fed:vp@acme.test"},
+    }
+
+
+def test_role_hierarchy_no_roles_short_circuits() -> None:
+    # An org with no role hierarchy → the single UserRole query returns empty and
+    # nothing else is fetched (no owner/role/member queries).
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        soql = request.url.params.get("q", "")
+        seen.append(soql)
+        if "FROM UserRole" in soql:
+            return httpx.Response(200, json={"records": []})
+        raise AssertionError(f"should not query beyond UserRole: {soql}")
+
+    per_account, edges = asyncio.run(_fetch_hierarchy(_connector_with(handler), ["A1"]))
+    assert per_account == {} and edges == {}
+    assert sum("FROM UserRole" in s for s in seen) == 1
+    assert not any("OwnerId FROM Account" in s for s in seen)
+
+
+def test_role_hierarchy_403_over_hides_never_leaks() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        soql = request.url.params.get("q", "")
+        if "FROM UserRole" in soql:
+            return httpx.Response(403, json=[{"errorCode": "INSUFFICIENT_ACCESS"}])
+        raise AssertionError(f"unexpected SOQL: {soql}")
+
+    per_account, edges = asyncio.run(_fetch_hierarchy(_connector_with(handler), ["A1"]))
+    assert per_account == {} and edges == {}
 
 
 def test_group_only_member_user_is_fetched_and_edged() -> None:

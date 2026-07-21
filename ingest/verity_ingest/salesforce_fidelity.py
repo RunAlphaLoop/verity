@@ -349,16 +349,72 @@ def _account_grant_subjects(
     return out
 
 
+def _role_hierarchy_subjects(
+    oracle: SalesforceOracle, account_ids: Sequence[str]
+) -> dict[str, set[str]]:
+    """Per-account fed subjects gained via IMPLICIT role hierarchy — mirrors the
+    connector's `_fetch_role_hierarchy`: a record owned in role R is visible to
+    every user in an ANCESTOR role of R. Modelling it here keeps the harness an
+    accurate oracle once the connector reconstructs hierarchy (else it would
+    forever mis-flag managers as over-hide)."""
+    if not account_ids:
+        return {}
+    parent: dict[str, str | None] = {}
+    for row in oracle.query("SELECT Id, ParentRoleId FROM UserRole"):
+        parent[str(row["Id"])] = row.get("ParentRoleId") or None
+    if not parent:
+        return {}
+
+    def ancestors(role_id: str | None) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        cur = parent.get(role_id) if role_id else None
+        while cur and cur not in seen:
+            seen.add(cur)
+            out.append(cur)
+            cur = parent.get(cur)
+        return out
+
+    ids = "','".join(account_ids)
+    owner_of = {
+        str(r["Id"]): str(r.get("OwnerId") or "")
+        for r in oracle.query(f"SELECT Id, OwnerId FROM Account WHERE Id IN ('{ids}')")
+        if str(r.get("OwnerId") or "").startswith(USER_KEY_PREFIX)
+    }
+    owner_ids = sorted(set(owner_of.values()))
+    role_of: dict[str, str | None] = {}
+    if owner_ids:
+        oids = "','".join(owner_ids)
+        for r in oracle.query(f"SELECT Id, UserRoleId FROM User WHERE Id IN ('{oids}')"):
+            role_of[str(r["Id"])] = r.get("UserRoleId") or None
+
+    acct_anc = {a: ancestors(role_of.get(o)) for a, o in owner_of.items()}
+    needed = {r for anc in acct_anc.values() for r in anc}
+    members: dict[str, set[str]] = {}
+    if needed:
+        rids = "','".join(sorted(needed))
+        for r in oracle.query(
+            "SELECT Id, FederationIdentifier, IsActive, UserRoleId "
+            f"FROM User WHERE UserRoleId IN ('{rids}')"
+        ):
+            fed = (r.get("FederationIdentifier") or "").strip().lower()
+            if fed and bool(r.get("IsActive", True)):
+                members.setdefault(str(r["UserRoleId"]), set()).add(fed)
+    return {a: {s for role in anc for s in members.get(role, set())} for a, anc in acct_anc.items()}
+
+
 def audit(
     oracle: SalesforceOracle,
     *,
     sample_accounts: int = 200,
     include_view_all_fix: bool = False,
+    include_role_hierarchy: bool = False,
 ) -> FidelityReport:
     """Run the live floor-vs-oracle audit over Accounts (the objects the connector
-    resolves per-record). ``include_view_all_fix`` folds the org-wide view-all
-    users' fed subjects into every record's stamped set — set True to measure the
-    RESIDUAL gap after the view-all reconstruction lands."""
+    resolves per-record). ``include_view_all_fix`` / ``include_role_hierarchy``
+    fold those reconstructions' subjects into each record's stamped set — set True
+    to measure the RESIDUAL gap after that reconstruction lands (both default on in
+    the connector, so pass both True to audit the connector's real behaviour)."""
     users_rows = oracle.query(
         "SELECT Id, Name, FederationIdentifier FROM User WHERE IsActive = true"
     )
@@ -383,6 +439,10 @@ def audit(
         }
         for rid in grants:
             grants[rid] |= va_subjects  # type: ignore[arg-type]
+
+    if include_role_hierarchy:
+        for rid, subjects in _role_hierarchy_subjects(oracle, account_ids).items():
+            grants.setdefault(rid, set()).update(subjects)
 
     oracle_read: dict[tuple[str, str], bool] = {}
     for uid in users:
@@ -426,6 +486,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fold org-wide View/Modify-All users into every record's stamped set "
         "to measure the RESIDUAL gap after the reconstruction",
     )
+    p.add_argument(
+        "--with-role-hierarchy",
+        action="store_true",
+        help="fold implicit role-hierarchy (owner's ancestor roles) into the stamped "
+        "set — pass with --with-view-all-fix to audit the connector's real behaviour",
+    )
     args = p.parse_args(argv)
 
     if args.org_json:
@@ -442,6 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         oracle,
         sample_accounts=args.sample_accounts,
         include_view_all_fix=args.with_view_all_fix,
+        include_role_hierarchy=args.with_role_hierarchy,
     )
     print(report.render())
     # Exit non-zero iff a real leak exists — usable as a CI/conformance gate.
