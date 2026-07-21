@@ -146,6 +146,7 @@ SHARE_QUERY_CHUNK = 200
 SHARE_OBJECTS = {
     "Account": ("AccountShare", "AccountId"),
     "Opportunity": ("OpportunityShare", "OpportunityId"),
+    "Lead": ("LeadShare", "LeadId"),
 }
 
 #: The synthetic group carrying org-wide View All Data / Modify All Data (SPEC
@@ -211,6 +212,7 @@ DEFAULT_FIELDS = {
     "Account": ["Name", "Industry", "Website", "AnnualRevenue"],
     "Contact": ["FirstName", "LastName", "Email", "Title", "AccountId"],
     "Opportunity": ["Name", "StageName", "Amount", "CloseDate", "AccountId"],
+    "Lead": ["FirstName", "LastName", "Company", "Email", "Status"],
 }
 
 #: Record keys never emitted as facts: the pk mirror, the REST envelope's
@@ -562,14 +564,15 @@ class SalesforceConnector(Connector):
         Fail-closed: a share-fetch error leaves those records on the admin floor; a
         roster error degrades EVERYTHING to the floor (never stamp on a partial
         roster). Mutates the events + :attr:`group_edges` in place."""
-        # (A) records needing a share lookup, by object; contacts pull in their
-        # parent Accounts so inheritance has a resolved parent to copy.
-        account_ids = set(records_by_type.get("Account", []))
-        account_ids |= set(contact_parent.values())
-        share_ids: dict[str, list[str]] = {
-            "Account": sorted(account_ids),
-            "Opportunity": sorted(set(records_by_type.get("Opportunity", []))),
-        }
+        # (A) records needing a share lookup, per share-object; contacts pull in
+        # their parent Accounts so inheritance has a resolved parent to copy.
+        share_ids: dict[str, list[str]] = {}
+        for object_type in SHARE_OBJECTS:
+            ids = set(records_by_type.get(object_type, []))
+            if object_type == "Account":
+                ids |= set(contact_parent.values())
+            share_ids[object_type] = sorted(ids)
+        account_ids = set(share_ids["Account"])
 
         # (B) fetch <Object>Share rows (best-effort; additive metadata).
         shares: dict[str, list[str]] = {}
@@ -578,6 +581,22 @@ class SalesforceConnector(Connector):
                 continue
             try:
                 shares.update(await self._object_share_principals(object_type, ids))
+            except httpx.HTTPStatusError as exc:
+                # No share object exists when the object's OWD is Public (e.g. the
+                # default Lead OWD) — Salesforce returns INVALID_TYPE. That is not a
+                # failure: there is no restrictive sharing to mirror, so those records
+                # correctly ride the floor. Distinguish it from a real error.
+                if exc.response.status_code == 400 and "INVALID_TYPE" in exc.response.text:
+                    logger.debug(
+                        "%s has no share object (Public OWD); records ride admin floor",
+                        object_type,
+                    )
+                else:
+                    logger.warning(
+                        "%sShare fetch failed (%s); those records ride admin floor",
+                        object_type,
+                        exc,
+                    )
             except httpx.HTTPError as exc:
                 logger.warning(
                     "%sShare fetch failed (%s); those records ride admin floor",

@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Mapping, Sequence
 
+import httpx
+
 from verity_ingest.connectors.salesforce import (
     API_VERSION,
     GROUP_KEY_PREFIX,
@@ -299,7 +301,16 @@ def _object_grant_subjects(
         return {}
     share_object, key = SHARE_OBJECTS[object_type]
     ids = "','".join(record_ids)
-    shares = oracle.query(f"SELECT {key}, UserOrGroupId FROM {share_object} WHERE {key} IN ('{ids}')")
+    try:
+        shares = oracle.query(
+            f"SELECT {key}, UserOrGroupId FROM {share_object} WHERE {key} IN ('{ids}')"
+        )
+    except httpx.HTTPStatusError as exc:
+        # No share object → the object's OWD is Public (e.g. default Lead OWD).
+        # Nothing restrictive to mirror; records ride the floor. Not an error.
+        if exc.response.status_code == 400 and "INVALID_TYPE" in exc.response.text:
+            return {}
+        raise
     per_account: dict[str, list[str]] = {}
     for row in shares:
         uog = str(row.get("UserOrGroupId") or "")
@@ -432,16 +443,18 @@ def audit(
     lim = int(sample_accounts)
     account_ids = [r["Id"] for r in oracle.query(f"SELECT Id FROM Account LIMIT {lim}")]
     opp_ids = [r["Id"] for r in oracle.query(f"SELECT Id FROM Opportunity LIMIT {lim}")]
+    lead_ids = [r["Id"] for r in oracle.query(f"SELECT Id FROM Lead LIMIT {lim}")]
     contact_rows = oracle.query(f"SELECT Id, AccountId FROM Contact LIMIT {lim}")
     contact_parent = {r["Id"]: r.get("AccountId") for r in contact_rows}
     contact_ids = list(contact_parent)
 
-    # Account + Opportunity share-based grants. Account grants also cover contact
-    # parents (some parents may not be in the sampled account page) for inheritance.
+    # Share-based grants for Account, Opportunity, Lead. Account grants also cover
+    # contact parents (some may be outside the sampled page) for inheritance.
     parent_ids = {a for a in contact_parent.values() if a}
     account_grants = _object_grant_subjects(oracle, "Account", sorted(set(account_ids) | parent_ids))
     grants: dict[str, set[str]] = {a: account_grants.get(a, set()) for a in account_ids}
     grants.update(_object_grant_subjects(oracle, "Opportunity", opp_ids))
+    grants.update(_object_grant_subjects(oracle, "Lead", lead_ids))  # {} under Public OWD
     # Contact inherits its parent Account's grant set (Controlled by Parent).
     for cid, acct in contact_parent.items():
         grants[cid] = set(account_grants.get(acct, set())) if acct else set()
@@ -451,8 +464,9 @@ def audit(
         for rid, subjects in acct_hier.items():
             if rid in grants:
                 grants[rid].update(subjects)
-        for rid, subjects in _role_hierarchy_subjects(oracle, "Opportunity", opp_ids).items():
-            grants.setdefault(rid, set()).update(subjects)
+        for object_type, ids in (("Opportunity", opp_ids), ("Lead", lead_ids)):
+            for rid, subjects in _role_hierarchy_subjects(oracle, object_type, ids).items():
+                grants.setdefault(rid, set()).update(subjects)
         for cid, acct in contact_parent.items():  # contacts inherit parent hierarchy
             if acct:
                 grants[cid].update(acct_hier.get(acct, set()))
@@ -466,7 +480,7 @@ def audit(
         for rid in grants:
             grants[rid] |= va_subjects  # type: ignore[arg-type]
 
-    all_ids = account_ids + opp_ids + contact_ids
+    all_ids = account_ids + opp_ids + lead_ids + contact_ids
     oracle_read: dict[tuple[str, str], bool] = {}
     for uid in users:
         for rid, has in oracle.has_read(uid, all_ids).items():

@@ -64,6 +64,8 @@ def make_mock_salesforce(
     roster_500: bool = False,
     view_all_assignees: list[dict] | None = None,
     view_all_fail: bool = False,
+    lead_records: list[dict] | None = None,
+    lead_share_invalid: bool = False,
 ) -> httpx.MockTransport:
     """Routes the token endpoint and SOQL queries to fixtures. Tokens mint as
     ``sf-token-1``, ``sf-token-2``, ... With ``reject_first_query`` the very
@@ -126,12 +128,19 @@ def make_mock_salesforce(
         if "FROM OpportunityShare" in soql:
             # No Opportunity sharing in the base fixtures → opps ride the floor.
             return httpx.Response(200, json={"records": []})
+        if "FROM LeadShare" in soql:
+            if lead_share_invalid:
+                # Simulate the default Public Lead OWD: no share object exists.
+                return httpx.Response(400, json=[{"errorCode": "INVALID_TYPE"}])
+            return httpx.Response(200, json={"records": []})
         if "FROM Account" in soql:
             return httpx.Response(200, json=fixture("query_accounts_page1.json"))
         if "FROM Contact" in soql:
             return httpx.Response(200, json=fixture("query_contacts.json"))
         if "FROM Opportunity" in soql:
             return httpx.Response(200, json=fixture("query_opportunities.json"))
+        if "FROM Lead" in soql:
+            return httpx.Response(200, json={"records": lead_records or []})
         raise AssertionError(f"unexpected SOQL: {soql}")
 
     return httpx.MockTransport(handler)
@@ -713,6 +722,8 @@ def test_poll_resolves_opportunity_shares() -> None:
         soql = request.url.params.get("q", "")
         if "FROM AccountShare" in soql:
             return httpx.Response(200, json={"records": []})
+        if "FROM LeadShare" in soql:
+            return httpx.Response(200, json={"records": []})
         if "FROM OpportunityShare" in soql:
             return httpx.Response(
                 200,
@@ -747,6 +758,8 @@ def test_poll_resolves_opportunity_shares() -> None:
             )
         if "FROM Account" in soql:  # main object query
             return httpx.Response(200, json={"records": []})
+        if "FROM Lead" in soql:
+            return httpx.Response(200, json={"records": []})
         raise AssertionError(f"unexpected SOQL: {soql}")
 
     events, _ = run_poll(_connector_with(handler), None)
@@ -755,6 +768,68 @@ def test_poll_resolves_opportunity_shares() -> None:
     # resolved on FederationIdentifier (lowercased), NOT User.Email
     assert all(e.record_owner_emails == ["owner@fed"] for e in opps)
     assert all(e.record_principals is None for e in opps)  # owner-only share → no group
+
+
+def test_poll_resolves_lead_shares() -> None:
+    # A Lead resolves its LeadShare owner through the roster (same share pattern;
+    # Leads have no parent Account and may be Queue-owned — a 00G owner would flow
+    # through the group path, exercised elsewhere).
+    def handler(request: httpx.Request) -> httpx.Response:
+        soql = request.url.params.get("q", "")
+        if "FROM LeadShare" in soql:
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"LeadId": "00QLEAD00000001", "UserOrGroupId": "005OWN", "RowCause": "Owner"}
+                ]},
+            )
+        if "FROM AccountShare" in soql or "FROM OpportunityShare" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM UserRole" in soql or "FROM PermissionSetAssignment" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM GroupMember" in soql:
+            return httpx.Response(200, json={"records": []})
+        if "FROM User" in soql:
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"Id": "005OWN", "Email": "o@x.test", "Username": "o",
+                     "FederationIdentifier": "Lead@Owner", "IsActive": True}
+                ]},
+            )
+        if "FROM Lead" in soql:
+            return httpx.Response(
+                200,
+                json={"records": [
+                    {"Id": "00QLEAD00000001", "FirstName": "L", "LastName": "Ead",
+                     "Company": "Acme", "Email": "l@x.test", "Status": "New",
+                     "LastModifiedDate": "2026-07-08T00:00:00.000+0000"}
+                ]},
+            )
+        if "FROM Contact" in soql or "FROM Opportunity" in soql or "FROM Account" in soql:
+            return httpx.Response(200, json={"records": []})
+        raise AssertionError(f"unexpected SOQL: {soql}")
+
+    events, _ = run_poll(_connector_with(handler), None)
+    leads = [e for e in events if isinstance(e, SalesforceFactEvent) and e.object_type == "Lead"]
+    assert leads
+    assert all(e.record_owner_emails == ["lead@owner"] for e in leads)
+
+
+def test_lead_public_owd_no_share_object_rides_floor() -> None:
+    # The default Public Lead OWD has NO LeadShare object → the query returns
+    # INVALID_TYPE. The Lead must still be INGESTED and ride the floor (no per-record
+    # principals), never crash the sync.
+    log: list[dict] = []
+    lead = {
+        "Id": "00QLEAD00000009", "FirstName": "P", "LastName": "Ublic", "Company": "Acme",
+        "Email": "p@x.test", "Status": "New", "LastModifiedDate": "2026-07-08T00:00:00.000+0000",
+    }
+    connector = make_connector(log, lead_records=[lead], lead_share_invalid=True)
+    events, _ = run_poll(connector, None)
+    leads = [e for e in events if isinstance(e, SalesforceFactEvent) and e.object_type == "Lead"]
+    assert leads  # ingested despite the missing share object
+    assert all(e.record_principals is None and e.record_owner_emails is None for e in leads)
 
 
 def test_group_only_member_user_is_fetched_and_edged() -> None:
