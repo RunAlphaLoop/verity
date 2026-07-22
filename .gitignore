@@ -11,3 +11,10 @@ ingest/*.log
 
 # stray dev server log (not source)
 server-*.log
+
+# secrets / keys — never commit (belt-and-suspenders for a public repo)
+*.pem
+*.key
+*.p12
+*.pfx
+*.pkcs12
