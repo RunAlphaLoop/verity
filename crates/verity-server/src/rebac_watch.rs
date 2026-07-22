@@ -644,15 +644,49 @@ pub(crate) async fn run(state: Arc<AppState>) {
                 continue;
             }
         };
-        // NOTE (verified live): an idle watch sends no bytes — not even
-        // response headers — until the first event, so this await may pend
-        // for a long time on a quiet datastore. That is the correct posture,
-        // not a hang: the watch anchors its start revision at RPC receipt
-        // (a write made just before connecting is still delivered), so
-        // nothing is missed while pending, and dropping/re-opening WOULD
-        // risk missing an event between streams. `connected` therefore only
-        // flips true once the first frame arrives.
-        match rebac.watch_connect(cursor.as_deref()).await {
+        // An idle/empty datastore withholds ALL bytes on the watch stream —
+        // even the HTTP response headers — until the first event, so
+        // `watch_connect().await` can pend indefinitely on a fresh, quiet
+        // deployment. The stream's start revision is anchored at RPC-issue time
+        // (a write made just before connecting is still delivered), so pending
+        // misses nothing. BUT the recall-side staleness fence keys off
+        // `connected` + the local lag gauge, and if we only flip those AFTER the
+        // pending connect returns, a fresh install with no ReBAC activity reads
+        // "stale" forever and the fence blanks ALL recall (found by the clean-VM
+        // gate). So while the connect pends, periodically PROVE the watch
+        // endpoint is reachable with the idle-safe `watch_probe` and refresh the
+        // freshness gauge — the real stream still delivers/materializes any
+        // DELETE. Fail-closed: a probe error clears `connected`, so the fence
+        // trips exactly as a genuine outage should.
+        let connect = rebac.watch_connect(cursor.as_deref());
+        tokio::pin!(connect);
+        let mut prime = tokio::time::interval(HEARTBEAT_EVERY);
+        let connected = loop {
+            tokio::select! {
+                r = &mut connect => break r,
+                _ = prime.tick() => match rebac.watch_probe().await {
+                    Ok(()) => {
+                        // Reachable + our stream is anchored → the materialized
+                        // set is trustworthy as of now; keep the fence inert and
+                        // the leader heartbeat warm while awaiting the first frame.
+                        state.watch.set_connected(true);
+                        state.watch.mark_advance();
+                        if leadership.heartbeat(&holder).await.is_err() {
+                            break Err(RebacError::Transport(
+                                "leadership heartbeat failed while awaiting watch connect; \
+                                 relinquishing to avoid a zombie-leader cursor race".into(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        // Not reachable → do NOT vouch freshness; the fence trips.
+                        state.watch.set_connected(false);
+                        state.watch.record_error(&format!("watch reachability probe: {e}"));
+                    }
+                },
+            }
+        };
+        match connected {
             Ok(resp) => {
                 state.watch.set_connected(true);
                 // Connected-and-leading: the materialized set is trustworthy as
@@ -1136,7 +1170,7 @@ mod tests {
 
     // ---------- live integration (gated on SpiceDB + DSN, skips otherwise) ----------
 
-    async fn watch_test_state() -> Option<(Arc<AppState>, TenantId)> {
+    async fn watch_test_state(db_suffix: &str) -> Option<(Arc<AppState>, TenantId)> {
         let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
         let rebac = Rebac::from_env()?;
         if rebac.ensure_schema().await.is_err() {
@@ -1152,20 +1186,27 @@ mod tests {
         // 2026-07-12 the first night dev ran fully wired. One consumer per
         // database is the design invariant (see the module docs); tests
         // honor it by owning a scratch db.
+        // Per-test scratch DB name (stable across reruns → DROP-reuse, but
+        // distinct per test so DSN-gated tests can run concurrently without
+        // racing on one CREATE DATABASE).
+        let db = format!("verity_watch_unit_{db_suffix}");
         let scratch = {
             let base = sqlx::PgPool::connect(&dsn).await.expect("connect base");
-            sqlx::query("DROP DATABASE IF EXISTS verity_watch_unit WITH (FORCE)")
-                .execute(&base)
-                .await
-                .expect("drop scratch");
-            sqlx::query("CREATE DATABASE verity_watch_unit")
+            // Name is a hardcoded test literal (no user input) — AssertSqlSafe.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {db} WITH (FORCE)"
+            )))
+            .execute(&base)
+            .await
+            .expect("drop scratch");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
                 .execute(&base)
                 .await
                 .expect("create scratch");
             // No url-crate dep: swap the database segment by string surgery
             // (the DSN's last path segment is the database name).
             let cut = dsn.rfind('/').expect("dsn has a path");
-            format!("{}/verity_watch_unit", &dsn[..cut])
+            format!("{}/{db}", &dsn[..cut])
         };
         let pg = verity_storage::PostgresAdapter::connect(&scratch)
             .await
@@ -1217,7 +1258,7 @@ mod tests {
     /// without a re-mint.
     #[tokio::test]
     async fn watch_materializes_out_of_band_membership_delete() {
-        let Some((state, tenant)) = watch_test_state().await else {
+        let Some((state, tenant)) = watch_test_state("oob").await else {
             eprintln!("VERITY_TEST_DSN / VERITY_SPICEDB_URL not set; skipping");
             return;
         };
@@ -1299,5 +1340,48 @@ mod tests {
         let snap = state.watch.snapshot();
         assert!(snap["deltas_applied"].as_u64().unwrap() >= 1);
         assert!(snap["tombstones_written"].as_u64().unwrap() >= 1);
+    }
+
+    /// SpiceDB+DSN-gated regression (found by the clean-VM gate, 2026-07-22):
+    /// a watch started against a QUIET SpiceDB — no events, ever — must read
+    /// FRESH within a couple of heartbeat ticks via the reachability-probe
+    /// prime, so the recall-side staleness fence does NOT blank all recall on a
+    /// fresh install. Before the fix, `connected` only flipped on the first
+    /// stream frame, which an idle datastore never sends (it withholds even the
+    /// response headers), so `is_stale()` stayed true forever and every recall
+    /// returned ∅ under a subjectless dev handle.
+    #[tokio::test]
+    async fn idle_watch_reads_fresh_from_birth() {
+        let Some((state, _tenant)) = watch_test_state("idle").await else {
+            eprintln!("VERITY_TEST_DSN / VERITY_SPICEDB_URL not set; skipping");
+            return;
+        };
+        state.watch.set_enabled(true);
+        // Cold: never advanced this process → fences (fail closed) up front.
+        assert!(
+            state.watch.is_stale(900),
+            "a cold watch must fence until proven fresh"
+        );
+
+        // Run the real loop against a quiet SpiceDB — NO writes, so the stream
+        // never delivers a frame. Freshness must come from the prime alone.
+        let loop_state = Arc::clone(&state);
+        let task = tokio::spawn(async move { run(loop_state).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut fresh = false;
+        while std::time::Instant::now() < deadline {
+            if !state.watch.is_stale(900) {
+                fresh = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        task.abort();
+        assert!(
+            fresh,
+            "an idle-from-birth watch must read FRESH via the reachability prime \
+             (no SpiceDB event was written)"
+        );
     }
 }
