@@ -303,12 +303,14 @@ fn docker_up(repo: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    // No service filter on purpose: `up -d` starts EVERY compose service —
-    // spicedb (identity), minio (+ its bucket bootstrap, media tier),
-    // temporal (ingest orchestration), qdrant (SCALE profile) included.
+    // `up -d` (no --profile) starts the default serving stack only —
+    // paradedb (durable tier + pgvector ANN), spicedb (identity), minio
+    // (+ its bucket bootstrap, media tier). temporal + qdrant sit behind the
+    // compose `scale` profile and are NOT started here (opt-in; the core
+    // serves recall/ingest/resolve without them).
     ui::step_ok(
         "compose",
-        "docker compose up -d (paradedb pg17 + spicedb + minio + temporal + qdrant)",
+        "docker compose up -d (paradedb pg17 + spicedb + minio; temporal + qdrant are opt-in via --profile scale)",
     );
     Ok(())
 }
@@ -503,11 +505,22 @@ async fn wait_for_temporal() {
             Some(false) if started.elapsed() < Duration::from_secs(30) => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            _ => {
+            None => {
+                // Container absent: temporal is opt-in (compose `scale` profile),
+                // not started by the default `up -d`. The serving core never
+                // needs it — only connector SCHEDULES do. Not a problem to report.
                 println!(
-                    "  {} {}  temporal (container verity-temporal) not healthy within 30s — \
-                     optional plane, continuing without it (connector schedules only; \
-                     `docker logs verity-temporal` to inspect)",
+                    "  {} {}  temporal opt-in, not started — enable connector schedules with \
+                     `docker compose --profile scale up`",
+                    ui::dim("·"),
+                    ui::pad("temporal", 8)
+                );
+                return;
+            }
+            Some(false) => {
+                println!(
+                    "  {} {}  temporal (container verity-temporal) started but not healthy within \
+                     30s — optional plane, continuing without it (`docker logs verity-temporal`)",
                     ui::yellow("…"),
                     ui::pad("temporal", 8)
                 );

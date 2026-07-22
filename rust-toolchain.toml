@@ -1,0 +1,6 @@
+# Pinned so a fresh checkout builds identically and `clippy -D warnings` is
+# reproducible (a newer toolchain can introduce lints that fail the build).
+# rustup reads this automatically and installs the toolchain on first cargo run.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

@@ -47,6 +47,10 @@ services:
   qdrant:
     image: qdrant/qdrant
     container_name: verity-qdrant
+    # Opt-in: not started by a bare `docker compose up`. The default dev/quickstart
+    # path serves ANN from pgvector (ParadeDB). Bring this up only for the SCALE
+    # engine: `docker compose --profile scale up`.
+    profiles: ["scale"]
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -73,6 +77,10 @@ services:
   temporal:
     image: temporalio/temporal:latest
     container_name: verity-temporal
+    # Opt-in: not started by a bare `docker compose up`. The serving core (recall,
+    # ingest, resolve) runs without it — connector schedules are the only feature
+    # that needs it. Bring it up with `docker compose --profile scale up`.
+    profiles: ["scale"]
     command: server start-dev --ip 0.0.0.0
     ports:
       - "7233:7233" # gRPC (workers, schedules helper)

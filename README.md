@@ -27,14 +27,24 @@ migrations/             # SQL migrations (L0 evidence log, L1 bi-temporal facts,
 deploy/                 # docker-compose for the Postgres profile
 ```
 
+## Prerequisites
+
+- **Docker**, running — `verity-cli dev` brings up the dev stack (Postgres/ParadeDB + SpiceDB + MinIO) via `docker compose`. Give Docker ~8 GB RAM.
+- **Rust**, stable — the toolchain is pinned in `rust-toolchain.toml`, so `rustup` selects it automatically. Plus a C toolchain (`cc`) for native deps.
+- ~20 GB free disk for container images and the release build.
+
 ## Quickstart (dev)
 
+Run these from the repo checkout. **The first run builds the workspace from source and downloads a small local embedding model — budget ~15 minutes.** Every run after that starts in seconds.
+
 ```sh
-cargo run --release -p verity-cli -- dev            # compose up + server + tenant + scope handle
-verity-cli add ./docs --visibility 1                # ingest a directory (visibility is never guessed)
-verity-cli query "what do we know about pricing?"   # scoped hybrid recall with provenance tags
-verity-cli webhook mint my-system --visibility 1    # any system that can POST JSON is now a source
+cargo run --release -p verity-cli -- dev                             # compose up + server + tenant + org-wide scope handle
+cargo run --release -p verity-cli -- add ./docs --visibility 1       # ingest a directory (visibility is required, never guessed)
+cargo run --release -p verity-cli -- query "what do we know about pricing?"   # scoped hybrid recall with provenance tags
+cargo run --release -p verity-cli -- webhook mint my-system --visibility 1    # any system that can POST JSON is now a source
 ```
+
+Prefer `cargo install --path crates/verity-cli` to shorten `add`/`query`/`webhook` to bare `verity-cli ...` (they only talk to the server over HTTP). Note that `verity-cli dev` must still run from the repo checkout — it discovers the compose file and server binary relative to the source tree.
 
 Benchmarks (`docs/BENCHMARKS.md` is the honesty log — every number measured, never quoted):
 
@@ -48,9 +58,11 @@ cargo run -p verity-bench -- run                    # p50/p95/p99 per path; load
 `verity-mcp` is a stdio MCP server any MCP-capable agent (Claude Code, LangGraph,
 CrewAI, ...) can use. Identity comes from the environment, never from tool arguments:
 
+Use the tenant UUID and principal token that `verity-cli dev` printed (on a fresh `dev` tenant the `user:dev` token is `1`):
+
 ```sh
 claude mcp add verity \
-  -e VERITY_TENANT_ID=<tenant-uuid> -e VERITY_PRINCIPALS=7 \
+  -e VERITY_TENANT_ID=<tenant-uuid> -e VERITY_PRINCIPALS=1 \
   -e VERITY_ACTOR_SUB=user:you -e VERITY_ACTOR_AZP=agent:claude-code \
   -- /path/to/target/release/verity-mcp
 ```
