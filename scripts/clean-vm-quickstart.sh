@@ -26,7 +26,14 @@ timed(){ local t0 t1; t0=$(date +%s); "$@"; local rc=$?; t1=$(date +%s); printf 
 step "0. Environment"
 uname -a; nproc; free -h 2>/dev/null | head -2; df -h / | tail -1
 
-step "1. Prerequisites a stranger must install (Docker + rustup)"
+step "1. Prerequisites a stranger must install (build toolchain + Docker + rustup)"
+# A fresh Ubuntu has NO C linker; rustup does not ship one. Without this the
+# from-source build dies immediately at: error: linker `cc` not found.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq git build-essential pkg-config libssl-dev cmake curl \
+  && ok "build toolchain present (git, cc, pkg-config, libssl, cmake)" \
+  || bad "apt install of build toolchain failed"
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh || bad "Docker install failed"
 fi
@@ -52,22 +59,38 @@ step "3. quickstart step 1: build + bring up the dev stack (the ~15 min claim)"
 echo "This builds the workspace from source (fresh target/) AND cold-pulls the"
 echo "docker images AND downloads the embedding model. Timing it honestly:"
 # `dev` blocks until healthy then returns; run it and capture the wall time.
+# PIPESTATUS[0] is the cargo/dev exit code (tee would otherwise mask a failure).
 timed cargo run --release -p verity-cli -- dev 2>&1 | tee dev.log
-grep -qiE "ready|scope|handle minted" dev.log && ok "dev came up (tenant + scope minted)" || bad "dev did NOT reach a ready state — see dev.log"
-echo "--- containers actually running (expect 4: postgres, spicedb, minio, minio-init) ---"
+DEV_RC=${PIPESTATUS[0]}
+# Real readiness: dev exited 0 AND the server answers /healthz. A build failure
+# leaves stale/absent state and MUST fail here (not match a stray log word).
+if [ "$DEV_RC" -eq 0 ] && curl -fsS http://localhost:7717/healthz >/dev/null 2>&1; then
+  ok "dev came up (exit 0, /healthz OK)"
+else
+  bad "dev did NOT come up (exit $DEV_RC, /healthz unreachable) — see dev.log"
+fi
+echo "--- containers actually running (expect 3-4: postgres, spicedb, minio[, minio-init]) ---"
 docker ps --format '{{.Names}}\t{{.Status}}'
+running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+CORE_OK=true;  for c in verity-postgres verity-spicedb verity-minio; do running "$c" || CORE_OK=false; done
+SCALE_LEAK=false; for c in verity-temporal verity-qdrant; do running "$c" && SCALE_LEAK=true; done
 CNT=$(docker ps --format '{{.Names}}' | grep -c '^verity-')
-[ "$CNT" -le 4 ] && ok "lean default stack: $CNT verity-* containers (temporal/qdrant correctly NOT started)" \
-                  || bad "expected <=4 verity-* containers, saw $CNT"
+if $CORE_OK && ! $SCALE_LEAK; then
+  ok "lean default stack: core 3 up (postgres/spicedb/minio), temporal+qdrant correctly absent ($CNT total)"
+else
+  bad "stack wrong: core_up=$CORE_OK scale_leaked=$SCALE_LEAK ($CNT verity-* running) — 0 = nothing started"
+fi
 
 step "4. quickstart steps 2-4: ingest, recall, webhook"
 mkdir -p ./docs && printf 'Our Q3 pricing is usage-based at \$0.002 per token.\n' > ./docs/pricing.md
-timed cargo run --release -p verity-cli -- add ./docs --visibility 1 2>&1 | tail -3 && ok "add ran" || bad "add failed"
+# `if timed cmd` keys off the command's real exit code (not a piped tail's).
+if timed cargo run --release -p verity-cli -- add ./docs --visibility 1 > add.log 2>&1; then
+  ok "add ran"; else tail -5 add.log; bad "add failed"; fi
 OUT=$(cargo run --release -p verity-cli -- query "what do we know about pricing?" 2>&1)
 echo "$OUT" | tail -8
 echo "$OUT" | grep -qi pricing && ok "recall returned the ingested doc" || bad "recall did NOT return the doc (the headline demo)"
-cargo run --release -p verity-cli -- webhook mint my-system --visibility 1 2>&1 | tail -3 \
-  && ok "webhook mint ran" || bad "webhook mint failed"
+if timed cargo run --release -p verity-cli -- webhook mint my-system --visibility 1 > webhook.log 2>&1; then
+  ok "webhook mint ran"; else tail -5 webhook.log; bad "webhook mint failed"; fi
 
 step "SUMMARY"
 if [ "$FAILED" -eq 0 ]; then

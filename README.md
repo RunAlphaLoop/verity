@@ -30,7 +30,8 @@ deploy/                 # docker-compose for the Postgres profile
 ## Prerequisites
 
 - **Docker**, running — `verity-cli dev` brings up the dev stack (Postgres/ParadeDB + SpiceDB + MinIO) via `docker compose`. Give Docker ~8 GB RAM.
-- **Rust**, stable — the toolchain is pinned in `rust-toolchain.toml`, so `rustup` selects it automatically. Plus a C toolchain (`cc`) for native deps.
+- **Rust**, stable — the toolchain is pinned in `rust-toolchain.toml`, so `rustup` selects it automatically.
+- **A C toolchain + build deps** for native crates (`rustup` does not ship a linker). On Debian/Ubuntu: `sudo apt install build-essential pkg-config libssl-dev cmake`. On macOS: `xcode-select --install`.
 - ~20 GB free disk for container images and the release build.
 
 ## Quickstart (dev)
