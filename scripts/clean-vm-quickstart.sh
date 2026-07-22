@@ -87,8 +87,16 @@ mkdir -p ./docs && printf 'Our Q3 pricing is usage-based at \$0.002 per token.\n
 if timed cargo run --release -p verity-cli -- add ./docs --visibility 1 > add.log 2>&1; then
   ok "add ran"; else tail -5 add.log; bad "add failed"; fi
 OUT=$(cargo run --release -p verity-cli -- query "what do we know about pricing?" 2>&1)
-echo "$OUT" | tail -8
-echo "$OUT" | grep -qi pricing && ok "recall returned the ingested doc" || bad "recall did NOT return the doc (the headline demo)"
+echo "$OUT" | tail -10
+# Assert on the ∅ marker / numbered hits — NOT on the word "pricing" (which
+# appears in the query echo and would false-pass a dark recall, as it once did).
+if echo "$OUT" | grep -q 'no hits'; then
+  bad "recall returned ∅ — content ingested but not recallable (headline demo is dark)"
+elif echo "$OUT" | grep -qE '^[[:space:]]*[0-9]+\.[[:space:]]'; then
+  ok "recall returned hits for the ingested content"
+else
+  bad "recall output unrecognized — inspect above"
+fi
 if timed cargo run --release -p verity-cli -- webhook mint my-system --visibility 1 > webhook.log 2>&1; then
   ok "webhook mint ran"; else tail -5 webhook.log; bad "webhook mint failed"; fi
 
