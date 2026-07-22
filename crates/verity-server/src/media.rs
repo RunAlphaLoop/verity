@@ -352,6 +352,12 @@ pub(crate) async fn upload_file(
                 .upsert_chunks(writes)
                 .await
                 .map_err(internal)?;
+            // Mark the tenant dirty so entity resolution materializes tags/
+            // aliases for these freshly-indexed chunks — the same signal
+            // ingest_documents (main.rs), the debezium sink, and webhooks all
+            // emit after a write. Its absence here meant file content added via
+            // `verity-cli add` (POST /v1/files) was never entity-resolved.
+            state.resolution.mark_dirty(payload.tenant_id);
             extraction_receipt = Some(serde_json::json!({
                 "method": method,
                 "truncated": truncated,
