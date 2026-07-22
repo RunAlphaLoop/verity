@@ -21,6 +21,13 @@ use crate::scope::{ScopeMinter, ScopePayload};
 use crate::{AdminAuth, AppState};
 
 async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
+    test_state_debounce(0.0).await
+}
+
+/// Like [`test_state`] but with a configurable resolution debounce. A positive
+/// value ENABLES the scheduler (0.0 disables it), so a test can observe that an
+/// ingest path marked the tenant dirty via `due_tenants`.
+async fn test_state_debounce(debounce_secs: f64) -> Option<(Arc<AppState>, TenantId)> {
     let dsn = std::env::var("VERITY_TEST_DSN").ok()?;
     let pg = PostgresAdapter::connect(&dsn).await.expect("connect");
     pg.migrate().await.expect("migrate");
@@ -56,7 +63,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
         knowledge_auto_merge: true,
-        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(0.0),
+        resolution: crate::scheduler::ResolutionScheduler::with_debounce_seconds(debounce_secs),
         media_store: None,
     });
     Some((state, tenant))
@@ -743,4 +750,49 @@ async fn scheduler_pass_runs_resolution_for_dirty_tenant() {
     // window — no hot-loop.
     let later = now + std::time::Duration::from_secs(10_000);
     assert!(sched.due_tenants(later).is_empty());
+}
+
+/// Regression (from the clean-VM gate, 2026-07-22): POST /v1/files — the path
+/// `verity-cli add` uses — must mark the tenant dirty so file content is
+/// entity-resolved. It was the ONE chunk-writing ingest path missing the
+/// `mark_dirty` call the others have (fixed c462cc1); nothing guarded the
+/// parity, which is how it drifted. This locks it: after ingesting a text file
+/// the tenant must be due for resolution.
+#[tokio::test]
+async fn file_ingest_marks_tenant_dirty_for_resolution() {
+    let Some((state, tenant)) = test_state_debounce(900.0).await else {
+        eprintln!("VERITY_TEST_DSN not set; skipping");
+        return;
+    };
+    assert!(state.resolution.enabled(), "scheduler must be enabled here");
+    let now = std::time::Instant::now();
+    assert!(
+        state.resolution.due_tenants(now).is_empty(),
+        "a clean tenant is not due before any ingest"
+    );
+
+    // Ingest a small text file under an org-wide handle (principals [1]).
+    let h = handle(&state, tenant);
+    let resp = crate::media::ingest_file(
+        &state,
+        &h,
+        b"Acme Corp renewed. Owner jordan@acme.example, $61k annual.".to_vec(),
+        "text/plain".to_string(),
+        Some("note.txt".to_string()),
+        None,
+    )
+    .await
+    .expect("ingest_file");
+    assert!(
+        resp.0["chunks_indexed"].as_u64().unwrap() >= 1,
+        "a text file must index at least one chunk"
+    );
+
+    // The handler must have marked the tenant dirty → immediately due (never
+    // resolved). This is the exact signal that was missing on this path.
+    assert_eq!(
+        state.resolution.due_tenants(now),
+        vec![tenant],
+        "file ingest must mark the tenant dirty for entity resolution"
+    );
 }

@@ -209,11 +209,26 @@ pub(crate) async fn upload_file(
         StatusCode::UNPROCESSABLE_ENTITY,
         "missing scope_handle field".to_string(),
     ))?;
-    let payload = state.verify_scope(&handle)?;
     let (bytes, mime, filename) = file.ok_or((
         StatusCode::UNPROCESSABLE_ENTITY,
         "missing file field".to_string(),
     ))?;
+    ingest_file(&state, &handle, bytes, mime, filename, entities_field).await
+}
+
+/// The post-parse core of [`upload_file`], callable without a multipart body so
+/// the file-ingest path — including its entity-resolution `mark_dirty` signal —
+/// is unit-testable. Verifies the scope handle, persists the blob, indexes
+/// extractable/text content, and marks the tenant dirty for resolution.
+pub(crate) async fn ingest_file(
+    state: &AppState,
+    handle: &str,
+    bytes: Vec<u8>,
+    mime: String,
+    filename: Option<String>,
+    entities_field: Option<String>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    let payload = state.verify_scope(handle)?;
     let entities = resolve_entities(
         &payload,
         entities_field
