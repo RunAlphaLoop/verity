@@ -4,7 +4,7 @@
 **Author role:** design lead.
 **Visual target:** the existing self-contained HTML prototype (two modes, identity/group closure graph, right-panel corpus breakdown by source/confidentiality/provenance, grant-confidence bar, click-a-document → highlight-the-why-path). This spec makes that UX *real* against the codebase.
 
-All file/line references are to `/Users/mattfleming/agent-memory`, verified via Maps A (admin plane), B (data layer), C (UI/CSP).
+All file/line references are relative to the repo root, verified via Maps A (admin plane), B (data layer), C (UI/CSP).
 
 ---
 

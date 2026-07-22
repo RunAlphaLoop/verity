@@ -4,16 +4,22 @@
 
 Enterprises run agents across sales, support, marketing, and ops, but each agent is an island: the context they need lives in CRMs, ticketing systems, docs, and wikis. Verity mirrors those systems of record into a bi-temporal memory store via CDC/webhooks, inherits source ACLs into a Zanzibar-style permission graph, compiles caller scope into every retrieval as a mandatory pre-filter, and serves scoped hybrid recall — exposed MCP-first to any agent framework.
 
-**Status: v0.1.** The engine is measured (<50ms p95 every retrieval path at 1M chunks,
-query encoding included), the scope plane is fuzzed in CI, identity resolves through
-SpiceDB, and the ingestion funnel is live (CLI, MCP, minted webhooks, file drop,
-HubSpot + Google Drive connectors, Debezium CDC). See [SPEC.md](SPEC.md) — the build contract — and [docs/research/](docs/research/) for the research that produced it.
+**Status: v0.1.** The load-bearing claim is measured: **0 cross-entity leaks across 1,220
+adversarial probes** and **0 stale reads** after CDC supersession (`verity-bench srb`; results
+in [docs/benchmark/](docs/benchmark/)). The scope plane is fuzzed in CI, identity resolves
+through SpiceDB, and the ingestion funnel is live (CLI, MCP, minted webhooks, file drop,
+Google Drive/Gmail/HubSpot/Salesforce/Notion/Intercom connectors, Debezium CDC). Latency is
+honest, not flat — point reads and BM25 stay fast at scale, while dense/hybrid recall rises
+with corpus size, ACL selectivity, and cache state; the full measured curves with stated
+conditions are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). What Verity does **not** do yet is
+in [HONESTY.md](HONESTY.md). See [SPEC.md](SPEC.md) — the build contract — and
+[docs/research/](docs/research/) for the research that produced it.
 
 ## The three claims
 
 1. **Provable scoping** — an agent talking to customer A can never surface customer B's pricing. Enforcement is architectural (in-index pre-filters from a ReBAC permission graph, fail-closed), never delegated to the model.
 2. **Live truth** — source change to queryable in seconds. "Opportunity updated" is a deterministic keyed upsert that structurally retires the old value; no LLM in the write path for structured data.
-3. **Inner-loop speed** — target <50ms p95 scoped recall (including local query encoding) and ~5ms entity/brief point reads. Every published number is measured, never vendor-quoted.
+3. **Inner-loop speed** — point reads (~0.5ms) and BM25 (~23ms p95) stay fast at 1M chunks; dense/hybrid scoped recall is <50ms p95 warm at 100k chunks and rises with ACL selectivity and cache state at 1M (measured 75ms–~1.2s p95). Every number is measured with its conditions stated, never vendor-quoted — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Layout
 

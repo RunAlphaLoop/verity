@@ -1,6 +1,6 @@
 # ER Tier-3 abstain gates (tau_nil, margin_delta) — measured sweep
 
-Eval set: `/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/mention_sweep_cases.json` — **102 graded labeled mentions** (64 gold-link, 38 gold-abstain) + 4 annex cases reported separately below. **Synthetic, hand-labeled STRESS set — not a natural mention distribution**: bands were designed to sit on the deterministic scorer's decision boundaries so the grid has measurable cliffs. Every number below was produced by running the shipped pipeline over this corpus; no number is quoted from elsewhere.
+Eval set: `ingest/tests/fixtures/entity_resolution/mention_sweep_cases.json` — **102 graded labeled mentions** (64 gold-link, 38 gold-abstain) + 4 annex cases reported separately below. **Synthetic, hand-labeled STRESS set — not a natural mention distribution**: bands were designed to sit on the deterministic scorer's decision boundaries so the grid has measurable cliffs. Every number below was produced by running the shipped pipeline over this corpus; no number is quoted from elsewhere.
 
 Pipeline: `resolve_tier3.plan_tier3` (detect -> retrieve -> disambiguate), deterministic end-to-end — the NER-backstop seam is exercised by a scripted detector replaying hand-authored fixture spans (`detector_spans`); **no LLM or network call anywhere**. Answers design §10 Q6 (cross-source-entity-resolution.md): measure `tau_nil`/`margin_delta` fresh on a tenant-catalog EL benchmark rather than bootstrapping from the knowledge-merge judge's operating point.
 

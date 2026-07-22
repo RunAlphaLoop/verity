@@ -1,6 +1,6 @@
 {
   "date": "2026-07-11",
-  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json",
+  "eval_set": "ingest/tests/fixtures/entity_resolution/entity_pairs.json",
   "honesty": "Synthetic, hand-labeled STRESS corpus \u2014 adversarial composition, not a natural distribution. Deterministic scorers only; no LLM anywhere.",
   "metric": "entity_resolution_key_independence_sweep",
   "result": {

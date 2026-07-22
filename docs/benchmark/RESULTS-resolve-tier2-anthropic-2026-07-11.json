@@ -1,6 +1,6 @@
 {
   "date": "2026-07-11",
-  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json",
+  "eval_set": "ingest/tests/fixtures/entity_resolution/entity_pairs.json",
   "judge": "anthropic",
   "metric": "entity_resolution_judge_precision_recall",
   "result": {

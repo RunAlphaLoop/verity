@@ -37,8 +37,11 @@ import sys
 import urllib.request
 
 BASE = os.environ.get("VERITY_URL", "http://127.0.0.1:7717")
+# Default resolves relative to this checkout (demo/ -> repo root -> target/release),
+# so a fresh clone runs without pointing VERITY_MCP_BIN at anyone's machine.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MCP_BIN = os.environ.get(
-    "VERITY_MCP_BIN", "/Users/mattfleming/agent-memory/target/release/verity-mcp"
+    "VERITY_MCP_BIN", os.path.join(_REPO_ROOT, "target", "release", "verity-mcp")
 )
 PSQL_DSN = os.environ.get("VERITY_DSN", "postgres://verity:verity@localhost:5433/verity")
 

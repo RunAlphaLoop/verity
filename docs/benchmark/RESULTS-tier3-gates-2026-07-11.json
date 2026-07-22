@@ -75,7 +75,7 @@
   },
   "date": "2026-07-11",
   "design_question": "cross-source-entity-resolution.md section 10 Q6",
-  "eval_set": "/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/mention_sweep_cases.json",
+  "eval_set": "ingest/tests/fixtures/entity_resolution/mention_sweep_cases.json",
   "grid": {
     "deltas": [
       0.0,

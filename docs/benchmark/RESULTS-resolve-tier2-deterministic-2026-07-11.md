@@ -1,6 +1,6 @@
 # ER Tier-2 entity-resolution judge — measured eval (deterministic)
 
-Eval set: `/Users/mattfleming/agent-memory/ingest/tests/fixtures/entity_resolution/entity_pairs.json` — **103 labeled entity pairs** (47 positives, 52 hard negatives, 4 easy negatives).
+Eval set: `ingest/tests/fixtures/entity_resolution/entity_pairs.json` — **103 labeled entity pairs** (47 positives, 52 hard negatives, 4 easy negatives).
 
 Judge: `deterministic` from `ingest/verity_ingest/resolve_tier2.py`, scored exactly as the Tier-2 producer's blocker->judge cascade decides a pair (pairwise "same entity?", strict, fail-closed), after the upstream free-mail denylist pre-filter. Mirrors the knowledge-merge judge eval (`consolidation_eval.py`, SRB metric #6) — directly comparable.
 

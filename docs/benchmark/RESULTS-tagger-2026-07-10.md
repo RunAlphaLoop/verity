@@ -1,6 +1,6 @@
 # SRB metric #5 — tagger recall (deterministic v0 baseline)
 
-Corpus: `/Users/mattfleming/agent-memory/docs/benchmark/tagger-eval.jsonl` — **118 examples**, 100 expected tags, 188 distractor entities, 40 examples with NO expected tag.
+Corpus: `docs/benchmark/tagger-eval.jsonl` — **118 examples**, 100 expected tags, 188 distractor entities, 40 examples with NO expected tag.
 
 Tagger: `DeterministicExtractor` entity-name echo (exact bare-name substring match over chunk content, confidence 0.95).
 
