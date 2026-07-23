@@ -56,12 +56,20 @@ def c(code, s):
     return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else s
 
 
+# A fresh `verity-cli dev` server runs auth-open, so no token is needed. Set
+# VERITY_ADMIN_TOKEN if you point the demo at a server that gates the admin plane.
+_ADMIN = os.environ.get("VERITY_ADMIN_TOKEN")
+
+
 def http(method, path, body=None, params=None):
     url = BASE + path
     if params:
         url += "?" + "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items())
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if _ADMIN:
+        headers["authorization"] = f"Bearer {_ADMIN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r:
         raw = r.read()
         return json.loads(raw) if raw else {}
