@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
 BASE = os.environ.get("VERITY_URL", "http://127.0.0.1:7717")
@@ -54,6 +55,13 @@ MARKER = "falcon-release-q3"  # unique term; only the confidential doc carries i
 
 def c(code, s):
     return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else s
+
+
+def pause(secs=0.9):
+    """Deliberate pacing so the reveal lands when a human is watching; a no-op
+    when piped/automated (CI, exit-code checks), so the proof stays instant there."""
+    if sys.stdout.isatty():
+        time.sleep(secs)
 
 
 # A fresh `verity-cli dev` server runs auth-open, so no token is needed. Set
@@ -155,6 +163,11 @@ def sees_marker(hits):
 
 def main():
     print(c("1;36", "\n══ Verity — two-agent trust demo ══\n"))
+    print("  The claim: an agent can recall only what its user is already allowed to")
+    print("  see — permissions INHERITED from group membership and enforced in the")
+    print("  index, never handed to the agent as a token, never left to the model.")
+    print("  Proven live, end to end, over the real MCP tool interface.\n")
+    pause(1.4)
     tenant = http("POST", "/v1/admin/tenants", {"name": "two-agent-demo"})["tenant_id"]
     print(f"  demo space: {tenant}\n")
 
@@ -171,7 +184,10 @@ def main():
         "content": f"CONFIDENTIAL — the Q3 engineering roadmap: shipping the {MARKER}.",
         "visibility": [tok], "acl_provenance": "mirrored"})
     print(c("1", "  shared:  "), f"'eng-roadmap' → {G_ALL} only\n")
+    pause(1.1)
 
+    print(c("2", "  two agents connect over MCP — each naming only WHO it is:\n"))
+    pause(0.8)
     alice = Agent("alice", tenant, U_ALICE)
     bob = Agent("bob", tenant, U_BOB)
     ok = True
@@ -185,6 +201,7 @@ def main():
               else c("1;31", "✗ cannot see it (unexpected)"),
               "— resolved alice → engineering → all-staff\n")
         ok &= alice_sees
+        pause(1.1)
 
         hb = bob.tool("memory_open_scope", {}).get("scope_handle")
         bob_sees = sees_marker(bob.tool("memory_recall", {"scope_handle": hb, "text": "engineering roadmap", "k": 5}))
@@ -196,6 +213,7 @@ def main():
               "on a normal query")
         print("   ", c("1;32", "✓ DARK") if not bob_inject else c("1;31", "✗ LEAK"),
               "under a prompt-injection attempt\n")
+        pause(1.2)
         ok &= (not bob_sees) and (not bob_inject)
     finally:
         alice.close()
