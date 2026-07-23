@@ -65,6 +65,10 @@ Prefer `cargo install --path crates/verity-cli` to shorten `add`/`query`/`webhoo
 
 ### …or drive it from the browser (web console)
 
+![Verity console — the built-in denial proof: the same query run through two sessions, one holding the key (3 memories) and one that doesn't (0 memories), ending in "Denied — correctly"](demo/console-denial.gif)
+
+The console has a built-in **denial proof** (above): it runs one query through two sessions — your working handle, and a `proof-blind` session that holds no matching key — side by side. The blind session comes back with **0 memories** and the console says so in plain words: *an empty result is a safety answer, not a bug.* That refusal is the whole pitch, and you can watch it happen.
+
 `verity-cli dev` prints a console link; open it in a browser (it's the same server, no extra setup):
 
 ```
