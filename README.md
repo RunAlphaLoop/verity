@@ -61,6 +61,30 @@ cargo run --release -p verity-cli -- webhook mint my-system --visibility 1    # 
 
 Prefer `cargo install --path crates/verity-cli` to shorten `add`/`query`/`webhook` to bare `verity-cli ...` (they only talk to the server over HTTP). Note that `verity-cli dev` must still run from the repo checkout — it discovers the compose file and server binary relative to the source tree.
 
+`verity-cli dev` is the *only* setup step. From there you can drive Verity three ways — the CLI above, the **web console** below, or **MCP** ([the next section](#connect-an-agent-mcp)) — all against the same running server.
+
+### …or drive it from the browser (web console)
+
+`verity-cli dev` prints a console link; open it in a browser (it's the same server, no extra setup):
+
+```
+http://127.0.0.1:7717/ui?tenant=<the tenant-id that dev printed>
+```
+
+A guided setup checklist takes you from zero, and the panels cover the whole loop without the CLI:
+
+- **Playground** — run a scoped recall under a scope handle and see the hits it returns — then narrow the scope and watch what drops, so you can see the fail-closed pre-filter at work.
+- **Memories / Ingest** — add a memory, or drop files, under an explicit visibility.
+- **Sources** — connect a source (Google Drive, Gmail, HubSpot, and more) and back-fill it, so recall inherits that system's ACLs.
+- **Scope** — paste a scope handle to decode it and run reads under it.
+- **People & groups** and **Permission graph** — see who can see what, and *why* (the graph answers "what does X see / who sees Y").
+
+The admin panels (People & groups, Permission graph) need `VERITY_ADMIN_TOKEN` when the server runs gated; a fresh `verity-cli dev` is auth-open, so they just work.
+
+### …or wire it to an agent (MCP)
+
+See [Connect an agent (MCP)](#connect-an-agent-mcp) below — point Claude Code (or any MCP-capable agent) at the same server and it gets scoped, permission-aware memory tools.
+
 Benchmarks (`docs/BENCHMARKS.md` is the honesty log — every number measured, never quoted):
 
 ```sh
