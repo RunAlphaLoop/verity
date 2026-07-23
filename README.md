@@ -82,3 +82,5 @@ timeline — check what other agents did before acting), `memory_whoami`.
 ## License
 
 Apache 2.0, permanently. One codebase. Nothing security-critical ever paywalled.
+
+Verity is a trademark of AlphaLoops, Inc. The Apache-2.0 license covers the code, not the name or marks.
