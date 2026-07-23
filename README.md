@@ -21,6 +21,14 @@ in [HONESTY.md](HONESTY.md). See [SPEC.md](SPEC.md) — the build contract — a
 2. **Live truth** — source change to queryable in seconds. "Opportunity updated" is a deterministic keyed upsert that structurally retires the old value; no LLM in the write path for structured data.
 3. **Inner-loop speed** — point reads (~0.5ms) and BM25 (~23ms p95) stay fast at 1M chunks; dense/hybrid scoped recall is <50ms p95 warm at 100k chunks and rises with ACL selectivity and cache state at 1M (measured 75ms–~1.2s p95). Every number is measured with its conditions stated, never vendor-quoted — see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+## See claim #1 hold — 20 seconds
+
+![Two-agent trust demo: alice recalls a group-shared doc via nested-group inheritance; bob stays dark, even under a prompt-injection attempt](demo/two-agent-trust.gif)
+
+`all-staff ⊃ engineering ⊃ alice`; a confidential doc is shared with `all-staff`; **bob is in neither group.** Two agents connect over MCP naming only *who* they are — never a permission token. Alice's recall resolves the nested groups and sees the doc; bob's is dark, and **stays** dark when it tries a prompt-injection to pry it loose. The filter is compiled into the index, so a prompt can't argue past it. Exit code 0 = the boundary held.
+
+Run it yourself (with `verity-cli dev` up): `python3 demo/two_agent_trust.py`.
+
 ## Layout
 
 ```
