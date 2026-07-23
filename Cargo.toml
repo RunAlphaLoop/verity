@@ -16,7 +16,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/verity/verity"
+repository = "https://github.com/RunAlphaLoop/verity"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
