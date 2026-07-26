@@ -72,6 +72,8 @@ class VerityClient:
         )
         # entity-scope tuple -> (scope_handle, expires_at)
         self._scopes: dict[tuple[str, ...], tuple[str, datetime]] = {}
+        # ("subject", subject, *entity_scope) -> (scope_handle, expires_at)
+        self._subject_scopes: dict[tuple[str, ...], tuple[str, datetime]] = {}
 
     # ---------- write plane (admin-token gated) ----------
 
@@ -137,6 +139,51 @@ class VerityClient:
         payload = response.json()
         handle = payload["scope_handle"]
         self._scopes[key] = (handle, parse_timestamp(payload["expires_at"]))
+        return handle
+
+    def mint_subject_scope(
+        self,
+        subject: str,
+        *,
+        entity_scope: list[str] | None = None,
+        ttl_seconds: int = 3600,
+    ) -> str:
+        """POST /v1/scopes for a subject-bound READ scope, cached per
+        ``(subject, entity_scope)`` until near expiry.
+
+        Unlike :meth:`mint_scope` (which sends raw ``principals`` — the sink's
+        policy), this sends ``subject`` (e.g. ``"user:alice@acme.example"``) and
+        NO ``principals``: the server resolves it via ReBAC into the caller's
+        own token plus its transitive group closure (SPEC §6/§9a; server
+        ``open_scope`` at crates/verity-server/src/main.rs:2037-2124). ``subject``
+        and ``principals`` are mutually exclusive server-side, so the
+        ``principals`` key is omitted entirely.
+
+        This never widens visibility: it resolves the caller's real, already
+        granted powers, so it is a READ-only capability. Requires ReBAC on the
+        server (``VERITY_SPICEDB_URL``); a subject without ReBAC configured is
+        rejected 422 (main.rs:2126-2131).
+        """
+        cache_key = ("subject", subject) + tuple(entity_scope or [])
+        cached = self._subject_scopes.get(cache_key)
+        now = datetime.now(timezone.utc)
+        if cached and cached[1] - SCOPE_EXPIRY_MARGIN > now:
+            return cached[0]
+        body: dict = {
+            "tenant_id": self.tenant_id,
+            "subject": subject,
+            "ttl_seconds": ttl_seconds,
+        }
+        if entity_scope:
+            body["entity_scope"] = entity_scope
+        response = self._http.post("/v1/scopes", json=body)
+        response.raise_for_status()
+        payload = response.json()
+        handle = payload["scope_handle"]
+        self._subject_scopes[cache_key] = (
+            handle,
+            parse_timestamp(payload["expires_at"]),
+        )
         return handle
 
     def recall(
