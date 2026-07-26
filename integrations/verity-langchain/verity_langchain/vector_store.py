@@ -26,6 +26,23 @@ from ._client import VerityClient, require_visibility_policy
 ENTITIES_METADATA_KEY = "verity_entities"
 
 
+def _document_from_hit(hit: dict) -> Document:
+    """Shared hit->Document projection for both the policy and subject read
+    lanes (identical recall response shape)."""
+    return Document(
+        id=hit["chunk_id"],
+        page_content=hit["content"],
+        metadata={
+            "document_id": hit["document_id"],
+            "entity_tags": hit["entity_tags"],
+            "acl_provenance": hit["acl_provenance"],
+            "trust_tier": hit["trust_tier"],
+            "valid_from": hit["valid_from"],
+            "provenance": hit["provenance"],
+        },
+    )
+
+
 class VerityVectorStore(VectorStore):
     """LangChain vector store backed by a Verity server.
 
@@ -139,24 +156,7 @@ class VerityVectorStore(VectorStore):
     ) -> List[Tuple[Document, float]]:
         handle = self._client.mint_scope(self.visibility_policy)
         hits = self._client.recall(scope_handle=handle, k=k, text=query)
-        return [
-            (
-                Document(
-                    id=hit["chunk_id"],
-                    page_content=hit["content"],
-                    metadata={
-                        "document_id": hit["document_id"],
-                        "entity_tags": hit["entity_tags"],
-                        "acl_provenance": hit["acl_provenance"],
-                        "trust_tier": hit["trust_tier"],
-                        "valid_from": hit["valid_from"],
-                        "provenance": hit["provenance"],
-                    },
-                ),
-                hit["score"],
-            )
-            for hit in hits
-        ]
+        return [(_document_from_hit(hit), hit["score"]) for hit in hits]
 
     def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> List[Document]:
         return [doc for doc, _ in self.similarity_search_with_score(query, k=k)]
@@ -166,6 +166,45 @@ class VerityVectorStore(VectorStore):
         search_kwargs = kwargs.pop("search_kwargs", {})
         k = search_kwargs.get("k", 4)
         return VerityRetriever(vectorstore=self, k=k, **kwargs)
+
+    @classmethod
+    def subject_retriever(
+        cls,
+        *,
+        verity_url: str,
+        tenant_id: str,
+        subject: str,
+        k: int = 4,
+        entity_scope: Optional[List[str]] = None,
+        timeout: float = 30.0,
+        transport: Optional[httpx.BaseTransport] = None,
+    ) -> "VeritySubjectRetriever":
+        """Build a READ-ONLY retriever bound to a real ``subject`` (e.g.
+        ``"user:alice@acme.example"``).
+
+        Every read mints a subject-bound scope (``POST /v1/scopes`` with
+        ``subject=``, resolved server-side via ReBAC — the caller's own token
+        plus its transitive group closure, SPEC §6/§9a) and calls recall. This
+        is deliberately NOT a ``VerityVectorStore``: there is no write path
+        under a subject — writes stay policy-based/admin-assigned (SPEC §5e.4).
+        No ``admin_token`` and no ``visibility_policy`` are accepted here.
+
+        Requires ReBAC on the server (``VERITY_SPICEDB_URL``); without it the
+        server rejects subject scopes 422.
+        """
+        client = VerityClient(
+            verity_url,
+            tenant_id,
+            admin_token=None,
+            timeout=timeout,
+            transport=transport,
+        )
+        return VeritySubjectRetriever(
+            client=client,
+            subject=subject,
+            k=k,
+            entity_scope=list(entity_scope) if entity_scope else None,
+        )
 
     # ---------- constructors ----------
 
@@ -199,3 +238,33 @@ class VerityRetriever(BaseRetriever):
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> List[Document]:
         return self.vectorstore.similarity_search(query, k=self.k)
+
+
+class VeritySubjectRetriever(BaseRetriever):
+    """READ-ONLY retriever bound to a real ``subject``.
+
+    Every ``invoke()`` mints a subject-bound scope (``POST /v1/scopes`` with
+    ``subject=``, resolved server-side via ReBAC into the caller's own token
+    plus its transitive group closure) and reads through ``POST /v1/recall``.
+    There is intentionally NO write path here: writes stay policy-based /
+    admin-assigned (SPEC §5e.4). A subject read never widens visibility — it
+    resolves the caller's real, already-granted powers.
+
+    Construct via :meth:`VerityVectorStore.subject_retriever`.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    client: VerityClient
+    subject: str
+    k: int = 4
+    entity_scope: Optional[List[str]] = None
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> List[Document]:
+        handle = self.client.mint_subject_scope(
+            self.subject, entity_scope=self.entity_scope
+        )
+        hits = self.client.recall(scope_handle=handle, k=self.k, text=query)
+        return [_document_from_hit(hit) for hit in hits]
