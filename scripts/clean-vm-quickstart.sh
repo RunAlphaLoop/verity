@@ -23,8 +23,28 @@ ok()   { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; }
 bad()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*"; FAILED=1; }
 timed(){ local t0 t1; t0=$(date +%s); "$@"; local rc=$?; t1=$(date +%s); printf '   (%ds)\n' "$((t1-t0))"; return $rc; }
 
-step "0. Environment"
+step "0. Environment + sizing precheck (fail fast before the ~15-min build)"
 uname -a; nproc; free -h 2>/dev/null | head -2; df -h / | tail -1
+# A too-small box (e.g. the default 8GB EC2 root volume) does NOT fail cleanly:
+# the from-source build (~3GB target/) + docker images + the embedding model run
+# the disk out during `dev`, and it surfaces as a confusing "no tenant configured"
+# cascade in step 4. Catch it here, before installing anything, with a clear message.
+DISK_AVAIL_GB=$(df -kP / | awk 'NR==2{printf "%d", $4/1024/1024}')
+RAM_TOTAL_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}'); : "${RAM_TOTAL_MB:=0}"
+SIZING_OK=true
+if [ "${DISK_AVAIL_GB:-0}" -lt 20 ]; then
+  bad "only ${DISK_AVAIL_GB}GB free on / — need ~20GB+ (spec: 40GB). The build + docker images + embedding model won't fit. Relaunch with a 40GB gp3 root volume."
+  SIZING_OK=false
+fi
+if [ "${RAM_TOTAL_MB:-0}" -lt 7500 ]; then
+  bad "only ~$((RAM_TOTAL_MB/1024))GB RAM — need >=8GB (spec: 16GB). Relaunch a larger instance (e.g. t3.xlarge / c7i.2xlarge)."
+  SIZING_OK=false
+fi
+if ! $SIZING_OK; then
+  printf '\n\033[1;31mBox too small — stopping before the ~15-min build. Fix sizing and re-run.\033[0m\n'
+  exit 1
+fi
+ok "sizing OK (${DISK_AVAIL_GB}GB free on /, ~$((RAM_TOTAL_MB/1024))GB RAM)"
 
 step "1. Prerequisites a stranger must install (build toolchain + Docker + rustup)"
 # A fresh Ubuntu has NO C linker; rustup does not ship one. Without this the
