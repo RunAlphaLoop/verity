@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from verity_ingest.connectors.entra_directory import (
+    CONNECTOR_STATUS_PATH,
     CROSSWALK_PATH,
     DEPROVISION_PATH,
     EVERYONE_GROUP,
@@ -34,8 +35,10 @@ from verity_ingest.connectors.entra_directory import (
     PRINCIPALS_PATH,
     REGISTRY_ALIAS_PATH,
     REGISTRY_CANONICAL_PATH,
+    SOURCE_NAME,
     AdminOp,
     AliasCollision,
+    ConformanceResult,
     EntraAdminSink,
     EntraDirectoryConfig,
     EntraDirectoryConnector,
@@ -119,22 +122,30 @@ class FixtureGraphTransport:
         users=None,
         groups=None,
         members=None,
+        transitive=None,
         delta_pages=None,
         reset_links=None,
     ):
         self.users_pages = users or []
         self.groups_pages = groups or []
         self.members = members or {}
+        # transitive maps a group objectId to its /transitiveMembers page list
+        # (DIAGNOSTIC oracle only — never on the delivery path).
+        self.transitive = transitive or {}
         self.delta_pages = delta_pages or {}
         self.reset_links = set(reset_links or ())
         self.calls: list[tuple[str, dict]] = []
 
     def get_json(self, path, params):
         self.calls.append((path, dict(params)))
-        # groups/{oid}/members
         parts = path.split("/")
+        # groups/{oid}/members
         if len(parts) == 3 and parts[0] == "groups" and parts[2] == "members":
             pages = self.members.get(parts[1], [{"value": []}])
+            return pages[0] if pages else {"value": []}
+        # groups/{oid}/transitiveMembers (conformance oracle only)
+        if len(parts) == 3 and parts[0] == "groups" and parts[2] == "transitiveMembers":
+            pages = self.transitive.get(parts[1], [{"value": []}])
             return pages[0] if pages else {"value": []}
         raise AssertionError(f"unexpected Graph GET {path} {params}")
 
@@ -475,6 +486,242 @@ def test_alias_quarantine_raises_fail_closed():
                 {"tenant_id": TENANT, "aliases": [{"canonical": ALICE, "alias": "x@y", "source": "entra_declared"}]},
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# t6b — heartbeat surfaces fail-closed alarms into the connector-status body
+# (SyncStateReset, AliasCollision, null-alias_field) — the operator's ONLY
+# signal that a fail-closed event happened. A swallowed one is a silent stale-open.
+# ---------------------------------------------------------------------------
+
+
+def _recording_entra_sink(*, alias_collision=False):
+    """An EntraAdminSink whose MockTransport records every POSTed body. When
+    ``alias_collision`` is set, the registry/alias route returns a non-empty
+    quarantined[] (so ``apply`` raises AliasCollision). All other routes 200 OK.
+    Returns (sink, posts) where ``posts`` is a list of (path, json-body)."""
+    posts: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        posts.append((request.url.path, body))
+        if request.url.path == REGISTRY_ALIAS_PATH and alias_collision:
+            return httpx.Response(
+                200,
+                json={
+                    "upserted": [],
+                    "quarantined": [
+                        {"alias": "x@y", "canonical": BOB, "reason": "alias_already_bound"}
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    sink = EntraAdminSink(
+        "http://verity.local:8080",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return sink, posts
+
+
+def _status_body(posts):
+    """The last connector-status body posted, or None."""
+    hits = [body for path, body in posts if path == CONNECTOR_STATUS_PATH]
+    return hits[-1] if hits else None
+
+
+def test_heartbeat_reports_source_entra_not_gdirectory(tmp_path):
+    # The base VerityAdminSink.heartbeat hardcodes gdirectory's SOURCE_NAME; the
+    # Entra sink MUST report source="entra" or it masquerades as a Google sync.
+    sink, posts = _recording_entra_sink()
+    run_once(
+        EntraDirectoryConnector(_first_sync_transport(), _config()),
+        sink,
+        tmp_path / "snap.json",
+        persist=False,
+        now="2026-07-28T00:00:00Z",
+    )
+    body = _status_body(posts)
+    assert body is not None, "expected a connector-status heartbeat"
+    assert body["source"] == SOURCE_NAME == "entra"
+
+
+def test_sync_state_reset_alarm_lands_in_connector_status_body(tmp_path):
+    # Seed a persisted snapshot with cursors so run_once takes the delta path,
+    # then force a SyncStateReset when the users deltaLink is followed.
+    from verity_ingest.connectors.entra_directory import _save_snapshot
+
+    prev = _seed_snapshot()
+    state_file = tmp_path / "snap.json"
+    _save_snapshot(state_file, prev, "2026-07-28T00:00:00Z")
+
+    t = FixtureGraphTransport(reset_links={"https://graph/users-delta-1"})
+    conn = EntraDirectoryConnector(t, _config())
+    sink, posts = _recording_entra_sink()
+
+    with pytest.raises(SyncStateReset):
+        run_once(conn, sink, state_file, now="2026-07-28T00:05:00Z")
+
+    body = _status_body(posts)
+    assert body is not None, "SyncStateReset must fire an alarm heartbeat"
+    assert body["source"] == "entra"
+    kinds = [a["kind"] for a in body.get("alarms", [])]
+    assert "sync_state_reset" in kinds, f"expected a sync_state_reset alarm, got {body}"
+
+
+def test_alias_collision_alarm_lands_in_connector_status_body(tmp_path):
+    # A registry/alias quarantine aborts the cycle (AliasCollision); the alarm
+    # must reach the operator via the connector-status body, not just stdout. Use
+    # a user carrying a DISTINCT onPremisesImmutableId so an alias op is actually
+    # emitted (an alias == primary email would emit none — see _collect_aliases).
+    state_file = tmp_path / "snap.json"
+    users = [
+        {
+            "value": [
+                {
+                    **_user(ALICE_OID, "alice@corp.example", "alice@corp.example"),
+                    "onPremisesImmutableId": "ALICE-ANCHOR-b64==",
+                }
+            ],
+            "@odata.deltaLink": "https://graph/users-delta-1",
+        }
+    ]
+    t = FixtureGraphTransport(users=users, groups=[{"value": [], "@odata.deltaLink": "g"}])
+    conn = EntraDirectoryConnector(t, _config(alias_field="onPremisesImmutableId"))
+    sink, posts = _recording_entra_sink(alias_collision=True)
+
+    with pytest.raises(AliasCollision):
+        run_once(conn, sink, state_file, now="2026-07-28T00:00:00Z")
+
+    body = _status_body(posts)
+    assert body is not None, "AliasCollision must fire an alarm heartbeat"
+    assert body["source"] == "entra"
+    kinds = [a["kind"] for a in body.get("alarms", [])]
+    assert "alias_collision" in kinds, f"expected an alias_collision alarm, got {body}"
+    # Fail closed: the cycle did not checkpoint.
+    assert not state_file.exists()
+
+
+def test_null_alias_field_warning_lands_in_connector_status_body(tmp_path):
+    # A cloud-only tenant under a configured alias_field yields no aliases; the
+    # loud warning must ride the delivered heartbeat as an alarm, not vanish.
+    state_file = tmp_path / "snap.json"
+    conn = EntraDirectoryConnector(
+        _first_sync_transport(), _config(alias_field="onPremisesImmutableId")
+    )
+    sink, posts = _recording_entra_sink()
+
+    run_once(conn, sink, state_file, now="2026-07-28T00:00:00Z", persist=False)
+
+    body = _status_body(posts)
+    assert body is not None
+    kinds = [a["kind"] for a in body.get("alarms", [])]
+    assert "null_alias_field" in kinds, f"expected a null_alias_field alarm, got {body}"
+
+
+# ---------------------------------------------------------------------------
+# t-oracle — conformance_oracle: DIAGNOSTIC /transitiveMembers cross-check.
+# It compares the connector's DELIVERED direct-edge closure to Graph's
+# authoritative transitive set. It MUST report a discrepancy, never silently
+# feed it into the delivered edge set (direct-edges-let-SpiceDB-close stays the
+# ONE delivery path).
+# ---------------------------------------------------------------------------
+
+
+def _tmember(oid, upn, mail, **kw):
+    """A /transitiveMembers user entry (carries the four-part gate facets so the
+    oracle can gate it exactly like delivery)."""
+    return {"@odata.type": "#microsoft.graph.user", **_user(oid, upn, mail, **kw)}
+
+
+def test_conformance_oracle_matches_delivered_closure():
+    # Deliver the SYNC1 graph, then oracle group `all`: its transitiveMembers are
+    # exactly {alice, bob, carol}. Local delivered closure must equal it.
+    conn = EntraDirectoryConnector(_first_sync_transport(), _config())
+    snap = conn.reconcile()
+
+    transitive = {
+        ALL_GID: [
+            {
+                "value": [
+                    _tmember(ALICE_OID, "alice@corp.example", "alice@corp.example"),
+                    _tmember(BOB_OID, "bob@corp.example", "bob@corp.example"),
+                    _tmember(CAROL_OID, "carol@corp.example", "carol@corp.example"),
+                    # A nested group principal appears in transitiveMembers too;
+                    # the oracle compares only user leaves.
+                    _gmember(ENG_GID),
+                ]
+            }
+        ]
+    }
+    oracle_conn = EntraDirectoryConnector(
+        FixtureGraphTransport(transitive=transitive), _config()
+    )
+    result = oracle_conn.conformance_oracle(ALL_GID, snap)
+    assert isinstance(result, ConformanceResult)
+    assert result.conforms, result
+    assert result.local_users == {ALICE, BOB, CAROL}
+    assert result.graph_users == {ALICE, BOB, CAROL}
+
+
+def test_conformance_oracle_gates_graph_guests_like_delivery():
+    # /transitiveMembers returns a guest; the oracle gates it through the SAME
+    # four-part is_active_member rule, so a guest is NOT a false discrepancy.
+    conn = EntraDirectoryConnector(_first_sync_transport(), _config())
+    snap = conn.reconcile()
+    transitive = {
+        ALL_GID: [
+            {
+                "value": [
+                    _tmember(ALICE_OID, "alice@corp.example", "alice@corp.example"),
+                    _tmember(BOB_OID, "bob@corp.example", "bob@corp.example"),
+                    _tmember(CAROL_OID, "carol@corp.example", "carol@corp.example"),
+                    # A guest Graph resolves transitively — excluded by the gate.
+                    _tmember(GUEST_OID, GUEST_UPN, "guest@gmail.com", user_type="Guest"),
+                ]
+            }
+        ]
+    }
+    oracle_conn = EntraDirectoryConnector(
+        FixtureGraphTransport(transitive=transitive), _config()
+    )
+    result = oracle_conn.conformance_oracle(ALL_GID, snap)
+    assert result.conforms, result
+    assert "user:guest@gmail.com" not in result.graph_users
+
+
+def test_conformance_oracle_reports_discrepancy_never_silently_delivers():
+    # Inject a discrepancy: Graph resolves an EXTRA active Member (dave) that the
+    # delivered snapshot never carried. The oracle must REPORT it (missing_locally),
+    # and the DELIVERED snapshot must remain untouched.
+    conn = EntraDirectoryConnector(_first_sync_transport(), _config())
+    snap = conn.reconcile()
+    before_edges = list(snap.memberships)
+
+    DAVE_OID = "00000000-0000-0000-0000-00000000da7e"
+    DAVE = "user:dave@corp.example"
+    transitive = {
+        ALL_GID: [
+            {
+                "value": [
+                    _tmember(ALICE_OID, "alice@corp.example", "alice@corp.example"),
+                    _tmember(BOB_OID, "bob@corp.example", "bob@corp.example"),
+                    _tmember(CAROL_OID, "carol@corp.example", "carol@corp.example"),
+                    _tmember(DAVE_OID, "dave@corp.example", "dave@corp.example"),
+                ]
+            }
+        ]
+    }
+    oracle_conn = EntraDirectoryConnector(
+        FixtureGraphTransport(transitive=transitive), _config()
+    )
+    result = oracle_conn.conformance_oracle(ALL_GID, snap)
+    assert not result.conforms
+    assert result.missing_locally == {DAVE}, result
+    assert not result.extra_locally
+    # The oracle is diagnostics-only: it never mutated the delivered edge set.
+    assert list(snap.memberships) == before_edges
+    assert DAVE not in {m for _, m in snap.memberships}
 
 
 # ---------------------------------------------------------------------------

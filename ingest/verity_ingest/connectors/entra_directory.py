@@ -127,6 +127,7 @@ __all__ = [
     "EntraDirectoryConfig",
     "EntraUser",
     "EntraSnapshot",
+    "ConformanceResult",
     "GraphTransport",
     "HttpGraphTransport",
     "EntraDirectoryConnector",
@@ -479,6 +480,27 @@ class EntraSnapshot:
             memberships=sorted(set(memberships)),
             directory_users=list(self.directory_users),
         )
+
+
+@dataclass(frozen=True)
+class ConformanceResult:
+    """The output of :meth:`EntraDirectoryConnector.conformance_oracle` — a
+    DIAGNOSTIC comparison of the connector's delivered direct-edge closure for one
+    group against Graph's authoritative ``/transitiveMembers``. Never fed back into
+    the delivery path. ``conforms`` is True iff the two active-Member user sets are
+    equal; ``missing_locally`` are users Graph resolves that we did NOT deliver
+    (an under-share risk), ``extra_locally`` are users we delivered that Graph does
+    NOT resolve (an over-share risk)."""
+
+    group: str
+    local_users: frozenset[str] | set[str]
+    graph_users: frozenset[str] | set[str]
+    missing_locally: frozenset[str] | set[str]
+    extra_locally: frozenset[str] | set[str]
+
+    @property
+    def conforms(self) -> bool:
+        return not self.missing_locally and not self.extra_locally
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +899,67 @@ class EntraDirectoryConnector:
                 "is null for everyone — confirm the tenant's actual SAML NameID field."
             )
 
+    # -- conformance oracle (DIAGNOSTICS ONLY) -------------------------------
+
+    def conformance_oracle(
+        self, group_object_id: str, snapshot: EntraSnapshot
+    ) -> ConformanceResult:
+        """DIAGNOSTIC oracle: does the connector's DELIVERED direct-edge closure for
+        one group match Graph's authoritative ``/transitiveMembers`` for it?
+
+        Pulls Graph ``/groups/{id}/transitiveMembers`` (the flattened, server-side
+        transitive set) and compares it to :func:`transitive_user_closure` over the
+        ``snapshot``'s DELIVERED direct edges (the exact edges the connector shipped
+        — ``group:entra-group-…`` nesting let SpiceDB close). The Graph side is
+        gated through the SAME four-part :func:`is_active_member` rule, because
+        ``/transitiveMembers`` returns guests / disabled / nested-group principals
+        the delivery path deliberately excludes — comparing raw would flag every
+        guest as a false discrepancy.
+
+        This is a READ-ONLY CHECK. It MUST NEVER feed the reconcile edge set or the
+        delivered truth: direct-edges-let-SpiceDB-close stays the ONE delivery path.
+        A discrepancy is REPORTED (for an operator / CI conformance gate), never
+        silently reconciled into what we ship."""
+        gp = group_principal(group_object_id)
+        # Local: the connector's delivered closure for THIS group (active-Member
+        # user canonicals only), from the snapshot's own direct edges.
+        local_users = transitive_user_closure(snapshot.memberships).get(gp, set())
+
+        # Graph oracle: the server-side transitive member set, gated to active
+        # Members exactly as delivery gates (so the two sets are comparable).
+        graph_users: set[str] = set()
+        for raw in self._list_transitive_members(group_object_id):
+            if raw.get("@odata.type") != _MEMBER_TYPE_USER:
+                continue  # only user leaves compare; nested groups are structure
+            user = self._parse_user(raw)
+            if is_active_member(user):
+                graph_users.add(user.canonical)
+
+        return ConformanceResult(
+            group=gp,
+            local_users=local_users,
+            graph_users=graph_users,
+            missing_locally=graph_users - local_users,
+            extra_locally=local_users - graph_users,
+        )
+
+    def _list_transitive_members(self, group_oid: str) -> list[dict]:
+        """Graph ``/groups/{id}/transitiveMembers`` (paged) — the flattened
+        transitive set, used ONLY by :meth:`conformance_oracle`. Never on the
+        delivery path (that walks DIRECT members and lets SpiceDB close)."""
+        members: list[dict] = []
+        params = {
+            "$select": _USER_SELECT,
+        }
+        next_path: str | None = f"groups/{group_oid}/transitiveMembers"
+        next_params: Mapping[str, str] | None = params
+        while next_path is not None:
+            page = self._transport.get_json(next_path, next_params or {})
+            members.extend(page.get("value", []))
+            next_path = page.get("@odata.nextLink")
+            next_params = None
+        return members
+
 
 # ---------------------------------------------------------------------------
 # Tombstone → deprovision + per-edge delete (G3(b))
@@ -940,7 +1023,24 @@ class EntraAdminSink(VerityAdminSink):
     subject is already bound to a DIFFERENT canonical) raises
     :class:`AliasCollision`, aborting the cycle before checkpoint. The base sink
     only checks HTTP status; the alias route returns 200 with the collision in
-    the body, so it must be inspected here."""
+    the body, so it must be inspected here.
+
+    It also OVERRIDES ``heartbeat`` for two reasons: (1) the base ``heartbeat``
+    hardcodes gdirectory's module ``SOURCE_NAME`` (``"gdirectory"``); an Entra
+    heartbeat must report ``source="entra"`` or it would masquerade as a Google
+    sync in the operator panel; (2) it surfaces the fail-closed **alarms**
+    (:attr:`_alarms`) — a swallowed ``SyncStateReset`` is a silent stale-open, and
+    the operator's ONLY signal that a fail-closed event happened is this heartbeat
+    body. Alarms are accumulated by the runner via :meth:`record_alarm` (null
+    ``alias_field`` warnings, an :class:`AliasCollision` that aborted a cycle, a
+    :class:`SyncStateReset` that forced a full resync) and posted in the same
+    best-effort ``connector-status`` body."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Fail-closed alarm accumulator, drained on each heartbeat (mirrors the
+        # ``_applied`` accumulator). Each entry: {"kind": str, "detail": str}.
+        self._alarms: list[dict[str, str]] = []
 
     def apply(self, op: AdminOp) -> None:
         response = self._client.request(
@@ -956,6 +1056,52 @@ class EntraAdminSink(VerityAdminSink):
                 raise AliasCollision(quarantined)
         self._applied += 1
         self._tenant_id = op.body.get("tenant_id", self._tenant_id)
+
+    def record_alarm(self, kind: str, detail: str) -> None:
+        """Queue one fail-closed alarm for the next heartbeat. ``kind`` is a
+        stable machine tag (``sync_state_reset`` / ``alias_collision`` /
+        ``null_alias_field``); ``detail`` is a human string (never a secret)."""
+        self._alarms.append({"kind": kind, "detail": detail})
+
+    def heartbeat(self, cursor: str | None = None) -> None:
+        """Best-effort ``POST /v1/admin/connector-status`` for ``source="entra"``.
+        Unlike the base, it fires when there are **alarms** even if zero ops were
+        applied — a ``SyncStateReset`` that delivered nothing MUST still reach the
+        operator. Never raises; drains both accumulators in ``finally``."""
+        alarms = list(self._alarms)
+        if not alarms and (not self._applied or not self._tenant_id):
+            # Nothing delivered and nothing to alarm: no signal to send. Still
+            # drain so a stale accumulator can't leak into a later cycle.
+            self._applied = 0
+            self._alarms = []
+            return
+        # A tenant is required to key the row; fall back to the connector's
+        # configured tenant if no op set it (alarm-only cycles set no _tenant_id).
+        tenant = self._tenant_id or self.alarm_tenant_id
+        if not tenant:
+            self._applied = 0
+            self._alarms = []
+            return
+        try:
+            body: dict[str, Any] = {
+                "tenant_id": tenant,
+                "source": SOURCE_NAME,
+                "items_synced": self._applied,
+            }
+            if cursor is not None:
+                body["cursor"] = cursor
+            if alarms:
+                body["alarms"] = alarms
+            self._client.post(f"{self._base_url}{CONNECTOR_STATUS_PATH}", json=body)
+        except Exception:  # noqa: BLE001 — telemetry only
+            pass
+        finally:
+            self._applied = 0
+            self._alarms = []
+
+    #: Set by the runner so an alarm-only heartbeat (zero applied ops, e.g. a
+    #: SyncStateReset on the very first fold) can still key its row by tenant.
+    alarm_tenant_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1047,6 +1193,25 @@ def build_cycle_ops(prev: EntraSnapshot, desired: EntraSnapshot, tenant_id: str)
     return merged
 
 
+def _record_alarm(sink: AdminSink, kind: str, detail: str) -> None:
+    """Queue a fail-closed alarm on the sink if it can carry one (the real
+    :class:`EntraAdminSink`); a dry-run/other sink silently ignores it — the
+    alarm still prints on stdout via the caller. Never swallowed on the real
+    path: a swallowed SyncStateReset is a silent stale-open."""
+    record = getattr(sink, "record_alarm", None)
+    if record is not None:
+        record(kind, detail)
+
+
+def _fire_heartbeat(sink: AdminSink, *, cursor: str | None) -> None:
+    """Fire the sink's best-effort heartbeat if it has one. On the real sink this
+    posts ``connector-status`` with the drained alarms + items_synced; on a
+    dry-run sink there is none, so this is a no-op."""
+    heartbeat = getattr(sink, "heartbeat", None)
+    if heartbeat is not None:
+        heartbeat(cursor=cursor)
+
+
 def run_once(
     connector: EntraDirectoryConnector,
     sink: AdminSink,
@@ -1060,28 +1225,61 @@ def run_once(
     apply ops in order, checkpoint. A :class:`SyncStateReset` from the transport
     forces a full resync and FAILS CLOSED — it propagates without checkpointing
     (the caller discards the cursor and retries full). ``persist=False`` (dry
-    run) never advances the snapshot."""
+    run) never advances the snapshot.
+
+    Fail-closed **alarms** are threaded into the connector-status heartbeat, not
+    just stdout, so the operator sees them: a null-``alias_field`` warning after a
+    delivered cycle, and — because they abort before the normal heartbeat —
+    :class:`SyncStateReset` and :class:`AliasCollision`, each of which fires a
+    dedicated alarm heartbeat before re-raising. A swallowed SyncStateReset would
+    be a silent stale-open."""
+    # Let an alarm-only heartbeat (zero applied ops) still key its row by tenant.
+    if hasattr(sink, "alarm_tenant_id"):
+        sink.alarm_tenant_id = connector.config.tenant_id
+    reconciled_at = now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     previous = _load_snapshot(state_file)
     try:
         if previous.users_delta_link and previous.groups_delta_link:
             desired = connector.reconcile_delta(previous)
         else:
             desired = connector.reconcile()
-    except SyncStateReset:
+    except SyncStateReset as exc:
         # Fail closed: do NOT checkpoint. Discard cursors so the next cycle does a
-        # clean full resync, and re-raise so the runner logs the reset.
+        # clean full resync, surface the reset as an operator alarm (never just
+        # swallowed to stdout), and re-raise so the runner logs it.
         if persist and state_file.exists():
             state_file.unlink()
+        _record_alarm(
+            sink,
+            "sync_state_reset",
+            f"delta token invalidated ({exc}); forced full resync — group-membership "
+            "freshness paused until it succeeds (fail-closed).",
+        )
+        _fire_heartbeat(sink, cursor=None)
         raise
     ops = build_cycle_ops(previous, desired, connector.config.tenant_id)
-    for op in ops:
-        sink.apply(op)
-    reconciled_at = now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        for op in ops:
+            sink.apply(op)
+    except AliasCollision as exc:
+        # A cross-IdP under-merge: the alias is already bound to a different
+        # canonical. The cycle aborted before checkpoint; surface it as an alarm
+        # so the operator can remediate, then re-raise.
+        _record_alarm(
+            sink,
+            "alias_collision",
+            f"SSO alias already bound to a different canonical (cross-IdP under-merge): "
+            f"{exc.quarantined}",
+        )
+        _fire_heartbeat(sink, cursor=None)
+        raise
+    # Surface any null-alias_field / honesty warnings the connector raised this
+    # cycle as alarms alongside the delivered heartbeat.
+    for warning in connector.warnings:
+        _record_alarm(sink, "null_alias_field", warning)
     if persist:
         _save_snapshot(state_file, desired, reconciled_at)
-    heartbeat = getattr(sink, "heartbeat", None)
-    if heartbeat is not None:
-        heartbeat(cursor=reconciled_at)
+    _fire_heartbeat(sink, cursor=reconciled_at)
     return len(ops)
 
 
@@ -1141,7 +1339,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             applied = run_once(connector, sink, args.state_file, persist=not args.dry_run)
         except SyncStateReset:
+            # run_once already fired the fail-closed alarm heartbeat before re-raising.
             print("entra_directory: delta token invalidated — full resync next cycle (fail-closed)")
+            connector.warnings.clear()
+            if args.once:
+                return 1
+            time.sleep(args.interval)
+            continue
+        except AliasCollision as exc:
+            # run_once already fired the alarm heartbeat. A cross-IdP under-merge
+            # aborts THIS cycle (no checkpoint); the operator must remediate the
+            # colliding alias. Keep the supervised loop alive.
+            print(
+                "entra_directory: alias collision — SSO subject already bound to a "
+                f"different canonical (fail-closed, not welded): {exc.quarantined}"
+            )
+            connector.warnings.clear()
             if args.once:
                 return 1
             time.sleep(args.interval)

@@ -69,6 +69,7 @@ async fn test_state(with_s3: bool) -> Option<(Arc<AppState>, TenantId)> {
         folder_scans: std::sync::Arc::new(crate::folder_watch::FolderScanPlane::new()),
         knowledge_worker: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         directory: crate::directory_worker::DirectoryPlane::disabled(),
+        entra_directory: crate::directory_worker::EntraDirectoryPlane::disabled(),
         connectors: std::sync::Arc::new(crate::connector_worker::ConnectorPlane::disabled()),
         sync: std::sync::Arc::new(crate::sync_scheduler::SyncPlane::new()),
         repo_root: None,
