@@ -613,11 +613,19 @@ class AdminOp:
     body: Mapping[str, Any]
 
 
-def build_registry_ops(users: Sequence[DirectoryUser], tenant_id: str) -> list[AdminOp]:
+def build_registry_ops(
+    users: Sequence[DirectoryUser], tenant_id: str, source: str = SOURCE_NAME
+) -> list[AdminOp]:
     """The M2 2b registry-populate ops for a set of active users, ordered so the
     canonical exists before its aliases/crosswalk reference it: canonical rows →
     SSO-alias rows → self-crosswalk rows. Idempotent server-side (keyed upserts);
     a re-run of an unchanged user is a no-op.
+
+    ``source`` is the crosswalk ``source`` stamped on each self-crosswalk row;
+    it defaults to this module's ``gdirectory`` but is parameterized so a sibling
+    directory connector (e.g. entra_directory) can reuse this helper UNCHANGED
+    while stamping its own source (``entra``) — the crosswalk source must match
+    the source a downstream content ACL presents (G2), so it cannot be hardcoded.
 
     These MUST precede the crosswalk-mediated connector writes (a source-local
     owner only resolves once its canonical + alias exist), which is why
@@ -660,7 +668,7 @@ def build_registry_ops(users: Sequence[DirectoryUser], tenant_id: str) -> list[A
                     CROSSWALK_PATH,
                     {
                         "tenant_id": tenant_id,
-                        "source": SOURCE_NAME,
+                        "source": source,
                         "local_id": u.directory_id,
                         "canonical": u.canonical,
                         "link_method": "directory_vouched",
@@ -670,15 +678,18 @@ def build_registry_ops(users: Sequence[DirectoryUser], tenant_id: str) -> list[A
     return ops
 
 
-def build_admin_ops(diff: SyncDiff, tenant_id: str) -> list[AdminOp]:
+def build_admin_ops(diff: SyncDiff, tenant_id: str, source: str = SOURCE_NAME) -> list[AdminOp]:
     """Turn a diff into ordered admin ops: registry populate → principals upsert
     → membership adds → membership removals → deprovisions. Registry ops go FIRST
     (a crosswalk-mediated connector write only resolves once the canonical +
     alias exist). Removals + deprovisions go LAST and one at a time — each writes
     revocation tombstones before the tuple/token change server-side, so ordering
     is fail-closed (a crash mid-cycle leaves extra grants pending re-run of the
-    adds, never a lost tombstone)."""
-    ops: list[AdminOp] = build_registry_ops(diff.registry_users, tenant_id)
+    adds, never a lost tombstone).
+
+    ``source`` is threaded to :func:`build_registry_ops` so a sibling connector
+    reuses this engine UNCHANGED while stamping its own crosswalk source."""
+    ops: list[AdminOp] = build_registry_ops(diff.registry_users, tenant_id, source)
     if diff.added_principals:
         ops.append(
             AdminOp(
