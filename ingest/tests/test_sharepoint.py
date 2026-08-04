@@ -19,12 +19,16 @@ The suite exercises the red-teamed LEAK cases, not just happy paths:
   recipient missing it is dropped (and a sole dropped recipient quarantines
   via zero tokens); a loginName — parseable or not — is NEVER an identity key;
 - G3: past-SLA (or never-reconciled) polls are forced to quarantine posture
-  for NEW indexing — and, honestly stated, a detected retraction (a removal
-  marker, a mirrored→quarantined transition, a delta reset) produces NO
-  delivered op because there is no server-side retire path yet: previously-
-  indexed content keeps serving. The suite asserts the signal is PARKED in
-  the retraction ledger + alarmed on the heartbeat, never silently consumed
-  by the advancing delta cursor;
+  for NEW indexing — and a detected retraction (a removal marker, a
+  mirrored→quarantined transition) produces NO documents-endpoint op: it is
+  PARKED in the retraction ledger, then DRAINED as a byte-exact POST
+  /v1/admin/retire replay (enforced at the index, next read). The suite
+  asserts a 2xx empties the ledger + clears the alarm, a failed replay stays
+  parked + alarmed, a re-detected document re-parks and re-drains safely
+  (idempotent server), and a sink WITHOUT the retire transport (dry-run /
+  capture-only) keeps everything parked + alarmed, never silently consumed
+  by the advancing delta cursor. A delta reset still loses the window's
+  retraction signal until a full re-backfill re-detects it;
 - L2: a backfill with ingest failures must NOT stamp last_reconcile_at and
   must alarm backfill_incomplete;
 - C1: roles outside the confers-read allowlist — or empty/missing — poison;
@@ -57,6 +61,7 @@ from verity_ingest.connectors.entra_directory import (
     group_principal as entra_group_principal,
 )
 from verity_ingest.connectors.sharepoint import (
+    RETIRE_PATH,
     DriveCanary,
     HttpSharePointRegistry,
     SharePointConfig,
@@ -90,6 +95,7 @@ ALICE = f"{crosswalk.AAD_OID_PREFIX}{ALICE_OID}"
 
 DELTA_LINK = f"https://graph.microsoft.com/v1.0/drives/{DRIVE}/root/delta?token=abc"
 NEW_DELTA_LINK = f"https://graph.microsoft.com/v1.0/drives/{DRIVE}/root/delta?token=def"
+THIRD_DELTA_LINK = f"https://graph.microsoft.com/v1.0/drives/{DRIVE}/root/delta?token=ghi"
 BAD_DELTA_LINK = f"https://graph.microsoft.com/v1.0/drives/{DRIVE_BAD}/root/delta?token=bad"
 PERM_PAGE2 = (
     f"https://graph.microsoft.com/v1.0/drives/{DRIVE}/items/item-notes/permissions"
@@ -609,7 +615,9 @@ def _event(acl: AclEnvelope, **kw) -> SharePointDocumentEvent:
 
 class AlarmSink(DryRunSink):
     """DryRunSink + the record_alarm/heartbeat surface the runners probe for
-    (the live SharePointStatusSink shape, capture-only)."""
+    (capture-only). Deliberately has NO ``retire`` transport: the drain must
+    leave everything parked + alarmed on such a sink (fail closed), which is
+    what the pre-drain parking tests below assert."""
 
     def __init__(self) -> None:
         super().__init__(stream=io.StringIO())
@@ -636,8 +644,68 @@ class FailingSink(AlarmSink):
         super().deliver(request)
 
 
+class RetiringSink(AlarmSink):
+    """AlarmSink + the ``retire`` transport (the live SharePointStatusSink
+    shape): every replay succeeds (a 2xx), bodies are captured byte-exact.
+    ``calls`` interleaves deliver/retire so order can be asserted (the
+    over-retire race is an ORDERING bug)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.retired: list[dict] = []
+        self.calls: list[tuple[str, str]] = []
+
+    def deliver(self, request: dict) -> None:
+        self.calls.append(("deliver", request["document_id"]))
+        super().deliver(request)
+
+    def retire(self, request: dict) -> None:
+        self.calls.append(("retire", request["document_id"]))
+        self.retired.append(dict(request))
+
+
+class FailingRetireSink(RetiringSink):
+    """Records the replay attempt, then fails it (a retire 5xx stand-in)."""
+
+    def retire(self, request: dict) -> None:
+        super().retire(request)
+        raise httpx.HTTPError("retire 500")
+
+
+class ToggleRetireSink(RetiringSink):
+    """Retire fails while ``failing`` is True — a retire route that recovers
+    between cycles (the race window's precondition)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = True
+
+    def retire(self, request: dict) -> None:
+        super().retire(request)
+        if self.failing:
+            raise httpx.HTTPError("retire 500")
+
+
 def _ledger(tmp_path) -> list[dict]:
     return json.loads((tmp_path / "sharepoint_parked_retractions.json").read_text())
+
+
+def _preexisting_park(tmp_path, item_id: str = "item-old", reason: str = "removed") -> str:
+    """Write a prior-cycle parked entry straight into the ledger; returns its
+    document_id."""
+    document_id = f"{DRIVE}:{item_id}"
+    entry = {
+        "drive_id": DRIVE,
+        "item_id": item_id,
+        "document_id": document_id,
+        "reason": reason,
+        "first_seen": "2026-08-02T00:00:00Z",
+        "last_seen": "2026-08-02T00:00:00Z",
+    }
+    (tmp_path / "sharepoint_parked_retractions.json").write_text(
+        json.dumps([entry], indent=2, sort_keys=True) + "\n"
+    )
+    return document_id
 
 
 # ---------------------------------------------------------------------------
@@ -906,17 +974,16 @@ def test_poll_past_sla_forces_quarantine_posture():
     # G3/R3: delta can miss parent-only revocations; past the reconcile SLA
     # (clock 2026-08-03T12:00Z, last reconcile >24h before) nothing gets NEWLY
     # indexed as mirrored — permissions and content are not even fetched.
-    # HONESTY: this posture is recorded (and the runner alarms/parks it), not
-    # enforced against the index — quarantined bodies produce no delivered op,
-    # so anything already indexed keeps serving until the server-side retire
-    # path exists.
+    # Enforcement against the index is the RUNNER's job, not poll's: the
+    # quarantined bodies it emits get parked and drained via /v1/admin/retire
+    # (asserted in the drain tests).
     transport = _poll_transport()
     connector = SharePointConnector(transport, _cfg(), clock=_clock)
     events, _ = asyncio.run(connector.poll(_cursor(last_reconcile_at="2026-08-01T00:00:00Z")))
     by_id = {e.document_id: e for e in events}
     assert by_id[f"{DRIVE}:item-notes"].acl == AclEnvelope(resolvable=False)
-    # The removal-marker EVENT still surfaces — but the runner can only park
-    # it (no retire op), so "removal" here is a ledger signal, not a narrowing.
+    # The removal-marker EVENT still surfaces — the runner parks it and the
+    # drain replays it as a /v1/admin/retire, which IS the narrowing.
     assert by_id[f"{DRIVE}:item-gone"].removed
     assert transport.bytes_calls == []
     assert all("item-notes/permissions" not in path for path, _ in transport.json_calls)
@@ -953,10 +1020,11 @@ def test_run_once_delivers_checkpoints_and_parks_the_removal_marker(tmp_path):
     connector = SharePointConnector(_poll_transport(), _cfg(), clock=_clock)
     sink = AlarmSink()
     delivered = run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
-    # notes delivered. The removal marker CANNOT be delivered (there is no
-    # server-side retire op yet — item-gone stays in the index until that
-    # lands): it must be PARKED in the retraction ledger and alarmed, never
-    # silently dropped.
+    # notes delivered. The removal marker cannot ride the documents endpoint;
+    # it is PARKED in the retraction ledger — and because this sink has no
+    # retire transport, the drain leaves it parked + alarmed (fail closed,
+    # never silently dropped). The enforced path is asserted in the
+    # drain tests below.
     assert delivered == 1
     assert [r["document_id"] for r in sink.requests] == [f"{DRIVE}:item-notes"]
     ledger = _ledger(tmp_path)
@@ -999,8 +1067,9 @@ def test_run_backfill_persists_delta_links_and_reconcile_stamp(tmp_path):
         connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file
     )
     # notes + report mirrored; open/secret quarantined + gone removed cannot
-    # be delivered (no server-side retire op) — they are PARKED in the ledger
-    # and alarmed, never silently dropped.
+    # ride the documents endpoint — they are PARKED in the ledger, and with no
+    # retire transport on this sink they STAY parked + alarmed (fail closed,
+    # never silently dropped).
     assert delivered == 2
     assert sorted(r["document_id"] for r in sink.requests) == [
         f"{DRIVE}:item-notes",
@@ -1046,11 +1115,13 @@ def test_failed_backfill_does_not_stamp_the_sla_and_alarms(tmp_path):
 
 
 def test_mirrored_to_quarantined_transition_is_parked_and_alarmed(tmp_path):
-    # THE probe-verified gap: item-notes was previously indexed mirrored; this
-    # cycle its ACL gained an anonymous link ⇒ quarantined body ⇒ the sink
-    # ladder cannot deliver it (no retire op) ⇒ the already-indexed content
-    # KEEPS SERVING. The signal must not be consumed silently: it lands in the
-    # parked-retractions ledger and alarms on the heartbeat.
+    # The probe-verified detection: item-notes was previously indexed
+    # mirrored; this cycle its ACL gained an anonymous link ⇒ quarantined body
+    # ⇒ no documents-endpoint op. On a sink WITHOUT the retire transport the
+    # signal must not be consumed silently: it lands in the parked-retractions
+    # ledger and alarms on the heartbeat (the already-indexed content keeps
+    # serving ONLY until a retire-capable cycle drains it — the enforced end
+    # state is test_mirrored_to_quarantined_transition_is_fully_enforced).
     state_file = tmp_path / "sharepoint_cursor.json"
     state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
     transport = _poll_transport()
@@ -1084,6 +1155,320 @@ def test_mirrored_to_quarantined_transition_is_parked_and_alarmed(tmp_path):
     ]
     run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
     assert len(_ledger(tmp_path)) == 2
+
+
+# ---------------------------------------------------------------------------
+# The retire drain: parked retractions ENFORCED via POST /v1/admin/retire
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_drains_the_removal_marker_and_clears_the_alarm(tmp_path):
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    connector = SharePointConnector(_poll_transport(), _cfg(), clock=_clock)
+    sink = RetiringSink()
+    delivered = run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 1
+    # The parked removal marker was replayed byte-exact against the retire
+    # route (admin plane, same bearer as deliver on the live sink)…
+    assert sink.retired == [
+        {
+            "tenant_id": TENANT,
+            "source": "sharepoint",
+            "document_id": f"{DRIVE}:item-gone",
+            "reason": "removed",
+        }
+    ]
+    # …the 2xx emptied the ledger, so NO parked_retraction alarm fires.
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_failed_retire_replay_keeps_the_entry_parked_and_alarmed(tmp_path):
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    connector = SharePointConnector(_poll_transport(), _cfg(), clock=_clock)
+    sink = FailingRetireSink()
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    # The replay was attempted, failed, and the entry survives for the next
+    # cycle; the alarm counts exactly what remains.
+    assert [r["document_id"] for r in sink.retired] == [f"{DRIVE}:item-gone"]
+    assert [e["document_id"] for e in _ledger(tmp_path)] == [f"{DRIVE}:item-gone"]
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+    detail = sink.alarms[0]["detail"]
+    assert "1 detected retraction(s)" in detail
+    assert RETIRE_PATH in detail
+
+
+def test_mirrored_to_quarantined_transition_is_fully_enforced(tmp_path):
+    # The full enforcement arc of the probe-confirmed gap: item-notes was
+    # previously indexed mirrored; its ACL gains an anonymous link ⇒
+    # quarantined body ⇒ no documents-endpoint op ⇒ PARKED ⇒ DRAINED as a
+    # /v1/admin/retire replay — the server closes the current chunks (valid_to
+    # + blanked visibility), so the content stops serving on the next read.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    transport = _poll_transport()
+    transport.json_routes[f"drives/{DRIVE}/items/item-notes/permissions"] = {
+        "value": [_user_grant(ALICE_OID), _link("anonymous")]
+    }
+    connector = SharePointConnector(transport, _cfg(), clock=_clock)
+    sink = RetiringSink()
+    delivered = run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 0
+    assert sink.requests == []  # the retraction never rides the ingest ladder
+    assert sorted(sink.retired, key=lambda b: b["document_id"]) == [
+        {
+            "tenant_id": TENANT,
+            "source": "sharepoint",
+            "document_id": f"{DRIVE}:item-gone",
+            "reason": "removed",
+        },
+        {
+            "tenant_id": TENANT,
+            "source": "sharepoint",
+            "document_id": f"{DRIVE}:item-notes",
+            "reason": "quarantined",
+        },
+    ]
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []  # fully enforced ⇒ nothing left to alarm
+    # The cursor advanced as before — the ledger + drain, not the cursor,
+    # carried the signal to enforcement.
+    saved = json.loads(json.loads(state_file.read_text())["cursor"])
+    assert saved["drives"] == {DRIVE: NEW_DELTA_LINK}
+
+
+def test_replay_safe_redetected_document_re_parks_and_re_drains(tmp_path):
+    # Replay safety: a document whose retraction already drained gets
+    # re-surfaced by delta (still quarantined) — it re-parks, re-drains, and
+    # the server's idempotent retire (0 chunks closed, still a 2xx) unparks it
+    # again with no error and no leftover alarm.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    transport = _poll_transport()
+    transport.json_routes[f"drives/{DRIVE}/items/item-notes/permissions"] = {
+        "value": [_user_grant(ALICE_OID), _link("anonymous")]
+    }
+    connector = SharePointConnector(transport, _cfg(), clock=_clock)
+    sink = RetiringSink()
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert _ledger(tmp_path) == []
+    # Cycle 2: delta re-surfaces the same (still-quarantined) item.
+    transport.delta_routes[NEW_DELTA_LINK] = [
+        {"value": [_NOTES_ITEM], "@odata.deltaLink": NEW_DELTA_LINK}
+    ]
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    notes_replays = [b for b in sink.retired if b["document_id"] == f"{DRIVE}:item-notes"]
+    assert len(notes_replays) == 2  # one per detection; identical bodies
+    assert notes_replays[0] == notes_replays[1]
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_run_backfill_drains_all_three_parked_retractions(tmp_path):
+    # The backfill lane drains too: open/secret (quarantined) + gone (removed)
+    # all end enforced; nothing outstanding, no alarm.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    connector = SharePointConnector(_backfill_transport(), _cfg(), clock=_clock)
+    sink = RetiringSink()
+    delivered = run_backfill(
+        connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file
+    )
+    assert delivered == 2
+    assert {b["document_id"]: b["reason"] for b in sink.retired} == {
+        f"{DRIVE}:item-open": "quarantined",
+        f"{DRIVE}:item-gone": "removed",
+        f"{DRIVE_BAD}:item-secret": "quarantined",
+    }
+    assert all(
+        b["tenant_id"] == TENANT and b["source"] == "sharepoint" for b in sink.retired
+    )
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_restored_document_unparks_its_stale_retraction(tmp_path):
+    # THE over-retire race, regression-pinned. Cycle N: item-gone is removed;
+    # its retire replay fails (server down) so the entry stays parked. Cycle
+    # N+1: the item is RESTORED, delivered mirrored, and freshly indexed —
+    # under the old order the end-of-cycle drain then replayed the STALE
+    # parked "removed" and blanked the just-written chunks. Fixed: the
+    # delivery is strictly newer than the parked signal, so it UNPARKS the
+    # entry; no retire for the document ever fires at-or-after its delivery,
+    # and once the retire route recovers there is nothing left to replay.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    doc = f"{DRIVE}:item-gone"
+    restored = {
+        "id": "item-gone",
+        "name": "restored.txt",
+        "file": {"mimeType": "text/plain"},
+        "lastModifiedDateTime": "2026-08-03T09:00:00Z",
+        "eTag": '"v2"',
+    }
+    transport = _poll_transport()  # cycle N: DELTA_LINK emits gone as removed
+    transport.delta_routes[NEW_DELTA_LINK] = [
+        {"value": [restored], "@odata.deltaLink": THIRD_DELTA_LINK}
+    ]
+    transport.delta_routes[THIRD_DELTA_LINK] = [
+        {"value": [], "@odata.deltaLink": THIRD_DELTA_LINK}
+    ]
+    transport.json_routes[f"drives/{DRIVE}/items/item-gone/permissions"] = {
+        "value": [_user_grant(ALICE_OID)]
+    }
+    transport.bytes_routes[f"drives/{DRIVE}/items/item-gone/content"] = b"restored body"
+    connector = SharePointConnector(transport, _cfg(), clock=_clock)
+    sink = ToggleRetireSink()
+
+    # Cycle N: removal parked; the replay fails; the entry survives, alarmed.
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert [e["document_id"] for e in _ledger(tmp_path)] == [doc]
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+
+    # Cycle N+1: restored + delivered while the retire route is STILL down.
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    bodies = [r for r in sink.requests if r["document_id"] == doc]
+    assert bodies and bodies[-1]["visibility"] == [101]  # freshly indexed, visible
+    assert all(e["document_id"] != doc for e in _ledger(tmp_path))  # unparked
+    # No retire for it at-or-after its delivery: the stale signal can never
+    # land on the fresh chunks (the pre-drain attempt, which failed, came first).
+    deliver_at = sink.calls.index(("deliver", doc))
+    assert ("retire", doc) not in sink.calls[deliver_at:]
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]  # cycle N's only
+
+    # Cycle N+2: the retire route recovers — NOTHING fires for the restored
+    # document (the unpark, not luck, is what protects it) and it stays visible.
+    sink.failing = False
+    replays_before = len(sink.retired)
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert len(sink.retired) == replays_before
+    assert _ledger(tmp_path) == []
+
+
+def test_preexisting_ledger_drains_before_any_delivery(tmp_path):
+    # Order guard #1: a parked entry from a PRIOR cycle replays BEFORE this
+    # cycle delivers anything — its retire must land on the old index state,
+    # never on chunks this cycle writes.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    old_doc = _preexisting_park(tmp_path)
+    connector = SharePointConnector(_poll_transport(), _cfg(), clock=_clock)
+    sink = RetiringSink()
+    run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    delivers = [i for i, c in enumerate(sink.calls) if c[0] == "deliver"]
+    assert delivers, "the cycle delivered (the ordering assertion is real)"
+    assert sink.calls.index(("retire", old_doc)) < min(delivers)
+    # This cycle's own reject (item-gone) still parks after delivery and drains.
+    assert ("retire", f"{DRIVE}:item-gone") in sink.calls[min(delivers) :]
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_backfill_preexisting_ledger_drains_before_any_delivery(tmp_path):
+    # The same order guard on the backfill lane.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    old_doc = _preexisting_park(tmp_path)
+    connector = SharePointConnector(_backfill_transport(), _cfg(), clock=_clock)
+    sink = RetiringSink()
+    run_backfill(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    delivers = [i for i, c in enumerate(sink.calls) if c[0] == "deliver"]
+    assert delivers
+    assert sink.calls.index(("retire", old_doc)) < min(delivers)
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_sync_state_reset_still_drains_the_preexisting_ledger(tmp_path):
+    # Fix: a delta reset must not skip enforcement of what is ALREADY parked
+    # — the ledger predates the lost window and its replays are independent
+    # of the cursor. The post-drain remainder rides the SAME heartbeat as the
+    # delta_reset alarm.
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    old_doc = _preexisting_park(tmp_path)
+    transport = _poll_transport()
+    transport.reset_links.add(DELTA_LINK)
+    connector = SharePointConnector(transport, _cfg(), clock=_clock)
+    sink = FailingRetireSink()
+    with pytest.raises(SyncStateReset):
+        run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    # The replay was attempted, failed, and the entry survives; BOTH alarms
+    # rode the one delta_reset heartbeat.
+    assert [r["document_id"] for r in sink.retired] == [old_doc]
+    assert [e["document_id"] for e in _ledger(tmp_path)] == [old_doc]
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction", "delta_reset"]
+    assert sink.heartbeats == [None]
+    assert not state_file.exists()
+
+    # A retire-capable reset cycle drains it clean: only delta_reset remains.
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    ok = RetiringSink()
+    with pytest.raises(SyncStateReset):
+        run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), ok, state_file)
+    assert [r["document_id"] for r in ok.retired] == [old_doc]
+    assert _ledger(tmp_path) == []
+    assert [a["kind"] for a in ok.alarms] == ["delta_reset"]
+    assert ok.heartbeats == [None]
+
+
+def test_drain_survives_non_http_retire_failures(tmp_path):
+    # The drain catches Exception, not just httpx.HTTPError: a sink bug or an
+    # unexpected response shape keeps the entry parked + alarmed — under the
+    # narrow catch it aborted the whole cycle (no checkpoint, no alarm, no
+    # heartbeat), leaving the operator blind to unenforced retractions.
+    class ExplodingRetireSink(RetiringSink):
+        def retire(self, request: dict) -> None:
+            super().retire(request)
+            raise ValueError("unexpected sink bug")
+
+    state_file = tmp_path / "sharepoint_cursor.json"
+    state_file.write_text(json.dumps({"cursor": _cursor()}, indent=2) + "\n")
+    connector = SharePointConnector(_poll_transport(), _cfg(), clock=_clock)
+    sink = ExplodingRetireSink()
+    delivered = run_once(connector, StaticSharePointRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 1  # the cycle completed
+    assert [e["document_id"] for e in _ledger(tmp_path)] == [f"{DRIVE}:item-gone"]
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+    assert sink.heartbeats  # the heartbeat still fired
+    saved = json.loads(json.loads(state_file.read_text())["cursor"])
+    assert saved["drives"] == {DRIVE: NEW_DELTA_LINK}  # checkpoint landed
+
+
+def test_status_sink_retire_posts_the_admin_retire_body_and_raises_on_failure():
+    posts: list[tuple[str, str | None, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(
+            (
+                request.url.path,
+                request.headers.get("Authorization"),
+                json.loads(request.content),
+            )
+        )
+        if len(posts) > 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={"chunks_retired": 3})
+
+    sink = SharePointStatusSink(
+        "http://verity.local:8080",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer admin-key"},
+        ),
+    )
+    body = {
+        "tenant_id": TENANT,
+        "source": "sharepoint",
+        "document_id": f"{DRIVE}:item-gone",
+        "reason": "removed",
+    }
+    sink.retire(body)
+    # The replay rides the admin route under the same bearer as deliver().
+    assert posts == [(RETIRE_PATH, "Bearer admin-key", body)]
+    # A non-2xx raises — the drain keeps the entry parked and re-alarms.
+    with pytest.raises(httpx.HTTPStatusError):
+        sink.retire(body)
 
 
 def test_item_with_neither_file_nor_folder_facet_is_skipped_entirely():

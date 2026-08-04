@@ -33,7 +33,8 @@ objectId poisons the item; a link RECIPIENT missing it is dropped (dropping a
 recipient only narrows; if nothing else survives the item quarantines anyway).
 
 G3 — fresh-or-quarantine for NEW indexing (R3/R4); retraction of PREVIOUSLY-
-INDEXED content is NOT yet enforced at the index. Delta tracks by id and does
+INDEXED content IS enforced at the index via the ``POST /v1/admin/retire``
+drain (below). Delta tracks by id and does
 NOT surface children whose only change is an inherited permission change from
 a parent — a parent-only revocation can go stale-open. Mitigations, in order:
 (a) a folder surfacing in the delta stream triggers a subtree re-walk of its
@@ -43,20 +44,33 @@ completed, ZERO-FAILURE full backfill) against ``reconcile_sla_hours``;
 past-SLA (or never reconciled), every polled document event is FORCED to
 quarantine posture until a backfill re-verifies.
 
-HONESTY (the G3 limit, stated plainly): those postures gate what gets
-(re)indexed — they strip NOTHING already in the index. The documents endpoint
-has no retire/visibility-strip op yet (the roadmap keystone; server-side
-future work), so a detected retraction — a removal marker, or an item
-transitioning to ``acl_provenance="quarantined"`` — produces NO delivered op
-and previously-indexed content KEEPS SERVING until that path exists. The
-signal is therefore never silently dropped: each such body is PARKED in the
-``sharepoint_parked_retractions.json`` ledger next to the cursor state
-(dedup'd by document_id; an operator or the future retire path replays it)
-and alarmed on the connector-status heartbeat (``kind="parked_retraction"``).
-The reconcile SLA is likewise recorded and alarmed, not enforced against the
-existing index. The delta cursor still advances past parked retractions —
-blocking it would livelock on permanently-quarantined items; the ledger, not
-the cursor, carries the signal.
+ENFORCEMENT (the retire drain): a detected retraction — a removal marker, or
+an item transitioning to ``acl_provenance="quarantined"`` — produces NO
+documents-endpoint op (the ingest ladder has nothing to deliver); each such
+body is PARKED in the ``sharepoint_parked_retractions.json`` ledger next to
+the cursor state (dedup'd by document_id) and every parked entry is REPLAYED
+as ``POST /v1/admin/retire`` under the same admin bearer the sinks use.
+Replay ORDER is load-bearing (the over-retire race): each cycle drains the
+PRE-EXISTING ledger BEFORE delivering the cycle's events, parks the cycle's
+own rejects after delivery, then drains those; and a successful delivery
+UNPARKS any older entry for the same document_id — a parked signal is
+strictly older than that delivery, so replaying it afterwards would blank
+the just-written chunks of a restored document.
+The server closes the document's current chunks
+(``valid_to`` + blanked visibility), so previously-indexed content stops
+serving on the next read after the drain. Any 2xx — including the idempotent
+0-chunk replay of an already-retired or never-indexed document — removes the
+entry from the ledger; any failure keeps it parked and alarmed on the
+connector-status heartbeat (``kind="parked_retraction"``, counting only what
+remains) until a later cycle drains it. The reconcile SLA is recorded and
+alarmed, not enforced against the existing index. The delta cursor still
+advances past parked retractions — blocking it would livelock on
+permanently-quarantined items; the ledger, not the cursor, carries the signal
+until its retire replay lands. Honest remainder: a per-item ACL NARROWING
+that stays mirrored (fewer principals, not a quarantine transition) is a
+re-index, not a retraction — it rides the re-ingest / acl-change paths, never
+this drain; and the gdrive connector has no drain wired yet (its removal
+markers still ride the documents endpoint only).
 A 410/``syncStateNotFound`` raises :class:`SyncStateReset` (reused from
 entra_directory) — the runner discards the cursor, alarms
 ``kind="delta_reset"`` (a full re-backfill is REQUIRED to re-narrow
@@ -145,7 +159,8 @@ Tier-1 binary lane; quarantined bodies carry NO ``visibility``).
 Runner: ``python -m verity_ingest.connectors.sharepoint --once|--backfill
 [--dry-run]`` with a JSON cursor state file (per-drive deltaLinks +
 ``last_reconcile_at``) and, beside it, the ``sharepoint_parked_retractions``
-ledger of detected-but-unenforced retractions (see G3).
+ledger of detected retractions awaiting their ``/v1/admin/retire`` replay
+(see G3; drained every cycle).
 """
 
 from __future__ import annotations
@@ -200,6 +215,7 @@ from verity_ingest.connectors.gdrive import (
 __all__ = [
     "SOURCE_NAME",
     "DOCUMENTS_PATH",
+    "RETIRE_PATH",
     "EVERYONE_GROUP",
     "SyncStateReset",
     "DriveCanary",
@@ -225,6 +241,11 @@ __all__ = [
 ]
 
 SOURCE_NAME = "sharepoint"
+
+#: The server-side retraction-enforcement route the parked-retractions drain
+#: replays into (admin plane; same bearer as the sinks). One body per parked
+#: document: ``{tenant_id, source, document_id, reason}``.
+RETIRE_PATH = "/v1/admin/retire"
 
 #: The sharePointIdentitySet facets Graph v1.0 documents. Any OTHER key in an
 #: identity set is an unknown facet ⇒ poison the item (G4 — never guess what a
@@ -716,10 +737,11 @@ class SharePointConnector(Connector):
         Past-SLA (or never reconciled): document events are FORCED to
         quarantine posture — delta can miss parent-only permission revocations
         (R3), so an un-reconciled window never gets NEWLY indexed as mirrored.
-        HONESTY: quarantine posture and removal markers produce bodies the
-        sink ladder cannot deliver (no server-side retire op yet) — content
-        already in the index keeps serving; the runner parks those bodies in
-        the retraction ledger and alarms (see module docstring, G3)."""
+        Quarantine posture and removal markers produce bodies the ingest
+        ladder cannot deliver — the runner parks them in the retraction ledger
+        and drains it as ``POST /v1/admin/retire`` replays, enforcing the
+        retraction at the index; only entries whose replay fails stay parked
+        and alarmed (see module docstring, G3)."""
         now = self._clock()
         self.skipped_nonfile = 0
         state = _parse_cursor(cursor)
@@ -1035,6 +1057,16 @@ class SharePointStatusSink(VerityDocumentSink):
         stable machine tag; ``detail`` is a human string (never a secret)."""
         self._alarms.append({"kind": kind, "detail": detail})
 
+    def retire(self, request: Mapping[str, Any]) -> None:
+        """Replay one parked retraction as ``POST /v1/admin/retire`` (module
+        docstring, G3): the server closes the document's current chunks
+        (``valid_to`` + blanked visibility), enforcing the retraction at the
+        index. Same client + admin bearer as :meth:`deliver`. Raises on
+        non-2xx — the drain keeps the entry parked and re-alarms; a replay of
+        an already-retired document is a 2xx with ``chunks_retired: 0``."""
+        response = self._client.post(f"{self._base_url}{RETIRE_PATH}", json=dict(request))
+        response.raise_for_status()
+
     def heartbeat(self, cursor: str | None = None) -> None:
         alarms = list(self._alarms)
         self._alarms = []
@@ -1066,7 +1098,7 @@ class SharePointStatusSink(VerityDocumentSink):
 
 
 # ---------------------------------------------------------------------------
-# Parked-retractions ledger (L1): the not-lost signal for the missing retire op
+# Parked-retractions ledger (L1) + the /v1/admin/retire drain that empties it
 # ---------------------------------------------------------------------------
 
 
@@ -1079,7 +1111,11 @@ def _ledger_path(state_file: Path) -> Path:
 def _park_retractions(
     state_file: Path, entries: Sequence[Mapping[str, str]], now_iso: str
 ) -> tuple[int, Path]:
-    """Persist detected-but-undeliverable retractions (module docstring, G3).
+    """Persist detected retractions pending their ``/v1/admin/retire`` replay
+    (module docstring, G3) — the drain (:func:`_drain_parked_retractions`)
+    runs right after parking, so an entry normally lives here only for the
+    instant between detection and its 2xx replay; it PERSISTS across cycles
+    only while the replay keeps failing (server down, refused body).
 
     Each entry carries ``{drive_id, item_id, document_id, reason}``; the ledger
     dedups by ``document_id`` (a permanently-quarantined item that resurfaces
@@ -1127,16 +1163,90 @@ def _parked_entry(event: SharePointDocumentEvent, body: Mapping[str, Any]) -> di
     }
 
 
+def _unpark_delivered(state_file: Path, document_ids: set[str]) -> int:
+    """Remove parked entries for documents successfully DELIVERED this cycle —
+    the other half of the over-retire-race guard: a 2xx delivery is strictly
+    NEWER evidence than any still-parked retraction signal for the same
+    document (the park predates the poll window that restored it). Left in
+    place, a later drain would replay the STALE ``removed``/``quarantined``
+    entry and blank the chunks the delivery just wrote. Returns the number of
+    entries removed."""
+    if not document_ids:
+        return 0
+    path = _ledger_path(state_file)
+    if not path.exists():
+        return 0
+    try:
+        raw = json.loads(path.read_text())
+    except ValueError:
+        return 0  # corrupt-ledger handling (move-aside) is _park_retractions' job
+    ledger = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    remaining = [e for e in ledger if str(e.get("document_id")) not in document_ids]
+    if len(remaining) != len(ledger):
+        path.write_text(json.dumps(remaining, indent=2, sort_keys=True) + "\n")
+    return len(ledger) - len(remaining)
+
+
+def _drain_parked_retractions(
+    state_file: Path, sink: DocumentSink, tenant_id: str
+) -> tuple[int, int]:
+    """Replay EVERY parked-retractions ledger entry as ``POST /v1/admin/retire``
+    ``{tenant_id, source, document_id, reason}`` — the enforcement half (module
+    docstring, G3): the server closes the document's current chunks, so the
+    retraction takes effect on the next read. Any 2xx (including the
+    idempotent ``chunks_retired: 0`` replay) removes the entry from the
+    ledger; any failure keeps it parked for the next cycle — the alarm then
+    counts only what remains. Sinks without a ``retire`` transport (dry-run,
+    capture-only fixtures) drain nothing: every entry stays parked and
+    alarmed, never silently dropped. Returns ``(outstanding, drained)``."""
+    path = _ledger_path(state_file)
+    if not path.exists():
+        return 0, 0
+    try:
+        raw = json.loads(path.read_text())
+    except ValueError:
+        return 0, 0  # corrupt-ledger handling (move-aside) is _park_retractions' job
+    ledger = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    retire = getattr(sink, "retire", None)
+    if not ledger or not callable(retire):
+        return len(ledger), 0
+    remaining: list[dict] = []
+    for entry in ledger:
+        body = {
+            "tenant_id": tenant_id,
+            "source": SOURCE_NAME,
+            "document_id": str(entry.get("document_id") or ""),
+            "reason": str(entry.get("reason") or ""),
+        }
+        try:
+            retire(body)
+        except Exception:  # noqa: BLE001 — deliberately broad, see below
+            # ANY replay failure — transport (httpx), auth, an unexpected
+            # response shape, even a sink bug — keeps the entry parked and
+            # alarmed, never crashes the drain. The ledger is the ONLY
+            # carrier of a detected retraction once the delta cursor has
+            # advanced past it: under the old httpx-only catch a non-HTTP
+            # exception aborted the whole cycle mid-drain (no checkpoint, no
+            # parked_retraction alarm, no heartbeat), leaving the operator
+            # blind to unenforced retractions. Fail closed; retried next
+            # cycle.
+            remaining.append(entry)
+    if len(remaining) != len(ledger):
+        path.write_text(json.dumps(remaining, indent=2, sort_keys=True) + "\n")
+    return len(remaining), len(ledger) - len(remaining)
+
+
 def _alarm_parked(sink: DocumentSink, total: int, ledger_path: Path) -> None:
-    """Alarm the outstanding parked-retraction count on sinks that support the
-    alarms[] heartbeat (best-effort on others — the ledger is the durable
-    signal either way)."""
+    """Alarm the outstanding (post-drain) parked-retraction count on sinks that
+    support the alarms[] heartbeat (best-effort on others — the ledger is the
+    durable signal either way). An empty ledger alarms nothing."""
     record_alarm = getattr(sink, "record_alarm", None)
     if total and callable(record_alarm):
         record_alarm(
             "parked_retraction",
-            f"{total} detected retraction(s) parked — NOT removed from the index "
-            f"(server-side retire path not built); ledger: {ledger_path}",
+            f"{total} detected retraction(s) parked — the {RETIRE_PATH} replay "
+            f"failed or is unavailable on this sink, so the content is NOT yet "
+            f"removed from the index; retried next cycle; ledger: {ledger_path}",
         )
 
 
@@ -1162,23 +1272,41 @@ def run_once(
     sink: DocumentSink,
     state_file: Path,
 ) -> int:
-    """One poll cycle: load cursor, poll, deliver, checkpoint.
+    """One poll cycle: load cursor, poll, deliver, checkpoint, drain.
 
-    Bodies the sink ladder cannot deliver — removal markers and quarantined
-    bodies (no server-side retire op yet) — are PARKED in the retraction
-    ledger and alarmed, never silently dropped; the cursor still advances
-    (holding it back would livelock on permanently-quarantined items — the
-    ledger, not the cursor, carries the signal). A :class:`SyncStateReset`
-    (expired/invalidated deltaLink) discards the cursor WITHOUT checkpointing,
-    alarms ``delta_reset``, and re-raises — a full ``--backfill`` is REQUIRED
-    to re-narrow visibility; until it runs, previously-indexed items keep
-    serving (the honest statement of the G3 limit)."""
+    Retraction bodies the ingest ladder cannot deliver — removal markers and
+    quarantined bodies — are PARKED in the retraction ledger, then the whole
+    ledger is DRAINED as ``POST /v1/admin/retire`` replays (enforced at the
+    index, next read); entries whose replay fails stay parked + alarmed,
+    never silently dropped. ORDER is load-bearing (the over-retire race): the
+    PRE-EXISTING ledger drains BEFORE this cycle's deliveries, and a
+    successful delivery UNPARKS any older entry for its document_id — a
+    parked signal is strictly older than the delivery, so replaying it after
+    would blank the just-written chunks of a restored document. The cursor
+    still advances (holding it back would livelock on permanently-quarantined
+    items — the ledger, not the cursor, carries the signal until its replay
+    lands). A :class:`SyncStateReset` (expired/invalidated deltaLink)
+    discards the cursor WITHOUT checkpointing, still drains the pre-existing
+    ledger (its replays do not depend on the cursor), alarms ``delta_reset``
+    (plus ``parked_retraction`` for the post-drain remainder) on one
+    heartbeat, and re-raises — a full ``--backfill`` is REQUIRED to re-narrow
+    visibility; until it runs, previously-indexed items keep serving (the
+    honest statement of the G3 limit)."""
     cursor = _load_cursor(state_file)
     try:
         events, next_cursor = asyncio.run(connector.poll(cursor))
     except SyncStateReset:
         if state_file.exists():
             state_file.unlink()
+        # A reset cycle must still ENFORCE what is already parked: the
+        # ledger predates the lost delta window and its retire replays are
+        # independent of the cursor. Whatever remains after the drain rides
+        # THIS heartbeat — otherwise the operator sees "reset" with no hint
+        # that detected retractions are still unenforced.
+        total_parked, _ = _drain_parked_retractions(
+            state_file, sink, connector.config.tenant_id
+        )
+        _alarm_parked(sink, total_parked, _ledger_path(state_file))
         record_alarm = getattr(sink, "record_alarm", None)
         if callable(record_alarm):
             record_alarm(
@@ -1191,7 +1319,15 @@ def run_once(
             if heartbeat is not None:
                 heartbeat()
         raise
+    # THE RACE, guard #1: drain the PRE-EXISTING ledger BEFORE delivering.
+    # A parked entry is strictly older than anything this cycle delivers, so
+    # its replay must land on the OLD index state — drained after delivery it
+    # would blank the fresh chunks of a document this cycle just restored.
+    _, pre_drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
     delivered = 0
+    delivered_ids: set[str] = set()
     parked: list[dict[str, str]] = []
     for event in events:
         assert isinstance(event, SharePointDocumentEvent)
@@ -1199,17 +1335,31 @@ def run_once(
         if not _is_indexable_body(body):
             # L1: an undeliverable retraction signal — park it, never drop it.
             parked.append(_parked_entry(event, body))
+            delivered_ids.discard(event.document_id)  # in-stream, the park is newer
             continue
         sink.deliver(body)
         delivered += 1
+        delivered_ids.add(event.document_id)
+        # In-stream order is truth order: this delivery supersedes any
+        # EARLIER same-cycle park for the same document.
+        parked = [p for p in parked if p["document_id"] != event.document_id]
+    # THE RACE, guard #2: a successful delivery is strictly newer than any
+    # entry still parked for the same document (e.g. guard #1's replay failed
+    # and the entry survived) — unpark it, or a later drain replays the STALE
+    # retraction over the chunks just written.
+    _unpark_delivered(state_file, delivered_ids)
     total_parked, ledger_path = _park_retractions(
         state_file, parked, _iso(connector._clock())
     )
-    if parked:
+    total_parked, drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
+    drained += pre_drained
+    if parked or drained:
         print(
-            f"sharepoint: parked {len(parked)} retraction signal(s) this cycle "
-            f"({total_parked} outstanding, awaiting the server-side retire path) "
-            f"-> {ledger_path}"
+            f"sharepoint: parked {len(parked)} retraction signal(s) this cycle; "
+            f"drained {drained} via POST {RETIRE_PATH}; "
+            f"{total_parked} still parked -> {ledger_path}"
         )
     if connector.skipped_nonfile:
         print(
@@ -1238,14 +1388,26 @@ def run_backfill(
     stamp — the stamp lands ONLY after a COMPLETE crawl with ZERO ingest
     failures (L2: a crashed OR partially-failed backfill re-proved nothing;
     with failures the prior stamp — possibly none — is carried unchanged and
-    ``backfill_incomplete`` is alarmed). Undeliverable retraction bodies
-    (removal markers, quarantined items) are parked in the retraction ledger
-    and alarmed, never silently dropped (module docstring, G3)."""
+    ``backfill_incomplete`` is alarmed). Retraction bodies the ingest ladder
+    cannot deliver (removal markers, quarantined items) are parked in the
+    retraction ledger, then drained as ``POST /v1/admin/retire`` replays —
+    enforced at the index; failed replays stay parked + alarmed, never
+    silently dropped. Same over-retire-race ordering as :func:`run_once`:
+    the pre-existing ledger drains BEFORE the crawl delivers, and a
+    successful delivery unparks any older entry for its document_id (module
+    docstring, G3)."""
     if reporter is not None:
         reporter.start(total=None)
+    # THE RACE, guard #1 (same as run_once): the PRE-EXISTING ledger drains
+    # BEFORE the crawl delivers anything — a parked entry is strictly older
+    # than this backfill's writes and must never blank them.
+    _, pre_drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
     delivered = 0
     pending = 0
     failed = 0
+    delivered_ids: set[str] = set()
     parked: list[dict[str, str]] = []
 
     async def _drive() -> None:
@@ -1258,6 +1420,7 @@ def run_backfill(
             if not _is_indexable_body(body):
                 # L1: an undeliverable retraction signal — park it, never drop it.
                 parked.append(_parked_entry(event, body))
+                delivered_ids.discard(event.document_id)  # in-stream, the park is newer
                 continue
             try:
                 sink.deliver(body)
@@ -1265,6 +1428,10 @@ def run_backfill(
                 failed += 1  # one bad document never aborts a whole-drive backfill
                 continue
             delivered += 1
+            delivered_ids.add(event.document_id)
+            # In-stream order is truth order: this delivery supersedes any
+            # EARLIER same-crawl park for the same document.
+            parked[:] = [p for p in parked if p["document_id"] != event.document_id]
             pending += 1
             if reporter is not None and pending >= flush_every:
                 reporter.advance(pending)
@@ -1282,13 +1449,22 @@ def run_backfill(
         if pending:
             reporter.advance(pending)
         reporter.finish()
+    # THE RACE, guard #2 (same as run_once): deliveries are strictly newer
+    # than any still-parked entry for the same document — unpark before the
+    # post-crawl park + drain.
+    _unpark_delivered(state_file, delivered_ids)
     total_parked, ledger_path = _park_retractions(
         state_file, parked, _iso(connector._clock())
     )
-    if parked or failed:
+    total_parked, drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
+    drained += pre_drained
+    if parked or drained or failed:
         print(
-            f"sharepoint: parked {len(parked)} retraction signal(s) "
-            f"({total_parked} outstanding -> {ledger_path}), "
+            f"sharepoint: parked {len(parked)} retraction signal(s); "
+            f"drained {drained} via POST {RETIRE_PATH} "
+            f"({total_parked} still parked -> {ledger_path}), "
             f"{failed} ingest failure(s)"
         )
     if connector.skipped_nonfile:

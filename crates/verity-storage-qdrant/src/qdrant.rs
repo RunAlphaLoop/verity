@@ -821,4 +821,44 @@ impl StorageAdapter for QdrantAdapter {
         self.mirror_positions(tenant, &positions).await?;
         Ok(facts_retired)
     }
+
+    /// Delegates the retire (chunk close + ledger append) to Postgres, then
+    /// re-mirrors every row of the `(source, document_id)` lineage so the
+    /// Qdrant points pick up their closed `valid_to` and blanked visibility.
+    /// Invalidate-don't-delete on both engines; a 0-chunk replay re-mirrors an
+    /// already-retired lineage, which is an idempotent no-op state-wise.
+    async fn retire_document(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        let retired = self
+            .inner
+            .retire_document(tenant, source, document_id, reason)
+            .await?;
+        let touched = sqlx::query(
+            "SELECT source, document_id, seq FROM chunks
+             WHERE tenant_id = $1 AND source = $2 AND document_id = $3",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .fetch_all(self.inner.pool())
+        .await
+        .map_err(db_err)?;
+        let positions: Vec<(String, String, i32)> = touched
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("source").map_err(db_err)?,
+                    r.try_get("document_id").map_err(db_err)?,
+                    r.try_get("seq").map_err(db_err)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        self.mirror_positions(tenant, &positions).await?;
+        Ok(retired)
+    }
 }
