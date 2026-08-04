@@ -252,6 +252,24 @@ RETIRE_PATH = "/v1/admin/retire"
 #: new facet grants).
 _KNOWN_FACETS = frozenset({"user", "group", "siteUser", "siteGroup", "application", "device"})
 
+#: COMPANION facets live Graph attaches ALONGSIDE a primary facet for the SAME
+#: principal (live-validated 2026-08 against a real SPO tenant; fixtures never
+#: carried them). They are metadata about the primary facet, never a second
+#: grant, and are IGNORED for classification — recognized so they do not trip
+#: the unknown-facet poison, but never consulted for an identity key:
+#:
+#: - ``sharePointGroup`` rides alongside ``siteGroup`` (same principal — its
+#:   ``principalId`` mirrors ``siteGroup.id``); the siteGroup facet's id stays
+#:   the ONLY site-group key.
+#: - ``siteUser`` (already in ``_KNOWN_FACETS``) rides alongside ``user`` and
+#:   ``group`` as SP-local claim metadata; it is consulted ONLY for the two
+#:   special tenant-token claims (R6), never as an identity key (R2).
+#:
+#: ``@``-prefixed keys (``@odata.type`` etc.) are OData annotations, not
+#: facets — ignored the same way. A truly-unknown facet, or an identity set
+#: with ONLY companions/annotations and no primary facet, still poisons (G4).
+_COMPANION_FACETS = frozenset({"sharePointGroup"})
+
 #: "Everyone except external users" claim, tenant-GUID-anchored (R6):
 #: ``c:0-.f|rolemanager|spo-grid-all-users/<tenantGUID>``. Matched as a strict
 #: PREFIX of the whole loginName (C4) — a substring match would let a lookalike
@@ -384,9 +402,16 @@ def _map_identity_set(
     the item quarantines on zero tokens anyway). Direct grants (``recipient=
     False``) poison instead — silently dropping a direct grant would mis-mirror
     the ACL (plan rows a/h)."""
-    unknown = set(idset) - _KNOWN_FACETS
+    unknown = (
+        {key for key in idset if not key.startswith("@")}
+        - _KNOWN_FACETS
+        - _COMPANION_FACETS
+    )
     if unknown:
         return _POISON  # a facet Graph added after this code was written: never guess
+    # Classification below is by PRIMARY facet, precedence user > group >
+    # siteGroup (after the siteUser special-claim gate, which can only narrow:
+    # tenant token or poison). Companion facets never classify.
     site_user = idset.get("siteUser")
     if site_user is not None:
         claim = _map_claim(str(site_user.get("loginName") or ""), tenant_guid)

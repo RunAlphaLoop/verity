@@ -250,6 +250,139 @@ def test_site_group_grant_emits_site_scoped_principal_when_resolvable():
     assert site_group_principal(SITE, "5") == f"group:sp-site-{SITE}-5"
 
 
+ALL_STAFF_GID = "8d80e8de-d41c-4648-9136-d92348f23c27"
+
+
+def _live_site_group_grant(principal_id: str, name: str) -> dict:
+    # Verbatim live shape (mattrunalphaloop.sharepoint.com): the siteGroup
+    # facet arrives with a sharePointGroup COMPANION facet for the SAME
+    # principal (principalId mirrors siteGroup.id) — fixtures never carried it.
+    # Legacy grantedTo rides alongside grantedToV2 on EVERY live row.
+    return {
+        "id": f"perm-live-sg-{principal_id}",
+        "roles": ["write"],
+        "grantedToV2": {
+            "siteGroup": {
+                "@odata.type": "#microsoft.graph.sharePointIdentity",
+                "id": principal_id,
+                "displayName": name,
+                "loginName": name,
+            },
+            "sharePointGroup": {"id": principal_id, "title": name, "principalId": principal_id},
+        },
+        "grantedTo": {"user": {"displayName": name}},
+    }
+
+
+def _live_entra_group_grant(gid: str = ALL_STAFF_GID) -> dict:
+    # Verbatim live shape: the group facet (id = Entra objectId) arrives with a
+    # siteUser COMPANION carrying the c:0t.c|tenant|<oid> claim loginName —
+    # claim metadata for the same principal, never a second grant and never an
+    # identity key (R2).
+    return {
+        "id": "perm-live-group",
+        "roles": ["read"],
+        "grantedToV2": {
+            "group": {
+                "@odata.type": "#microsoft.graph.sharePointIdentity",
+                "displayName": "all-staff",
+                "id": gid,
+            },
+            "siteUser": {
+                "id": "12",
+                "displayName": "all-staff",
+                "loginName": f"c:0t.c|tenant|{gid}",
+            },
+        },
+        "grantedTo": {"user": {"displayName": "all-staff"}},
+    }
+
+
+def _live_user_grant(oid: str = ALICE_OID) -> dict:
+    # Verbatim live shape: user facet with the sharePointIdentity annotation +
+    # email, siteUser membership-claim companion, legacy grantedTo alongside.
+    return {
+        "id": "perm-live-user",
+        "roles": ["write"],
+        "grantedToV2": {
+            "user": {
+                "@odata.type": "#microsoft.graph.sharePointIdentity",
+                "displayName": "Alice",
+                "email": "alice@contoso.com",
+                "id": oid,
+            },
+            "siteUser": {"id": "6", "loginName": "i:0#.f|membership|alice@contoso.com"},
+        },
+        "grantedTo": {"user": {"id": oid, "displayName": "Alice", "email": "alice@contoso.com"}},
+    }
+
+
+def _live_permission_rows() -> list[dict]:
+    return [
+        _live_site_group_grant("5", "Communication site Members"),
+        _live_site_group_grant("3", "Communication site Owners"),
+        _live_entra_group_grant(),
+        _live_user_grant(),
+    ]
+
+
+def test_live_companion_facets_map_all_four_row_types():
+    # The live-validation finding: real Graph rows carry companion facets
+    # (sharePointGroup beside siteGroup; siteUser beside group/user; @odata
+    # annotations; legacy grantedTo beside grantedToV2). None may poison —
+    # classification is by primary facet, precedence user > group > siteGroup.
+    envelope = _map(_live_permission_rows(), site_groups_resolvable=True)
+    assert envelope == AclEnvelope(
+        resolvable=True,
+        principals=[ALICE],
+        groups=[
+            site_group_principal(SITE, "5"),
+            site_group_principal(SITE, "3"),
+            entra_group_principal(ALL_STAFF_GID),
+        ],
+    )
+    # The companions were never consulted as identity keys: no siteUser claim
+    # loginName and no sharePointGroup-derived key leaks into the envelope.
+    assert not any("c:0t.c" in p for p in envelope.principals + envelope.groups)
+    assert not any("membership" in p for p in envelope.principals + envelope.groups)
+
+
+def test_live_site_group_rows_still_quarantine_when_unresolvable():
+    # R8 posture is unchanged by companion recognition: with the default
+    # site_groups_resolvable=False the live site-group rows still quarantine
+    # the whole item, even alongside the mappable group + user grants.
+    assert _map(_live_permission_rows()) == AclEnvelope(resolvable=False)
+
+
+def test_companion_only_identity_set_still_poisons():
+    # A companion is metadata about a primary facet — an identity set with ONLY
+    # the companion has nothing to classify: poison, never guess (G4).
+    perms = [
+        {
+            "id": "p-companion-only",
+            "roles": ["read"],
+            "grantedToV2": {"sharePointGroup": {"id": "5", "principalId": "5"}},
+        }
+    ]
+    assert _map(perms, site_groups_resolvable=True) == AclEnvelope(resolvable=False)
+
+
+def test_unknown_facet_alongside_a_primary_still_poisons():
+    # Companion recognition must not widen G4: a facet outside the audited
+    # companion set poisons even when a perfectly mappable primary is present.
+    perms = [
+        {
+            "id": "p-unknown-companion",
+            "roles": ["read"],
+            "grantedToV2": {
+                "user": {"id": ALICE_OID, "displayName": "Alice"},
+                "fancyPrincipal": {"id": "9"},
+            },
+        }
+    ]
+    assert _map(perms) == AclEnvelope(resolvable=False)
+
+
 def test_anonymous_link_quarantines_even_alongside_real_grants():
     assert _map([_link("anonymous")]) == AclEnvelope(resolvable=False)
     # A public-internet link poisons the WHOLE item — never partial-emit.
