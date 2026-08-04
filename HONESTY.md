@@ -36,9 +36,9 @@ production org at scale.
 ## Connectors — what's real, and how faithful
 
 All six source connectors (Google Drive, Gmail, HubSpot, Salesforce, Notion, Intercom) plus
-Google Directory ship on `main` and are tested in CI **against recorded fixtures — no live
-credentials run in CI.** Each has also been validated once against a live account during
-development. That is a development validation, not continuous testing and not a turnkey,
+two directory syncs (Google Workspace and Microsoft Entra ID) ship on `main` and are tested
+in CI **against recorded fixtures — no live credentials run in CI.** Each has also been
+validated once against a live account during development. That is a development validation, not continuous testing and not a turnkey,
 production-hardened integration. ACL fidelity varies by what each source's API actually
 exposes:
 
@@ -54,8 +54,17 @@ exposes:
 - **Intercom** — conversations ride the operator-declared teammate-audience floor plus the
   resolved assignee as a provable superset; fail-closed on unassigned.
 
-Directory sync (nested-group ACL inheritance) is proven end-to-end and fixture-verified;
-it has not been run at directory scale against a large production tenant.
+Directory sync (nested-group ACL inheritance) is proven end-to-end and fixture-verified for
+both IdPs — Google Workspace against a real workspace, and Microsoft Entra against a real
+(scratch) tenant, including the delete-a-user proof: a hard-deleted user's group edges are
+purged from the connector's own snapshot even though Graph's group-delta stream never
+reports them. Honest limits on the Entra side: cross-IdP SSO-alias welding is fail-closed
+inert on cloud-only tenants (`onPremisesImmutableId` is null, so zero aliases are written —
+surfaced as a warning, never guessed) and has not been confirmed against a federated
+tenant. Neither directory sync has been run at scale against a large production tenant, and
+the Entra sync alone is an identity plane — no Microsoft *content* connector ships yet
+(SharePoint/OneDrive is the next planned spoke), so today it resolves group grants that
+other sources reference, nothing more.
 
 ## No users, no SOC 2, no hosted cloud
 
