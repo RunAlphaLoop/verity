@@ -69,8 +69,8 @@ permanently-quarantined items; the ledger, not the cursor, carries the signal
 until its retire replay lands. Honest remainder: a per-item ACL NARROWING
 that stays mirrored (fewer principals, not a quarantine transition) is a
 re-index, not a retraction — it rides the re-ingest / acl-change paths, never
-this drain; and the gdrive connector has no drain wired yet (its removal
-markers still ride the documents endpoint only).
+this drain. (The gdrive connector now drains through the same route — see
+its module docstring.)
 A 410/``syncStateNotFound`` raises :class:`SyncStateReset` (reused from
 entra_directory) — the runner discards the cursor, alarms
 ``kind="delta_reset"`` (a full re-backfill is REQUIRED to re-narrow

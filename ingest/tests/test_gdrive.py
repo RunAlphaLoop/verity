@@ -22,11 +22,13 @@ from verity_ingest.connector import AclEnvelope
 from verity_ingest.connectors.gdrive import (
     DOCUMENTS_PATH,
     PRINCIPALS_PATH,
+    RETIRE_PATH,
     DryRunFactSink,
     DryRunSink,
     GDriveConfig,
     GDriveConnector,
     GDriveDocumentEvent,
+    GDriveStatusSink,
     HttpRegistry,
     StaticRegistry,
     VerityDocumentSink,
@@ -524,8 +526,134 @@ def test_verity_sink_raises_on_rejection():
 
 
 # ---------------------------------------------------------------------------
-# Runner: cursor checkpointing
+# Runner: cursor checkpointing + the parked-retractions ledger
 # ---------------------------------------------------------------------------
+
+
+class AlarmSink(DryRunSink):
+    """DryRunSink + the record_alarm/heartbeat surface the runners probe for
+    (capture-only). Deliberately has NO ``retire`` transport: the drain must
+    leave everything parked + alarmed on such a sink (fail closed), which is
+    what the parking tests below assert."""
+
+    def __init__(self) -> None:
+        super().__init__(stream=io.StringIO())
+        self.alarms: list[dict[str, str]] = []
+        self.heartbeats: list[str | None] = []
+
+    def record_alarm(self, kind: str, detail: str) -> None:
+        self.alarms.append({"kind": kind, "detail": detail})
+
+    def heartbeat(self, cursor: str | None = None) -> None:
+        self.heartbeats.append(cursor)
+
+
+class RetiringSink(AlarmSink):
+    """AlarmSink + the ``retire`` transport (the live GDriveStatusSink shape):
+    every replay succeeds (a 2xx), bodies are captured byte-exact. ``calls``
+    interleaves deliver/retire so order can be asserted (the over-retire race
+    is an ORDERING bug)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.retired: list[dict] = []
+        self.calls: list[tuple[str, str]] = []
+
+    def deliver(self, request: dict) -> None:
+        self.calls.append(("deliver", request["document_id"]))
+        super().deliver(request)
+
+    def retire(self, request: dict) -> None:
+        self.calls.append(("retire", request["document_id"]))
+        self.retired.append(dict(request))
+
+
+class FailingRetireSink(RetiringSink):
+    """Records the replay attempt, then fails it (a retire 5xx stand-in)."""
+
+    def retire(self, request: dict) -> None:
+        super().retire(request)
+        raise httpx.HTTPError("retire 500")
+
+
+class ToggleRetireSink(RetiringSink):
+    """Retire fails while ``failing`` is True — a retire route that recovers
+    between cycles (the race window's precondition)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = True
+
+    def retire(self, request: dict) -> None:
+        super().retire(request)
+        if self.failing:
+            raise httpx.HTTPError("retire 500")
+
+
+class RunnerTransport(FixtureTransport):
+    """FixtureTransport + injectable extra changes pages / file metadata /
+    permission overrides / byte routes, for multi-cycle runner tests (restore
+    races, mirrored→quarantined transitions) the static fixtures can't
+    express. Anything not overridden falls through to the recorded fixtures."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pages: dict[str, dict] = {}
+        self.files: dict[str, dict] = {}
+        self.perms: dict[str, dict] = {}
+        self.byte_routes: dict[str, bytes] = {}
+
+    def get_json(self, path: str, params: dict) -> dict:
+        if path == "changes" and params.get("pageToken") in self.pages:
+            self.json_calls.append((path, dict(params)))
+            return self.pages[params["pageToken"]]
+        parts = path.split("/")
+        if (
+            len(parts) == 3
+            and parts[0] == "files"
+            and parts[2] == "permissions"
+            and parts[1] in self.perms
+        ):
+            self.json_calls.append((path, dict(params)))
+            return self.perms[parts[1]]
+        if len(parts) == 2 and parts[0] == "files" and parts[1] in self.files:
+            self.json_calls.append((path, dict(params)))
+            return self.files[parts[1]]
+        return super().get_json(path, params)
+
+    def get_bytes(self, path: str, params: dict) -> bytes:
+        if path in self.byte_routes and params.get("alt") == "media":
+            self.bytes_calls.append((path, dict(params)))
+            return self.byte_routes[path]
+        return super().get_bytes(path, params)
+
+
+def _ledger(tmp_path) -> list[dict]:
+    return json.loads((tmp_path / "gdrive_parked_retractions.json").read_text())
+
+
+def _state_at(tmp_path, cursor: str = "387") -> Path:
+    state_file = tmp_path / "gdrive_cursor.json"
+    state_file.write_text(json.dumps({"cursor": cursor}, indent=2) + "\n")
+    return state_file
+
+
+STALE_ID = "1StaleOldDocZZZZZZZZZZZZZZZZZZZZ"
+
+
+def _preexisting_park(tmp_path, document_id: str = STALE_ID, reason: str = "removed") -> str:
+    """Write a prior-cycle parked entry straight into the ledger; returns its
+    document_id."""
+    entry = {
+        "document_id": document_id,
+        "reason": reason,
+        "first_seen": "2026-07-08T00:00:00Z",
+        "last_seen": "2026-07-08T00:00:00Z",
+    }
+    (tmp_path / "gdrive_parked_retractions.json").write_text(
+        json.dumps([entry], indent=2, sort_keys=True) + "\n"
+    )
+    return document_id
 
 
 def test_run_once_establishes_then_advances_cursor(tmp_path):
@@ -540,17 +668,341 @@ def test_run_once_establishes_then_advances_cursor(tmp_path):
 
     # Second run: polls from 387. Only the three SCOPABLE files are delivered
     # to /v1/ingest/documents — the two removals (GONE_ID, TRASHED_ID) and the
-    # anyone-shared quarantine (PDF_ID) are skipped fail-closed: the server's
-    # documents endpoint accepts only mirrored/approximated/admin-assigned
-    # writes (it has no `removed` field and rejects `quarantined`), so
-    # delivering them would 422 and, worse, one such file would abort a whole
-    # crawl. Skipped files are counted and reported, never indexed. Cursor
-    # still advances to 412 (the whole window was processed).
+    # anyone-shared quarantine (PDF_ID) are retraction signals the documents
+    # endpoint rejects (it has no `removed` field and rejects `quarantined`):
+    # they are PARKED in the retraction ledger, and because this DryRunSink
+    # has no retire transport they STAY parked (fail closed, never silently
+    # dropped — the enforced path is asserted in the retire-drain tests
+    # below). Cursor still advances to 412 (the ledger, not the cursor,
+    # carries the signal).
     connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
     sink = DryRunSink(stream=io.StringIO())
     assert run_once(connector, registry, sink, state_file) == 3
     assert json.loads(state_file.read_text()) == {"cursor": "412"}
     assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, XLSX_ID]
+    assert {e["document_id"]: e["reason"] for e in _ledger(tmp_path)} == {
+        GONE_ID: "removed",
+        PDF_ID: "quarantined",
+        TRASHED_ID: "removed",
+    }
+
+
+# ---------------------------------------------------------------------------
+# The retire drain: parked retractions ENFORCED via POST /v1/admin/retire
+# (template: test_sharepoint.py's drain suite, adapted to gdrive's bare
+# file-id document_ids and its changes.list fixtures)
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_parks_without_retire_transport_and_alarms(tmp_path):
+    # The fail-closed floor: on a sink WITHOUT the retire transport the three
+    # retraction signals (two removals + the anyone-shared quarantine) are
+    # parked + alarmed, never silently consumed. Deliveries are unaffected.
+    state_file = _state_at(tmp_path)
+    connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
+    sink = AlarmSink()
+    delivered = run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 3
+    ledger = {e["document_id"]: e for e in _ledger(tmp_path)}
+    assert {d: e["reason"] for d, e in ledger.items()} == {
+        GONE_ID: "removed",
+        PDF_ID: "quarantined",
+        TRASHED_ID: "removed",
+    }
+    assert all(e["first_seen"] == e["last_seen"] for e in ledger.values())
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+    detail = sink.alarms[0]["detail"]
+    assert "3 detected retraction(s)" in detail
+    assert "gdrive_parked_retractions.json" in detail
+    assert sink.heartbeats == ["412"]  # the alarm rode the cycle's heartbeat
+
+
+def test_run_once_drains_removal_and_quarantine_byte_exact(tmp_path):
+    # The enforced path: every parked signal is replayed against the retire
+    # route byte-exact ({tenant_id, source, document_id, reason}); the 2xx
+    # empties the ledger so nothing is left to alarm.
+    state_file = _state_at(tmp_path)
+    connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
+    sink = RetiringSink()
+    delivered = run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 3
+    assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, XLSX_ID]
+    assert sorted(sink.retired, key=lambda b: b["document_id"]) == sorted(
+        [
+            {
+                "tenant_id": TENANT,
+                "source": "gdrive",
+                "document_id": GONE_ID,
+                "reason": "removed",
+            },
+            {
+                "tenant_id": TENANT,
+                "source": "gdrive",
+                "document_id": PDF_ID,
+                "reason": "quarantined",
+            },
+            {
+                "tenant_id": TENANT,
+                "source": "gdrive",
+                "document_id": TRASHED_ID,
+                "reason": "removed",
+            },
+        ],
+        key=lambda b: b["document_id"],
+    )
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+    assert json.loads(state_file.read_text()) == {"cursor": "412"}
+
+
+def test_failed_retire_replay_keeps_entries_parked_and_alarmed(tmp_path):
+    state_file = _state_at(tmp_path)
+    connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
+    sink = FailingRetireSink()
+    delivered = run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    # The replays were attempted, failed, and the entries survive for the next
+    # cycle; the alarm counts exactly what remains. The cycle itself completed
+    # (deliveries + checkpoint) — a drain failure never aborts it.
+    assert delivered == 3
+    assert sorted(r["document_id"] for r in sink.retired) == sorted(
+        [GONE_ID, PDF_ID, TRASHED_ID]
+    )
+    assert {e["document_id"] for e in _ledger(tmp_path)} == {GONE_ID, PDF_ID, TRASHED_ID}
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+    detail = sink.alarms[0]["detail"]
+    assert "3 detected retraction(s)" in detail
+    assert RETIRE_PATH in detail
+    assert json.loads(state_file.read_text()) == {"cursor": "412"}  # checkpoint landed
+
+
+def test_preexisting_ledger_drains_before_any_delivery(tmp_path):
+    # Order guard #1: a parked entry from a PRIOR cycle replays BEFORE this
+    # cycle delivers anything — its retire must land on the old index state,
+    # never on chunks this cycle writes.
+    state_file = _state_at(tmp_path)
+    old_doc = _preexisting_park(tmp_path)
+    connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
+    sink = RetiringSink()
+    run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    delivers = [i for i, c in enumerate(sink.calls) if c[0] == "deliver"]
+    assert delivers, "the cycle delivered (the ordering assertion is real)"
+    assert sink.calls.index(("retire", old_doc)) < min(delivers)
+    # This cycle's own rejects still park after delivery and drain.
+    assert ("retire", GONE_ID) in sink.calls[min(delivers) :]
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+
+
+def test_restored_file_unparks_its_stale_retraction(tmp_path):
+    # THE over-retire race, regression-pinned. Cycle N: GONE_ID is removed;
+    # its retire replay fails (server down) so the entry stays parked. Cycle
+    # N+1: the file is RESTORED (untrashed/undeleted), delivered mirrored,
+    # and freshly indexed — under a drain-after-delivery-only order the
+    # end-of-cycle drain would replay the STALE parked "removed" and blank
+    # the just-written chunks. The delivery is strictly newer than the parked
+    # signal, so it UNPARKS the entry; no retire for the document ever fires
+    # at-or-after its delivery, and once the retire route recovers there is
+    # nothing left to replay for it.
+    state_file = _state_at(tmp_path)
+    transport = RunnerTransport()
+    transport.pages["412"] = {
+        "kind": "drive#changeList",
+        "newStartPageToken": "500",
+        "changes": [
+            {
+                "kind": "drive#change",
+                "changeType": "file",
+                "time": "2026-07-10T08:00:00.000Z",
+                "removed": False,
+                "fileId": GONE_ID,
+            }
+        ],
+    }
+    transport.pages["500"] = {
+        "kind": "drive#changeList",
+        "newStartPageToken": "500",
+        "changes": [],
+    }
+    transport.files[GONE_ID] = {
+        "id": GONE_ID,
+        "name": "restored.txt",
+        "mimeType": "text/plain",
+        "modifiedTime": "2026-07-10T07:59:00.000Z",
+        "trashed": False,
+        "version": "7",
+    }
+    transport.perms[GONE_ID] = {
+        "permissions": [
+            {"id": "p1", "type": "user", "emailAddress": "alice@corp.example", "role": "owner"}
+        ]
+    }
+    transport.byte_routes[f"files/{GONE_ID}"] = b"restored body"
+    connector = GDriveConnector(transport, GDriveConfig(tenant_id=TENANT))
+    sink = ToggleRetireSink()
+
+    # Cycle N: removal parked; the replay fails; the entry survives, alarmed.
+    run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert GONE_ID in {e["document_id"] for e in _ledger(tmp_path)}
+    assert [a["kind"] for a in sink.alarms] == ["parked_retraction"]
+
+    # Cycle N+1: restored + delivered while the retire route is STILL down.
+    run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    bodies = [r for r in sink.requests if r["document_id"] == GONE_ID]
+    assert bodies and bodies[-1]["visibility"] == [101]  # freshly indexed, visible
+    assert bodies[-1]["content"] == "restored body"
+    assert all(e["document_id"] != GONE_ID for e in _ledger(tmp_path))  # unparked
+    # No retire for it at-or-after its delivery: the stale signal can never
+    # land on the fresh chunks (the pre-drain attempt, which failed, came
+    # first). PDF/TRASHED from cycle N stay parked — the retire route is down.
+    deliver_at = sink.calls.index(("deliver", GONE_ID))
+    assert ("retire", GONE_ID) not in sink.calls[deliver_at:]
+    assert {e["document_id"] for e in _ledger(tmp_path)} == {PDF_ID, TRASHED_ID}
+
+    # Cycle N+2: the retire route recovers — NOTHING fires for the restored
+    # file (the unpark, not luck, protects it), the leftovers drain clean.
+    sink.failing = False
+    run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert ("retire", GONE_ID) not in sink.calls[deliver_at:]
+    assert _ledger(tmp_path) == []
+
+
+def test_mirrored_to_quarantined_transition_is_fully_enforced(tmp_path):
+    # The transition case: DOC_ID was previously indexed mirrored; the next
+    # cycle its ACL gains an anyone link ⇒ quarantined body ⇒ no documents-
+    # endpoint op ⇒ PARKED ⇒ DRAINED as a /v1/admin/retire replay — the server
+    # closes the current chunks (valid_to + blanked visibility), so the
+    # content stops serving on the next read.
+    state_file = _state_at(tmp_path)
+    transport = RunnerTransport()
+    transport.pages["412"] = {
+        "kind": "drive#changeList",
+        "newStartPageToken": "500",
+        "changes": [
+            {
+                "kind": "drive#change",
+                "changeType": "file",
+                "time": "2026-07-10T09:00:00.000Z",
+                "removed": False,
+                "fileId": DOC_ID,
+            }
+        ],
+    }
+    connector = GDriveConnector(transport, GDriveConfig(tenant_id=TENANT))
+    sink = RetiringSink()
+
+    # Cycle 1: DOC_ID delivered mirrored; the fixture window's own retraction
+    # signals all drain clean.
+    delivered = run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 3
+    assert _ledger(tmp_path) == []
+
+    # Cycle 2: the doc's sharing gained an anyone link → quarantined.
+    transport.perms[DOC_ID] = {
+        "permissions": [{"id": "anyoneWithLink", "type": "anyone", "role": "reader"}]
+    }
+    delivered = run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    assert delivered == 0
+    # No new delivery for DOC_ID — the retraction never rides the ingest
+    # ladder; it parks and drains as the retire replay.
+    assert [r["document_id"] for r in sink.requests].count(DOC_ID) == 1  # cycle 1's only
+    assert sink.retired[-1] == {
+        "tenant_id": TENANT,
+        "source": "gdrive",
+        "document_id": DOC_ID,
+        "reason": "quarantined",
+    }
+    assert _ledger(tmp_path) == []
+    assert sink.alarms == []
+    # The cursor advanced as ever — the ledger + drain, not the cursor,
+    # carried the signal to enforcement.
+    assert json.loads(state_file.read_text()) == {"cursor": "500"}
+
+
+def test_corrupt_ledger_is_moved_aside_never_overwritten(tmp_path):
+    state_file = _state_at(tmp_path)
+    ledger_path = tmp_path / "gdrive_parked_retractions.json"
+    ledger_path.write_text("{{{ not json")
+    connector = GDriveConnector(FixtureTransport(), GDriveConfig(tenant_id=TENANT))
+    sink = RetiringSink()
+    run_once(connector, StaticRegistry(REGISTRY_MAP), sink, state_file)
+    # The unreadable ledger was moved aside (the signal is not lost) and a
+    # fresh ledger took its place; this cycle's own retractions still drained.
+    assert (tmp_path / "gdrive_parked_retractions.json.corrupt").read_text() == "{{{ not json"
+    assert _ledger(tmp_path) == []
+    assert sorted(r["document_id"] for r in sink.retired) == sorted(
+        [GONE_ID, PDF_ID, TRASHED_ID]
+    )
+
+
+def test_status_sink_retire_posts_the_admin_retire_body_and_raises_on_failure():
+    posts: list[tuple[str, str | None, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(
+            (
+                request.url.path,
+                request.headers.get("Authorization"),
+                json.loads(request.content),
+            )
+        )
+        if len(posts) > 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={"chunks_retired": 3})
+
+    sink = GDriveStatusSink(
+        "http://verity.local:8080",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer admin-key"},
+        ),
+    )
+    body = {
+        "tenant_id": TENANT,
+        "source": "gdrive",
+        "document_id": GONE_ID,
+        "reason": "removed",
+    }
+    sink.retire(body)
+    # The replay rides the admin route under the same bearer as deliver().
+    assert posts == [(RETIRE_PATH, "Bearer admin-key", body)]
+    # A non-2xx raises — the drain keeps the entry parked and re-alarms.
+    with pytest.raises(httpx.HTTPStatusError):
+        sink.retire(body)
+
+
+def test_status_sink_heartbeat_carries_alarms_even_with_zero_deliveries():
+    posts: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={})
+
+    sink = GDriveStatusSink(
+        "http://verity.local:8080",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    sink.alarm_tenant_id = TENANT
+    sink.record_alarm("parked_retraction", "1 detected retraction(s) parked")
+    sink.heartbeat()
+    assert posts == [
+        (
+            "/v1/admin/connector-status",
+            {
+                "tenant_id": TENANT,
+                "source": "gdrive",
+                "items_synced": 0,
+                "alarms": [
+                    {
+                        "kind": "parked_retraction",
+                        "detail": "1 detected retraction(s) parked",
+                    }
+                ],
+            },
+        )
+    ]
+    # Drained: a later alarm-free heartbeat with nothing delivered stays silent.
+    sink.heartbeat()
+    assert len(posts) == 1
 
 
 # --- M1 connector ACL-diff lane (build #5): document-target retraction ------

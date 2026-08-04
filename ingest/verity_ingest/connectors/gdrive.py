@@ -53,12 +53,38 @@ the owner — no copy-down/inherited case to observe). Residual: the Shared-Driv
 inherited-listing behavior could not be exercised here (no shared drive present);
 revisit with a Shared-Drive corpus before claiming Shared-Drive conformance.
 
-Deletions and trashed files emit a removal marker event
-(``GDriveDocumentEvent(removed=True)``); the sink posts it with
-``{"removed": true}``. TODO(server): wire to the server-side retire path —
-§8c source hard-deletes must propagate to tombstone + purge, not merely to
-invalidation. Until that endpoint exists the marker is delivered to the same
-documents endpoint and the server treats it as invalidate-only.
+Retraction enforcement (the retire drain; template: :mod:`sharepoint`, which
+first wired it): a detected retraction — a removal marker
+(``GDriveDocumentEvent(removed=True)`` for a hard delete or a trashed file),
+or a file whose built body comes out QUARANTINED (unreadable/unmappable ACL,
+or all principals unresolvable) — produces NO documents-endpoint op (the
+ingest ladder has nothing it may deliver); each such body is PARKED in the
+``gdrive_parked_retractions.json`` ledger next to the cursor state (dedup'd
+by document_id) and every parked entry is REPLAYED as
+``POST /v1/admin/retire`` under the same admin bearer the sink uses. Replay
+ORDER is load-bearing (the over-retire race): each cycle drains the
+PRE-EXISTING ledger BEFORE delivering the cycle's events, parks the cycle's
+own rejects after delivery, then drains those; and a successful delivery
+UNPARKS any older entry for the same document_id — a parked signal is
+strictly older than that delivery, so replaying it afterwards would blank the
+just-written chunks of a restored/untrashed file. The server closes the
+document's current chunks (``valid_to`` + blanked visibility), so
+previously-indexed content stops serving on the next read after the drain.
+Any 2xx — including the idempotent 0-chunk replay of an already-retired or
+never-indexed document — removes the entry from the ledger; any failure
+keeps it parked and alarmed on the connector-status heartbeat
+(``kind="parked_retraction"``, counting only what remains —
+:class:`GDriveStatusSink`; a sink without that alarm surface keeps the
+printed count plus the durable ledger, never a silent drop) until a later
+cycle drains it. A corrupt ledger is moved aside to ``*.corrupt``, never
+silently overwritten. The change cursor still advances past parked
+retractions — the ledger, not the cursor, carries the signal until its
+replay lands. Honest remainder: retire enforces invalidation at the index
+(chunks closed, visibility blanked), NOT the §8c tombstone + hard-purge
+pipeline — a source hard-delete still does not purge lineage or
+crypto-shred here; and a per-file ACL NARROWING that stays mirrored (fewer
+principals, not a quarantine transition) is a re-index via the acl-diff
+lane, never this drain.
 
 Push lane: ``changes.watch`` needs a public HTTPS endpoint plus channel
 renewal before the 7-day expiry (§5). Poll is the truth lane and always
@@ -92,13 +118,20 @@ bodies, integration lands later):
         "valid_from":     "<RFC 3339 modifiedTime>"
       }
 
-  Quarantined items carry NO ``visibility`` field — the server's structural
-  choke point (§5e) holds them, never indexes them. Removal markers are
-  ``{"tenant_id", "source", "document_id", "removed": true, "valid_from"}``.
+  Quarantined bodies (no ``visibility``) and removal markers
+  (``{"tenant_id", "source", "document_id", "removed": true, "valid_from"}``)
+  are NOT accepted by the documents endpoint — the runners park them in the
+  retraction ledger and drain them as ``POST /v1/admin/retire``
+  ``{"tenant_id", "source", "document_id", "reason"}`` replays (see the
+  retire-drain paragraph above).
 
 Runner: ``python -m verity_ingest.connectors.gdrive --once [--dry-run]``
-with a JSON cursor state file. ``--dry-run`` prints the would-be request
-bodies instead of POSTing.
+with a JSON cursor state file and, beside it, the
+``gdrive_parked_retractions`` ledger of detected retractions awaiting their
+``/v1/admin/retire`` replay (drained every cycle — see the retire-drain
+paragraph above). ``--dry-run`` prints the would-be request bodies instead
+of POSTing (no retire transport: retractions stay parked, printed, never
+silently dropped).
 """
 
 from __future__ import annotations
@@ -132,6 +165,12 @@ DOC_EXPORT_MIME = "text/plain"
 PRINCIPALS_PATH = "/v1/admin/principals"
 DOCUMENTS_PATH = "/v1/ingest/documents"
 CONNECTOR_STATUS_PATH = "/v1/admin/connector-status"
+
+#: The server-side retraction-enforcement route (admin plane, same bearer as
+#: the sink; verity-server ``admin_retire_document``). One body per parked
+#: retraction: ``{tenant_id, source, document_id, reason}`` with reason in
+#: {removed, quarantined, acl_unresolvable}.
+RETIRE_PATH = "/v1/admin/retire"
 
 # The fact lane (selective identity-keyed org/person records) posts here, NOT
 # to /v1/ingest/documents. Debezium-shaped envelopes; verity_acl is a TOP-LEVEL
@@ -1006,6 +1045,10 @@ def build_document_request(
     - resolvable but zero principals resolve to tokens → quarantine (§6b:
       unmappable principals confer nothing; all-unmappable → quarantine);
     - otherwise → mirrored body with int visibility tokens.
+
+    The first two rungs produce bodies the documents endpoint rejects — the
+    runners PARK them in the retraction ledger and drain them as
+    ``POST /v1/admin/retire`` replays (module docstring, the retire drain).
     """
     if event.removed:
         return {
@@ -1061,10 +1104,10 @@ class DocumentSink(Protocol):
 class VerityDocumentSink:
     """POSTs each request body to ``{base}/v1/ingest/documents``.
 
-    The endpoint is being built in a parallel task; this client codes to the
-    contract in the module docstring. Removal markers go to the same endpoint
-    with ``removed: true`` — TODO(server): switch to the retire/purge path
-    (§8c) when it lands.
+    Removal markers and quarantined bodies never ride :meth:`deliver` — the
+    endpoint rejects them; the runners park them in the retraction ledger and
+    drain them via ``POST /v1/admin/retire`` (:class:`GDriveStatusSink.retire`;
+    module docstring, the retire drain).
     """
 
     def __init__(
@@ -1104,6 +1147,70 @@ class VerityDocumentSink:
                 "tenant_id": self._tenant_id,
                 "source": self._source,
                 "items_synced": self._delivered,
+            }
+            if cursor is not None:
+                body["cursor"] = cursor
+            if self._last_event_at:
+                body["last_event_at"] = self._last_event_at
+            self._client.post(f"{self._base_url}{CONNECTOR_STATUS_PATH}", json=body)
+        except Exception:  # noqa: BLE001 — telemetry only
+            pass
+        finally:
+            self._delivered = 0
+            self._last_event_at = None
+
+
+class GDriveStatusSink(VerityDocumentSink):
+    """:class:`VerityDocumentSink` + the fail-closed ``alarms[]`` heartbeat
+    pattern and the ``POST /v1/admin/retire`` transport (the pattern SharePoint
+    established on top of this very sink — brought home so gdrive's own
+    retractions are enforced, not just skipped): the runner queues alarms via
+    :meth:`record_alarm` (``parked_retraction``) and they ride the best-effort
+    ``POST /v1/admin/connector-status`` body. Unlike the base heartbeat, an
+    alarm-bearing heartbeat fires even when ZERO documents were delivered — an
+    all-parked cycle that delivered nothing MUST still reach the operator.
+    Never raises from the heartbeat; drains accumulators in ``finally``."""
+
+    #: Set by the runner so an alarm-only heartbeat (zero delivered docs) can
+    #: still key its connector-status row by tenant.
+    alarm_tenant_id: str | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._alarms: list[dict[str, str]] = []
+
+    def record_alarm(self, kind: str, detail: str) -> None:
+        """Queue one fail-closed alarm for the next heartbeat. ``kind`` is a
+        stable machine tag; ``detail`` is a human string (never a secret)."""
+        self._alarms.append({"kind": kind, "detail": detail})
+
+    def retire(self, request: Mapping[str, Any]) -> None:
+        """Replay one parked retraction as ``POST /v1/admin/retire`` (module
+        docstring, the retire drain): the server closes the document's current
+        chunks (``valid_to`` + blanked visibility), enforcing the retraction
+        at the index. Same client + admin bearer as :meth:`deliver`. Raises on
+        non-2xx — the drain keeps the entry parked and re-alarms; a replay of
+        an already-retired document is a 2xx with ``chunks_retired: 0``."""
+        response = self._client.post(f"{self._base_url}{RETIRE_PATH}", json=dict(request))
+        response.raise_for_status()
+
+    def heartbeat(self, cursor: str | None = None) -> None:
+        alarms = list(self._alarms)
+        self._alarms = []
+        if not alarms:
+            super().heartbeat(cursor)
+            return
+        tenant = self._tenant_id or self.alarm_tenant_id
+        if not tenant:
+            self._delivered = 0
+            self._last_event_at = None
+            return
+        try:
+            body: dict[str, Any] = {
+                "tenant_id": tenant,
+                "source": "gdrive",
+                "items_synced": self._delivered,
+                "alarms": alarms,
             }
             if cursor is not None:
                 body["cursor"] = cursor
@@ -1413,15 +1520,173 @@ def _save_cursor(state_file: Path, cursor: str) -> None:
 def _is_indexable_body(body: Mapping[str, Any]) -> bool:
     """Whether a document body is one the ``/v1/ingest/documents`` endpoint
     accepts. A quarantine marker (an ACL we could not read or map — fail
-    closed, §5a/§5e.6) and a removal marker are NOT accepted there; they are
-    skipped so an unscopable or deleted file never aborts a whole-Drive crawl.
-    An unscopable file is simply not indexed — nothing leaks — and the skip is
-    counted and reported, never silent."""
+    closed, §5a/§5e.6) and a removal marker are NOT accepted there — they are
+    retraction signals, not deliveries: the runners PARK them in the
+    ``gdrive_parked_retractions.json`` ledger and drain them as
+    ``POST /v1/admin/retire`` replays (module docstring, the retire drain), so
+    an unscopable or deleted file never aborts a whole-Drive crawl and its
+    previously-indexed content stops serving once the replay lands."""
     if body.get("removed"):
         return False
     if body.get("acl_provenance") == "quarantined":
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Parked-retractions ledger + the /v1/admin/retire drain that empties it
+# (adapted from the sharepoint connector, which wired this drain first; gdrive
+# document_ids are bare Drive file ids, so entries carry document_id + reason)
+# ---------------------------------------------------------------------------
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ledger_path(state_file: Path) -> Path:
+    """The parked-retractions ledger lives NEXT TO the cursor state so the two
+    travel together (same .verity/ dir, same backup/rotation story)."""
+    return state_file.with_name("gdrive_parked_retractions.json")
+
+
+def _parked_entry(event: GDriveDocumentEvent, body: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "document_id": event.document_id,
+        "reason": "removed" if body.get("removed") else "quarantined",
+    }
+
+
+def _park_retractions(
+    state_file: Path, entries: Sequence[Mapping[str, str]], now_iso: str
+) -> tuple[int, Path]:
+    """Persist detected retractions pending their ``/v1/admin/retire`` replay
+    (module docstring, the retire drain) — the drain
+    (:func:`_drain_parked_retractions`) runs right after parking, so an entry
+    normally lives here only for the instant between detection and its 2xx
+    replay; it PERSISTS across cycles only while the replay keeps failing
+    (server down, refused body).
+
+    Each entry carries ``{document_id, reason}``; the ledger dedups by
+    ``document_id`` (a permanently-quarantined file that resurfaces every
+    cycle updates ``last_seen``/``reason``, it does not grow the file).
+    Returns ``(total_outstanding, ledger_path)`` — with no new entries it just
+    counts, so the alarm keeps firing while anything is still parked. An
+    unparseable ledger is moved aside to ``*.corrupt``, never silently
+    overwritten (the signal must not be lost)."""
+    path = _ledger_path(state_file)
+    ledger: list[dict] = []
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+        except ValueError:
+            path.replace(path.with_name(path.name + ".corrupt"))
+        else:
+            if isinstance(raw, list):
+                ledger = [e for e in raw if isinstance(e, dict)]
+    if not entries:
+        return len(ledger), path
+    by_document = {str(e.get("document_id")): e for e in ledger}
+    for entry in entries:
+        existing = by_document.get(entry["document_id"])
+        if existing is not None:
+            existing["last_seen"] = now_iso
+            existing["reason"] = entry["reason"]
+            continue
+        record = dict(entry)
+        record["first_seen"] = now_iso
+        record["last_seen"] = now_iso
+        ledger.append(record)
+        by_document[record["document_id"]] = record
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+    return len(ledger), path
+
+
+def _unpark_delivered(state_file: Path, document_ids: set[str]) -> int:
+    """Remove parked entries for documents successfully DELIVERED this cycle —
+    the other half of the over-retire-race guard: a 2xx delivery is strictly
+    NEWER evidence than any still-parked retraction signal for the same
+    document (the park predates the poll window that restored/untrashed it).
+    Left in place, a later drain would replay the STALE
+    ``removed``/``quarantined`` entry and blank the chunks the delivery just
+    wrote. Returns the number of entries removed."""
+    if not document_ids:
+        return 0
+    path = _ledger_path(state_file)
+    if not path.exists():
+        return 0
+    try:
+        raw = json.loads(path.read_text())
+    except ValueError:
+        return 0  # corrupt-ledger handling (move-aside) is _park_retractions' job
+    ledger = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    remaining = [e for e in ledger if str(e.get("document_id")) not in document_ids]
+    if len(remaining) != len(ledger):
+        path.write_text(json.dumps(remaining, indent=2, sort_keys=True) + "\n")
+    return len(ledger) - len(remaining)
+
+
+def _drain_parked_retractions(
+    state_file: Path, sink: DocumentSink, tenant_id: str
+) -> tuple[int, int]:
+    """Replay EVERY parked-retractions ledger entry as ``POST /v1/admin/retire``
+    ``{tenant_id, source, document_id, reason}`` — the enforcement half (module
+    docstring, the retire drain): the server closes the document's current
+    chunks, so the retraction takes effect on the next read. Any 2xx
+    (including the idempotent ``chunks_retired: 0`` replay) removes the entry
+    from the ledger; any failure keeps it parked for the next cycle — the
+    alarm then counts only what remains. Sinks without a ``retire`` transport
+    (dry-run, capture-only fixtures) drain nothing: every entry stays parked
+    and alarmed, never silently dropped. Returns ``(outstanding, drained)``."""
+    path = _ledger_path(state_file)
+    if not path.exists():
+        return 0, 0
+    try:
+        raw = json.loads(path.read_text())
+    except ValueError:
+        return 0, 0  # corrupt-ledger handling (move-aside) is _park_retractions' job
+    ledger = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    retire = getattr(sink, "retire", None)
+    if not ledger or not callable(retire):
+        return len(ledger), 0
+    remaining: list[dict] = []
+    for entry in ledger:
+        body = {
+            "tenant_id": tenant_id,
+            "source": "gdrive",
+            "document_id": str(entry.get("document_id") or ""),
+            "reason": str(entry.get("reason") or ""),
+        }
+        try:
+            retire(body)
+        except Exception:  # noqa: BLE001 — deliberately broad, see below
+            # ANY replay failure — transport (httpx), auth, an unexpected
+            # response shape, even a sink bug — keeps the entry parked and
+            # alarmed, never crashes the drain. The ledger is the ONLY carrier
+            # of a detected retraction once the change cursor has advanced
+            # past it; aborting mid-drain would lose the checkpoint, the
+            # alarm, and the heartbeat, leaving the operator blind to
+            # unenforced retractions. Fail closed; retried next cycle.
+            remaining.append(entry)
+    if len(remaining) != len(ledger):
+        path.write_text(json.dumps(remaining, indent=2, sort_keys=True) + "\n")
+    return len(remaining), len(ledger) - len(remaining)
+
+
+def _alarm_parked(sink: DocumentSink, total: int, ledger_path: Path) -> None:
+    """Alarm the outstanding (post-drain) parked-retraction count on sinks that
+    support the alarms[] heartbeat (:class:`GDriveStatusSink`; best-effort on
+    others — the ledger plus the printed count are the durable signal either
+    way). An empty ledger alarms nothing."""
+    record_alarm = getattr(sink, "record_alarm", None)
+    if total and callable(record_alarm):
+        record_alarm(
+            "parked_retraction",
+            f"{total} detected retraction(s) parked — the {RETIRE_PATH} replay "
+            f"failed or is unavailable on this sink, so the content is NOT yet "
+            f"removed from the index; retried next cycle; ledger: {ledger_path}",
+        )
 
 
 def run_once(
@@ -1432,9 +1697,21 @@ def run_once(
     fact_sink: FactSink | None = None,
     acl_lane: AclDiffLane | None = None,
 ) -> int:
-    """One poll cycle: load cursor, poll, deliver, checkpoint. Returns the
-    number of delivered requests. The cursor is checkpointed only after
+    """One poll cycle: load cursor, poll, deliver, checkpoint, drain. Returns
+    the number of delivered requests. The cursor is checkpointed only after
     delivery succeeds, so a crash replays the window (at-least-once).
+
+    Retraction bodies the ingest ladder cannot deliver — removal markers and
+    quarantined bodies — are PARKED in the retraction ledger, then the whole
+    ledger is DRAINED as ``POST /v1/admin/retire`` replays (enforced at the
+    index, next read); entries whose replay fails stay parked + alarmed,
+    never silently dropped. ORDER is load-bearing (the over-retire race): the
+    PRE-EXISTING ledger drains BEFORE this cycle's deliveries, and a
+    successful delivery UNPARKS any older entry for its document_id — a
+    parked signal is strictly older than the delivery, so replaying it after
+    would blank the just-written chunks of a restored/untrashed file. The
+    cursor still advances past parked retractions — the ledger, not the
+    cursor, carries the signal until its replay lands.
 
     When ``fact_sink`` is given, the selective org/person facts accumulated over
     this poll batch (a side-effect of the document pass) are delivered AFTER the
@@ -1446,16 +1723,28 @@ def run_once(
     Purely additive — never affects the document count or the cursor."""
     cursor = _load_cursor(state_file)
     events, next_cursor = asyncio.run(connector.poll(cursor))
+    # THE RACE, guard #1: drain the PRE-EXISTING ledger BEFORE delivering.
+    # A parked entry is strictly older than anything this cycle delivers, so
+    # its replay must land on the OLD index state — drained after delivery it
+    # would blank the fresh chunks of a file this cycle just restored.
+    _, pre_drained = _drain_parked_retractions(state_file, sink, connector.config.tenant_id)
     delivered = 0
-    skipped = 0
+    delivered_ids: set[str] = set()
+    parked: list[dict[str, str]] = []
     for event in events:
         assert isinstance(event, GDriveDocumentEvent)
         body = build_document_request(event, registry, connector.config.tenant_id)
         if not _is_indexable_body(body):
-            skipped += 1
+            # An undeliverable retraction signal — park it, never drop it.
+            parked.append(_parked_entry(event, body))
+            delivered_ids.discard(event.document_id)  # in-stream, the park is newer
             continue
         sink.deliver(body)
         delivered += 1
+        delivered_ids.add(event.document_id)
+        # In-stream order is truth order: this delivery supersedes any
+        # EARLIER same-cycle park for the same document.
+        parked = [p for p in parked if p["document_id"] != event.document_id]
         # ACL-diff lane (additive): only for resolvable ACLs — an unresolvable
         # one quarantines and confers no principals, so it has no diff baseline.
         if acl_lane is not None and event.acl.resolvable:
@@ -1469,15 +1758,31 @@ def run_once(
         acl_lane.flush()
         if acl_lane.emitted:
             print(f"gdrive: emitted {acl_lane.emitted} acl-change (tightening) retraction(s)")
-    if skipped:
-        print(f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or removed)")
+    # THE RACE, guard #2: a successful delivery is strictly newer than any
+    # entry still parked for the same document (e.g. guard #1's replay failed
+    # and the entry survived) — unpark it, or a later drain replays the STALE
+    # retraction over the chunks just written.
+    _unpark_delivered(state_file, delivered_ids)
+    total_parked, ledger_path = _park_retractions(state_file, parked, _utcnow_iso())
+    total_parked, drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
+    drained += pre_drained
+    if parked or drained:
+        print(
+            f"gdrive: parked {len(parked)} retraction signal(s) this cycle "
+            f"(removed/quarantined); drained {drained} via POST {RETIRE_PATH}; "
+            f"{total_parked} still parked -> {ledger_path}"
+        )
     if fact_sink is not None:
         orgs, persons = deliver_facts(connector, registry, fact_sink)
         if orgs or persons:
             print(f"gdrive: emitted {orgs} org, {persons} person fact(s)")
     _save_cursor(state_file, next_cursor)
+    _alarm_parked(sink, total_parked, ledger_path)
     # Best-effort connector heartbeat (task 28): sinks that support it
-    # (VerityDocumentSink) report the batch; DryRunSink et al. just skip.
+    # (VerityDocumentSink/GDriveStatusSink) report the batch — including any
+    # parked_retraction alarm; DryRunSink et al. just skip.
     heartbeat = getattr(sink, "heartbeat", None)
     if heartbeat is not None:
         heartbeat(cursor=next_cursor)
@@ -1488,6 +1793,7 @@ def run_backfill(
     connector: GDriveConnector,
     registry: PrincipalRegistry,
     sink: DocumentSink,
+    state_file: Path,
     reporter: BackfillReporter | None = None,
     *,
     flush_every: int = 20,
@@ -1503,24 +1809,39 @@ def run_backfill(
     ``flush_every`` deliveries so the bar moves without a post per item. A crash
     mid-crawl is reported as a ``failed`` run (with the error) and then
     re-raised; a clean finish marks the run ``completed``. Returns the number of
-    delivered requests."""
+    delivered requests.
+
+    ``state_file`` anchors the parked-retractions ledger (the backfill itself
+    checkpoints no cursor — ``poll`` owns the change token). Quarantined
+    bodies the ingest ladder cannot deliver are parked there and drained as
+    ``POST /v1/admin/retire`` replays — enforced at the index; failed replays
+    stay parked + alarmed, never silently dropped. Same over-retire-race
+    ordering as :func:`run_once`: the pre-existing ledger drains BEFORE the
+    crawl delivers, and a successful delivery unparks any older entry for its
+    document_id (module docstring, the retire drain)."""
     if reporter is not None:
         reporter.start(total=None)
+    # THE RACE, guard #1 (same as run_once): the PRE-EXISTING ledger drains
+    # BEFORE the crawl delivers anything — a parked entry is strictly older
+    # than this backfill's writes and must never blank them.
+    _, pre_drained = _drain_parked_retractions(state_file, sink, connector.config.tenant_id)
     delivered = 0
     pending = 0
-    skipped = 0
     failed = 0
+    delivered_ids: set[str] = set()
+    parked: list[dict[str, str]] = []
 
     async def _drive() -> None:
-        nonlocal delivered, pending, skipped, failed
+        nonlocal delivered, pending, failed
         async for event in connector.full_crawl():
             assert isinstance(event, GDriveDocumentEvent)
             body = build_document_request(event, registry, connector.config.tenant_id)
-            # Fail-closed skip: a file whose ACL we couldn't read/map, or that
-            # was removed, isn't sent to the index endpoint (it wouldn't be
-            # accepted and shouldn't be indexed) — counted, not fatal.
             if not _is_indexable_body(body):
-                skipped += 1
+                # An undeliverable retraction signal (a quarantined file — the
+                # crawl walks non-trashed files, so removals ride poll, not
+                # here) — park it, never drop it.
+                parked.append(_parked_entry(event, body))
+                delivered_ids.discard(event.document_id)  # in-stream, the park is newer
                 continue
             # One file's ingest failure never aborts a whole-Drive backfill:
             # record it and press on, so a single malformed/oversized/rejected
@@ -1534,6 +1855,10 @@ def run_backfill(
                 failed += 1
                 continue
             delivered += 1
+            delivered_ids.add(event.document_id)
+            # In-stream order is truth order: this delivery supersedes any
+            # EARLIER same-crawl park for the same document.
+            parked[:] = [p for p in parked if p["document_id"] != event.document_id]
             pending += 1
             if reporter is not None and pending >= flush_every:
                 reporter.advance(pending)
@@ -1551,10 +1876,21 @@ def run_backfill(
         if pending:
             reporter.advance(pending)
         reporter.finish()
-    if skipped or failed:
+    # THE RACE, guard #2 (same as run_once): deliveries are strictly newer
+    # than any still-parked entry for the same document — unpark before the
+    # post-crawl park + drain.
+    _unpark_delivered(state_file, delivered_ids)
+    total_parked, ledger_path = _park_retractions(state_file, parked, _utcnow_iso())
+    total_parked, drained = _drain_parked_retractions(
+        state_file, sink, connector.config.tenant_id
+    )
+    drained += pre_drained
+    if parked or drained or failed:
         print(
-            f"gdrive: skipped {skipped} file(s) (unreadable/unmappable ACL or "
-            f"removed), {failed} ingest failure(s)"
+            f"gdrive: parked {len(parked)} retraction signal(s) (quarantined); "
+            f"drained {drained} via POST {RETIRE_PATH} "
+            f"({total_parked} still parked -> {ledger_path}), "
+            f"{failed} ingest failure(s)"
         )
     # Fact lane (additive): after the whole crawl has drained, resolve the owner
     # token once and deliver the deduped org/person envelopes. A delivery
@@ -1567,6 +1903,10 @@ def run_backfill(
         else:
             if orgs or persons:
                 print(f"gdrive: emitted {orgs} org, {persons} person fact(s)")
+    _alarm_parked(sink, total_parked, ledger_path)
+    heartbeat = getattr(sink, "heartbeat", None)
+    if heartbeat is not None:
+        heartbeat()
     return delivered
 
 
@@ -1654,9 +1994,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry = StaticRegistry(json.loads(args.principal_map.read_text()))
     else:
         registry = HttpRegistry(args.verity_url, tenant_id=config.tenant_id, api_key=api_key)
-    sink: DocumentSink = (
-        DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
-    )
+    sink: DocumentSink
+    if args.dry_run:
+        sink = DryRunSink()
+    else:
+        status_sink = GDriveStatusSink(args.verity_url, api_key=api_key)
+        # Alarm-only heartbeats (an all-parked cycle that delivered nothing)
+        # still need a tenant to key their connector-status row.
+        status_sink.alarm_tenant_id = config.tenant_id
+        sink = status_sink
     fact_sink: FactSink | None = None
     if config.emit_facts:
         fact_sink = (
@@ -1684,7 +2030,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_id=run_id,
             )
         )
-        delivered = run_backfill(connector, registry, sink, reporter, fact_sink=fact_sink)
+        delivered = run_backfill(
+            connector, registry, sink, args.state_file, reporter, fact_sink=fact_sink
+        )
         print(f"gdrive: backfill delivered {delivered} request(s)")
         return 0
 
