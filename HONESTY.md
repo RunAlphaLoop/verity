@@ -68,9 +68,27 @@ reports them. Honest limits on the Entra side: cross-IdP SSO-alias welding is fa
 inert on cloud-only tenants (`onPremisesImmutableId` is null, so zero aliases are written —
 surfaced as a warning, never guessed) and has not been confirmed against a federated
 tenant. Neither directory sync has been run at scale against a large production tenant, and
-the Entra sync alone is an identity plane — no Microsoft *content* connector ships yet
-(SharePoint/OneDrive is the next planned spoke), so today it resolves group grants that
-other sources reference, nothing more.
+the Entra sync is the identity plane the SharePoint/OneDrive content connector resolves
+its group grants through.
+
+## Two different fail-closed guarantees — and a stalled sync only gets you one
+
+"Fail closed" covers two distinct promises, and Verity currently delivers them unevenly:
+
+1. **Fail closed on "you don't have access"** — enforced everywhere, always: the in-index
+   pre-filter, quarantine-on-unresolvable-ACL, empty-scope-matches-nothing.
+2. **Fail closed on "we don't know if this is still valid"** — enforced today only on the
+   **identity plane**: recall sits behind a staleness fence keyed off the authorization
+   datastore's change stream, and returns empty rather than serve permission data whose
+   freshness it cannot positively confirm.
+
+What a **silently stalled source connector** (rate-limited API, expired token) gets you is
+NOT the second guarantee: already-indexed rows keep serving their last-synced ACLs. The
+stall is *observable* — per-connector heartbeats, reconcile-SLA alarms, and new indexing
+quarantines once the SLA is blown — but it is not *enforced on the read path*: hits do not
+carry a per-source `last_synced_at`, and nothing refuses rows behind a freshness threshold.
+Until that per-source freshness gate exists (planned, on the same fence machinery), assume
+a stalled connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
 
 ## No users, no SOC 2, no hosted cloud
 
