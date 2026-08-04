@@ -294,8 +294,15 @@ class HttpGraphTransport:
     def _get(self, url_or_path: str, params: Mapping[str, str] | None) -> dict:
         attempt = 0
         while True:
+            # params=None must stay None: httpx treats an EMPTY dict as "replace
+            # the URL's query string", which would strip the $skiptoken off a
+            # followed @odata.nextLink and restart the enumeration forever (a
+            # live-only loop the fixture transport can't see — caught in the
+            # phase-9 live validation).
             response = self._client.get(
-                url_or_path, params=dict(params or {}), headers=self._headers()
+                url_or_path,
+                params=dict(params) if params else None,
+                headers=self._headers(),
             )
             if response.status_code == 429 and attempt < self._max_retries:
                 retry_after = float(response.headers.get("Retry-After", "1"))

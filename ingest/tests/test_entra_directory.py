@@ -1010,6 +1010,49 @@ def test_http_transport_raises_sync_state_reset_on_410():
         list(transport.get_delta("https://graph/expired-link", {}))
 
 
+def test_http_transport_follows_nextlink_verbatim_preserving_skiptoken():
+    """Regression for the live-only paging loop: httpx treats params={} as
+    "replace the URL's query", which stripped the $skiptoken off a followed
+    @odata.nextLink and restarted the enumeration forever. The follow-up request
+    must carry the skiptoken and must NOT re-send the initial $select/$top."""
+    from verity_ingest.connectors.entra_directory import HttpGraphTransport
+
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        if "$skiptoken" not in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "value": [{"id": "u1"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/delta?$skiptoken=tokenA123",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"value": [], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/users/delta?$deltatoken=final"},
+        )
+
+    transport = HttpGraphTransport(
+        lambda: "tok",
+        client=httpx.Client(
+            base_url="https://graph.microsoft.com/v1.0",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    pages = list(transport.get_delta("users/delta", {"$select": "id", "$top": "999"}))
+    # Terminates in exactly two pages (no loop), and the follow-up preserved the
+    # skiptoken while dropping the initial params (link followed verbatim).
+    assert len(pages) == 2
+    assert "@odata.deltaLink" in pages[1]
+    assert len(seen) == 2
+    assert "%24select=id" in str(seen[0]) or "$select=id" in str(seen[0])
+    followed = str(seen[1])
+    assert "skiptoken=tokenA123" in followed
+    assert "select" not in followed
+
+
 def test_http_transport_honors_retry_after_on_429():
     from verity_ingest.connectors.entra_directory import HttpGraphTransport
 
