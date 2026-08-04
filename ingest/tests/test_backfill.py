@@ -9,6 +9,7 @@ crawl runs over the same recorded Drive fixtures as test_gdrive.py.
 from __future__ import annotations
 
 import io
+import json
 
 import httpx
 import pytest
@@ -139,7 +140,7 @@ class _CrawlTransport(FixtureTransport):
         return super().get_json(path, params)
 
 
-def test_run_backfill_crawls_and_reports_progress():
+def test_run_backfill_crawls_and_reports_progress(tmp_path):
     connector = GDriveConnector(_CrawlTransport(), GDriveConfig(tenant_id=TENANT))
     registry = StaticRegistry(REGISTRY_MAP)
     sink = DryRunSink(stream=io.StringIO())
@@ -147,13 +148,20 @@ def test_run_backfill_crawls_and_reports_progress():
     reporter = BackfillReporter(
         "http://verity.local", TENANT, "gdrive", client=client, run_id="bf"
     )
+    state_file = tmp_path / "gdrive_cursor.json"
 
     # flush_every=1 so each delivery emits an advance we can count.
-    delivered = run_backfill(connector, registry, sink, reporter, flush_every=1)
+    delivered = run_backfill(connector, registry, sink, state_file, reporter, flush_every=1)
 
-    # Three non-trashed files walked across two pages, each delivered once.
-    assert delivered == 3
-    assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID, PDF_ID]
+    # Three non-trashed files walked across two pages; the two mirrored ones
+    # delivered. The anyone-shared PDF quarantines fail-closed: the documents
+    # endpoint rejects quarantined bodies, so it is PARKED in the retraction
+    # ledger — and with no retire transport on this DryRunSink it STAYS parked
+    # (never silently dropped; the enforced drain is pinned in test_gdrive.py).
+    assert delivered == 2
+    assert [r["document_id"] for r in sink.requests] == [DOC_ID, TXT_ID]
+    parked = json.loads((tmp_path / "gdrive_parked_retractions.json").read_text())
+    assert [(e["document_id"], e["reason"]) for e in parked] == [(PDF_ID, "quarantined")]
 
     bodies = [b for _, b in client.posts]
     assert bodies[0]["state"] == "running"
@@ -163,7 +171,7 @@ def test_run_backfill_crawls_and_reports_progress():
     assert advanced == delivered, "reported progress accounts for every delivery"
 
 
-def test_run_backfill_reports_failure_then_reraises():
+def test_run_backfill_reports_failure_then_reraises(tmp_path):
     class _BoomSink(DryRunSink):
         def deliver(self, request: dict) -> None:
             raise RuntimeError("sink exploded")
@@ -176,7 +184,13 @@ def test_run_backfill_reports_failure_then_reraises():
     )
 
     with pytest.raises(RuntimeError, match="sink exploded"):
-        run_backfill(connector, registry, _BoomSink(stream=io.StringIO()), reporter)
+        run_backfill(
+            connector,
+            registry,
+            _BoomSink(stream=io.StringIO()),
+            tmp_path / "gdrive_cursor.json",
+            reporter,
+        )
 
     states = [b.get("state") for _, b in client.posts]
     assert states[0] == "running"
