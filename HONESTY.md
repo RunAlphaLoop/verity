@@ -36,7 +36,7 @@ production org at scale.
 ## Connectors — what's real, and how faithful
 
 All six source connectors (Google Drive, Gmail, HubSpot, Salesforce, Notion, Intercom) plus
-two directory syncs (Google Workspace and Microsoft Entra ID) ship on `main` and are tested
+two directory syncs (Google Workspace and Microsoft Entra ID) and a SharePoint Online/OneDrive content connector ship on `main` and are tested
 in CI **against recorded fixtures — no live credentials run in CI.** Each has also been
 validated once against a live account during development. That is a development validation, not continuous testing and not a turnkey,
 production-hardened integration. ACL fidelity varies by what each source's API actually
@@ -51,6 +51,12 @@ exposes:
 - **Notion — approximated.** The public Notion API exposes no per-page sharing, so Notion
   content rides an admin-assigned visibility floor: **fail-closed** (it over-hides, never
   leaks), but it is *not* true per-page ACL inheritance like Drive.
+- **SharePoint/OneDrive** — per-item Graph permissions mirrored on the Entra identity plane,
+  live-proven end to end on a (scratch) tenant including deletion-to-dark: a source-deleted
+  document is detected, retired via `/v1/admin/retire`, and stops resolving on the next cycle.
+  Honest limits: SP-native site groups quarantine until the SP-REST lane exists; a drive
+  without a configured completeness canary quarantines wholesale (Graph returns partial ACLs
+  to under-privileged callers with a 200); change subscriptions not yet wired (poll lane only).
 - **Intercom** — conversations ride the operator-declared teammate-audience floor plus the
   resolved assignee as a provable superset; fail-closed on unassigned.
 
