@@ -463,6 +463,11 @@ pub(crate) struct AppState {
     /// `--directory` flag routes through the server start endpoint, never a
     /// second child. See directory_worker::DirectoryPlane.
     pub(crate) directory: directory_worker::DirectoryPlane,
+    /// Console/CLI-started Microsoft Entra directory-sync plane — the Microsoft
+    /// analog of `directory`. Its own server-owned child + Entra app-registration
+    /// spawn config; ONE owner only, routed through the entra start endpoint. See
+    /// directory_worker::EntraDirectoryPlane.
+    pub(crate) entra_directory: directory_worker::EntraDirectoryPlane,
     /// Console-triggered per-(tenant, source) ONE-SHOT backfill plane (Phase 3):
     /// the owner map keyed on (tenant, source) + the env SA-key fallback. Only
     /// gdrive/gmail are spawnable; callers gate. Wrapped in `Arc` so the detached
@@ -958,6 +963,11 @@ async fn admin_planes(
     // heartbeat proxy. The reconcile interval is the group-membership ACL SLO.
     planes.push(directory_plane_row(&state, q.tenant_id).await);
 
+    // 7b · Entra directory-sync worker (Identity Plane, Microsoft analog) — same
+    // two-tier treatment as gdirectory, keyed on the `entra` connector-status
+    // heartbeat when not server-owned.
+    planes.push(entra_directory_plane_row(&state, q.tenant_id).await);
+
     // 8 · continuous-sync SCHEDULER (Phase 4) — the per-(tenant, source) interval
     // loops firing `--once` poll cycles. Server-authoritative from the in-memory
     // armed-loop count (a loop is armed iff this process owns it); the durable
@@ -1286,6 +1296,131 @@ async fn directory_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_j
     row
 }
 
+/// The exact missing-prereq fix for a not-startable Entra directory worker
+/// (repo / venv / app-registration config, in resolution order). `None` when all
+/// prereqs exist. Mirrors `directory_start_hint`.
+fn entra_directory_start_hint(
+    repo: Option<&std::path::Path>,
+    venv: bool,
+    config: bool,
+) -> Option<String> {
+    let Some(repo) = repo else {
+        return Some(
+            "start the server with --repo <path> (or VERITY_REPO) so it can find ingest/.venv"
+                .to_string(),
+        );
+    };
+    if !venv {
+        Some(format!(
+            "no ingest virtualenv at {}/ingest/.venv/bin/python — create it (cd ingest && \
+             python -m venv .venv && .venv/bin/pip install -e '.[gdrive]') then try again",
+            repo.display()
+        ))
+    } else if !config {
+        Some(
+            "Entra directory sync needs an app registration — set ENTRA_TENANT_ID, ENTRA_CLIENT_ID \
+             and one of ENTRA_CLIENT_SECRET_FILE / ENTRA_CLIENT_CERT_FILE on the server, then try \
+             again"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// The `entra_directory` row — the Microsoft analog of `directory_plane_row`.
+/// Authoritative when this server owns a live entra child, else the tenant-scoped
+/// `entra` connector-status heartbeat proxy. A dead owned child is reaped before
+/// falling through — never a stale "running, pid N".
+async fn entra_directory_plane_row(state: &AppState, tenant_id: uuid::Uuid) -> serde_json::Value {
+    const LABEL: &str = "Entra directory sync worker";
+
+    // Tier 1 — AUTHORITATIVE (server-owned), same probe/reap discipline.
+    if let Some(worker) = state.entra_directory.owned_live().await {
+        let detail = format!(
+            "running · pid {} · started from this console {} — reconciling Microsoft Entra \
+             users + groups (nested membership) into SpiceDB every {}s; that interval is the \
+             ACL-freshness bound.",
+            worker.pid,
+            humanize_ago(worker.started_at),
+            state.entra_directory.interval_secs,
+        );
+        let mut row = plane_row(
+            "entra_directory",
+            LABEL,
+            "startable",
+            "on",
+            detail,
+            false,
+            None,
+        );
+        let obj = row.as_object_mut().expect("plane_row is an object");
+        obj.insert("authority".into(), serde_json::json!("server"));
+        obj.insert("stoppable".into(), serde_json::json!(true));
+        obj.insert("pid".into(), serde_json::json!(worker.pid));
+        obj.insert(
+            "started_at".into(),
+            serde_json::json!(worker.started_at.to_rfc3339()),
+        );
+        obj.insert(
+            "worker_tenant_id".into(),
+            serde_json::json!(worker.tenant_id.to_string()),
+        );
+        return row;
+    }
+
+    // Tier 2 — OBSERVED PROXY: the `entra` connector-status heartbeat.
+    let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT updated_at FROM connector_status WHERE tenant_id = $1 AND source = 'entra'",
+    )
+    .bind(tenant_id)
+    .fetch_optional(state.pool())
+    .await
+    .ok()
+    .flatten();
+
+    let repo = state.repo_root.as_deref();
+    let venv = directory_worker::venv_exists(repo);
+    let config = state.entra_directory.config_ready();
+    let startable = repo.is_some() && venv && config;
+    let hint = entra_directory_start_hint(repo, venv, config);
+
+    let recent = last.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(2));
+    let (status, detail) = if recent {
+        let t = last.expect("recent implies Some");
+        (
+            "unknown",
+            format!(
+                "recently reconciled {}, but this console doesn't own a running worker (it may \
+                 have just finished, or be running elsewhere). Start one here to own and stop it.",
+                humanize_ago(t)
+            ),
+        )
+    } else {
+        let recency = match last {
+            Some(t) => format!("last reconciled {}", humanize_ago(t)),
+            None => "has never run".to_string(),
+        };
+        (
+            "off",
+            format!("off — {recency}. Group-membership ACLs go stale until it runs."),
+        )
+    };
+    let mut row = plane_row(
+        "entra_directory",
+        LABEL,
+        "startable",
+        status,
+        detail,
+        startable,
+        hint.as_deref(),
+    );
+    let obj = row.as_object_mut().expect("plane_row is an object");
+    obj.insert("authority".into(), serde_json::json!("observed"));
+    obj.insert("stoppable".into(), serde_json::json!(false));
+    row
+}
+
 /// POST /v1/admin/planes/knowledge/start {tenant_id} (admin): spawn + track the
 /// consolidation worker for this tenant. Idempotent (an already-owned live
 /// child → 200 no-op). Missing repo/venv → 422, missing key / OS spawn failure
@@ -1461,6 +1596,91 @@ async fn admin_planes_directory_stop(
     }
 }
 
+/// POST /v1/admin/planes/entra-directory/start {tenant_id} (admin): spawn + track
+/// the Microsoft Entra directory-sync worker for this tenant — the Microsoft
+/// analog of the directory start. Idempotent (an already-owned live child → 200
+/// no-op). Missing repo/venv → 422; missing app-registration config / OS spawn
+/// failure → 503 — each with the exact fix, NEVER a 500. The client secret/cert
+/// PATH is passed to the child; the server never reads the secret contents.
+async fn admin_planes_entra_directory_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.entra_directory.worker.lock().await;
+
+    // ONE owner per server: a LIVE child (any tenant) → idempotent no-op; a dead
+    // child is reaped and we respawn.
+    if let Some(worker) = guard.as_mut() {
+        match worker.child.try_wait() {
+            Ok(None) => {
+                return Ok(Json(serde_json::json!({
+                    "started": false,
+                    "pid": worker.pid,
+                    "already_running": true,
+                })));
+            }
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    let base_url = worker_base_url(&state.listen);
+    match directory_worker::spawn_entra(
+        state.repo_root.as_deref(),
+        &base_url,
+        body.tenant_id,
+        state.admin_token.as_deref(),
+        &state.entra_directory.creds,
+        state.entra_directory.interval_secs,
+    ) {
+        Ok(worker) => {
+            let pid = worker.pid;
+            *guard = Some(worker);
+            Ok(Json(serde_json::json!({ "started": true, "pid": pid })))
+        }
+        Err(directory_worker::SpawnError::NoRepo) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the server doesn't know its repo path — start it with --repo <path> or VERITY_REPO \
+             so it can find ingest/.venv"
+                .to_string(),
+        )),
+        Err(directory_worker::SpawnError::NoVenv(msg)) => {
+            Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+        }
+        Err(directory_worker::SpawnError::NoConfig(msg)) => {
+            Err((StatusCode::SERVICE_UNAVAILABLE, msg))
+        }
+        Err(directory_worker::SpawnError::Os(msg)) => Err((StatusCode::SERVICE_UNAVAILABLE, msg)),
+    }
+}
+
+/// POST /v1/admin/planes/entra-directory/stop {tenant_id} (admin): kill + reap
+/// the tracked entra child. Honest no-op when this console owns no entra worker.
+async fn admin_planes_entra_directory_stop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(_body): Json<KnowledgeWorkerBody>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    let mut guard = state.entra_directory.worker.lock().await;
+    match guard.take() {
+        Some(mut worker) => {
+            let pid = worker.pid;
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+            Ok(Json(serde_json::json!({ "stopped": true, "pid": pid })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "stopped": false,
+            "note": "nothing to stop — this console doesn't own an Entra directory worker. If one \
+                     is running it was started outside this console; stop it there.",
+        }))),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // FTUE §2.3: when RUST_LOG is unset, default to `info` — a bare `./verity`
@@ -1579,6 +1799,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|t| !t.is_empty()),
         directory: directory_worker::DirectoryPlane::from_env(),
+        entra_directory: directory_worker::EntraDirectoryPlane::from_env(),
         connectors: Arc::new(connector_worker::ConnectorPlane::from_env()),
         sync: Arc::new(sync_scheduler::SyncPlane::new()),
         metrics: app_metrics,
@@ -1799,6 +2020,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/admin/planes/directory/stop",
             post(admin_planes_directory_stop),
+        )
+        .route(
+            "/v1/admin/planes/entra-directory/start",
+            post(admin_planes_entra_directory_start),
+        )
+        .route(
+            "/v1/admin/planes/entra-directory/stop",
+            post(admin_planes_entra_directory_stop),
         )
         .route(
             "/v1/admin/groups",
