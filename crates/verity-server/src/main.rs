@@ -48,6 +48,8 @@ mod purpose;
 mod rebac;
 mod rebac_watch;
 mod resolver;
+#[cfg(test)]
+mod retire_tests;
 mod revocation;
 mod scheduler;
 mod scope;
@@ -1859,6 +1861,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/documents", post(ingest_documents))
         .route("/v1/ingest/acl-change", post(ingest_acl_change))
         .route("/v1/admin/acl/correct", post(admin_correct_acl))
+        .route("/v1/admin/retire", post(admin_retire_document))
         .route("/v1/briefs/{entity}", get(brief))
         .route("/v1/admin/briefs/refresh", post(admin_refresh_briefs))
         .route("/v1/admin/reembed/batch", post(admin_reembed_batch))
@@ -3997,6 +4000,60 @@ async fn admin_correct_acl(
         &changed_by,
     )
     .await
+}
+
+/// The connector-retraction reasons `POST /v1/admin/retire` accepts — the
+/// SharePoint parked-retractions vocabulary plus the ACL-unresolvable case.
+/// Anything else is a 422 (an unaudited reason must never be recorded as
+/// evidence).
+const RETIRE_REASONS: [&str; 3] = ["removed", "quarantined", "acl_unresolvable"];
+
+#[derive(Deserialize)]
+struct RetireDocumentRequest {
+    tenant_id: TenantId,
+    source: String,
+    document_id: String,
+    reason: String,
+}
+
+/// POST /v1/admin/retire (admin/connector): strip a previously-indexed
+/// document from the serving index — the ENFORCEMENT half of a connector-
+/// detected retraction (source deletion, mirrored→quarantined transition,
+/// unresolvable ACL; e.g. the SharePoint parked-retractions drain). Closes
+/// every CURRENT chunk of `(source, document_id)` (`valid_to = now()` +
+/// blanked visibility, defense-in-depth over-hide) and appends one append-only
+/// `document_retire_ledger` row — THE audit evidence for this route (written
+/// even on a 0-chunk replay, so no `spawn_audit` here). Idempotent: a replay
+/// retires 0 and is a recorded 200, never a 404 — the connector drain treats
+/// any 2xx as "safe to unpark". Facts are untouched (`retire_entity`'s job)
+/// and there is no knowledge cascade (`forget`'s job).
+async fn admin_retire_document(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RetireDocumentRequest>,
+) -> HandlerResult<Json<serde_json::Value>> {
+    state.admin.check(&headers)?;
+    if !RETIRE_REASONS.contains(&req.reason.as_str()) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "reason must be one of removed|quarantined|acl_unresolvable, got {:?}",
+                req.reason
+            ),
+        ));
+    }
+    state
+        .storage
+        .inner()
+        .ensure_tenant(req.tenant_id)
+        .await
+        .map_err(storage_status)?;
+    let retired = state
+        .storage
+        .retire_document(req.tenant_id, &req.source, &req.document_id, &req.reason)
+        .await
+        .map_err(storage_status)?;
+    Ok(Json(serde_json::json!({ "chunks_retired": retired })))
 }
 
 /// POST /v1/ingest/documents (admin): one document version in → one L0

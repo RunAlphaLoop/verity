@@ -49,6 +49,16 @@ PRINCIPALS_PATH = "/v1/admin/principals"
 FEDERATION_MEMBER_PREFIX = "fed:"
 CROSSWALK_MEMBER_PREFIX = "hubspot-owner:"
 
+#: SharePoint user-grant marker (G2: the immutable Entra objectId is the ONLY
+#: user key — never loginName/UPN/displayName). ``aad-oid:<objectId>`` resolves
+#: through the ``principal_crosswalk`` row the Entra directory sync writes:
+#: ``(source="entra", local_id=<objectId>, link_method="directory_vouched")``.
+AAD_OID_PREFIX = "aad-oid:"
+
+#: The crosswalk ``source`` the Entra directory sync stamps on its self rows
+#: (entra_directory SOURCE_NAME) — the weld target for AAD_OID_PREFIX markers.
+ENTRA_CROSSWALK_SOURCE = "entra"
+
 
 @dataclass(frozen=True)
 class CrosswalkOwner:
@@ -167,3 +177,31 @@ def split_google_principals(principals: Sequence[str]) -> tuple[list[str], list[
         else:
             others.append(principal)
     return emails, others
+
+
+def split_sharepoint_principals(
+    principals: Sequence[str],
+) -> tuple[list[CrosswalkOwner], list[str]]:
+    """Split SharePoint principal strings into (crosswalk_owners, others).
+
+    An ``aad-oid:<objectId>`` user marker becomes
+    ``CrosswalkOwner(source="entra", local_id=<objectId>)`` — resolved via the
+    directory_vouched self-crosswalk rows the Entra dir-sync writes; a miss
+    contributes nothing (fail-closed: no dir-sync ⇒ user grants confer no
+    visibility, never a blind ``user:<guessed-email>`` mint). Everything else
+    (``group:entra-group-…``, ``group:sp-site-…``, the tenant token) is
+    already canonical and rides ``principals`` unchanged.
+    """
+    owners: list[CrosswalkOwner] = []
+    others: list[str] = []
+    for principal in principals:
+        if principal.startswith(AAD_OID_PREFIX):
+            owners.append(
+                CrosswalkOwner(
+                    source=ENTRA_CROSSWALK_SOURCE,
+                    local_id=principal[len(AAD_OID_PREFIX) :],
+                )
+            )
+        else:
+            others.append(principal)
+    return owners, others

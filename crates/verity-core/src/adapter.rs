@@ -151,6 +151,23 @@ pub trait StorageAdapter: Send + Sync {
         deleted_at: DateTime<Utc>,
     ) -> Result<u64>;
 
+    /// Document retraction enforcement (`POST /v1/admin/retire`): close every
+    /// CURRENT chunk of `(source, document_id)` (`valid_to = now()`, plus a
+    /// blanked visibility as defense-in-depth over-hide) and append one
+    /// `document_retire_ledger` evidence row — written even when 0 chunks were
+    /// retired, so a replay is recorded, never an error. Idempotent by
+    /// semantics: a replay's UPDATE matches no current rows. Chunks ONLY —
+    /// facts are `retire_entity`'s job and the knowledge-retraction cascade is
+    /// `forget`'s; nothing is DELETEd (invalidate-don't-delete; hard purge
+    /// stays the §8 pipeline). Returns the number of chunks retired.
+    async fn retire_document(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        reason: &str,
+    ) -> Result<u64>;
+
     // ---- L3 materialized briefs (SPEC §2 L3) ----
     //
     // These carry default implementations so profiles that have not yet built

@@ -203,6 +203,20 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         Ok(retired)
     }
 
+    async fn retire_document(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        // Chunks only — never touches L1 facts, so the facts cache stays warm
+        // (same rationale as a chunk forget).
+        self.inner
+            .retire_document(tenant, source, document_id, reason)
+            .await
+    }
+
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
         self.inner.activity(query).await
     }

@@ -4685,6 +4685,62 @@ impl StorageAdapter for PostgresAdapter {
         Ok(result.rows_affected())
     }
 
+    async fn retire_document(
+        &self,
+        tenant: TenantId,
+        source: &str,
+        document_id: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Close every CURRENT chunk of the lineage and blank its visibility in
+        // the same UPDATE: `valid_to` makes the row non-current (the read
+        // path's mandatory predicate), and the emptied token set is defense-
+        // in-depth over-hide (`visibility && $tokens` can never match).
+        // Superseded rows are untouched — bi-temporal history stays queryable
+        // — and the `valid_to IS NULL` predicate makes a replay inherently
+        // idempotent (it matches nothing and retires 0).
+        let retired = sqlx::query(
+            "UPDATE chunks SET valid_to = now(), visibility = '{}'
+             WHERE tenant_id = $1 AND source = $2 AND document_id = $3
+               AND valid_to IS NULL",
+        )
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        // Append-only evidence, written EVEN for a 0-chunk replay: the ledger
+        // records that the retraction signal was (re-)driven; idempotency
+        // lives in the UPDATE above, never in a key here. Facts and knowledge
+        // are deliberately untouched (retire_entity's / forget's jobs).
+        sqlx::query(
+            "INSERT INTO document_retire_ledger
+                (id, tenant_id, source, document_id, reason, chunks_retired)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(source)
+        .bind(document_id)
+        .bind(reason)
+        .bind(retired as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        tracing::info!(
+            source,
+            document_id,
+            reason,
+            retired,
+            "retire_document: lineage closed"
+        );
+        Ok(retired)
+    }
+
     async fn activity(&self, query: ActivityQuery) -> Result<Vec<ActionRecord>> {
         let scope = &query.scope;
         // Fail closed, same contract as recall.
