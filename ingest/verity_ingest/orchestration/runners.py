@@ -111,9 +111,11 @@ def _hubspot_runner() -> DebeziumPollRunner:
     from verity_ingest.connectors.hubspot import HubSpotConnector, VerityDebeziumSink
 
     policy = _visibility_from_env("HUBSPOT_VISIBILITY")
+    # from_env demands the heartbeat source explicitly: idle beats key the
+    # server's per-source freshness gate and must never ride a default.
     return DebeziumPollRunner(
         connector_factory=lambda: HubSpotConnector(policy),
-        sink_factory=VerityDebeziumSink.from_env,
+        sink_factory=lambda: VerityDebeziumSink.from_env("hubspot"),
     )
 
 
@@ -122,9 +124,12 @@ def _salesforce_runner() -> DebeziumPollRunner:
     from verity_ingest.connectors.salesforce import SalesforceConnector
 
     policy = _visibility_from_env("SALESFORCE_VISIBILITY")
+    # The shared sink defaults its heartbeat source to HubSpot's; an idle
+    # Salesforce cycle heartbeating as "hubspot" would silently mis-key the
+    # server's per-source freshness gate — make it explicit.
     return DebeziumPollRunner(
         connector_factory=lambda: SalesforceConnector(policy),
-        sink_factory=VerityDebeziumSink.from_env,
+        sink_factory=lambda: VerityDebeziumSink.from_env("salesforce"),
     )
 
 
@@ -205,10 +210,20 @@ def _gdrive_runner() -> GDrivePollRunner:
             return StaticRegistry(json.loads(Path(principal_map).read_text()))
         return HttpRegistry(verity_url, api_key=api_key)
 
+    def sink_factory() -> VerityDocumentSink:
+        sink = VerityDocumentSink(verity_url, api_key=api_key)
+        # Same wiring as the module main: a cycle that delivered NOTHING still
+        # needs a tenant + source to key its idle heartbeat row, or the beat is
+        # silently skipped and the server's per-source freshness gate reads a
+        # healthy-but-quiet Drive connector as stalled.
+        sink.alarm_tenant_id = config.tenant_id
+        sink.default_source = "gdrive"
+        return sink
+
     return GDrivePollRunner(
         connector_factory=connector_factory,
         registry_factory=registry_factory,
-        sink_factory=lambda: VerityDocumentSink(verity_url, api_key=api_key),
+        sink_factory=sink_factory,
     )
 
 

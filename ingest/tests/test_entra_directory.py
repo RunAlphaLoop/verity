@@ -546,6 +546,27 @@ def test_heartbeat_reports_source_entra_not_gdirectory(tmp_path):
     assert body["source"] == SOURCE_NAME == "entra"
 
 
+def test_idle_cycle_heartbeats_items_synced_zero():
+    # An idle reconcile (zero ops, zero alarms) still POSTs an items_synced:0
+    # heartbeat keyed by the runner-wired tenant: the server's per-source
+    # freshness gate reads connector_status.updated_at as liveness, and a
+    # healthy directory sync with nothing to apply must not look stalled.
+    sink, posts = _recording_entra_sink()
+    sink.alarm_tenant_id = TENANT  # runner wiring (main sets this)
+    sink.heartbeat(cursor="2026-07-28T00:00:00Z")
+    body = _status_body(posts)
+    assert body == {
+        "tenant_id": TENANT,
+        "source": "entra",
+        "items_synced": 0,
+        "cursor": "2026-07-28T00:00:00Z",
+    }
+    # Without any tenant to key the row, an idle beat is (still) skipped.
+    bare, bare_posts = _recording_entra_sink()
+    bare.heartbeat()
+    assert _status_body(bare_posts) is None
+
+
 def test_sync_state_reset_alarm_lands_in_connector_status_body(tmp_path):
     # Seed a persisted snapshot with cursors so run_once takes the delta path,
     # then force a SyncStateReset when the users deltaLink is followed.

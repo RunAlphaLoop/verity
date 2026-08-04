@@ -1670,9 +1670,42 @@ def test_status_sink_heartbeat_carries_alarms_even_with_zero_deliveries():
             },
         )
     ]
-    # Drained: a later alarm-free heartbeat with nothing delivered stays silent.
+    # Drained: the next alarm-free idle cycle still beats (items_synced 0,
+    # no alarms) so the per-source freshness gate sees a live connector.
     sink.heartbeat()
-    assert len(posts) == 1
+    assert posts[-1] == (
+        "/v1/admin/connector-status",
+        {"tenant_id": TENANT, "source": "sharepoint", "items_synced": 0},
+    )
+
+
+def test_status_sink_idle_cycle_heartbeats_zero():
+    """An idle SharePoint cycle (no deliveries, no alarms) POSTs an
+    items_synced:0 heartbeat — the base-sink idle beat the server's per-source
+    freshness gate needs to tell quiet-but-healthy from stalled."""
+    posts: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={})
+
+    sink = SharePointStatusSink(
+        "http://verity.local:8080",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    sink.alarm_tenant_id = TENANT  # runner wiring (main sets this)
+    sink.heartbeat(cursor="delta-42")
+    assert posts == [
+        (
+            "/v1/admin/connector-status",
+            {
+                "tenant_id": TENANT,
+                "source": "sharepoint",
+                "items_synced": 0,
+                "cursor": "delta-42",
+            },
+        )
+    ]
 
 
 def test_split_sharepoint_principals_shapes_the_crosswalk_request():

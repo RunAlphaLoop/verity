@@ -508,10 +508,47 @@ def test_verity_sink_heartbeat_reports_batch_then_resets():
             "last_event_at": "2026-02-03T10:00:00.000Z",
         },
     )
-    # Accumulators reset: a heartbeat with nothing delivered posts nothing.
-    calls_before = len(posted)
+    # Accumulators reset: the next (idle) cycle still beats — items_synced 0,
+    # no last_event_at — so the server's per-source freshness gate sees a
+    # live-but-quiet connector, not a stalled one.
     sink.heartbeat(cursor="413")
-    assert len(posted) == calls_before
+    assert posted[-1] == (
+        "/v1/admin/connector-status",
+        {
+            "tenant_id": TENANT,
+            "source": "gdrive",
+            "items_synced": 0,
+            "cursor": "413",
+        },
+    )
+
+
+def test_verity_sink_idle_cycle_heartbeats_zero_with_runner_defaults():
+    """A sink that NEVER delivered (fresh idle cycle) still beats when the
+    runner wired the tenant/source defaults — the per-source freshness gate
+    treats a silent connector as stalled, so idle must not be silent."""
+    posted: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"recorded": True})
+
+    sink = VerityDocumentSink(
+        "http://verity.local:8080", client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    # Without runner defaults there is nothing to key the row by: no beat.
+    sink.heartbeat(cursor="1")
+    assert posted == []
+    # With the runner wiring (gdrive main sets both), the idle beat fires.
+    sink.alarm_tenant_id = TENANT
+    sink.default_source = "gdrive"
+    sink.heartbeat(cursor="2")
+    assert posted == [
+        (
+            "/v1/admin/connector-status",
+            {"tenant_id": TENANT, "source": "gdrive", "items_synced": 0, "cursor": "2"},
+        )
+    ]
 
 
 def test_verity_sink_raises_on_rejection():
@@ -1000,9 +1037,13 @@ def test_status_sink_heartbeat_carries_alarms_even_with_zero_deliveries():
             },
         )
     ]
-    # Drained: a later alarm-free heartbeat with nothing delivered stays silent.
+    # Drained: the next alarm-free idle cycle still beats (items_synced 0, no
+    # alarms) so the per-source freshness gate sees a live connector.
     sink.heartbeat()
-    assert len(posts) == 1
+    assert posts[-1] == (
+        "/v1/admin/connector-status",
+        {"tenant_id": TENANT, "source": "gdrive", "items_synced": 0},
+    )
 
 
 # --- M1 connector ACL-diff lane (build #5): document-target retraction ------

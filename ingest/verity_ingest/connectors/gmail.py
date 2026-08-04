@@ -1773,9 +1773,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry = StaticRegistry(json.loads(args.principal_map.read_text()))
     else:
         registry = HttpRegistry(args.verity_url, tenant_id=config.tenant_id, api_key=api_key)
-    sink: DocumentSink = (
-        DryRunSink() if args.dry_run else VerityDocumentSink(args.verity_url, api_key=api_key)
-    )
+    sink: DocumentSink
+    if args.dry_run:
+        sink = DryRunSink()
+    else:
+        verity_sink = VerityDocumentSink(args.verity_url, api_key=api_key)
+        # Idle cycles must still heartbeat (items_synced: 0) or the server's
+        # per-source freshness gate reads a quiet-but-healthy gmail sync as
+        # stalled; with zero deliveries the sink has no request body to learn
+        # tenant/source from, so the runner provides the defaults.
+        verity_sink.alarm_tenant_id = config.tenant_id
+        verity_sink.default_source = "gmail"
+        sink = verity_sink
     fact_sink: FactSink | None = None
     if config.emit_facts:
         fact_sink = (

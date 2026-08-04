@@ -82,13 +82,21 @@ its group grants through.
    datastore's change stream, and returns empty rather than serve permission data whose
    freshness it cannot positively confirm.
 
-What a **silently stalled source connector** (rate-limited API, expired token) gets you is
-NOT the second guarantee: already-indexed rows keep serving their last-synced ACLs. The
-stall is *observable* — per-connector heartbeats, reconcile-SLA alarms, and new indexing
-quarantines once the SLA is blown — but it is not *enforced on the read path*: hits do not
-carry a per-source `last_synced_at`, and nothing refuses rows behind a freshness threshold.
-Until that per-source freshness gate exists (planned, on the same fence machinery), assume
-a stalled connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
+What a **silently stalled source connector** (rate-limited API, expired token) gets you by
+default is still NOT the second guarantee — but the per-source freshness gate now exists,
+**opt-in**. Every recall hit is annotated with its source connector's last successful
+heartbeat (`source_synced_at`, keyed off `connector_status.updated_at`; idle cycles beat
+too), and when a staleness bound is set (`VERITY_SOURCE_FRESHNESS_MAX_SECS`, or a request's
+`max_source_staleness_secs` — the stricter wins) recall DROPS hits from connector sources
+whose last heartbeat is older than the bound, disclosing the drop in an
+`X-Verity-Source-Fence` header and a `source_fence_drops_total` counter. The gate covers
+**recall only**: `get_record` point reads, briefs/`latest_chunks`, and `subscribe`
+deliveries are not yet gated. Exemptions, stated
+plainly: `agent`, `webhook:*`, `folder:*`, and ad-hoc sources ingested outside the
+connector registry have no polling connector to stall and always pass. A registry connector
+source that has **never** heartbeated fails closed while the gate is on (never-synced is
+indistinguishable from stalled). With the gate off — the default — assume a stalled
+connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
 
 ## No users, no SOC 2, no hosted cloud
 

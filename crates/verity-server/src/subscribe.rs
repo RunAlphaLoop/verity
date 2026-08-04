@@ -264,7 +264,7 @@ async fn poll_chunks(
     since: DateTime<Utc>,
 ) -> HandlerResult<Vec<(RecallHit, DateTime<Utc>)>> {
     let rows = sqlx::query(
-        "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier,
+        "SELECT id, source, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier,
                 valid_from, provenance, recorded_at
          FROM chunks
          WHERE tenant_id = $1
@@ -339,6 +339,10 @@ async fn poll_actions(
 fn row_to_hit(row: &PgRow) -> HandlerResult<RecallHit> {
     Ok(RecallHit {
         chunk_id: row.try_get("id").map_err(internal)?,
+        source: row.try_get("source").map_err(internal)?,
+        // Subscriptions deliver by recency; the freshness gate annotates only
+        // the recall path, so no synced-at ride-along here.
+        source_synced_at: None,
         document_id: row.try_get("document_id").map_err(internal)?,
         seq: row.try_get("seq").map_err(internal)?,
         content: row.try_get("content").map_err(internal)?,

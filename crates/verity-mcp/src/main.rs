@@ -468,6 +468,54 @@ fn file_name_from_url(url: &reqwest::Url) -> String {
         .to_owned()
 }
 
+// ---------- local helpers for memory_recall ----------
+
+/// Response header the server sets when the per-source freshness gate dropped
+/// hits from stale/never-heartbeated connector sources.
+const SOURCE_FENCE_HEADER: &str = "x-verity-source-fence";
+
+/// Parse the fence header value (`dropped=<n>; stale=<s1,s2>`) into a
+/// structured object; an unrecognized value is passed through verbatim under
+/// `"raw"` (never silently dropped — the whole point is disclosure).
+fn parse_source_fence(value: &str) -> serde_json::Value {
+    let mut dropped: Option<u64> = None;
+    let mut stale: Option<Vec<String>> = None;
+    for part in value.split(';') {
+        match part.trim().split_once('=') {
+            Some(("dropped", n)) => dropped = n.parse().ok(),
+            Some(("stale", s)) => {
+                stale = Some(
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                )
+            }
+            _ => {}
+        }
+    }
+    match (dropped, stale) {
+        (Some(dropped), Some(stale)) => serde_json::json!({
+            "dropped": dropped,
+            "stale_sources": stale,
+        }),
+        _ => serde_json::json!({ "raw": value }),
+    }
+}
+
+/// Shape the `memory_recall` tool text: the BARE hits array whenever the
+/// server reported no fence drops (backward-compatible — identical to the REST
+/// body), and the `{hits, source_fence}` envelope ONLY when hits were actually
+/// dropped (disclosure trumps shape stability in that case).
+fn render_recall_result(hits: serde_json::Value, fence: Option<serde_json::Value>) -> String {
+    let value = match fence {
+        Some(fence) => serde_json::json!({ "hits": hits, "source_fence": fence }),
+        None => hits,
+    };
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
 // ---------- local helpers for memory_poll_changes ----------
 
 /// Parse an RFC 3339 timestamp field out of a server JSON record.
@@ -577,7 +625,44 @@ impl VerityMcp {
         &self,
         Parameters(p): Parameters<RecallParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.post_json("/v1/recall", &p).await
+        // Not `post_json`: the per-source freshness fence discloses drops in a
+        // RESPONSE HEADER (the HTTP body stays a bare hits array — REST
+        // integrations depend on that shape). The MCP layer is where the
+        // header becomes agent-visible: when the server reported drops this
+        // tool wraps the array in a {hits, source_fence} envelope; with no
+        // drops it returns the bare hits array unchanged (backward-compatible
+        // with pre-gate consumers).
+        let resp = match self
+            .http
+            .post(self.endpoint("/v1/recall"))
+            .json(&p)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "verity server unreachable at {}: {e}",
+                    self.config.url
+                ))]));
+            }
+        };
+        let status = resp.status();
+        let fence = resp
+            .headers()
+            .get(SOURCE_FENCE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(parse_source_fence);
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "verity REST error {status}: {body}"
+            ))]));
+        }
+        let hits: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+        let text = render_recall_result(hits, fence);
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -988,7 +1073,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{changes_for_entity, file_name_from_url, html_to_text};
+    use super::{
+        changes_for_entity, file_name_from_url, html_to_text, parse_source_fence,
+        render_recall_result,
+    };
     use chrono::{DateTime, Utc};
 
     fn ts(s: &str) -> DateTime<Utc> {
@@ -1066,6 +1154,49 @@ mod tests {
     #[test]
     fn html_to_text_drops_unclosed_script_through_eof() {
         assert_eq!(html_to_text("<p>kept</p><script>var dropped;"), "kept");
+    }
+
+    #[test]
+    fn source_fence_header_parses_or_passes_through_raw() {
+        assert_eq!(
+            parse_source_fence("dropped=3; stale=gdrive,gmail"),
+            serde_json::json!({"dropped": 3, "stale_sources": ["gdrive", "gmail"]})
+        );
+        assert_eq!(
+            parse_source_fence("dropped=1; stale=hubspot"),
+            serde_json::json!({"dropped": 1, "stale_sources": ["hubspot"]})
+        );
+        // Unrecognized shapes are disclosed verbatim, never dropped.
+        assert_eq!(
+            parse_source_fence("weird"),
+            serde_json::json!({"raw": "weird"})
+        );
+    }
+
+    #[test]
+    fn recall_result_is_bare_hits_array_when_nothing_was_fenced() {
+        // Backward-compatible: no fence header → the tool text IS the REST
+        // body (a bare hits array), not an envelope.
+        let hits = serde_json::json!([{"chunk_id": "c1", "content": "body"}]);
+        let text = render_recall_result(hits.clone(), None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            hits
+        );
+    }
+
+    #[test]
+    fn recall_result_is_enveloped_only_when_the_server_reported_drops() {
+        let hits = serde_json::json!([{"chunk_id": "c1", "content": "body"}]);
+        let fence = parse_source_fence("dropped=2; stale=gdrive");
+        let text = render_recall_result(hits.clone(), Some(fence));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({
+                "hits": hits,
+                "source_fence": {"dropped": 2, "stale_sources": ["gdrive"]},
+            })
+        );
     }
 
     #[test]

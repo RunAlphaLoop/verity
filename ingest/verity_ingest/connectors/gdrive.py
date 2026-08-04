@@ -140,6 +140,7 @@ import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import sys
@@ -155,6 +156,8 @@ from verity_ingest import crosswalk
 from verity_ingest.acl_diff import AclDiffLane
 from verity_ingest.connector import AclEnvelope, Connector, DocumentEvent, FactEvent
 from verity_ingest.connectors.backfill import BackfillReporter
+
+logger = logging.getLogger(__name__)
 
 DRIVE_BASE_URL = "https://www.googleapis.com/drive/v3"
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
@@ -1110,6 +1113,18 @@ class VerityDocumentSink:
     module docstring, the retire drain).
     """
 
+    #: Runner-provided fallback tenant so a cycle that delivered NOTHING can
+    #: still key its connector-status row. Historically only the alarms[]
+    #: subclasses used this (hence the name, kept for the existing runner
+    #: wiring); it is now the general default for EVERY heartbeat: the server's
+    #: per-source freshness gate treats a silent connector as stalled, so an
+    #: idle-but-healthy connector MUST keep beating (items_synced: 0).
+    alarm_tenant_id: str | None = None
+    #: Runner/subclass-provided fallback heartbeat source for idle cycles
+    #: (e.g. ``"gdrive"``, ``"gmail"``) — with zero deliveries there is no
+    #: request body to learn the source from.
+    default_source: str | None = None
+
     def __init__(
         self,
         base_url: str,
@@ -1138,14 +1153,35 @@ class VerityDocumentSink:
 
     def heartbeat(self, cursor: str | None = None) -> None:
         """Best-effort heartbeat to ``POST /v1/admin/connector-status`` after
-        a delivery batch; resets the accumulators. Never raises — a heartbeat
-        failure must never fail (or replay) a sync that already delivered."""
-        if not self._delivered or not self._tenant_id or not self._source:
+        a poll cycle; resets the accumulators. Never raises — a heartbeat
+        failure must never fail (or replay) a sync that already delivered.
+
+        IDLE cycles beat too (``items_synced: 0``): the server's per-source
+        freshness gate keys liveness off ``connector_status.updated_at``, so a
+        healthy connector that simply saw no changes must not read as stalled.
+        Tenant/source fall back to the runner-provided defaults
+        (:attr:`alarm_tenant_id` / :attr:`default_source`) when nothing was
+        delivered this cycle; without either there is no row to key and the
+        beat is skipped (accumulators still drain)."""
+        tenant = self._tenant_id or self.alarm_tenant_id
+        source = self._source or self.default_source
+        if not tenant or not source:
+            # Not silently: a skipped idle beat reads as a STALLED connector to
+            # the server's per-source freshness gate — surface the miswiring.
+            logger.debug(
+                "connector-status heartbeat skipped: no tenant/source to key it "
+                "(tenant=%r, source=%r) — set alarm_tenant_id/default_source on "
+                "the sink so idle cycles can beat",
+                tenant,
+                source,
+            )
+            self._delivered = 0
+            self._last_event_at = None
             return
         try:
             body: dict[str, Any] = {
-                "tenant_id": self._tenant_id,
-                "source": self._source,
+                "tenant_id": tenant,
+                "source": source,
                 "items_synced": self._delivered,
             }
             if cursor is not None:
@@ -1169,11 +1205,15 @@ class GDriveStatusSink(VerityDocumentSink):
     ``POST /v1/admin/connector-status`` body. Unlike the base heartbeat, an
     alarm-bearing heartbeat fires even when ZERO documents were delivered — an
     all-parked cycle that delivered nothing MUST still reach the operator.
-    Never raises from the heartbeat; drains accumulators in ``finally``."""
+    Never raises from the heartbeat; drains accumulators in ``finally``.
 
-    #: Set by the runner so an alarm-only heartbeat (zero delivered docs) can
-    #: still key its connector-status row by tenant.
-    alarm_tenant_id: str | None = None
+    ``alarm_tenant_id`` (the runner-set tenant fallback) now lives on the base
+    :class:`VerityDocumentSink`, generalized to every heartbeat — including the
+    idle beats the per-source freshness gate depends on."""
+
+    #: Idle-cycle heartbeat source (base-class fallback; the alarm path below
+    #: keeps its explicit literal).
+    default_source = "gdrive"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1999,8 +2039,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         sink = DryRunSink()
     else:
         status_sink = GDriveStatusSink(args.verity_url, api_key=api_key)
-        # Alarm-only heartbeats (an all-parked cycle that delivered nothing)
-        # still need a tenant to key their connector-status row.
+        # Heartbeats that ride a cycle which delivered nothing (alarm-only
+        # cycles, and the idle items_synced:0 beats the per-source freshness
+        # gate depends on) still need a tenant to key their row.
         status_sink.alarm_tenant_id = config.tenant_id
         sink = status_sink
     fact_sink: FactSink | None = None

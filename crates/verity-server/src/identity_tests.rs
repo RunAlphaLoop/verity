@@ -63,6 +63,7 @@ async fn test_state(rebac: Option<Rebac>, allow_restricted: bool) -> (Arc<AppSta
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,
+        source_freshness: crate::source_freshness::SourceFreshnessPlane::new(None),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         allow_restricted_without_rebac: allow_restricted,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
@@ -223,7 +224,7 @@ async fn recall_docs(
         "k": 20,
     }))
     .expect("request shape");
-    let Json(hits) = crate::recall(State(Arc::clone(state)), Json(req)).await?;
+    let (_headers, Json(hits)) = crate::recall(State(Arc::clone(state)), Json(req)).await?;
     Ok(hits.into_iter().map(|h| h.document_id).collect())
 }
 

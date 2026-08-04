@@ -1074,16 +1074,15 @@ class EntraAdminSink(VerityAdminSink):
         """Best-effort ``POST /v1/admin/connector-status`` for ``source="entra"``.
         Unlike the base, it fires when there are **alarms** even if zero ops were
         applied — a ``SyncStateReset`` that delivered nothing MUST still reach the
-        operator. Never raises; drains both accumulators in ``finally``."""
+        operator. IDLE cycles beat too (``items_synced: 0``): the server keys
+        connector liveness off ``connector_status.updated_at``, so a directory
+        sync that reconciled cleanly with zero ops must not read as stalled.
+        Never raises; drains both accumulators in ``finally``."""
         alarms = list(self._alarms)
-        if not alarms and (not self._applied or not self._tenant_id):
-            # Nothing delivered and nothing to alarm: no signal to send. Still
-            # drain so a stale accumulator can't leak into a later cycle.
-            self._applied = 0
-            self._alarms = []
-            return
         # A tenant is required to key the row; fall back to the connector's
-        # configured tenant if no op set it (alarm-only cycles set no _tenant_id).
+        # configured tenant if no op set it (idle and alarm-only cycles set no
+        # _tenant_id). Without either, drain so a stale accumulator can't leak
+        # into a later cycle.
         tenant = self._tenant_id or self.alarm_tenant_id
         if not tenant:
             self._applied = 0

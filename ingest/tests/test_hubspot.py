@@ -345,9 +345,41 @@ def test_sink_heartbeat_failure_never_fails_the_sync() -> None:
     assert sink.post(events) == {"written": 2, "superseded": 0, "retired": 0, "unchanged": 0}
 
 
-def test_sink_no_events_no_post() -> None:
-    sink = VerityDebeziumSink(url="http://x", tenant_id="t")
-    assert sink.post([]) == {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+def test_sink_empty_cycle_heartbeats_zero_and_skips_delivery() -> None:
+    # An empty poll cycle delivers nothing BUT still beats items_synced:0 —
+    # the server's per-source freshness gate keys connector liveness off
+    # connector_status.updated_at, so a healthy-but-quiet HubSpot poll must
+    # not read as stalled. Source comes from sink CONFIG (there are no events
+    # to infer it from) and no last_event_at is fabricated.
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "path": request.url.path,
+                "auth": request.headers.get("Authorization"),
+                "body": json.loads(request.content),
+            }
+        )
+        return httpx.Response(200, json={"recorded": True})
+
+    sink = VerityDebeziumSink(
+        url="http://verity.local:7717",
+        tenant_id="0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        admin_token="secret-token",
+        transport=httpx.MockTransport(handler),
+    )
+    summary = sink.post([], cursor="2026-07-09T16:00:05.000Z")
+    assert summary == {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+    # ONE request: the heartbeat. No delivery POST rode the empty cycle.
+    assert [s["path"] for s in seen] == ["/v1/admin/connector-status"]
+    assert seen[0]["auth"] == "Bearer secret-token"
+    assert seen[0]["body"] == {
+        "tenant_id": "0b0e8b9e-6a34-4b1e-9a75-1de1f3a1c001",
+        "source": "hubspot",
+        "items_synced": 0,
+        "cursor": "2026-07-09T16:00:05.000Z",
+    }
 
 
 # ---------- truth lane: poll() against a mock HubSpot ----------

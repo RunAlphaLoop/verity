@@ -647,9 +647,20 @@ class VerityDebeziumSink:
     admin_token: str | None = None
     pk: str = "id"
     transport: httpx.BaseTransport | None = None  # injection point for tests
+    #: Heartbeat source, from CONFIG — never inferred from the batch (an empty
+    #: cycle has no events to infer from, and the server's per-source freshness
+    #: gate needs idle beats keyed to the right source). Every sharing
+    #: connector (Salesforce, Notion, Intercom) MUST set it explicitly at
+    #: construction — :meth:`from_env` makes that mandatory.
+    source: str = SOURCE
 
     @classmethod
-    def from_env(cls) -> "VerityDebeziumSink":
+    def from_env(cls, source: str) -> "VerityDebeziumSink":
+        """Build the sink from ``VERITY_*`` env vars, with an EXPLICIT
+        heartbeat ``source``. Required at every call site: this sink is shared
+        by all the structured connectors, and a defaulted source would key
+        their idle heartbeats as ``"hubspot"`` — silently mis-feeding the
+        server's per-source freshness gate."""
         tenant_id = os.environ.get("VERITY_TENANT_ID")
         if not tenant_id:
             raise RuntimeError("VERITY_TENANT_ID is required (a tenant UUID)")
@@ -657,6 +668,7 @@ class VerityDebeziumSink:
             url=os.environ.get("VERITY_URL", "http://127.0.0.1:7717"),
             tenant_id=tenant_id,
             admin_token=os.environ.get("VERITY_ADMIN_TOKEN"),
+            source=source,
         )
 
     @staticmethod
@@ -948,13 +960,21 @@ class VerityDebeziumSink:
         time, and — when the runner passes it — the cursor). A heartbeat
         failure NEVER fails the sync: the facts are already committed and the
         heartbeat is telemetry (see migrations/0012_connector_status.sql).
+
+        EMPTY cycles heartbeat too (``items_synced: 0``, no ``last_event_at``):
+        the server's per-source freshness gate keys connector liveness off
+        ``connector_status.updated_at``, so a healthy poll that found no
+        changes must not read as a stalled connector.
         """
-        if not events:
-            return {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
-        self._stamp_record_visibility(events)
         headers = {}
         if self.admin_token:
             headers["Authorization"] = f"Bearer {self.admin_token}"
+        if not events:
+            # Idle beat only: nothing to deliver, but the connector is alive.
+            with httpx.Client(timeout=30.0, transport=self.transport) as client:
+                self._heartbeat(client, headers, [], cursor)
+            return {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+        self._stamp_record_visibility(events)
         params = {"tenant_id": self.tenant_id, "pk": self.pk}
         bound = self._bound_visibility(events)
         if bound is not None:
@@ -1056,14 +1076,18 @@ class VerityDebeziumSink:
         events: list[FactEvent],
         cursor: str | None,
     ) -> None:
-        """Best-effort connector heartbeat; swallows every failure."""
+        """Best-effort connector heartbeat; swallows every failure. The source
+        comes from the sink CONFIG (never ``events[0]`` — empty cycles have no
+        events); ``last_event_at`` is omitted on empty cycles so an idle beat
+        can never rewind or fabricate the newest-event signal."""
         try:
             body = {
                 "tenant_id": self.tenant_id,
-                "source": events[0].source,
+                "source": self.source,
                 "items_synced": len(events),
-                "last_event_at": max(e.valid_from for e in events).isoformat(),
             }
+            if events:
+                body["last_event_at"] = max(e.valid_from for e in events).isoformat()
             if cursor is not None:
                 body["cursor"] = cursor
             client.post(
@@ -1241,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.credential_file is not None:
         cred_token = _read_credential_file(args.credential_file)
 
-    sink = VerityDebeziumSink.from_env()
+    sink = VerityDebeziumSink.from_env(SOURCE)
 
     if args.webhook_file:
         payload = json.loads(args.webhook_file.read_text())

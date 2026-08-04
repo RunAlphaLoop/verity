@@ -65,6 +65,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         repo_root: None,
         listen: "127.0.0.1:0".to_string(),
         admin_token: None,
+        source_freshness: crate::source_freshness::SourceFreshnessPlane::new(None),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         allow_restricted_without_rebac: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
