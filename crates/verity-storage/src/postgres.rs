@@ -4064,13 +4064,53 @@ impl StorageAdapter for PostgresAdapter {
             .map_err(db_err)?;
             written += result.rows_affected() as usize;
         }
+        // Shrink close (the stale-tail gap): the per-seq retire above only
+        // supersedes positions the NEW delivery covers. When a re-delivery has
+        // FEWER chunks than the prior version, the old tail (seq beyond the
+        // highest delivered seq) would otherwise stay open at `valid_to IS
+        // NULL` and keep serving stale content forever. Close it here, in the
+        // same transaction. Strict `valid_from < $1` keeps a replay of the
+        // same delivery idempotent: on replay the old tail rows already carry
+        // `valid_to` (excluded by `valid_to IS NULL`), and rows written at the
+        // same `valid_from` can never be closed by their own delivery.
+        let mut tails: HashMap<(TenantId, &str, &str), (DateTime<Utc>, i32)> = HashMap::new();
+        for c in &chunks {
+            let entry = tails
+                .entry((c.tenant_id, c.source.as_str(), c.document_id.as_str()))
+                .or_insert((c.valid_from, c.seq));
+            entry.0 = entry.0.max(c.valid_from);
+            entry.1 = entry.1.max(c.seq);
+        }
+        let mut tail_tags: Vec<String> = Vec::new();
+        for ((tenant, source, document_id), (valid_from, max_seq)) in &tails {
+            let closed = sqlx::query(
+                "UPDATE chunks SET valid_to = $1
+                 WHERE tenant_id = $2 AND source = $3 AND document_id = $4
+                   AND seq > $5 AND valid_to IS NULL AND valid_from < $1
+                 RETURNING entity_tags",
+            )
+            .bind(valid_from)
+            .bind(tenant)
+            .bind(source)
+            .bind(document_id)
+            .bind(max_seq)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            for row in &closed {
+                let tags: Vec<String> = row.try_get("entity_tags").map_err(db_err)?;
+                tail_tags.extend(tags);
+            }
+        }
         // Derived-view staleness (SPEC §2 L3): a write to any chunk marks the
         // briefs of the entities it touches STALE, synchronously, in the same
         // transaction (cheap UPDATE; recompute is lazy/batch). Entity tags are
-        // the lineage key for briefs.
+        // the lineage key for briefs — including tags carried only by
+        // tail-closed rows (their content just left the current view).
         let affected: Vec<String> = chunks
             .iter()
             .flat_map(|c| c.entity_tags.iter().cloned())
+            .chain(tail_tags)
             .collect();
         if let Some(t) = chunks.first().map(|c| c.tenant_id) {
             mark_briefs_stale_tx(&mut tx, t, &affected).await?;
