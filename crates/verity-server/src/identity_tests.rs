@@ -66,6 +66,7 @@ async fn test_state(rebac: Option<Rebac>, allow_restricted: bool) -> (Arc<AppSta
         source_freshness: crate::source_freshness::SourceFreshnessPlane::new(None),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         allow_restricted_without_rebac: allow_restricted,
+        remember_require_lineage: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
         knowledge_auto_merge: true,
@@ -193,6 +194,7 @@ async fn index_chunk(
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
+            derived_from: vec![],
         }])
         .await
         .expect("chunk");

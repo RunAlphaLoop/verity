@@ -377,6 +377,7 @@ pub(crate) async fn ingest_file(
                     valid_from: now,
                     provenance: episode_id,
                     acl_provenance: AclProvenance::AdminAssigned,
+                    derived_from: vec![],
                 });
             }
             chunks_indexed = state

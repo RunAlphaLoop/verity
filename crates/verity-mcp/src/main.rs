@@ -142,6 +142,18 @@ struct RememberParams {
     /// entity_scope; omit to inherit the whole scope.
     #[serde(skip_serializing_if = "Option::is_none")]
     entities: Option<Vec<String>>,
+    /// UUIDs of the memories this observation was derived from — chunk_id or
+    /// provenance values from memory_recall hits, or episode_ids from earlier
+    /// memory_remember results. The stored memory becomes visible only to
+    /// principals who can see EVERY input. A ref you cannot currently see is
+    /// rejected and nothing is written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived_from: Option<Vec<String>>,
+    /// Explicit visibility policy: principal strings (e.g. "user:a@x.com").
+    /// Must be a subset of your own scope's principals — narrowing only,
+    /// widening is rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility_policy: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -686,7 +698,7 @@ impl VerityMcp {
 
     #[tool(
         name = "memory_remember",
-        description = "Append an observation to shared memory (immutable episode + immediately searchable chunk). Use to record durable knowledge learned during the task — decisions, facts, customer statements — so this and other agents can surface it later via memory_recall. Entity tags must stay inside the scope."
+        description = "Append an observation to shared memory (immutable episode + immediately searchable chunk). Use to record durable knowledge learned during the task — decisions, facts, customer statements — so this and other agents can surface it later via memory_recall. Entity tags must stay inside the scope. When the observation summarizes or depends on recalled memory, pass those hits' chunk_id or provenance values as derived_from — the memory is then visible only to principals who can see every input. Omitting derived_from stores it at your own scope's visibility, labeled writer-scoped."
     )]
     async fn memory_remember(
         &self,
@@ -1101,7 +1113,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{
         changes_for_entity, file_name_from_url, html_to_text, parse_source_fence,
-        render_recall_result,
+        render_recall_result, RememberParams,
     };
     use chrono::{DateTime, Utc};
 
@@ -1231,5 +1243,49 @@ mod tests {
         assert_eq!(file_name_from_url(&url), "page.html");
         let root = reqwest::Url::parse("https://example.com/").unwrap();
         assert_eq!(file_name_from_url(&root), "webpage.txt");
+    }
+
+    /// The remember passthrough contract: `derived_from`/`visibility_policy`
+    /// serialize under exactly the field names the server's RememberRequest
+    /// deserializes (uuid strings decode into `Vec<Uuid>` server-side), and a
+    /// lineage-less call omits both keys — byte-compatible with pre-lineage
+    /// servers (unknown-field-free), so old deployments keep accepting it.
+    #[test]
+    fn remember_params_serialize_lineage_fields_and_omit_them_when_absent() {
+        let with = RememberParams {
+            scope_handle: "h".into(),
+            observation: "summary of two docs".into(),
+            entities: None,
+            derived_from: Some(vec![
+                "0198c0de-0000-7000-8000-000000000001".into(),
+                "0198c0de-0000-7000-8000-000000000002".into(),
+            ]),
+            visibility_policy: Some(vec!["user:a@example.com".into()]),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            v["derived_from"],
+            serde_json::json!([
+                "0198c0de-0000-7000-8000-000000000001",
+                "0198c0de-0000-7000-8000-000000000002",
+            ])
+        );
+        assert_eq!(
+            v["visibility_policy"],
+            serde_json::json!(["user:a@example.com"])
+        );
+
+        let without = RememberParams {
+            scope_handle: "h".into(),
+            observation: "plain observation".into(),
+            entities: None,
+            derived_from: None,
+            visibility_policy: None,
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("derived_from"));
+        assert!(!obj.contains_key("visibility_policy"));
+        assert!(!obj.contains_key("entities"));
     }
 }

@@ -63,6 +63,7 @@ async fn retire_state() -> (Arc<AppState>, TenantId) {
         source_freshness: crate::source_freshness::SourceFreshnessPlane::new(None),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         allow_restricted_without_rebac: true,
+        remember_require_lineage: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
         knowledge_auto_merge: true,
@@ -115,6 +116,7 @@ async fn index_document(state: &AppState, tenant: TenantId, source: &str, doc: &
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
+            derived_from: vec![],
         })
         .collect();
     state.storage.upsert_chunks(chunks).await.expect("chunks");

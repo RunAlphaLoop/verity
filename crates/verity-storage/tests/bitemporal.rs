@@ -140,6 +140,7 @@ async fn recall_fails_closed() {
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .unwrap();

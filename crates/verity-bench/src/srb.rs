@@ -288,6 +288,7 @@ async fn leakage_suite(adapter: &PostgresAdapter, n_scopes: usize) -> Result<Val
             valid_from: now - chrono::Duration::hours(2),
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
+            derived_from: vec![],
         });
         chunk_models.push(model);
     }
@@ -317,6 +318,7 @@ async fn leakage_suite(adapter: &PostgresAdapter, n_scopes: usize) -> Result<Val
             valid_from: now - chrono::Duration::hours(2),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         });
         // Superseded chunks get a newer version so a leak of the OLD one is
         // detectable (returning it would be both a scope bug and a currency bug).
@@ -816,6 +818,7 @@ async fn staleness_suite(adapter: &PostgresAdapter, cycles: usize) -> Result<Val
                     valid_from: t_event,
                     provenance: episode,
                     acl_provenance: AclProvenance::Mirrored,
+                    derived_from: vec![],
                 }])
                 .await?;
         }

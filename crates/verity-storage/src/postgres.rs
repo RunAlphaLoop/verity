@@ -4040,8 +4040,8 @@ impl StorageAdapter for PostgresAdapter {
                 "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
                                      content_hash, embedding, visibility, entity_tags,
                                      confidentiality, trust_tier, valid_from, provenance,
-                                     acl_provenance)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                                     acl_provenance, derived_from)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                  ON CONFLICT (tenant_id, source, document_id, seq, valid_from) DO NOTHING",
             )
             .bind(Uuid::now_v7())
@@ -4059,18 +4059,59 @@ impl StorageAdapter for PostgresAdapter {
             .bind(c.valid_from)
             .bind(c.provenance)
             .bind(c.acl_provenance.as_str())
+            .bind(&c.derived_from)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
             written += result.rows_affected() as usize;
         }
+        // Shrink close (the stale-tail gap): the per-seq retire above only
+        // supersedes positions the NEW delivery covers. When a re-delivery has
+        // FEWER chunks than the prior version, the old tail (seq beyond the
+        // highest delivered seq) would otherwise stay open at `valid_to IS
+        // NULL` and keep serving stale content forever. Close it here, in the
+        // same transaction. Strict `valid_from < $1` keeps a replay of the
+        // same delivery idempotent: on replay the old tail rows already carry
+        // `valid_to` (excluded by `valid_to IS NULL`), and rows written at the
+        // same `valid_from` can never be closed by their own delivery.
+        let mut tails: HashMap<(TenantId, &str, &str), (DateTime<Utc>, i32)> = HashMap::new();
+        for c in &chunks {
+            let entry = tails
+                .entry((c.tenant_id, c.source.as_str(), c.document_id.as_str()))
+                .or_insert((c.valid_from, c.seq));
+            entry.0 = entry.0.max(c.valid_from);
+            entry.1 = entry.1.max(c.seq);
+        }
+        let mut tail_tags: Vec<String> = Vec::new();
+        for ((tenant, source, document_id), (valid_from, max_seq)) in &tails {
+            let closed = sqlx::query(
+                "UPDATE chunks SET valid_to = $1
+                 WHERE tenant_id = $2 AND source = $3 AND document_id = $4
+                   AND seq > $5 AND valid_to IS NULL AND valid_from < $1
+                 RETURNING entity_tags",
+            )
+            .bind(valid_from)
+            .bind(tenant)
+            .bind(source)
+            .bind(document_id)
+            .bind(max_seq)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            for row in &closed {
+                let tags: Vec<String> = row.try_get("entity_tags").map_err(db_err)?;
+                tail_tags.extend(tags);
+            }
+        }
         // Derived-view staleness (SPEC §2 L3): a write to any chunk marks the
         // briefs of the entities it touches STALE, synchronously, in the same
         // transaction (cheap UPDATE; recompute is lazy/batch). Entity tags are
-        // the lineage key for briefs.
+        // the lineage key for briefs — including tags carried only by
+        // tail-closed rows (their content just left the current view).
         let affected: Vec<String> = chunks
             .iter()
             .flat_map(|c| c.entity_tags.iter().cloned())
+            .chain(tail_tags)
             .collect();
         if let Some(t) = chunks.first().map(|c| c.tenant_id) {
             mark_briefs_stale_tx(&mut tx, t, &affected).await?;
@@ -4099,6 +4140,82 @@ impl StorageAdapter for PostgresAdapter {
                 "recall requires an embedding, text, or both".into(),
             )),
         }
+    }
+
+    /// ONE scope-predicated query resolving declared derivation refs (chunk
+    /// ids OR episode ids) to their current rows' full visibility +
+    /// confidentiality. The predicate is EXACTLY the recall predicate —
+    /// tenant partition, `valid_to IS NULL`, `visibility && $principals`,
+    /// `confidentiality <= $ceiling`, plus the entity fence for entity-bound
+    /// scopes — so lineage can only cite what the writer could recall. Rows a
+    /// scope cannot see are structurally absent (fail closed): the caller sees
+    /// an unresolved ref, never a hint that a hidden row exists.
+    async fn resolve_derivation_inputs(
+        &self,
+        scope: &Scope,
+        refs: &[Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        // Fail closed in the shared layer, mirroring `recall`.
+        if scope.principals.is_empty() || refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Safe: the predicate string is assembled from constants only; all
+        // caller data goes through binds (same argument as recall_dense).
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT id, provenance, visibility, confidentiality FROM chunks
+             WHERE tenant_id = $1
+               AND valid_to IS NULL
+               AND (id = ANY($2) OR provenance = ANY($2))
+               AND visibility && $3
+               AND confidentiality <= $4
+               {}",
+            entity_scope_predicate(scope, "$5"),
+        )))
+        .bind(scope.tenant_id)
+        .bind(refs)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
+        .bind(&scope.entity_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Fold rows per caller ref. A chunk-id ref matches exactly its row; an
+        // episode-id ref matches ALL its current chunks — visibility is the
+        // intersection across them, confidentiality the max, so a multi-chunk
+        // episode is only as visible as its most restricted chunk.
+        let mut inputs = Vec::with_capacity(refs.len());
+        for &reference in refs {
+            let mut episode_id: Option<EpisodeId> = None;
+            let mut visibility: Option<Vec<PrincipalToken>> = None;
+            let mut confidentiality = Confidentiality::Public;
+            for row in &rows {
+                let id: Uuid = row.try_get("id").map_err(db_err)?;
+                let provenance: Uuid = row.try_get("provenance").map_err(db_err)?;
+                if id != reference && provenance != reference {
+                    continue;
+                }
+                let vis: Vec<PrincipalToken> = row.try_get("visibility").map_err(db_err)?;
+                let conf = Confidentiality::from_i16(
+                    row.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+                );
+                episode_id = Some(provenance);
+                confidentiality = confidentiality.max(conf);
+                visibility = Some(match visibility {
+                    None => vis,
+                    Some(acc) => acc.into_iter().filter(|t| vis.contains(t)).collect(),
+                });
+            }
+            if let (Some(episode_id), Some(visibility)) = (episode_id, visibility) {
+                inputs.push(DerivationInput {
+                    reference,
+                    episode_id,
+                    visibility,
+                    confidentiality,
+                });
+            }
+        }
+        Ok(inputs)
     }
 
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {

@@ -325,6 +325,7 @@ async fn correct_chunk_acl_rewrites_lineage_and_audits() {
         valid_from: t0,
         provenance: episode,
         acl_provenance: AclProvenance::Mirrored,
+        derived_from: vec![],
     });
     for seq in 0..3 {
         writes.push(ChunkWrite {
@@ -342,6 +343,7 @@ async fn correct_chunk_acl_rewrites_lineage_and_audits() {
             valid_from: t0 + Duration::minutes(1),
             provenance: episode,
             acl_provenance: AclProvenance::Mirrored,
+            derived_from: vec![],
         });
     }
     adapter.upsert_chunks(writes).await.unwrap();
@@ -456,6 +458,7 @@ async fn current_chunk_confidentiality_reports_lineage_max() {
                 valid_from: t0,
                 provenance: episode,
                 acl_provenance: AclProvenance::Mirrored,
+                derived_from: vec![],
             }])
             .await
             .unwrap();

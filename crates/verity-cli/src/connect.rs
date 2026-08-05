@@ -19,6 +19,14 @@ use crate::{config, ui, util, webhook, Ctx};
 /// The Slack app manifest pasted at api.slack.com/apps ("From a manifest" →
 /// JSON tab). Socket Mode on, so event delivery needs no request URL and no
 /// public HTTPS — the one vendor where BYOT push costs nothing (SPEC §5e.2).
+///
+/// Scopes cover BOTH channel families the connector mirrors (public
+/// `channels:*` + private `groups:*`), `users:read` + `users:read.email` for
+/// the identity crosswalk (Slack Uid → the directory-vouched email), and
+/// `channels:join` so the connector can self-join public channels it is asked
+/// to index. Events mirror the poll lane's detection surface (message edits/
+/// deletes, membership churn, channel lifecycle) for the future Socket-Mode
+/// push lane; the poll connector is the truth lane either way.
 fn slack_manifest() -> serde_json::Value {
     serde_json::json!({
         "display_information": {
@@ -33,12 +41,29 @@ fn slack_manifest() -> serde_json::Value {
         },
         "oauth_config": {
             "scopes": {
-                "bot": ["channels:history", "channels:read", "users:read"]
+                "bot": [
+                    "channels:history",
+                    "channels:join",
+                    "channels:read",
+                    "groups:history",
+                    "groups:read",
+                    "users:read",
+                    "users:read.email"
+                ]
             }
         },
         "settings": {
             "event_subscriptions": {
-                "bot_events": ["message.channels"]
+                "bot_events": [
+                    "channel_archive",
+                    "channel_converted_to_private",
+                    "channel_deleted",
+                    "channel_rename",
+                    "member_joined_channel",
+                    "member_left_channel",
+                    "message.channels",
+                    "message.groups"
+                ]
             },
             "org_deploy_enabled": false,
             "socket_mode_enabled": true,
@@ -79,6 +104,16 @@ pub async fn slack(ctx: &mut Ctx, print_manifest_only: bool) -> Result<()> {
         "     {}",
         ui::dim(
             "(need it in a file? verity-cli connect slack --print-manifest-only > manifest.json)"
+        )
+    );
+    println!();
+    println!(
+        "     {}",
+        ui::dim(
+            "already created the Verity app from an older manifest? Paste this one over it \
+             (App Manifest page) and then RE-INSTALL the app (Install App → Reinstall to \
+             Workspace) — Slack only grants new scopes at install time, and the reinstall \
+             may mint a fresh xoxb- token: re-run this wizard to store it.",
         )
     );
     println!();
@@ -455,13 +490,35 @@ mod tests {
     fn slack_manifest_pins_socket_mode_and_scopes() {
         let m = slack_manifest();
         assert_eq!(m["settings"]["socket_mode_enabled"], true);
+        // The connector's full read surface: public + private channel history/
+        // rosters, users + email (the identity crosswalk), and self-join for
+        // public channels. Changing this list means every existing install
+        // must RE-INSTALL the app (scopes grant at install time) — the wizard
+        // copy says so; keep them in sync.
         assert_eq!(
             m["oauth_config"]["scopes"]["bot"],
-            serde_json::json!(["channels:history", "channels:read", "users:read"])
+            serde_json::json!([
+                "channels:history",
+                "channels:join",
+                "channels:read",
+                "groups:history",
+                "groups:read",
+                "users:read",
+                "users:read.email"
+            ])
         );
         assert_eq!(
             m["settings"]["event_subscriptions"]["bot_events"],
-            serde_json::json!(["message.channels"])
+            serde_json::json!([
+                "channel_archive",
+                "channel_converted_to_private",
+                "channel_deleted",
+                "channel_rename",
+                "member_joined_channel",
+                "member_left_channel",
+                "message.channels",
+                "message.groups"
+            ])
         );
     }
 }
