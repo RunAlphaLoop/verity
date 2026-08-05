@@ -49,7 +49,7 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// and the local `folder` aggregate heartbeats per-watch as `folder:<name>` —
 /// none of them belong here. A unit test below guards this list against
 /// registry drift.
-pub(crate) const CONNECTOR_CHUNK_SOURCES: [&str; 7] = [
+pub(crate) const CONNECTOR_CHUNK_SOURCES: [&str; 8] = [
     "gdrive",
     "gmail",
     "hubspot",
@@ -57,6 +57,7 @@ pub(crate) const CONNECTOR_CHUNK_SOURCES: [&str; 7] = [
     "notion",
     "intercom",
     "sharepoint",
+    "slack",
 ];
 
 /// Per-tenant map: source → last heartbeat (`connector_status.updated_at`).
