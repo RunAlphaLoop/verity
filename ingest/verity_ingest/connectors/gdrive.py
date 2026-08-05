@@ -232,6 +232,12 @@ class GDriveDocumentEvent(DocumentEvent):
 BINARY_EXTRACTABLE_MIMES = frozenset(
     {
         "application/pdf",
+        # Word: the server's extract.rs has handled docx + legacy doc all along;
+        # these mimes were missing HERE, so connectors (gdrive, and sharepoint
+        # which imports this gate) silently skipped Word files — the dominant
+        # format on SharePoint. Caught while enumerating the converter matrix.
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.ms-excel",
