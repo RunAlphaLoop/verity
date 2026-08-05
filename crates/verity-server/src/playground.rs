@@ -1111,6 +1111,8 @@ mod tests {
     fn sample_hit(chunk_id: ChunkId) -> RecallHit {
         RecallHit {
             chunk_id,
+            source: "agent".into(),
+            source_synced_at: None,
             document_id: "doc-1".into(),
             seq: 0,
             content: "champion Dana G left for Initech".into(),

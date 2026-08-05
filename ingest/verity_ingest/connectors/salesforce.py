@@ -1068,7 +1068,10 @@ def main(argv: list[str] | None = None) -> int:
     if not policy:
         parser.error("--visibility must name at least one principal token (fail closed)")
 
-    sink = VerityDebeziumSink.from_env()
+    # The shared sink heartbeats from CONFIG, not from the batch: an empty
+    # cycle still beats (items_synced: 0) and must be keyed "salesforce",
+    # never the sink's HubSpot default — from_env demands the source.
+    sink = VerityDebeziumSink.from_env(SOURCE)
 
     async def run_once() -> tuple[list[SalesforceFactEvent], str, dict[str, set[str]], bool]:
         connector = SalesforceConnector(policy, fetch_account_shares=not args.no_shares)
@@ -1089,8 +1092,9 @@ def main(argv: list[str] | None = None) -> int:
     # Sync group membership FIRST so a subject resolves through their group the
     # moment group-scoped facts land (identical to the HubSpot runner lifecycle).
     edges = sink.sync_group_edges(group_edges)
-    # The shared sink heartbeats /v1/admin/connector-status after delivery
-    # (best-effort; source rides on the events, so this reports "salesforce").
+    # The shared sink heartbeats /v1/admin/connector-status after every cycle
+    # (best-effort; source from sink config above, so this reports
+    # "salesforce" — including the idle items_synced:0 beats).
     summary = sink.post(events, cursor=next_cursor)
     _write_cursor(args.state_file, next_cursor)
     scoped = sum(1 for e in events if getattr(e, "record_principals", None))

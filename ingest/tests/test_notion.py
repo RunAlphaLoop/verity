@@ -268,6 +268,39 @@ def test_no_inline_acl_every_event_rides_admin_floor() -> None:
     assert VerityDebeziumSink._bound_visibility(list(events)) == "7,12"
 
 
+def test_shared_sink_idle_cycle_heartbeats_zero_as_notion() -> None:
+    # Notion shares HubSpot's VerityDebeziumSink; main constructs it via
+    # from_env(SOURCE), so an idle cycle (empty batch) must still POST an
+    # items_synced:0 heartbeat keyed "notion" — never the sink's HubSpot
+    # default, and never a fabricated last_event_at — so the server's
+    # per-source freshness gate sees a live-but-quiet Notion connector.
+    seen: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"recorded": True})
+
+    sink = VerityDebeziumSink(
+        url="http://sink",
+        tenant_id="t",
+        transport=httpx.MockTransport(handler),
+        source="notion",  # main's from_env(SOURCE) wiring
+    )
+    summary = sink.post([], cursor="2026-07-09T00:00:00+00:00")
+    assert summary == {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+    assert seen == [
+        (
+            "/v1/admin/connector-status",
+            {
+                "tenant_id": "t",
+                "source": "notion",
+                "items_synced": 0,
+                "cursor": "2026-07-09T00:00:00+00:00",
+            },
+        )
+    ]
+
+
 # ---------- truth lane: poll() against the mock ----------
 
 

@@ -928,6 +928,39 @@ def test_sync_group_edges_posts_sorted_and_nest_capable() -> None:
     assert VerityDebeziumSink.sync_team_edges is VerityDebeziumSink.sync_group_edges
 
 
+def test_shared_sink_idle_cycle_heartbeats_zero_as_salesforce() -> None:
+    # The Salesforce runner shares HubSpot's VerityDebeziumSink and overrides
+    # its config source. An idle cycle (empty batch) must still POST an
+    # items_synced:0 heartbeat keyed "salesforce" — never the sink's HubSpot
+    # default, and never a fabricated last_event_at — so the server's
+    # per-source freshness gate sees a live-but-quiet Salesforce connector.
+    seen: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"recorded": True})
+
+    sink = VerityDebeziumSink(
+        url="http://sink",
+        tenant_id="t",
+        transport=httpx.MockTransport(handler),
+        source="salesforce",  # main's from_env(SOURCE) wiring
+    )
+    summary = sink.post([], cursor="2026-07-09T00:00:00+00:00")
+    assert summary == {"written": 0, "superseded": 0, "retired": 0, "unchanged": 0}
+    assert seen == [
+        (
+            "/v1/admin/connector-status",
+            {
+                "tenant_id": "t",
+                "source": "salesforce",
+                "items_synced": 0,
+                "cursor": "2026-07-09T00:00:00+00:00",
+            },
+        )
+    ]
+
+
 # ---------- degraded ACL: 403 on the roster → admin fallback + signal ----------
 
 

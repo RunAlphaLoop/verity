@@ -54,6 +54,7 @@ mod revocation;
 mod scheduler;
 mod scope;
 mod slo;
+mod source_freshness;
 #[cfg(test)]
 mod sse_tests;
 mod subscribe;
@@ -484,6 +485,13 @@ pub(crate) struct AppState {
     /// the loop reuses `ConnectorPlane::start(PollOnce, ..)` for spawn/cleanup/
     /// ownership, skipping a tick when the prior cycle is still in-flight.
     pub(crate) sync: Arc<sync_scheduler::SyncPlane>,
+    /// Per-source freshness gate (source_freshness.rs): recall annotates every
+    /// hit with its source connector's last heartbeat and — when the gate is
+    /// active (`VERITY_SOURCE_FRESHNESS_MAX_SECS` and/or the request's
+    /// `max_source_staleness_secs`) — drops hits from stale or never-
+    /// heartbeated connector sources. OFF by default; same 5s-TTL memoized
+    /// per-tenant query pattern as `revocations` (read-path purity holds).
+    pub(crate) source_freshness: source_freshness::SourceFreshnessPlane,
     /// M0 instrument panel (metrics.rs): hand-rolled atomic counters/gauges
     /// rendered by `/metrics`. The hot-path counters (recall, exact-scan,
     /// revocation subtract, audit drops) are cheap `Relaxed` adds; scrape-time
@@ -1804,6 +1812,10 @@ async fn main() -> anyhow::Result<()> {
         entra_directory: directory_worker::EntraDirectoryPlane::from_env(),
         connectors: Arc::new(connector_worker::ConnectorPlane::from_env()),
         sync: Arc::new(sync_scheduler::SyncPlane::new()),
+        // Configured-but-unparseable bound = hard startup failure (same
+        // convention as SpiceDB/media-store): the gate must never silently
+        // come up OFF when the operator set a value.
+        source_freshness: source_freshness::SourceFreshnessPlane::from_env()?,
         metrics: app_metrics,
     });
 
@@ -2493,6 +2505,12 @@ struct RecallRequest {
     embedding: Option<Vec<f32>>,
     #[serde(default = "default_k")]
     k: usize,
+    /// Per-request opt-in to the per-source freshness gate: drop hits whose
+    /// source connector has not heartbeated within this many seconds. The
+    /// stricter of this and `VERITY_SOURCE_FRESHNESS_MAX_SECS` wins; both
+    /// unset = gate off (hits are still annotated with `source_synced_at`).
+    #[serde(default)]
+    max_source_staleness_secs: Option<u64>,
 }
 
 fn default_k() -> usize {
@@ -2502,7 +2520,7 @@ fn default_k() -> usize {
 async fn recall(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecallRequest>,
-) -> HandlerResult<Json<Vec<RecallHit>>> {
+) -> HandlerResult<(HeaderMap, Json<Vec<RecallHit>>)> {
     // M0 instrumentation: count every recall + observe end-to-end latency
     // (cheap Relaxed atomics; no allocation on the hot path).
     state.metrics.record_recall_request();
@@ -2515,27 +2533,70 @@ async fn recall(
         (None, Some(text)) => state.encode(text).await?,
         (None, None) => None,
     };
+    // Per-source freshness gate (source_freshness.rs): when active, over-fetch
+    // so post-filter drops don't starve the caller's k; the survivors are
+    // truncated back down below.
+    let effective_staleness = state
+        .source_freshness
+        .effective_max_secs(req.max_source_staleness_secs);
+    let k = req.k.min(100);
+    let fetch_k = if effective_staleness.is_some() {
+        (k * 2).min(100)
+    } else {
+        k
+    };
     let query = RecallQuery {
         scope: state.scope_for(&payload).await?,
         embedding,
         text: req.text,
-        k: req.k.min(100),
+        k: fetch_k,
     };
+    let tenant = query.scope.tenant_id;
     let summary = query.text.clone();
     // M3: no per-hit recheck. Restricted (tier-3) is filtered by the SAME
     // materialized `visibility && (baked − tombstones)` pre-filter as every tier
     // (`scope_for` above already subtracted durable revocations and fenced on
     // watch-staleness) — the read path is now purely index-served for all tiers.
     let hits = state.storage.recall(query).await.map_err(internal)?;
+    // Annotate source_synced_at UNCONDITIONALLY (5s-TTL cached per-tenant
+    // heartbeat map — no per-read DB round-trip beyond the refresh); apply the
+    // freshness fence only when a bound is set. Drops are disclosed, never
+    // silent: the X-Verity-Source-Fence header + source_fence_drops_total.
+    let synced = state
+        .source_freshness
+        .synced_map(state.pool(), tenant)
+        .await?;
+    let outcome =
+        source_freshness::annotate_and_gate(hits, &synced, effective_staleness, Utc::now(), k);
+    let mut headers = HeaderMap::new();
+    if outcome.dropped > 0 {
+        state
+            .metrics
+            .record_source_fence_drops(outcome.dropped as u64);
+        // fence_header_value sanitizes source names to header-safe chars, so
+        // this parse cannot fail — but a drop must NEVER go unreported, so
+        // the impossible branch logs loudly instead of falling through.
+        match source_freshness::fence_header_value(outcome.dropped, &outcome.stale_sources).parse()
+        {
+            Ok(value) => {
+                headers.insert("x-verity-source-fence", value);
+            }
+            Err(e) => tracing::error!(
+                "unreportable X-Verity-Source-Fence value (dropped={}, stale={:?}): {e}",
+                outcome.dropped,
+                outcome.stale_sources
+            ),
+        }
+    }
     spawn_audit(
         &state,
         &payload,
         "recall",
         summary.as_deref(),
-        hits.iter().map(|h| h.chunk_id).collect(),
+        outcome.hits.iter().map(|h| h.chunk_id).collect(),
     );
     state.metrics.observe_recall_latency(started.elapsed());
-    Ok(Json(hits))
+    Ok((headers, Json(outcome.hits)))
 }
 
 // ---------- get ----------

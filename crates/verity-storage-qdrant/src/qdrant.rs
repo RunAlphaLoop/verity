@@ -446,6 +446,9 @@ fn hit_from_payload(
         .unwrap_or_default();
     Ok(RecallHit {
         chunk_id: Uuid::parse_str(&get_str("pg_id")?).map_err(db_err)?,
+        source: get_str("source")?,
+        // Annotated by the server's per-source freshness gate, never by storage.
+        source_synced_at: None,
         document_id: get_str("document_id")?,
         seq: get_i64("seq")? as i32,
         content: get_str("content")?,

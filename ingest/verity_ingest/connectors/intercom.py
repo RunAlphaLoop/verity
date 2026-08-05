@@ -719,7 +719,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.credential_file is not None:
         cred_token = _read_credential_file(args.credential_file)
 
-    sink = VerityDebeziumSink.from_env()
+    # Explicit source: the shared sink's idle heartbeats must key "intercom"
+    # for the server's per-source freshness gate, never the HubSpot default.
+    sink = VerityDebeziumSink.from_env(SOURCE)
 
     async def run_once() -> tuple[list[IntercomFactEvent], str, dict[str, set[str]], int, bool]:
         connector = IntercomConnector(

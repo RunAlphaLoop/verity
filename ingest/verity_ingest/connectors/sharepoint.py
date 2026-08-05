@@ -1067,11 +1067,16 @@ class SharePointStatusSink(VerityDocumentSink):
     ``POST /v1/admin/connector-status`` body. Unlike the base heartbeat, an
     alarm-bearing heartbeat fires even when ZERO documents were delivered —
     a delta reset or an all-parked cycle that delivered nothing MUST still
-    reach the operator. Never raises; drains accumulators in ``finally``."""
+    reach the operator. Never raises; drains accumulators in ``finally``.
 
-    #: Set by the runner so an alarm-only heartbeat (zero delivered docs) can
-    #: still key its connector-status row by tenant.
-    alarm_tenant_id: str | None = None
+    ``alarm_tenant_id`` (the runner-set tenant fallback) now lives on the base
+    :class:`VerityDocumentSink`, generalized to every heartbeat — including the
+    idle beats (``items_synced: 0``) the server's per-source freshness gate
+    depends on to tell a quiet-but-healthy connector from a stalled one."""
+
+    #: Idle-cycle heartbeat source (base-class fallback; the alarm path below
+    #: keeps its explicit ``SOURCE_NAME``).
+    default_source = SOURCE_NAME
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

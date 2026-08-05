@@ -3569,7 +3569,7 @@ impl PostgresAdapter {
         // Safe: the predicate string is assembled from constants only; all
         // caller data goes through binds.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, source, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     1 - ({col} <=> $1) AS score
              FROM chunks
              WHERE tenant_id = $2
@@ -3613,7 +3613,7 @@ impl PostgresAdapter {
         // full match set (measured 542ms p50; docs/BENCHMARKS.md). This is
         // filter-then-rank, never truncate-then-authorize.
         let sql = if scope.entity_scope.is_empty() {
-            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, source, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     paradedb.score(id) AS score
              FROM chunks
              WHERE id @@@ paradedb.match('content', $1)
@@ -3638,7 +3638,7 @@ impl PostgresAdapter {
                    AND valid_to IS NULL
                    AND confidentiality <= $4
              )
-             SELECT c.id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
+             SELECT c.id, c.source, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     cand.score AS score
              FROM cand JOIN chunks c ON c.id = cand.id
              WHERE (c.kind = 'knowledge'
@@ -3677,6 +3677,9 @@ fn entity_scope_predicate(scope: &Scope, bind: &str) -> String {
 fn row_to_hit(row: &PgRow) -> Result<RecallHit> {
     Ok(RecallHit {
         chunk_id: row.try_get("id").map_err(db_err)?,
+        source: row.try_get("source").map_err(db_err)?,
+        // Annotated by the server's per-source freshness gate, never by storage.
+        source_synced_at: None,
         document_id: row.try_get("document_id").map_err(db_err)?,
         seq: row.try_get("seq").map_err(db_err)?,
         content: row.try_get("content").map_err(db_err)?,
@@ -4517,7 +4520,7 @@ impl StorageAdapter for PostgresAdapter {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT id, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
+            "SELECT id, source, document_id, seq, content, entity_tags, kind, support_tier, acl_provenance, trust_tier, valid_from, provenance,
                     0.0::float8 AS score
              FROM chunks
              WHERE tenant_id = $1

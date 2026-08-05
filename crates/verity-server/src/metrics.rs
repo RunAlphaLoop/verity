@@ -70,6 +70,12 @@ pub(crate) struct Metrics {
     /// into live re-resolution / fail-closed. A rising counter = the Watch is
     /// degraded/lagging and the read path is over-hiding to stay honest.
     pub(crate) staleness_fence_engaged: AtomicU64,
+    /// `source_fence_drops_total` — recall hits dropped by the per-source
+    /// freshness gate (source_freshness.rs): stale or never-heartbeated
+    /// connector sources refused while the gate was active. A rising counter =
+    /// a connector is stalled (or was never run) and recall is over-hiding its
+    /// rows to stay honest.
+    pub(crate) source_fence_drops: AtomicU64,
 }
 
 impl Metrics {
@@ -83,12 +89,20 @@ impl Metrics {
             revocation_subtractions: Arc::new(AtomicU64::new(0)),
             audit_insert_drops: AtomicU64::new(0),
             staleness_fence_engaged: AtomicU64::new(0),
+            source_fence_drops: AtomicU64::new(0),
         }
     }
 
     /// Count one recall-side staleness-fence engagement.
     pub(crate) fn record_staleness_fence(&self) {
         self.staleness_fence_engaged.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count hits dropped by the per-source freshness gate (by the number
+    /// actually dropped, never the whole result set).
+    pub(crate) fn record_source_fence_drops(&self, dropped: u64) {
+        self.source_fence_drops
+            .fetch_add(dropped, Ordering::Relaxed);
     }
 
     /// A clone of the shared exact-scan counter, to wire into `PostgresAdapter`
@@ -211,6 +225,17 @@ impl Metrics {
             out,
             "staleness_fence_engaged_total {}",
             self.staleness_fence_engaged.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP source_fence_drops_total Recall hits dropped by the per-source freshness gate (stale/never-heartbeated connector sources)."
+        );
+        let _ = writeln!(out, "# TYPE source_fence_drops_total counter");
+        let _ = writeln!(
+            out,
+            "source_fence_drops_total {}",
+            self.source_fence_drops.load(Ordering::Relaxed)
         );
     }
 }

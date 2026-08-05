@@ -703,7 +703,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.credential_file is not None:
         cred_token = _read_credential_file(args.credential_file)
 
-    sink = VerityDebeziumSink.from_env()
+    # Explicit source: the shared sink's idle heartbeats must key "notion" for
+    # the server's per-source freshness gate, never the HubSpot default.
+    sink = VerityDebeziumSink.from_env(SOURCE)
 
     async def run_once() -> tuple[list[FactEvent | DocumentEvent], str, int, bool]:
         connector = NotionConnector(policy, token=cred_token, with_content=args.with_content)

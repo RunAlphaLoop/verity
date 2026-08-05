@@ -353,6 +353,17 @@ pub struct RecallHit {
     pub entity_tags: Vec<String>,
     /// "content" (scoped memory) or "knowledge" (published, entity-free — §7g).
     pub kind: String,
+    /// Origin source of the chunk ("gdrive", "agent", "webhook:crm", …) — the
+    /// same `chunks.source` the connectors stamp at ingest. `default` so
+    /// pre-upgrade serialized hits still deserialize (empty = unknown).
+    #[serde(default)]
+    pub source: String,
+    /// Last successful heartbeat instant of the hit's source connector
+    /// (`connector_status.updated_at`), annotated by the server's per-source
+    /// freshness gate. `None` for exempt sources (agent / webhook:* / folder:*
+    /// / ad-hoc) and for never-heartbeated sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_synced_at: Option<DateTime<Utc>>,
     /// Bucketed cross-customer support, present ONLY on `kind == "knowledge"`
     /// hits (knowledge-merge-tuning.md §5): a coarse tier the agent can weight
     /// by, never an exact count. `None` on ordinary content chunks.
