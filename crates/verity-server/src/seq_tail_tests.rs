@@ -75,6 +75,7 @@ async fn deliver(
             trust_tier: TrustTier::Authoritative,
             valid_from,
             provenance: episode,
+            derived_from: vec![],
             acl_provenance: AclProvenance::Mirrored,
         })
         .collect();
