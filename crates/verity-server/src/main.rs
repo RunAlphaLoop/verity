@@ -53,6 +53,8 @@ mod retire_tests;
 mod revocation;
 mod scheduler;
 mod scope;
+#[cfg(test)]
+mod seq_tail_tests;
 mod slo;
 mod source_freshness;
 #[cfg(test)]
