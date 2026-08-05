@@ -1424,3 +1424,16 @@ def test_poll_side_effect_accumulates_then_delivers_person_and_org():
     assert "bob@corp.example" in person_emails
     assert "eng-leads@corp.example" not in person_emails
     assert "corp.example" in org_domains  # foreign to ops@ourco.com
+
+
+def test_word_mimes_are_binary_extractable():
+    """Regression: docx/doc were absent from BINARY_EXTRACTABLE_MIMES even though
+    the server extracts both — Word files on Drive/SharePoint were silently
+    skipped. The sharepoint connector imports this gate, so this pins both."""
+    from verity_ingest.connectors.gdrive import is_binary_extractable
+
+    assert is_binary_extractable(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert is_binary_extractable("application/msword")
+    assert not is_binary_extractable("image/png")
