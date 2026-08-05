@@ -441,7 +441,9 @@ async fn no_lineage_is_writer_scoped_at_compiled_principals() {
 }
 
 /// VERITY_REMEMBER_REQUIRE_LINEAGE=1: a provenance-less remember is a 422;
-/// the same write WITH lineage (or a policy) still lands.
+/// the same write WITH lineage still lands. (Policy-ONLY under the knob is
+/// tested separately — the fail-closed reading refuses it: a policy is an
+/// asserted audience, not a provenance claim, so it does NOT satisfy the knob.)
 #[tokio::test]
 async fn require_lineage_knob_rejects_provenance_less_writes() {
     let (state, tenant) = derivation_state(true).await;
@@ -481,10 +483,10 @@ async fn require_lineage_knob_rejects_provenance_less_writes() {
 /// Explicit visibility_policy is clamped-by-rejection: a principal outside the
 /// writer's compiled set (or unknown entirely) is a 422 NAMING it — never a
 /// silent clamp. An in-set policy lands as `declared`, and with lineage
-/// present the policy overrides the intersection while lineage is still
-/// validated and persisted.
+/// present the policy may NARROW WITHIN the intersection (a strict subset)
+/// while lineage is still validated and persisted.
 #[tokio::test]
-async fn visibility_policy_clamps_by_rejection_and_overrides_intersection() {
+async fn visibility_policy_clamps_by_rejection_and_narrows_within_intersection() {
     let (state, tenant) = derivation_state(false).await;
     let mapped = crate::upsert_principal_tokens(
         state.pool(),
@@ -549,8 +551,8 @@ async fn visibility_policy_clamps_by_rejection_and_overrides_intersection() {
     assert_eq!(vis, vec![t_in]);
     assert_eq!(prov, "declared");
 
-    // Policy + lineage: policy overrides the intersection ({t_in, t_eng} →
-    // {t_in}), stays `declared`, and the lineage is still persisted.
+    // Policy + lineage: policy NARROWS WITHIN the intersection ({t_in, t_eng}
+    // → {t_in}, a strict subset), stays `declared`, lineage still persisted.
     let (input_episode, chunks) = seed_document(
         &state,
         tenant,
@@ -759,6 +761,211 @@ async fn confidentiality_max_propagates_and_enforces_on_read() {
     )
     .await;
     assert_eq!(high.len(), 1);
+}
+
+/// (a) Lineage + policy where the policy is a SUBSET OF THE INTERSECTION: the
+/// stamped visibility is exactly the policy set, the label is `declared`, and a
+/// reader holding the surviving token recalls it. The intersection is
+/// {t_a, t_b}; the policy narrows to {t_a}; the write lands at {t_a}.
+#[tokio::test]
+async fn lineage_plus_policy_subset_of_intersection_narrows_and_recalls() {
+    let (state, tenant) = derivation_state(false).await;
+    let mapped = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &["user:a@example.com".into(), "user:b@example.com".into()],
+    )
+    .await
+    .expect("principal tokens");
+    let (t_a, t_b) = (mapped[0].1, mapped[1].1);
+
+    // Input visible to {t_a, t_b} → intersection {t_a, t_b}.
+    let (input_episode, chunks) = seed_document(
+        &state,
+        tenant,
+        "crm:subset-input",
+        &[vec![t_a, t_b]],
+        Confidentiality::Internal,
+        "shared input zzsubsetinput",
+    )
+    .await;
+
+    let h = handle(&state, tenant, vec![t_a, t_b], Confidentiality::Internal);
+    let v = remember(
+        &state,
+        json!({
+            "scope_handle": h,
+            "observation": "narrowed derived zzsubsetderived",
+            "derived_from": [chunks[0]],
+            "visibility_policy": ["user:a@example.com"],
+        }),
+    )
+    .await
+    .expect("policy ⊆ intersection lands");
+    assert_eq!(v["acl_provenance"], "declared");
+    assert_eq!(v["visibility_count"], 1);
+
+    let episode_id = v["episode_id"].as_str().expect("episode id").to_string();
+    let (vis, prov, lineage, _) = observation_chunk(&state, tenant, &episode_id).await;
+    assert_eq!(vis, vec![t_a], "stamped = the policy set, ⊆ intersection");
+    assert_eq!(prov, "declared");
+    assert_eq!(lineage, vec![input_episode], "lineage still persisted");
+
+    // The surviving-token reader recalls it.
+    let seen = recall_contents(
+        &state,
+        tenant,
+        vec![t_a],
+        Confidentiality::Internal,
+        "zzsubsetderived",
+    )
+    .await;
+    assert_eq!(seen.len(), 1, "user:a recalls the narrowed derived memory");
+    // The token dropped by the policy (still in the intersection) gets ∅.
+    let dropped = recall_contents(
+        &state,
+        tenant,
+        vec![t_b],
+        Confidentiality::Internal,
+        "zzsubsetderived",
+    )
+    .await;
+    assert!(dropped.is_empty(), "user:b was narrowed out by the policy");
+}
+
+/// (b) The re-widen path is DEAD: lineage + a policy naming a token that is IN
+/// the writer's scope but OUTSIDE the lineage intersection is a 422 (nothing
+/// written), and — critically — a reader holding that very token gets ∅ on
+/// recall, proving the widened row never existed. Writer holds {t_narrow,
+/// t_wide}; input is visible only to {t_narrow} → intersection {t_narrow}; the
+/// policy tries to re-add t_wide.
+#[tokio::test]
+async fn lineage_plus_policy_rewiden_past_intersection_is_dead() {
+    let (state, tenant) = derivation_state(false).await;
+    let mapped = crate::upsert_principal_tokens(
+        state.pool(),
+        tenant,
+        &[
+            "user:narrow@example.com".into(),
+            "user:wide@example.com".into(),
+        ],
+    )
+    .await
+    .expect("principal tokens");
+    let (t_narrow, t_wide) = (mapped[0].1, mapped[1].1);
+
+    // Input visible ONLY to t_narrow → intersection {t_narrow}. t_wide is in
+    // writer scope but NOT in the intersection.
+    let (_, chunks) = seed_document(
+        &state,
+        tenant,
+        "crm:rewiden-input",
+        &[vec![t_narrow]],
+        Confidentiality::Internal,
+        "narrow input zzrewideninput",
+    )
+    .await;
+
+    let h = handle(
+        &state,
+        tenant,
+        vec![t_narrow, t_wide],
+        Confidentiality::Internal,
+    );
+    let err = remember(
+        &state,
+        json!({
+            "scope_handle": h,
+            "observation": "attempted re-widen zzrewiden",
+            "derived_from": [chunks[0]],
+            "visibility_policy": ["user:narrow@example.com", "user:wide@example.com"],
+        }),
+    )
+    .await
+    .expect_err("a policy re-widening past the intersection must be rejected");
+    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        err.1.contains("user:wide@example.com"),
+        "422 names the offending token: {}",
+        err.1
+    );
+    // Nothing written: no agent episode, no agent chunk.
+    assert_eq!(agent_write_counts(&state, tenant).await, (0, 0));
+
+    // THE proof the re-widen path is dead: the reader holding the very token
+    // the policy tried to re-add gets ∅ — the widened row was never created.
+    let wide_reader = recall_contents(
+        &state,
+        tenant,
+        vec![t_wide],
+        Confidentiality::Internal,
+        "zzrewiden",
+    )
+    .await;
+    assert!(
+        wide_reader.is_empty(),
+        "the re-widen target token recalls nothing — the write never happened"
+    );
+}
+
+/// (c) Fail-closed reading of VERITY_REMEMBER_REQUIRE_LINEAGE: a POLICY-ONLY
+/// write (no `derived_from`) does NOT satisfy the knob — a policy is an
+/// asserted audience, not a provenance claim — so it is a 422, nothing written.
+/// The same write with lineage added lands. This is what makes the knob mean
+/// exactly "require lineage".
+#[tokio::test]
+async fn require_lineage_knob_rejects_policy_only_writes() {
+    let (state, tenant) = derivation_state(true).await;
+    let mapped =
+        crate::upsert_principal_tokens(state.pool(), tenant, &["user:p@example.com".into()])
+            .await
+            .expect("principal token");
+    let t_p = mapped[0].1;
+    let h = handle(&state, tenant, vec![t_p], Confidentiality::Internal);
+
+    // Policy alone under the knob: refused.
+    let err = remember(
+        &state,
+        json!({
+            "scope_handle": h,
+            "observation": "policy only under strict zzpolicystrict",
+            "visibility_policy": ["user:p@example.com"],
+        }),
+    )
+    .await
+    .expect_err("policy alone does not satisfy require-lineage");
+    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        err.1.contains("derived_from"),
+        "the refusal explains lineage is required: {}",
+        err.1
+    );
+    assert_eq!(agent_write_counts(&state, tenant).await, (0, 0));
+
+    // Same policy WITH lineage: satisfies the knob and lands (policy ⊆
+    // intersection {t_p}).
+    let (_, chunks) = seed_document(
+        &state,
+        tenant,
+        "crm:strict-policy-input",
+        &[vec![t_p]],
+        Confidentiality::Internal,
+        "strict policy input zzstrictpolicyinput",
+    )
+    .await;
+    let v = remember(
+        &state,
+        json!({
+            "scope_handle": h,
+            "observation": "policy with lineage under strict zzstrictpolicyok",
+            "derived_from": [chunks[0]],
+            "visibility_policy": ["user:p@example.com"],
+        }),
+    )
+    .await
+    .expect("lineage + policy satisfies strict mode");
+    assert_eq!(v["acl_provenance"], "declared");
+    assert_eq!(v["visibility_count"], 1);
 }
 
 /// Hermetic: the new provenance labels round-trip and the rolling-upgrade

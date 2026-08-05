@@ -4384,23 +4384,35 @@ struct RememberRequest {
     /// Explicit visibility policy: principal strings (e.g. "user:a@x.com",
     /// "group:eng@x.com") resolved under the writer's own principal universe
     /// and CLAMPED to a subset of the writer's compiled scope — a principal
-    /// outside it is a 422, never a silent clamp. Labeled `declared`; when
-    /// `derived_from` is also present, the policy overrides the intersection
-    /// (still clamped, still `declared`) while lineage is validated + recorded.
+    /// outside it is a 422, never a silent clamp. Labeled `declared`. When
+    /// `derived_from` is also present, the policy may only FURTHER NARROW
+    /// within the lineage intersection (its ceiling is the intersection, not
+    /// the writer's scope) — a token in writer scope but outside the
+    /// intersection is a 422, never a re-widen. Still `declared`, but now
+    /// guaranteed ⊆ intersection: a row citing lineage is never wider than its
+    /// inputs. To exceed the inputs' audience, omit lineage.
     #[serde(default)]
     visibility_policy: Option<Vec<String>>,
 }
 
 /// Resolve an explicit `visibility_policy` (principal strings) to tokens,
-/// REJECTING any principal not inside the writer's own compiled principal set
-/// (422 naming it — explicit widening beyond the writer is an error, never a
-/// silent clamp). Read-only against the principals table: a string with no
-/// existing token cannot be inside the writer's set, so it is rejected without
-/// allocating (unlike the admin sink's allocating `upsert_principal_tokens`).
+/// REJECTING any principal not inside `ceiling` (422 naming it — explicit
+/// widening beyond the permitted set is an error, never a silent clamp).
+/// Read-only against the principals table: a string with no existing token
+/// cannot be inside any ceiling, so it is rejected without allocating (unlike
+/// the admin sink's allocating `upsert_principal_tokens`).
+///
+/// `ceiling` is the writer's own compiled principal set for a policy-only write,
+/// but the tighter LINEAGE INTERSECTION when `derived_from` is also present: a
+/// policy alongside lineage may only further NARROW within the intersection,
+/// never re-widen back up to writer scope. `ceiling_desc` names the bound in the
+/// rejection so the message is honest about which contract was violated.
 async fn resolve_visibility_policy(
     state: &AppState,
     scope: &Scope,
     policy: &[String],
+    ceiling: &[PrincipalToken],
+    ceiling_desc: &str,
 ) -> HandlerResult<Vec<PrincipalToken>> {
     let known: Vec<(String, PrincipalToken)> = sqlx::query_as(
         "SELECT principal, token FROM principals WHERE tenant_id = $1 AND principal = ANY($2)",
@@ -4415,19 +4427,21 @@ async fn resolve_visibility_policy(
     let mut tokens: Vec<PrincipalToken> = Vec::with_capacity(policy.len());
     for principal in policy {
         match by_principal.get(principal.as_str()) {
-            Some(token) if scope.principals.contains(token) => {
+            Some(token) if ceiling.contains(token) => {
                 if !tokens.contains(token) {
                     tokens.push(*token);
                 }
             }
-            // One message for unknown and out-of-scope alike: naming WHICH it
-            // is would let a writer probe the principal universe.
+            // One message for unknown and out-of-{ceiling} alike: naming WHICH
+            // it is would let a writer probe the principal universe. The
+            // ceiling description says whether the bound was the writer's own
+            // scope or the (tighter) lineage intersection.
             _ => {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!(
-                        "visibility_policy principal {principal:?} is not within the writer's \
-                         own principal set — a policy may narrow visibility, never widen it"
+                        "visibility_policy principal {principal:?} is not within {ceiling_desc} \
+                         — a policy may narrow visibility, never widen it"
                     ),
                 ));
             }
@@ -4476,6 +4490,17 @@ async fn remember(
             .map(|r| r.to_string())
             .collect();
         if !unresolved.is_empty() {
+            // Audit the adversarial signal (a caller citing lineage it cannot
+            // see) before refusing. Off the response path; carries the offending
+            // ref ids so the refusal is attributable. `result_ids` wants uuids,
+            // and derived_refs already are — pass them verbatim.
+            spawn_audit(
+                &state,
+                &payload,
+                "remember_refused",
+                Some("derived_from refs not visible in this scope"),
+                derived_refs.clone(),
+            );
             return Err((
                 StatusCode::FORBIDDEN,
                 format!(
@@ -4500,20 +4525,72 @@ async fn remember(
 
     let (visibility, acl_provenance, confidentiality) =
         match (&lineage, req.visibility_policy.as_deref()) {
-            // Explicit policy: clamped to ⊆ the writer's compiled principals,
-            // labeled `declared`. With lineage also present the policy
-            // overrides the intersection (lineage stays validated + recorded);
-            // confidentiality still propagates from the inputs.
-            (Some((_, conf)), Some(policy)) => (
-                resolve_visibility_policy(&state, &scope, policy).await?,
-                AclProvenance::Declared,
-                *conf,
-            ),
-            (None, Some(policy)) => (
-                resolve_visibility_policy(&state, &scope, policy).await?,
-                AclProvenance::Declared,
-                payload.max_confidentiality,
-            ),
+            // Explicit policy ALONGSIDE lineage: the policy may only further
+            // NARROW within the lineage intersection — never re-widen back up
+            // to writer scope. The ceiling here is the INTERSECTION (`vis`),
+            // not the writer's compiled scope: a token in writer scope but
+            // outside the intersection is a 422 naming it (uniform anti-probing
+            // message). Net contract: with lineage, `visibility_policy` can only
+            // narrow; to get a wider-than-inputs audience the caller must omit
+            // lineage (and is then honestly labeled without a lineage claim).
+            // Still labeled `declared` — the agent set it explicitly — but now
+            // guaranteed ⊆ intersection, so a row citing lineage is never wider
+            // than its inputs, unconditionally. Confidentiality still the max.
+            (Some((vis, conf)), Some(policy)) => {
+                let resolved = match resolve_visibility_policy(
+                    &state,
+                    &scope,
+                    policy,
+                    vis,
+                    "the lineage intersection (with declared derived_from, a \
+                     policy may only narrow within the inputs' shared audience)",
+                )
+                .await
+                {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        // Audit the adversarial signal (a lineage write trying
+                        // to re-widen past its inputs) before refusing. Off the
+                        // response path — the refusal never waits on it.
+                        spawn_audit(
+                            &state,
+                            &payload,
+                            "remember_refused",
+                            Some("visibility_policy widened past lineage intersection"),
+                            derived_refs.clone(),
+                        );
+                        return Err(e);
+                    }
+                };
+                (resolved, AclProvenance::Declared, *conf)
+            }
+            (None, Some(policy)) => {
+                // Fail-closed reading of the knob: REQUIRE_LINEAGE demands
+                // `derived_from` lineage. A policy alone is NOT lineage (it is
+                // an asserted audience, not a provenance claim), so it does not
+                // satisfy the knob — a policy-only write is still a 422 here.
+                // This keeps "require lineage" meaning exactly that.
+                if state.remember_require_lineage {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "VERITY_REMEMBER_REQUIRE_LINEAGE is set: remember requires derived_from \
+                         lineage; an explicit visibility_policy alone does not satisfy it"
+                            .into(),
+                    ));
+                }
+                (
+                    resolve_visibility_policy(
+                        &state,
+                        &scope,
+                        policy,
+                        &scope.principals,
+                        "the writer's own principal set",
+                    )
+                    .await?,
+                    AclProvenance::Declared,
+                    payload.max_confidentiality,
+                )
+            }
             // Lineage only: the intersection invariant (SPEC §2 L3, extended
             // to Tier-2 agent writes). An empty intersection still WRITES —
             // visibility {} is invisible-to-everyone (fail closed), disclosed
@@ -4528,7 +4605,7 @@ async fn remember(
                     return Err((
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "VERITY_REMEMBER_REQUIRE_LINEAGE is set: remember requires derived_from \
-                         lineage or an explicit visibility_policy"
+                         lineage"
                             .into(),
                     ));
                 }

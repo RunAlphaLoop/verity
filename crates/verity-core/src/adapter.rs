@@ -86,8 +86,11 @@ pub trait StorageAdapter: Send + Sync {
     /// visibility/confidentiality/entity/current-row predicate `recall`
     /// enforces, so a caller can only cite lineage it could have read. Each
     /// returned input carries the FULL visibility array + confidentiality of
-    /// its underlying current row(s); an episode ref spans ALL its current
-    /// chunks (intersection/max folded per input). A ref matching zero
+    /// its underlying current row(s); an episode ref spans all its current
+    /// chunks THE CALLER CAN SEE under the compiled scope (intersection/max
+    /// folded per input — a partially-visible episode folds only its visible
+    /// chunks, which is sound: you cannot derive from what you could not read).
+    /// A ref matching zero
     /// scope-visible current rows is simply absent from the result — the
     /// caller must treat that as a refusal (fail closed), never as an
     /// empty-visibility input.
