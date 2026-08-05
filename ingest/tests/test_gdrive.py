@@ -1436,4 +1436,18 @@ def test_word_mimes_are_binary_extractable():
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
     assert is_binary_extractable("application/msword")
-    assert not is_binary_extractable("image/png")
+
+
+def test_image_mimes_are_binary_extractable_png_jpeg_only():
+    """The server's local OCR tier (extract.rs + ocr.rs) handles PNG and JPEG;
+    the mime gate must deliver exactly those. Formats the server would refuse
+    (GIF/TIFF/WebP/SVG) stay honestly metadata-only — pin both directions.
+    The sharepoint connector imports this gate, so this pins it there too."""
+    from verity_ingest.connectors.gdrive import is_binary_extractable
+
+    assert is_binary_extractable("image/png")
+    assert is_binary_extractable("image/jpeg")
+    assert not is_binary_extractable("image/gif")
+    assert not is_binary_extractable("image/tiff")
+    assert not is_binary_extractable("image/webp")
+    assert not is_binary_extractable("image/svg+xml")

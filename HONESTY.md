@@ -98,6 +98,19 @@ source that has **never** heartbeated fails closed while the gate is on (never-s
 indistinguishable from stalled). With the gate off — the default — assume a stalled
 connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
 
+## OCR is local and printed-text-grade, not a document-AI service
+
+Scanned PDFs and PNG/JPEG images are extracted by a fully local, pure-Rust OCR engine
+([ocrs](https://github.com/robertknight/ocrs) on rten; ~12 MB of models fetched once into
+`~/.cache/ocrs`, no cloud calls, no system dependencies). It reads printed type well and is
+**best-effort beyond that**: expect it to miss handwriting, low-resolution scans, stylized
+layouts, and non-Latin scripts. Every extraction receipt discloses the method — `pdf-ocr`
+(with `pages_ocred`, capped at 50 pages) or `image-ocr` — so OCR-derived text is never
+passed off as a document's own text layer, and a file where OCR finds nothing lands
+metadata-only with a typed reason rather than silently indexing empty. Encrypted PDFs are
+still declined outright. Unsupported embedded encodings (CCITT/JBIG2/JPEG 2000) are
+skipped, not guessed at.
+
 ## No users, no SOC 2, no hosted cloud
 
 There are no production users yet. There is no SOC 2 (or any) compliance attestation. There

@@ -234,8 +234,9 @@ struct IngestTextParams {
 struct IngestFileParams {
     /// Scope handle from memory_open_scope.
     scope_handle: String,
-    /// Path to a LOCAL UTF-8 text file. Allowed extensions: .txt, .md,
-    /// .json, .csv, .html. Maximum size: 512 KB.
+    /// Path to a LOCAL file. Allowed extensions: .txt, .md, .json, .csv,
+    /// .html (UTF-8 text) and .png, .jpg, .jpeg (server-side local OCR).
+    /// Maximum size: 512 KB.
     path: String,
     /// Entity tags, e.g. ["account:acme-corp"]. Must be inside the scope's
     /// entity_scope; omit to inherit the whole scope.
@@ -363,22 +364,20 @@ impl VerityMcp {
     }
 
     /// Multipart POST /v1/files: fields `scope_handle`, `entities`
-    /// (comma-separated, only when tags were given), and `file`.
+    /// (comma-separated, only when tags were given), and `file`. The part is
+    /// caller-built: text content for the UTF-8 lane, raw bytes + image mime
+    /// for the OCR lane (the server extracts by magic either way).
     async fn post_file(
         &self,
         scope_handle: String,
         entities: Option<Vec<String>>,
-        file_name: String,
-        content: String,
+        part: reqwest::multipart::Part,
     ) -> Result<CallToolResult, ErrorData> {
         let mut form = reqwest::multipart::Form::new().text("scope_handle", scope_handle);
         if let Some(entities) = entities.filter(|e| !e.is_empty()) {
             form = form.text("entities", entities.join(","));
         }
-        form = form.part(
-            "file",
-            reqwest::multipart::Part::text(content).file_name(file_name),
-        );
+        form = form.part("file", part);
         self.proxy(self.http.post(self.endpoint("/v1/files")).multipart(form))
             .await
     }
@@ -392,8 +391,12 @@ fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 
 // ---------- local helpers for the ingest tools ----------
 
-/// Extensions memory_ingest_file accepts (UTF-8 text-like content only).
+/// Extensions memory_ingest_file accepts as UTF-8 text.
 const INGEST_FILE_EXTENSIONS: [&str; 5] = ["txt", "md", "json", "csv", "html"];
+/// Extensions memory_ingest_file accepts as raw image bytes: the server's
+/// local OCR tier (extract.rs + ocr.rs) extracts printed text best-effort,
+/// disclosed as method "image-ocr" on the receipt.
+const INGEST_IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 /// memory_ingest_file size cap.
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// memory_ingest_url download cap.
@@ -837,7 +840,7 @@ impl VerityMcp {
 
     #[tool(
         name = "memory_ingest_file",
-        description = "Read a LOCAL text file and ingest its contents into shared memory, so it becomes searchable via memory_recall. Use when the knowledge lives in a file on this machine rather than in-context. Accepts UTF-8 .txt/.md/.json/.csv/.html up to 512 KB; anything else is rejected with an error."
+        description = "Read a LOCAL file and ingest its contents into shared memory, so it becomes searchable via memory_recall. Use when the knowledge lives in a file on this machine rather than in-context. Accepts UTF-8 text (.txt/.md/.json/.csv/.html) and images (.png/.jpg/.jpeg — printed text is extracted by the server's local OCR, best-effort, disclosed as method image-ocr) up to 512 KB; anything else is rejected with an error."
     )]
     async fn memory_ingest_file(
         &self,
@@ -849,9 +852,10 @@ impl VerityMcp {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if !INGEST_FILE_EXTENSIONS.contains(&ext.as_str()) {
+        let is_image = INGEST_IMAGE_EXTENSIONS.contains(&ext.as_str());
+        if !is_image && !INGEST_FILE_EXTENSIONS.contains(&ext.as_str()) {
             return tool_error(format!(
-                "unsupported file type {:?}: memory_ingest_file accepts only UTF-8 text files with extension .txt, .md, .json, .csv, or .html",
+                "unsupported file type {:?}: memory_ingest_file accepts UTF-8 text files (.txt, .md, .json, .csv, .html) and images (.png, .jpg, .jpeg)",
                 p.path
             ));
         }
@@ -873,6 +877,28 @@ impl VerityMcp {
             Ok(bytes) => bytes,
             Err(e) => return tool_error(format!("cannot read file {:?}: {e}", p.path)),
         };
+        if is_image {
+            // Raw bytes to the server's OCR lane; the server sniffs magic and
+            // returns a typed, disclosed failure if OCR finds nothing.
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file.png")
+                .to_owned();
+            let mime = if ext == "png" {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            let part = match reqwest::multipart::Part::bytes(bytes)
+                .file_name(file_name)
+                .mime_str(mime)
+            {
+                Ok(part) => part,
+                Err(e) => return tool_error(format!("building upload part: {e}")),
+            };
+            return self.post_file(p.scope_handle, p.entities, part).await;
+        }
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(_) => {
@@ -887,8 +913,8 @@ impl VerityMcp {
             .and_then(|n| n.to_str())
             .unwrap_or("file.txt")
             .to_owned();
-        self.post_file(p.scope_handle, p.entities, file_name, content)
-            .await
+        let part = reqwest::multipart::Part::text(content).file_name(file_name);
+        self.post_file(p.scope_handle, p.entities, part).await
     }
 
     #[tool(
@@ -968,8 +994,8 @@ impl VerityMcp {
             return tool_error(format!("no textual content extracted from {url}"));
         }
         let file_name = file_name_from_url(&url);
-        self.post_file(p.scope_handle, p.entities, file_name, content)
-            .await
+        let part = reqwest::multipart::Part::text(content).file_name(file_name);
+        self.post_file(p.scope_handle, p.entities, part).await
     }
 
     #[tool(

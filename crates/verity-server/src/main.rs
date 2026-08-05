@@ -41,6 +41,7 @@ mod media;
 #[cfg(test)]
 mod media_tests;
 mod metrics;
+mod ocr;
 mod playground;
 #[cfg(test)]
 mod principals_tests;
@@ -3818,7 +3819,8 @@ struct IngestDocumentsRequest {
     #[serde(default)]
     content: Option<String>,
     /// Binary path (Tier-1 extraction, extract.rs): raw file bytes, base64.
-    /// The SERVER extracts text (PDF/PPTX/XLS(X), deterministic, no OCR) so
+    /// The SERVER extracts text (PDF/PPTX/XLS(X)/DOC(X) text layers, plus
+    /// local best-effort OCR for scanned PDFs and PNG/JPEG — ocr.rs) so
     /// connectors stay extraction-free. Chosen over posting to /v1/files
     /// because /v1/files stamps the uploader scope's principals — it would
     /// REPLACE the connector's mirrored per-item ACL, which is the whole
@@ -4262,11 +4264,20 @@ pub(crate) async fn ingest_document(
             (Some(c), hash)
         }
         DeliveredContent::Bytes { raw, hash_over } => {
-            let text = match extract::extract(&raw, req.filename.as_deref()) {
+            // Extraction runs on the blocking pool: the OCR paths (scanned
+            // PDFs, images) can take seconds and must not stall the runtime.
+            let fname = req.filename.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || extract::extract(&raw, fname.as_deref()))
+                    .await
+                    .map_err(internal)?;
+            let text = match outcome {
                 extract::ExtractOutcome::Extracted(ex) => {
-                    extraction_receipt = Some(serde_json::json!({
-                        "method": ex.method, "truncated": ex.truncated,
-                    }));
+                    extraction_receipt = Some(extract::receipt_json(
+                        ex.method,
+                        ex.truncated,
+                        ex.pages_ocred,
+                    ));
                     Some(ex.text)
                 }
                 extract::ExtractOutcome::Failed(f) => {
