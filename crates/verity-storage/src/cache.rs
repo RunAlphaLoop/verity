@@ -133,6 +133,14 @@ impl<S: StorageAdapter> StorageAdapter for CachedAdapter<S> {
         self.inner.recall(query).await
     }
 
+    async fn resolve_derivation_inputs(
+        &self,
+        scope: &Scope,
+        refs: &[uuid::Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        self.inner.resolve_derivation_inputs(scope, refs).await
+    }
+
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {
         self.inner.record_action(action).await
     }

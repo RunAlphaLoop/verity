@@ -158,6 +158,7 @@ async fn seed(cli: &Cli, chunks: usize, batch: usize, workers: usize) -> Result<
                                 valid_from: Utc::now(),
                                 provenance: episode,
                                 acl_provenance: AclProvenance::AdminAssigned,
+                                derived_from: vec![],
                             }
                         })
                         .collect()

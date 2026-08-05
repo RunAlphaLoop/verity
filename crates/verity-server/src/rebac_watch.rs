@@ -1230,6 +1230,7 @@ mod tests {
             rebac: Some(rebac),
             revocations: crate::revocation::RevocationPlane::new(300),
             allow_restricted_without_rebac: false,
+            remember_require_lineage: false,
             subscribers: crate::subscribe::Subscribers::new(16),
             auto_tag: false,
             knowledge_auto_merge: true,

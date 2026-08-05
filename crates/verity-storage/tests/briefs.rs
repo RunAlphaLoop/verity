@@ -57,6 +57,7 @@ fn chunk(
         valid_from: Utc::now(),
         provenance: ep,
         acl_provenance: AclProvenance::AdminAssigned,
+        derived_from: vec![],
     }
 }
 

@@ -50,7 +50,7 @@ pub(crate) struct SourceSpec {
 /// Fixed registry, alphabetical-ish by affinity: the zero-credential local
 /// path first, then content, directory, CRM. `folder` is the aggregate of
 /// every `folder:<name>` watch (the server IS that worker, in-process).
-pub(crate) const SOURCES: [SourceSpec; 9] = [
+pub(crate) const SOURCES: [SourceSpec; 10] = [
     SourceSpec {
         source: "folder",
         label: "Local folders",
@@ -92,6 +92,11 @@ pub(crate) const SOURCES: [SourceSpec; 9] = [
         kind: "support",
     },
     SourceSpec {
+        source: "slack",
+        label: "Slack",
+        kind: "content",
+    },
+    SourceSpec {
         source: "zoom",
         label: "Zoom",
         kind: "content",
@@ -123,7 +128,10 @@ pub(crate) enum CredentialClass {
     /// gdrive / gmail / gdirectory — a SA-key path; gmail/gdirectory also need
     /// a `subject` (domain-wide-delegation impersonation).
     Google { subject_required: bool },
-    /// folder — no credential is ever stored (fail closed: secret intake 422s).
+    /// folder — no credential is ever stored (fail closed: secret intake
+    /// 422s). Also slack: its bot token lives in the CONNECTOR machine's
+    /// `~/.verity/config.toml` (written 0600 by `verity-cli connect slack`),
+    /// never on the server, so server-side secret intake refuses it too.
     None,
 }
 
@@ -1892,12 +1900,14 @@ mod tests {
                 ("salesforce", "crm"),
                 ("notion", "content"),
                 ("intercom", "support"),
+                ("slack", "content"),
                 ("zoom", "content"),
             ]
         );
         assert_eq!(source_spec("hubspot").expect("known").label, "HubSpot");
         assert_eq!(source_spec("notion").expect("known").label, "Notion");
         assert_eq!(source_spec("intercom").expect("known").label, "Intercom");
+        assert_eq!(source_spec("slack").expect("known").label, "Slack");
         // Fail closed: an unknown source resolves to nothing, never a row.
         assert!(source_spec("zendesk").is_none());
         assert!(source_spec("folder:notes").is_none());

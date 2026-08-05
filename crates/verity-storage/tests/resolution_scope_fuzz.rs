@@ -373,6 +373,7 @@ async fn no_resolution_cross_entity_scope_leak() {
             valid_from: now - Duration::hours(1),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         };
         let doc_a = format!("doc-A-{seed}");
         let doc_b = format!("doc-B-{seed}");

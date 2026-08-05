@@ -154,6 +154,13 @@ impl Confidentiality {
 
 /// How a memory's visibility was determined (SPEC §5e.6). Surfaced on every
 /// read so the convenience lane and the truth lane are labeled in-product.
+///
+/// ROLLING-UPGRADE CAVEAT: `from_str_lossy` maps any UNKNOWN stored label to
+/// `AdminAssigned`. A pre-`derived`/`writer-scoped`/`declared` binary reading
+/// rows written by a newer one therefore MISLABELS them as `admin-assigned` on
+/// reads. This is a label-only degradation (the visibility array — the actual
+/// enforcement input — is unaffected), but operators doing mixed-version
+/// rollouts should upgrade readers before writers to keep labels honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AclProvenance {
@@ -164,6 +171,18 @@ pub enum AclProvenance {
     /// Explicit admin/agent-assigned visibility policy.
     AdminAssigned,
     Quarantined,
+    /// Agent write with declared lineage (`derived_from`): visibility is the
+    /// INTERSECTION of every input's visibility, confidentiality the max
+    /// (SPEC §2 L3 invariant extended to Tier-2 writes).
+    Derived,
+    /// Agent write with NO lineage and NO explicit policy: stamped with the
+    /// writer's own compiled principal set. Honest label for the convenience
+    /// lane — the write is as visible as the writer, nothing narrower.
+    WriterScoped,
+    /// Agent write under an explicit `visibility_policy`, clamped to a subset
+    /// of the writer's own compiled principal set (widening beyond the writer
+    /// is rejected, never silently clamped).
+    Declared,
 }
 
 impl AclProvenance {
@@ -173,6 +192,9 @@ impl AclProvenance {
             Self::Approximated => "approximated",
             Self::AdminAssigned => "admin-assigned",
             Self::Quarantined => "quarantined",
+            Self::Derived => "derived",
+            Self::WriterScoped => "writer-scoped",
+            Self::Declared => "declared",
         }
     }
 
@@ -181,6 +203,12 @@ impl AclProvenance {
             "mirrored" => Self::Mirrored,
             "approximated" => Self::Approximated,
             "quarantined" => Self::Quarantined,
+            "derived" => Self::Derived,
+            "writer-scoped" => Self::WriterScoped,
+            "declared" => Self::Declared,
+            // Unknown labels (including labels from a NEWER binary during a
+            // rolling upgrade) fall back to AdminAssigned — see the enum-level
+            // caveat above.
             _ => Self::AdminAssigned,
         }
     }
@@ -302,6 +330,26 @@ pub struct ChunkWrite {
     pub valid_from: DateTime<Utc>,
     pub provenance: EpisodeId,
     pub acl_provenance: AclProvenance,
+    /// Declared derivation lineage (input-derived visibility): the L0 episode
+    /// ids of the memories this chunk was derived from. Empty for non-derived
+    /// writes. serde-defaulted so pre-lineage serialized writes keep decoding.
+    #[serde(default)]
+    pub derived_from: Vec<EpisodeId>,
+}
+
+/// One resolved derivation input for an agent write with declared lineage
+/// (`StorageAdapter::resolve_derivation_inputs`). `reference` is the caller-
+/// supplied ref (a chunk id or an episode id) that matched; `episode_id` is
+/// the normalized L0 lineage key. For an episode ref spanning multiple current
+/// chunks, `visibility` is already the intersection across those chunks and
+/// `confidentiality` the max — so the caller's fold across inputs equals the
+/// flat intersection/max over every underlying row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivationInput {
+    pub reference: Uuid,
+    pub episode_id: EpisodeId,
+    pub visibility: Vec<PrincipalToken>,
+    pub confidentiality: Confidentiality,
 }
 
 /// The caller's compiled scope, resolved server-side from token + MemoryScope

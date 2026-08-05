@@ -593,11 +593,43 @@ impl StorageAdapter for QdrantAdapter {
                 "one upsert_chunks batch, one tenant".into(),
             ));
         }
-        let positions: Vec<(String, String, i32)> = chunks
+        let mut positions: Vec<(String, String, i32)> = chunks
             .iter()
             .map(|c| (c.source.clone(), c.document_id.clone(), c.seq))
             .collect();
+        // Highest delivered seq per document: everything past it is the
+        // shrink-closed tail the inner adapter may have just retired.
+        let mut doc_max: std::collections::HashMap<(String, String), i32> =
+            std::collections::HashMap::new();
+        for (source, doc, seq) in &positions {
+            let entry = doc_max.entry((source.clone(), doc.clone())).or_insert(*seq);
+            *entry = (*entry).max(*seq);
+        }
         let written = self.inner.upsert_chunks(chunks).await?;
+        // A shrinking re-delivery closes tail rows (seq beyond the delivered
+        // count) that are NOT positions of this batch — same re-mirror duty as
+        // retire_document, so their Qdrant points pick up the closed valid_to
+        // instead of serving stale content on the dense leg.
+        for ((source, doc), max_seq) in &doc_max {
+            let touched = sqlx::query(
+                "SELECT DISTINCT source, document_id, seq FROM chunks
+                 WHERE tenant_id = $1 AND source = $2 AND document_id = $3 AND seq > $4",
+            )
+            .bind(tenant)
+            .bind(source)
+            .bind(doc)
+            .bind(max_seq)
+            .fetch_all(self.inner.pool())
+            .await
+            .map_err(db_err)?;
+            for r in &touched {
+                positions.push((
+                    r.try_get("source").map_err(db_err)?,
+                    r.try_get("document_id").map_err(db_err)?,
+                    r.try_get("seq").map_err(db_err)?,
+                ));
+            }
+        }
         self.mirror_positions(tenant, &positions).await?;
         Ok(written)
     }
@@ -630,6 +662,17 @@ impl StorageAdapter for QdrantAdapter {
                 "recall requires an embedding, text, or both".into(),
             )),
         }
+    }
+
+    /// Delegates to the inner Postgres adapter: derivation-lineage resolution
+    /// is a metadata point-read on the system-of-record chunk rows, not a
+    /// vector-engine concern (the Qdrant mirror carries no `derived_from`).
+    async fn resolve_derivation_inputs(
+        &self,
+        scope: &Scope,
+        refs: &[Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        self.inner.resolve_derivation_inputs(scope, refs).await
     }
 
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {

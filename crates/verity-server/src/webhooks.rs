@@ -329,6 +329,7 @@ pub(crate) async fn webhook_post(
                 // Bound at mint time by an admin — explicit policy, not a
                 // mirrored or approximated source ACL.
                 acl_provenance: AclProvenance::AdminAssigned,
+                derived_from: vec![],
             }])
             .await
             .map_err(internal)?;

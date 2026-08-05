@@ -116,6 +116,34 @@ source that has **never** heartbeated fails closed while the gate is on (never-s
 indistinguishable from stalled). With the gate off — the default — assume a stalled
 connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
 
+## Derived-visibility on agent writes: lineage is client-DECLARED, not inferred
+
+`remember` (`POST /v1/episodes`) now enforces the SPEC §2 intersection
+invariant for agent writes **that declare their inputs**: pass `derived_from`
+(chunk ids / episode ids from recall) and the stored memory's visibility is the
+intersection of every input's visibility (confidentiality the max), resolved
+under the writer's own compiled scope — a ref the writer can't see refuses the
+whole write, and a disjoint intersection stores an invisible-to-everyone row,
+disclosed in the response. The fix was specified by a reviewer on reddit better
+than our own notes had. Two honesty limits remain:
+
+- **The server cannot infer lineage.** Scope handles are stateless (an HMAC
+  payload, no session store), so the server has no record of which recalls fed
+  a given write. If an agent summarizes a narrow row and *omits*
+  `derived_from`, the summary is still stored at the **writer's full compiled
+  scope** — labeled `writer-scoped` at read time so the difference is visible,
+  but labeled is not prevented. A strict knob exists
+  (`VERITY_REMEMBER_REQUIRE_LINEAGE=1` rejects provenance-less `remember`
+  writes); it is OFF by default.
+- **Only `remember` has the lineage lane so far.** `record_action`, ad-hoc
+  ingest (`ingest_text` / file / URL), and the media lanes still stamp the
+  writing scope's full principal set with no way to declare inputs — flagged
+  follow-ups, same shape as the original gap. Until those land, treat agent
+  side-channels other than `remember` as visible to the writing agent's whole
+  scope. The ancestor-narrow invalidation walk (re-narrowing derived rows when
+  an input's ACL narrows after the fact) is also not built yet; the
+  `chunks.derived_from` lineage column exists for it.
+
 ## No users, no SOC 2, no hosted cloud
 
 There are no production users yet. There is no SOC 2 (or any) compliance attestation. There
