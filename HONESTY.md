@@ -98,28 +98,33 @@ source that has **never** heartbeated fails closed while the gate is on (never-s
 indistinguishable from stalled). With the gate off — the default — assume a stalled
 connector serves ACLs as stale as the stall is long, and monitor the heartbeats.
 
-## Agent-authored memories currently carry the writer's scope
+## Derived-visibility on agent writes: lineage is client-DECLARED, not inferred
 
-Rows that arrive through a connector inherit their source system's ACL. Rows an
-agent writes itself (`memory_remember`, agent actions, ad-hoc text/file ingest)
-have no source ACL to inherit, and today they are stamped with the visibility of
-the **writing scope's full principal set**. That means a privileged agent that
-recalls one narrowly shared fact and writes a summary of it stores that summary
-at its own wider audience: an intra-tenant widening through a perfectly
-legitimate write, the same shape as the leak this project exists to prevent,
-one layer down. The confidentiality ceiling does propagate (a summary written
-from a Restricted session is stamped Restricted), but that narrows
-classification, not audience.
+`remember` (`POST /v1/episodes`) now enforces the SPEC §2 intersection
+invariant for agent writes **that declare their inputs**: pass `derived_from`
+(chunk ids / episode ids from recall) and the stored memory's visibility is the
+intersection of every input's visibility (confidentiality the max), resolved
+under the writer's own compiled scope — a ref the writer can't see refuses the
+whole write, and a disjoint intersection stores an invisible-to-everyone row,
+disclosed in the response. The fix was specified by a reviewer on reddit better
+than our own notes had. Two honesty limits remain:
 
-SPEC section 2 already states the correct invariant, that a derived artifact
-carries the intersection of its lineage's visibility, and this lane does not
-yet enforce it. The fix is in progress: writes that declare their inputs will
-be stamped with the intersection of those inputs' audiences, writes with no
-lineage will keep writer scope but carry a distinct label so the difference is
-visible at read time, and widening will only ever be explicit. Until it lands,
-treat agent-written summaries of restricted material as visible to the writing
-agent's whole scope. Found by a reviewer on reddit, who specified the fix
-better than our own notes had.
+- **The server cannot infer lineage.** Scope handles are stateless (an HMAC
+  payload, no session store), so the server has no record of which recalls fed
+  a given write. If an agent summarizes a narrow row and *omits*
+  `derived_from`, the summary is still stored at the **writer's full compiled
+  scope** — labeled `writer-scoped` at read time so the difference is visible,
+  but labeled is not prevented. A strict knob exists
+  (`VERITY_REMEMBER_REQUIRE_LINEAGE=1` rejects provenance-less `remember`
+  writes); it is OFF by default.
+- **Only `remember` has the lineage lane so far.** `record_action`, ad-hoc
+  ingest (`ingest_text` / file / URL), and the media lanes still stamp the
+  writing scope's full principal set with no way to declare inputs — flagged
+  follow-ups, same shape as the original gap. Until those land, treat agent
+  side-channels other than `remember` as visible to the writing agent's whole
+  scope. The ancestor-narrow invalidation walk (re-narrowing derived rows when
+  an input's ACL narrows after the fact) is also not built yet; the
+  `chunks.derived_from` lineage column exists for it.
 
 ## No users, no SOC 2, no hosted cloud
 

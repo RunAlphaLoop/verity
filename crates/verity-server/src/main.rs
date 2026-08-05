@@ -23,6 +23,8 @@ mod consolidation;
 mod consolidation_tests;
 #[cfg(test)]
 mod crosswalk_tests;
+#[cfg(test)]
+mod derivation_tests;
 mod directory_worker;
 #[cfg(test)]
 mod entity_resolution_tests;
@@ -391,6 +393,12 @@ pub(crate) struct AppState {
     /// `VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC=1` — explicit opt-out of the
     /// fail-closed restricted drop when no ReBAC engine is configured.
     pub(crate) allow_restricted_without_rebac: bool,
+    /// `VERITY_REMEMBER_REQUIRE_LINEAGE=1` — strict mode for `remember`: an
+    /// agent write carrying neither `derived_from` lineage nor an explicit
+    /// `visibility_policy` is rejected (422) instead of being stored at the
+    /// writer's own scope. Default OFF: provenance-less writes are allowed,
+    /// honestly labeled `writer-scoped`.
+    pub(crate) remember_require_lineage: bool,
     /// Live SSE subscription gauge (task 21): capped, 429 beyond.
     pub(crate) subscribers: subscribe::Subscribers,
     /// `VERITY_AUTO_TAG=1` — consolidation tag suggestions at >= 0.9
@@ -1783,6 +1791,8 @@ async fn main() -> anyhow::Result<()> {
             r
         },
         allow_restricted_without_rebac: std::env::var("VERITY_ALLOW_RESTRICTED_WITHOUT_REBAC")
+            .is_ok_and(|v| v == "1"),
+        remember_require_lineage: std::env::var("VERITY_REMEMBER_REQUIRE_LINEAGE")
             .is_ok_and(|v| v == "1"),
         subscribers: subscribe::Subscribers::from_env(),
         // Media blobs to object storage when configured; else the bytea path.
@@ -4340,6 +4350,7 @@ pub(crate) async fn ingest_document(
             valid_from,
             provenance: episode_id,
             acl_provenance: req.acl_provenance,
+            derived_from: vec![],
         });
     }
     let chunks_indexed = state
@@ -4366,6 +4377,79 @@ struct RememberRequest {
     observation: String,
     #[serde(default)]
     entities: Vec<String>,
+    /// Declared derivation lineage: chunk ids (from recall hits) and/or
+    /// episode ids (from recall provenance / earlier remember results) this
+    /// observation was derived from. When present, the write's visibility is
+    /// the INTERSECTION of the inputs' visibility — never the writer's scope.
+    #[serde(default)]
+    derived_from: Option<Vec<uuid::Uuid>>,
+    /// Explicit visibility policy: principal strings (e.g. "user:a@x.com",
+    /// "group:eng@x.com") resolved under the writer's own principal universe
+    /// and CLAMPED to a subset of the writer's compiled scope — a principal
+    /// outside it is a 422, never a silent clamp. Labeled `declared`. When
+    /// `derived_from` is also present, the policy may only FURTHER NARROW
+    /// within the lineage intersection (its ceiling is the intersection, not
+    /// the writer's scope) — a token in writer scope but outside the
+    /// intersection is a 422, never a re-widen. Still `declared`, but now
+    /// guaranteed ⊆ intersection: a row citing lineage is never wider than its
+    /// inputs. To exceed the inputs' audience, omit lineage.
+    #[serde(default)]
+    visibility_policy: Option<Vec<String>>,
+}
+
+/// Resolve an explicit `visibility_policy` (principal strings) to tokens,
+/// REJECTING any principal not inside `ceiling` (422 naming it — explicit
+/// widening beyond the permitted set is an error, never a silent clamp).
+/// Read-only against the principals table: a string with no existing token
+/// cannot be inside any ceiling, so it is rejected without allocating (unlike
+/// the admin sink's allocating `upsert_principal_tokens`).
+///
+/// `ceiling` is the writer's own compiled principal set for a policy-only write,
+/// but the tighter LINEAGE INTERSECTION when `derived_from` is also present: a
+/// policy alongside lineage may only further NARROW within the intersection,
+/// never re-widen back up to writer scope. `ceiling_desc` names the bound in the
+/// rejection so the message is honest about which contract was violated.
+async fn resolve_visibility_policy(
+    state: &AppState,
+    scope: &Scope,
+    policy: &[String],
+    ceiling: &[PrincipalToken],
+    ceiling_desc: &str,
+) -> HandlerResult<Vec<PrincipalToken>> {
+    let known: Vec<(String, PrincipalToken)> = sqlx::query_as(
+        "SELECT principal, token FROM principals WHERE tenant_id = $1 AND principal = ANY($2)",
+    )
+    .bind(scope.tenant_id)
+    .bind(policy)
+    .fetch_all(state.pool())
+    .await
+    .map_err(internal)?;
+    let by_principal: std::collections::HashMap<&str, PrincipalToken> =
+        known.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+    let mut tokens: Vec<PrincipalToken> = Vec::with_capacity(policy.len());
+    for principal in policy {
+        match by_principal.get(principal.as_str()) {
+            Some(token) if ceiling.contains(token) => {
+                if !tokens.contains(token) {
+                    tokens.push(*token);
+                }
+            }
+            // One message for unknown and out-of-{ceiling} alike: naming WHICH
+            // it is would let a writer probe the principal universe. The
+            // ceiling description says whether the bound was the writer's own
+            // scope or the (tighter) lineage intersection.
+            _ => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "visibility_policy principal {principal:?} is not within {ceiling_desc} \
+                         — a policy may narrow visibility, never widen it"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(tokens)
 }
 
 async fn remember(
@@ -4380,7 +4464,168 @@ async fn remember(
     let received_at = Utc::now();
     let payload = state.verify_scope(&req.scope_handle)?;
     let entities = resolve_entities(&payload, req.entities)?;
+    // The COMPILED scope — revocation subtraction and the staleness fence
+    // apply (scope_for), never the handle's raw principal list. This is what
+    // makes a provenance-less write "as visible as the writer IS", not "as
+    // visible as the writer was at mint time".
+    let scope = state.scope_for(&payload).await?;
 
+    // Declared lineage: resolve every ref UNDER the compiled scope BEFORE
+    // anything is written. A ref the writer cannot see (wrong principals,
+    // wrong tenant, retired row, over-ceiling confidentiality) refuses the
+    // WHOLE write — no episode, no chunk, nothing (fail closed; a partial L0
+    // write would let a rejected request still smuggle content into memory).
+    let derived_refs: Vec<uuid::Uuid> = req.derived_from.unwrap_or_default();
+    let mut derived_episodes: Vec<EpisodeId> = Vec::new();
+    let mut lineage: Option<(Vec<PrincipalToken>, Confidentiality)> = None;
+    if !derived_refs.is_empty() {
+        let inputs = state
+            .storage
+            .resolve_derivation_inputs(&scope, &derived_refs)
+            .await
+            .map_err(internal)?;
+        let resolved: std::collections::HashSet<uuid::Uuid> =
+            inputs.iter().map(|i| i.reference).collect();
+        let unresolved: Vec<String> = derived_refs
+            .iter()
+            .filter(|r| !resolved.contains(r))
+            .map(|r| r.to_string())
+            .collect();
+        if !unresolved.is_empty() {
+            // Audit the adversarial signal (a caller citing lineage it cannot
+            // see) before refusing. Off the response path; carries the offending
+            // ref ids so the refusal is attributable. `result_ids` wants uuids,
+            // and derived_refs already are — pass them verbatim.
+            spawn_audit(
+                &state,
+                &payload,
+                "remember_refused",
+                Some("derived_from refs not visible in this scope"),
+                derived_refs.clone(),
+            );
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "derived_from refs not visible in this scope: [{}] — nothing was written",
+                    unresolved.join(", ")
+                ),
+            ));
+        }
+        // Intersection across ALL inputs' visibility; confidentiality is the
+        // max (a summary is as sensitive as its most sensitive input).
+        let mut vis = inputs[0].visibility.clone();
+        let mut conf = inputs[0].confidentiality;
+        for input in &inputs {
+            vis.retain(|t| input.visibility.contains(t));
+            conf = conf.max(input.confidentiality);
+            if !derived_episodes.contains(&input.episode_id) {
+                derived_episodes.push(input.episode_id);
+            }
+        }
+        lineage = Some((vis, conf));
+    }
+
+    let (visibility, acl_provenance, confidentiality) =
+        match (&lineage, req.visibility_policy.as_deref()) {
+            // Explicit policy ALONGSIDE lineage: the policy may only further
+            // NARROW within the lineage intersection — never re-widen back up
+            // to writer scope. The ceiling here is the INTERSECTION (`vis`),
+            // not the writer's compiled scope: a token in writer scope but
+            // outside the intersection is a 422 naming it (uniform anti-probing
+            // message). Net contract: with lineage, `visibility_policy` can only
+            // narrow; to get a wider-than-inputs audience the caller must omit
+            // lineage (and is then honestly labeled without a lineage claim).
+            // Still labeled `declared` — the agent set it explicitly — but now
+            // guaranteed ⊆ intersection, so a row citing lineage is never wider
+            // than its inputs, unconditionally. Confidentiality still the max.
+            (Some((vis, conf)), Some(policy)) => {
+                let resolved = match resolve_visibility_policy(
+                    &state,
+                    &scope,
+                    policy,
+                    vis,
+                    "the lineage intersection (with declared derived_from, a \
+                     policy may only narrow within the inputs' shared audience)",
+                )
+                .await
+                {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        // Audit the adversarial signal (a lineage write trying
+                        // to re-widen past its inputs) before refusing. Off the
+                        // response path — the refusal never waits on it.
+                        spawn_audit(
+                            &state,
+                            &payload,
+                            "remember_refused",
+                            Some("visibility_policy widened past lineage intersection"),
+                            derived_refs.clone(),
+                        );
+                        return Err(e);
+                    }
+                };
+                (resolved, AclProvenance::Declared, *conf)
+            }
+            (None, Some(policy)) => {
+                // Fail-closed reading of the knob: REQUIRE_LINEAGE demands
+                // `derived_from` lineage. A policy alone is NOT lineage (it is
+                // an asserted audience, not a provenance claim), so it does not
+                // satisfy the knob — a policy-only write is still a 422 here.
+                // This keeps "require lineage" meaning exactly that.
+                if state.remember_require_lineage {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "VERITY_REMEMBER_REQUIRE_LINEAGE is set: remember requires derived_from \
+                         lineage; an explicit visibility_policy alone does not satisfy it"
+                            .into(),
+                    ));
+                }
+                (
+                    resolve_visibility_policy(
+                        &state,
+                        &scope,
+                        policy,
+                        &scope.principals,
+                        "the writer's own principal set",
+                    )
+                    .await?,
+                    AclProvenance::Declared,
+                    payload.max_confidentiality,
+                )
+            }
+            // Lineage only: the intersection invariant (SPEC §2 L3, extended
+            // to Tier-2 agent writes). An empty intersection still WRITES —
+            // visibility {} is invisible-to-everyone (fail closed), disclosed
+            // in the response — because refusing would push agents toward
+            // omitting lineage altogether.
+            (Some((vis, conf)), None) => (vis.clone(), AclProvenance::Derived, *conf),
+            // No lineage, no policy: the writer's own COMPILED principal set,
+            // honestly labeled `writer-scoped` (this fixes the historical
+            // `admin-assigned` mislabel on agent observations).
+            (None, None) => {
+                if state.remember_require_lineage {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "VERITY_REMEMBER_REQUIRE_LINEAGE is set: remember requires derived_from \
+                         lineage"
+                            .into(),
+                    ));
+                }
+                (
+                    scope.principals.clone(),
+                    AclProvenance::WriterScoped,
+                    payload.max_confidentiality,
+                )
+            }
+        };
+
+    let mut episode_payload =
+        serde_json::json!({ "observation": req.observation, "entities": entities });
+    if !derived_episodes.is_empty() {
+        // Lineage rides on the L0 episode too (normalized to episode ids), so
+        // provenance survives even a chunk-lineage rebuild.
+        episode_payload["derived_from"] = serde_json::json!(derived_episodes);
+    }
     let episode_id = state
         .storage
         .append_episode(NewEpisode {
@@ -4391,7 +4636,7 @@ async fn remember(
             // multi-entity observations attribute to their first entity.
             source_entity: entities.first().cloned(),
             kind: EpisodeKind::Observation,
-            payload: serde_json::json!({ "observation": req.observation, "entities": entities }),
+            payload: episode_payload,
             content_hash: format!("{:x}", md5ish(&req.observation)),
             trust_tier: TrustTier::Observation,
             writer_sub: payload.actor_sub.clone(),
@@ -4401,8 +4646,8 @@ async fn remember(
         .map_err(internal)?;
 
     // Deterministic Tier-2 materialization (SPEC §2): embedded when the local
-    // encoder is up, BM25-searchable regardless. Visible to the writer's own
-    // principal set.
+    // encoder is up, BM25-searchable regardless.
+    let observation_summary: String = req.observation.chars().take(120).collect();
     let embedding = state.encode(&req.observation).await.ok().flatten();
     state
         .storage
@@ -4414,19 +4659,44 @@ async fn remember(
             content: req.observation,
             content_hash: format!("obs-{episode_id}"),
             embedding,
-            visibility: payload.principals.clone(),
+            visibility: visibility.clone(),
             entity_tags: entities,
-            confidentiality: payload.max_confidentiality,
+            confidentiality,
             trust_tier: TrustTier::Observation,
             valid_from: Utc::now(),
             provenance: episode_id,
-            acl_provenance: AclProvenance::AdminAssigned,
+            acl_provenance,
+            derived_from: derived_episodes.clone(),
         }])
         .await
         .map_err(internal)?;
 
+    // Audit the write including the declared lineage refs (as supplied).
+    let mut audit_ids = vec![episode_id];
+    audit_ids.extend(derived_refs.iter().copied());
+    spawn_audit(
+        &state,
+        &payload,
+        "remember",
+        Some(&observation_summary),
+        audit_ids,
+    );
+
     slo::record_sample(state.pool(), payload.tenant_id, "agent", received_at).await;
-    Ok(Json(serde_json::json!({ "episode_id": episode_id })))
+    let mut body = serde_json::json!({
+        "episode_id": episode_id,
+        "visibility_count": visibility.len(),
+        "acl_provenance": acl_provenance.as_str(),
+    });
+    if visibility.is_empty() {
+        // Disclosed fail-closed write: the memory exists but is visible to
+        // NOBODY (including the writer). Honest, actionable, never silent.
+        body["hint"] = serde_json::json!(
+            "empty visibility: narrow derived_from to the inputs actually used, \
+             or pass visibility_policy"
+        );
+    }
+    Ok(Json(body))
 }
 
 /// Cheap content hash for L0 idempotency metadata (not security-relevant).
@@ -7335,6 +7605,7 @@ async fn admin_quarantine_reingest(
                     // The whole point: explicit admin policy, never a mirrored
                     // or approximated (unmappable) source ACL.
                     acl_provenance: AclProvenance::AdminAssigned,
+                    derived_from: vec![],
                 }])
                 .await
                 .map_err(internal)?;

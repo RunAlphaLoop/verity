@@ -304,6 +304,7 @@ async fn seed(
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         });
         if batch.len() == 500 {
             adapter.upsert_chunks(std::mem::take(&mut batch)).await?;

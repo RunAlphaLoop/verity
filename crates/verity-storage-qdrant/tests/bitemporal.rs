@@ -153,6 +153,7 @@ async fn recall_fails_closed() {
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .unwrap();
@@ -238,6 +239,7 @@ async fn retire_entity_retires_chunks_too() {
             valid_from: Utc::now() - Duration::hours(1),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .unwrap();

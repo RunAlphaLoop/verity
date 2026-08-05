@@ -664,6 +664,17 @@ impl StorageAdapter for QdrantAdapter {
         }
     }
 
+    /// Delegates to the inner Postgres adapter: derivation-lineage resolution
+    /// is a metadata point-read on the system-of-record chunk rows, not a
+    /// vector-engine concern (the Qdrant mirror carries no `derived_from`).
+    async fn resolve_derivation_inputs(
+        &self,
+        scope: &Scope,
+        refs: &[Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        self.inner.resolve_derivation_inputs(scope, refs).await
+    }
+
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {
         let tenant = action.tenant_id;
         let document_id = format!("action:{}", action.action_id);
