@@ -25,16 +25,30 @@ skip is counted and reported every cycle, never silent.
 G2 — directory-vouched-identity-or-nothing. ``users.list`` →
 ``profile.email`` → one ``principal_crosswalk`` row per full, active, human
 member: ``(source="slack", local_id=<Uid>) → user:<email.lower()>`` with
-``link_method="directory_vouched"`` (the workspace admin vouched that email at
-invite time), written through gdirectory's :func:`build_registry_ops` so the
-canonical row exists before the crosswalk references it. ``deleted`` users,
-``is_bot`` users, users without a ``profile.email``, and single/multi-channel
-guests (``is_restricted``/``is_ultra_restricted``) get NO row and NO
-membership edge — a drop only ever NARROWS what a channel token reaches
-(visibility is single-group: ``group:slack-channel-<id>``), so dropping an
-unmappable member is safe, unlike a content-ACL facet whose drop would
-mis-mirror a grant. Display names are rendering sugar in transcripts ONLY,
-never identity keys.
+``link_method="directory_vouched"`` — but ONLY when that canonical ALREADY
+exists (active) in the registry, vouched by a REAL directory sync
+(gdirectory/entra). ``profile.email`` is workspace-admin-mutable and gets
+re-read every cycle, so Slack's word must never MINT identity: a Slack admin
+who re-points a member's email could otherwise both redirect the member's
+edges AND have this connector CREATE the target canonical on Slack's say-so.
+The connector therefore emits crosswalk rows against pre-existing canonicals
+and NEVER creates ``canonical_principal`` rows (canonical-creation ops are
+filtered out of the reused gdirectory op stream; pre-existence is checked
+through the ``/v1/admin/principals`` ``emails`` resolve, which only answers
+for ACTIVE canonicals whose ``idp_subject``/SSO-alias a directory sync
+vouched — and only an exact ``user:<email>`` canonical match welds; an
+alias-resolved different canonical is dropped, never redirected to). A
+member whose canonical does not pre-exist confers NOTHING — no crosswalk
+row, no membership edge — exactly like ``deleted`` users, ``is_bot`` users,
+users without a ``profile.email``, and single/multi-channel guests
+(``is_restricted``/``is_ultra_restricted``). A drop only ever NARROWS what a
+channel token reaches (visibility is single-group:
+``group:slack-channel-<id>``), so dropping an unvouched member is safe,
+unlike a content-ACL facet whose drop would mis-mirror a grant. Residual,
+stated: an admin re-pointing an email can still REDIRECT edges among
+already-vouched canonicals — the gate closes creation, not aim; the
+directory sync stays the identity authority. Display names are rendering
+sugar in transcripts ONLY, never identity keys.
 
 G3 — membership as snapshot-diff, never truncate-and-reload. Per mirrored
 channel, ``conversations.members`` is a FULL snapshot diffed through the
@@ -80,6 +94,16 @@ HONEST REMAINDERS (poll-lane detection, stated not hidden):
   ``reconcile_overdue`` alarm fires on every heartbeat while
   ``last_reconcile_at`` (stamped ONLY by a zero-failure backfill) is older
   than ``reconcile_sla_hours``.
+- The poll lane's edit/delete detection (``message_changed`` /
+  ``message_deleted`` subtype rows in the fetched history window) is
+  FIXTURE-SHAPED: it matches Slack's documented event/history subtypes, but a
+  live ``conversations.history`` may instead surface an edit as the message
+  row's ``edited`` field and a delete as plain ABSENCE of the row — neither
+  of which this incremental lane would notice. Live falsification is still
+  owed (see Verification status). The ``--backfill`` reconcile diff is the
+  GUARANTEED catch either way — and the monotonic-supersede guard
+  (:meth:`SlackConnector._stamp_monotonic`) is what makes its re-delivery of
+  a changed-but-not-newer thread actually land at the index.
 - A private channel the bot is kicked from simply vanishes from
   ``conversations.list`` — indistinguishable from deletion; the connector
   fail-closes and retires its threads (over-hide, never stale-open).
@@ -104,7 +128,14 @@ lane — the poll connector never opens the WebSocket.
 Sink contract: ``POST /v1/ingest/documents`` bodies with
 ``document_id="slack:{channel_id}:{thread_ts}"`` (a non-threaded message is a
 thread of one), ``content`` = the chronological transcript with display
-names, ``valid_from`` = the LATEST ts in the thread, ``visibility`` = the
+names, ``valid_from`` = the LATEST ts in the thread — advanced monotonically
+past the last DELIVERED stamp whenever the content changed without that ts
+moving forward (deleting the latest reply regresses it; editing the latest
+message keeps its ts): the server's supersede retires only rows strictly
+OLDER than the incoming stamp and its replay-idempotency rides an
+insert-conflict DO NOTHING, so a non-advancing re-delivery would leave the
+deleted text serving or no-op the edit entirely (the L1 guard,
+:meth:`SlackConnector._stamp_monotonic`) — ``visibility`` = the
 resolved ``group:slack-channel-<id>`` token (via ``/v1/admin/principals``),
 ``acl_provenance`` mirrored; quarantined bodies carry NO ``visibility``.
 Admin contract: the same ``/v1/admin/{principals,groups,crosswalk,registry}``
@@ -123,14 +154,17 @@ behavior above is asserted against fixtures authored from Slack's documented
 Web API response shapes (conversations.list/members/history/replies,
 users.list, cursor pagination, 429/Retry-After). It has NOT run against a
 live workspace; live lanes still open: the Socket-Mode push lane, live proof
-of the internal-app rate-limit posture, and ``channels:join`` semantics on a
-real workspace.
+of the internal-app rate-limit posture, ``channels:join`` semantics on a
+real workspace, and the poll-lane edit/delete row shapes (whether a live
+``conversations.history`` really surfaces ``message_changed`` /
+``message_deleted`` subtype rows — see the honest remainder above).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -152,6 +186,7 @@ from verity_ingest.connectors.backfill import BackfillReporter
 # threads `source` into build_registry_ops so the self-crosswalk rows stamp
 # "slack" (the source a downstream resolve presents) without a fork.
 from verity_ingest.connectors.gdirectory import (
+    REGISTRY_CANONICAL_PATH,
     AdminOp,
     AdminSink,
     DirectorySnapshot,
@@ -197,6 +232,7 @@ __all__ = [
     "classify_channel",
     "map_slack_user",
     "channel_principal",
+    "content_digest",
     "thread_document_id",
     "render_transcript",
     "build_slack_document_request",
@@ -277,6 +313,50 @@ def _ts_max(a: str, b: str) -> str:
         return a or b
 
 
+def content_digest(content: bytes) -> str:
+    """Content fingerprint bookkept per delivered thread (the L1 guard's
+    changed-vs-unchanged signal): sha256 over the exact transcript bytes
+    delivered. Deterministic — the transcript renderer is deterministic — so
+    a replay of the SAME version always matches and is skipped."""
+    return hashlib.sha256(content).hexdigest()
+
+
+def _thread_entry(raw: Any) -> dict[str, Any]:
+    """Normalize one bookkept thread entry to ``{"delivered": iso, "digest":
+    hex|None}``. ``delivered`` is the ``valid_from`` actually DELIVERED for
+    the thread's current version (possibly advanced past the recomputed
+    latest-ts — see :meth:`SlackConnector._stamp_monotonic`). A legacy bare
+    ISO-string entry carries no digest: it reads as changed-content on next
+    sight, which over-delivers once (safe) and then self-heals."""
+    if isinstance(raw, Mapping):
+        digest = raw.get("digest")
+        return {
+            "delivered": str(raw.get("delivered") or ""),
+            "digest": str(digest) if digest else None,
+        }
+    return {"delivered": str(raw or ""), "digest": None}
+
+
+def _advance_stamp(delivered: str, *candidates: str) -> str:
+    """The smallest honest ``valid_from`` strictly AFTER the last delivered
+    stamp: the first candidate that beats it (both are this module's fixed
+    ``%Y-%m-%dT%H:%M:%SZ`` shape, so lexical order IS chronological order),
+    else ``delivered`` + 1s (the deterministic last resort — e.g. clock skew
+    put the cycle clock at/behind the bookkept stamp). Never returns a stamp
+    <= ``delivered``: the server supersede is strictly monotonic, so a
+    non-advancing stamp silently fails to retire the previous version."""
+    for candidate in candidates:
+        if candidate and candidate > delivered:
+            return candidate
+    try:
+        then = datetime.fromisoformat(delivered.replace("Z", "+00:00"))
+    except ValueError:
+        # A tampered/foreign bookkept stamp: fall back to the last candidate
+        # (the cycle clock) rather than crash the cycle.
+        return candidates[-1] if candidates else delivered
+    return _iso(then + timedelta(seconds=1))
+
+
 # ---------------------------------------------------------------------------
 # Config & credentials
 # ---------------------------------------------------------------------------
@@ -336,9 +416,11 @@ def classify_channel(channel: Mapping[str, Any]) -> str:
     Known-channel-shape-or-quarantine (G1): only a plain public or private
     channel (``is_channel`` or legacy ``is_group``) with ``is_shared`` /
     ``is_ext_shared`` / ``is_org_shared`` all false and no pending Slack
-    Connect invite mirrors. Any shared flag, a pending share, or a shape this
-    code does not recognize quarantines the WHOLE channel — its members are
-    not all workspace-vouched, so channel membership no longer approximates
+    Connect invite (``pending_shared`` / ``is_pending_ext_shared`` — Slack
+    documents both spellings for the invite-in-flight state) mirrors. Any
+    shared flag, a pending share, or a shape this code does not recognize
+    quarantines the WHOLE channel — its members are not all
+    workspace-vouched, so channel membership no longer approximates
     visibility. ``im``/``mpim`` are skipped (counted by the caller, never
     silent) — DMs are a consent surface this connector does not read."""
     if channel.get("is_im") or channel.get("is_mpim"):
@@ -349,6 +431,7 @@ def classify_channel(channel: Mapping[str, Any]) -> str:
         channel.get("is_shared")
         or channel.get("is_ext_shared")
         or channel.get("is_org_shared")
+        or channel.get("is_pending_ext_shared")
         or channel.get("pending_shared")
     ):
         return QUARANTINED
@@ -461,7 +544,10 @@ class SlackRegistry(Protocol):
 
 class StaticSlackRegistry:
     """Fixed mapping, from config or fixtures. Missing keys stay unresolved
-    (the ladder then quarantines on zero tokens — fail closed)."""
+    (the ladder then quarantines on zero tokens — fail closed). ``emails``
+    resolve iff their ``user:<email>`` canonical is in the map — the fixture
+    stand-in for the live server's idp_subject existence check (an email with
+    no pre-existing canonical confers nothing, the G2 weld gate)."""
 
     def __init__(self, mapping: Mapping[str, int]) -> None:
         self._mapping = dict(mapping)
@@ -472,6 +558,11 @@ class StaticSlackRegistry:
             for principal in request.principals
             if isinstance(token := self._mapping.get(principal), int)
         }
+        for email in request.emails:
+            canonical = f"user:{email}"
+            token = self._mapping.get(canonical)
+            if isinstance(token, int):
+                mappings[canonical] = token
         return crosswalk.ResolveResult(mappings=mappings, quarantined=False)
 
 
@@ -572,15 +663,25 @@ def build_slack_admin_ops(
     membership REMOVALS, each removal one at a time (tombstones before the
     tuple delete — G3).
 
-    Deliberate deviation from the directory connectors: ``deprovisioned`` is
-    CLEARED. Slack is not the authoritative directory — a member deactivated
-    (or simply deleted) in Slack loses every ``group:slack-channel-*`` edge
-    through the membership diff (access narrows immediately) but must NOT
-    fire the tenant-wide ``/v1/admin/deprovision`` durable revoke on Slack's
-    word alone; that verdict belongs to the gdirectory/entra sync."""
+    Deliberate deviations from the directory connectors (G2: Slack is not
+    the authoritative directory — an admin-mutable ``profile.email`` must
+    never mint or durably revoke identity on Slack's word alone):
+
+    - ``deprovisioned`` is CLEARED. A member deactivated (or simply deleted)
+      in Slack loses every ``group:slack-channel-*`` edge through the
+      membership diff (access narrows immediately) but must NOT fire the
+      tenant-wide ``/v1/admin/deprovision`` durable revoke; that verdict
+      belongs to the gdirectory/entra sync.
+    - canonical-CREATION ops are FILTERED OUT. Slack emits crosswalk rows
+      only (welding its Uid to a canonical the weld gate in
+      :meth:`SlackConnector.directory_snapshot` already proved pre-existing
+      and active), never ``/v1/admin/registry/canonical`` upserts — a
+      re-pointed email must not create (or re-activate) a canonical
+      principal on Slack's say-so."""
     diff = diff_snapshots(previous, desired)
     diff.deprovisioned = []
-    return build_admin_ops(diff, tenant_id, source=SOURCE_NAME)
+    ops = build_admin_ops(diff, tenant_id, source=SOURCE_NAME)
+    return [op for op in ops if op.path != REGISTRY_CANONICAL_PATH]
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +760,12 @@ class SlackConnector(Connector):
         self._transport = transport
         self.config = config or SlackConfig()
         self._clock = clock or _utcnow
+        # The G2 weld gate's registry (set by run_once/run_backfill before any
+        # snapshot builds): a member welds only when its canonical ALREADY
+        # exists — resolved via the registry's `emails` existence check. None
+        # (a bare connector driven outside the runners) fails CLOSED: no
+        # canonical can be verified, so no member confers anything.
+        self.weld_registry: SlackRegistry | None = None
         # Set by poll()/prepare() for the runner: the cycle's desired identity
         # snapshot (admin ops are applied BEFORE document delivery).
         self.last_view: WorkspaceView | None = None
@@ -744,12 +851,34 @@ class SlackConnector(Connector):
         self.skipped_im = view.skipped_im
         return view
 
+    def _vouched_canonicals(self, users: Sequence[DirectoryUser]) -> set[str]:
+        """The G2 weld gate: which of these members' canonicals ALREADY exist
+        (active) in the registry. One batched ``emails`` resolve — the server
+        only answers for canonicals a real directory sync (gdirectory/entra)
+        vouched via ``idp_subject``/SSO-alias, and NEVER creates one — so a
+        surviving mapping key IS proof of pre-existence. No registry wired
+        (``weld_registry is None``) → empty set, fail closed: Slack alone can
+        never establish identity."""
+        emails = sorted({u.primary_email for u in users})
+        if not emails or self.weld_registry is None:
+            return set()
+        result = self.weld_registry.resolve(crosswalk.ResolveRequest(emails=emails))
+        return set(result.mappings)
+
     def directory_snapshot(self, view: WorkspaceView) -> DirectorySnapshot:
-        """The cycle's desired identity state (G2/G3): every mapped member's
+        """The cycle's desired identity state (G2/G3): every VOUCHED member's
         registry record + one ``(group:slack-channel-<cid>, user:<email>)``
         edge per mirrored-channel member. Quarantined channels contribute NO
         edges (their token must reach nobody); unmapped member ids (bots,
-        guests, no-email) contribute nothing — narrowing, never poison."""
+        guests, no-email) contribute nothing; and — the G2 weld gate — a
+        member whose canonical does not ALREADY exist in the registry also
+        contributes nothing (no crosswalk row, no edge): Slack must never
+        mint identity from an admin-mutable ``profile.email``. All of these
+        drops only NARROW, never poison."""
+        vouched = self._vouched_canonicals(list(view.users.values()))
+        users = {
+            uid: mapped for uid, mapped in view.users.items() if mapped.canonical in vouched
+        }
         memberships: set[tuple[str, str]] = set()
         for cid in sorted(view.channels):
             if view.channel_class.get(cid) != MIRRORED:
@@ -760,10 +889,10 @@ class SlackConnector(Connector):
                 {"channel": cid, "limit": str(self.config.page_size)},
                 "members",
             ):
-                mapped = view.users.get(str(uid))
+                mapped = users.get(str(uid))
                 if mapped is not None:
                     memberships.add((group, mapped.canonical))
-        directory_users = sorted(view.users.values(), key=lambda u: u.primary_email)
+        directory_users = sorted(users.values(), key=lambda u: u.primary_email)
         return DirectorySnapshot(
             users=sorted({u.canonical for u in directory_users}),
             memberships=sorted(memberships),
@@ -886,17 +1015,56 @@ class SlackConnector(Connector):
             thread_ts=thread_ts,
         )
 
+    def _stamp_monotonic(
+        self, event: SlackDocumentEvent, entry: Mapping[str, Any] | None, *candidates: str
+    ) -> dict[str, Any] | None:
+        """The L1 non-monotonic-supersede guard. The server's supersede is
+        STRICTLY monotonic by design: an ingest retires only the currently-
+        open chunk rows ``WHERE valid_from < <new stamp>`` and the insert is
+        ``ON CONFLICT (…, valid_from) DO NOTHING`` — at-least-once replay
+        idempotency DEPENDS on that DO NOTHING, so the server must not bend.
+        But this connector's natural stamp (the latest ts in the thread) is
+        NON-monotonic: deleting the latest reply REGRESSES it (two open rows,
+        the deleted text keeps serving) and editing the latest message keeps
+        its ts (the redaction no-ops entirely). So the fix is ours: whenever
+        the re-rendered content CHANGED but the recomputed stamp is <= the
+        bookkept last-DELIVERED stamp, advance ``valid_from`` monotonically
+        past the bookkept stamp — the detection signal's own ts where
+        available, else the cycle clock, else bookkept+1s (deterministic last
+        resort). Unchanged content at a non-advancing stamp returns None:
+        skip the delivery outright (a replay of the same delivered version
+        stays a no-op at the connector, not index churn).
+
+        Returns the new bookkeeping entry ``{"delivered", "digest"}`` (and
+        mutates ``event.modified_time`` when the stamp had to advance), or
+        None when there is nothing to re-deliver."""
+        digest = content_digest(event.content)
+        if entry:
+            delivered = str(entry.get("delivered") or "")
+            if delivered and event.modified_time <= delivered:
+                if entry.get("digest") == digest:
+                    return None
+                event.modified_time = _advance_stamp(
+                    delivered, *candidates, _iso(self._clock())
+                )
+        return {"delivered": event.modified_time, "digest": digest}
+
     def _history_targets(
         self, channel_id: str, oldest: str
-    ) -> tuple[set[str], str, bool]:
-        """(thread roots to re-ingest, newest ts seen, readable) from the
-        channel rows since ``oldest`` (exclusive). ``message_changed`` /
-        ``message_deleted`` signal rows re-target the EDITED message's thread
-        (poll-lane edit/delete detection); ordinary rows target their own
-        thread (a reply broadcast re-targets its root). An unreadable channel
+    ) -> tuple[dict[str, str], str, bool]:
+        """(thread roots to re-ingest → the newest detecting row's ts, newest
+        ts seen, readable) from the channel rows since ``oldest``
+        (exclusive). ``message_changed`` / ``message_deleted`` signal rows
+        re-target the EDITED message's thread (poll-lane edit/delete
+        detection — fixture-shaped, see the module's honest remainders: live
+        history may show edits/deletes differently; the backfill diff is the
+        guaranteed catch); ordinary rows target their own thread (a reply
+        broadcast re-targets its root). The detecting row's own ts is kept
+        per target: it is the honest event-time candidate when the L1 guard
+        must advance a non-advancing ``valid_from``. An unreadable channel
         (`not_in_channel` — the bot was never joined/invited) is counted,
         never silently empty."""
-        targets: set[str] = set()
+        targets: dict[str, str] = {}
         max_ts = oldest
         try:
             for message in self._paged(
@@ -913,12 +1081,12 @@ class SlackConnector(Connector):
                     max_ts = _ts_max(max_ts, ts)
                 target = _target_thread(message)
                 if target:
-                    targets.add(target)
+                    targets[target] = _ts_max(targets.get(target) or "0", ts or "0")
         except SlackApiError as exc:
             if exc.error == "not_in_channel":
                 if channel_id not in self.unreadable_channels:
                     self.unreadable_channels.append(channel_id)
-                return set(), oldest, False
+                return {}, oldest, False
             raise
         return targets, max_ts, True
 
@@ -967,7 +1135,9 @@ class SlackConnector(Connector):
         next_channels: dict[str, dict] = {}
         for cid in sorted(view.channels):
             prev = channels_state.get(cid) or {}
-            prev_threads = {str(k): str(v) for k, v in (prev.get("threads") or {}).items()}
+            prev_threads = {
+                str(k): _thread_entry(v) for k, v in (prev.get("threads") or {}).items()
+            }
             if view.channel_class.get(cid) != MIRRORED:
                 # G1: quarantined. A mirrored→quarantined TRANSITION retires
                 # every bookkept thread; a channel that was never mirrored has
@@ -991,11 +1161,20 @@ class SlackConnector(Connector):
             threads = dict(prev_threads)
             for thread_ts in sorted(targets):
                 event = self._thread_event(cid, thread_ts, view)
-                events.append(event)
                 if event.removed:
+                    events.append(event)
                     threads.pop(thread_ts, None)
-                else:
-                    threads[thread_ts] = event.modified_time
+                    continue
+                # L1 guard: skip an unchanged replay outright; advance a
+                # changed-but-not-newer stamp past the delivered one (the
+                # detecting row's ts is the honest event-time candidate).
+                entry = self._stamp_monotonic(
+                    event, threads.get(thread_ts), _ts_iso(targets[thread_ts])
+                )
+                if entry is None:
+                    continue
+                events.append(event)
+                threads[thread_ts] = entry
             next_channels[cid] = {
                 "class": MIRRORED,
                 "latest": max_ts if readable else str(latest),
@@ -1038,7 +1217,10 @@ class SlackConnector(Connector):
         assert view is not None
         for cid in sorted(view.channels):
             prior = self.prior_channels.get(cid) or {}
-            prior_threads = {str(k) for k in (prior.get("threads") or {})}
+            prior_entries = {
+                str(k): _thread_entry(v) for k, v in (prior.get("threads") or {}).items()
+            }
+            prior_threads = set(prior_entries)
             prior_was_mirrored = prior.get("class") == MIRRORED
             if view.channel_class.get(cid) != MIRRORED:
                 if prior_was_mirrored:
@@ -1051,8 +1233,8 @@ class SlackConnector(Connector):
                 continue  # a resumed run already finished (and checkpointed) it
             self._ensure_member(view.channels[cid])
             partial = self.backfill_partial.get(cid) or {}
-            threads: dict[str, str] = {
-                str(k): str(v) for k, v in (partial.get("threads") or {}).items()
+            threads: dict[str, dict] = {
+                str(k): _thread_entry(v) for k, v in (partial.get("threads") or {}).items()
             }
             latest = str(partial.get("latest") or "0")
             cursor = self.backfill_progress.get(cid) or None
@@ -1083,14 +1265,24 @@ class SlackConnector(Connector):
                         targets.add(target)
                 for thread_ts in sorted(targets):
                     if thread_ts in threads:
-                        continue  # already ingested this crawl
+                        continue  # already ingested (or carried) this crawl
                     event = self._thread_event(cid, thread_ts, view)
-                    if not event.removed:
-                        threads[thread_ts] = event.modified_time
-                        yield event
-                    # A root already gone during the crawl: nothing was
-                    # indexed for it this run; the completion diff below
-                    # retires it if a PRIOR cycle had indexed it.
+                    if event.removed:
+                        # A root already gone during the crawl: nothing was
+                        # indexed for it this run; the completion diff below
+                        # retires it if a PRIOR cycle had indexed it.
+                        continue
+                    # L1 guard (no detection signal in a full crawl — the
+                    # cycle clock is the only advance candidate): a changed
+                    # thread whose recomputed stamp did not advance past the
+                    # last delivered one still supersedes; an unchanged one
+                    # is carried, not re-delivered (no reconcile churn).
+                    entry = self._stamp_monotonic(event, prior_entries.get(thread_ts))
+                    if entry is None:
+                        threads[thread_ts] = prior_entries[thread_ts]
+                        continue
+                    threads[thread_ts] = entry
+                    yield event
                 cursor = str(
                     (page.get("response_metadata") or {}).get("next_cursor") or ""
                 ).strip()
@@ -1459,6 +1651,7 @@ def run_once(
     nothing, so it must NOT advance the snapshot/marks — otherwise the next
     REAL cycle diffs against a state that was never applied and silently
     no-ops the real work (gdirectory's lesson)."""
+    connector.weld_registry = registry  # the G2 weld gate's existence check
     cursor = _load_cursor(state_file)
     previous_snapshot = _snapshot_from_dict(_parse_cursor(cursor).get("snapshot"))
     events, next_cursor = asyncio.run(connector.poll(cursor))
@@ -1560,7 +1753,13 @@ def run_backfill(
     none — is carried unchanged and ``backfill_incomplete`` is alarmed).
     Same over-retire-race ordering as :func:`run_once` (sharepoint's exact
     guards): pre-existing ledger drains BEFORE the crawl delivers, a
-    successful delivery unparks any older entry for its document_id."""
+    successful delivery unparks any older entry for its document_id — and
+    the unpark is persisted INCREMENTALLY, with every checkpoint (not only
+    at crawl end): a checkpoint that records a delivery while the stale park
+    entry survives would otherwise hand the NEXT run's guard-#1 pre-drain a
+    retraction for a document the resumed crawl will skip re-delivering
+    (over-hidden until the next full backfill)."""
+    connector.weld_registry = registry  # the G2 weld gate's existence check
     state = _parse_cursor(_load_cursor(state_file))
     prior_channels: dict[str, dict] = {
         cid: dict(entry)
@@ -1615,6 +1814,11 @@ def run_backfill(
                     reporter.advance(pending)
                 pending = 0
                 if persist:
+                    # C2: the unpark rides EVERY checkpoint, unpark FIRST — a
+                    # crash between the two re-crawls the tail (safe); the
+                    # reverse order would checkpoint a delivery whose stale
+                    # park entry survives for the next run's pre-drain.
+                    _unpark_delivered(state_file, delivered_ids)
                     _backfill_checkpoint(
                         state_file, connector, desired, prior_channels, prior_reconcile
                     )
@@ -1623,8 +1827,10 @@ def run_backfill(
         asyncio.run(_drive())
     except Exception as exc:  # noqa: BLE001 — surface as a failed run, then re-raise
         # The resumable cursors are already checkpointed (every flush_every);
-        # a re-run resumes instead of restarting.
+        # a re-run resumes instead of restarting. Unpark WITH the checkpoint
+        # (C2): the crash checkpoint records deliveries the resume will skip.
         if persist:
+            _unpark_delivered(state_file, delivered_ids)
             _backfill_checkpoint(state_file, connector, desired, prior_channels, prior_reconcile)
         if reporter is not None:
             if pending:

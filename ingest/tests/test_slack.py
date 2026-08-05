@@ -15,8 +15,17 @@ The suite exercises the red-teamed LEAK cases, not just happy paths:
   are skipped AND counted, never silent;
 - G2: a bot, a guest (is_restricted / is_ultra_restricted), a deleted user,
   and a member without a vouched profile.email confer NOTHING — no crosswalk
-  row, no membership edge (narrowing, never poison); Slack's word never
-  fires a tenant-wide deprovision;
+  row, no membership edge (narrowing, never poison); a member whose canonical
+  does not ALREADY exist in the registry also confers nothing, and slack
+  NEVER emits a canonical-creation op (profile.email is admin-mutable — Slack
+  must not mint identity); Slack's word never fires a tenant-wide
+  deprovision;
+- L1 (the monotonic-supersede guard): the server retires only rows strictly
+  OLDER than the incoming valid_from and replays ride its conflict-DO-NOTHING,
+  so deleting the latest reply (stamp regresses) and editing the latest
+  message (stamp unchanged — Slack edits keep ts) must ADVANCE valid_from
+  past the last delivered stamp; unchanged content is skipped, and a replay
+  of the same delivered version stays idempotent;
 - G3: membership rides the reused gdirectory diff engine — byte-exact
   registry/crosswalk/principals/groups bodies, removals as one-at-a-time
   DELETEs;
@@ -64,6 +73,7 @@ from verity_ingest.connectors.slack import (
     build_slack_document_request,
     channel_principal,
     classify_channel,
+    content_digest,
     load_slack_credentials,
     map_slack_user,
     render_transcript,
@@ -81,7 +91,15 @@ C_SHARED = "C0SHARED"
 GEN_GROUP = channel_principal(C_GEN)  # group:slack-channel-C0GEN
 PRIV_GROUP = channel_principal(C_PRIV)
 
-REGISTRY_MAP = {GEN_GROUP: 111, PRIV_GROUP: 222}
+# The G2 weld gate: user canonicals in the map ALREADY exist in the registry
+# (a real directory sync vouched them); a member email absent here fails the
+# existence check and confers nothing.
+REGISTRY_MAP = {
+    GEN_GROUP: 111,
+    PRIV_GROUP: 222,
+    "user:alice@acme.com": 1001,
+    "user:bob@acme.com": 1002,
+}
 
 # Raw Slack ts values and their ISO renderings (epoch 1700000000 =
 # 2023-11-14T22:13:20Z; the connector renders second resolution).
@@ -93,6 +111,7 @@ ISO_REPLY = "2023-11-14T22:15:00Z"
 TS_SOLO = "1700000200.000300"
 ISO_SOLO = "2023-11-14T22:16:40Z"
 TS_EDIT = "1700000300.000400"
+ISO_EDIT = "2023-11-14T22:18:20Z"
 
 _CLOCK_NOW = datetime(2023, 11, 15, 0, 0, 0, tzinfo=timezone.utc)
 NOW_ISO = "2023-11-15T00:00:00Z"
@@ -152,6 +171,16 @@ def _msg(ts: str, user: str, text: str, **kw) -> dict:
 THREAD_ROOT = _msg(TS_ROOT, "U0ALICE", "kickoff", thread_ts=TS_ROOT, reply_count=1)
 THREAD_REPLY = _msg(TS_REPLY, "U0BOB", "reply", thread_ts=TS_ROOT)
 SOLO_MSG = _msg(TS_SOLO, "U0BOB", "solo note")
+
+# The default workspace's rendered transcripts (bookkeeping digests are taken
+# over these exact bytes).
+GEN_TRANSCRIPT = f"[{ISO_ROOT}] Alice: kickoff\n[{ISO_REPLY}] Bob Builder: reply"
+SOLO_TRANSCRIPT = f"[{ISO_SOLO}] Bob Builder: solo note"
+
+
+def _entry(delivered: str, text: str) -> dict:
+    """One bookkept thread entry: the delivered valid_from + content digest."""
+    return {"delivered": delivered, "digest": content_digest(text.encode())}
 
 
 class FixtureSlackTransport:
@@ -381,9 +410,10 @@ class CaptureAdminSink:
 
 
 def test_shared_and_external_channels_quarantine_whole_channel():
-    for flag in ("is_shared", "is_ext_shared", "is_org_shared"):
+    for flag in ("is_shared", "is_ext_shared", "is_org_shared", "is_pending_ext_shared"):
         assert classify_channel(_channel(C_SHARED, "x", **{flag: True})) == QUARANTINED, flag
-    # A pending Slack Connect invite is already a share in flight: quarantine.
+    # A pending Slack Connect invite is already a share in flight: quarantine
+    # (both documented spellings of the invite-in-flight state).
     assert classify_channel(_channel(C_SHARED, "x", pending_shared=["E123"])) == QUARANTINED
     # Private channels quarantine on the same flags (no private exemption).
     assert (
@@ -462,28 +492,9 @@ def test_membership_and_crosswalk_ops_byte_exact(tmp_path):
     admin = CaptureAdminSink()
     state_file = _seed_state(tmp_path, _mirrored_gen_state())
     run_once(connector, StaticSlackRegistry(REGISTRY_MAP), AlarmSink(), admin, state_file)
+    # No /v1/admin/registry/canonical op ANYWHERE: slack welds to canonicals a
+    # real directory sync already created, it never creates them (G2).
     assert admin.ops == [
-        AdminOp(
-            "POST",
-            "/v1/admin/registry/canonical",
-            {
-                "tenant_id": TENANT,
-                "principals": [
-                    {
-                        "canonical": "user:alice@acme.com",
-                        "kind": "user",
-                        "idp_subject": "alice@acme.com",
-                        "active": True,
-                    },
-                    {
-                        "canonical": "user:bob@acme.com",
-                        "kind": "user",
-                        "idp_subject": "bob@acme.com",
-                        "active": True,
-                    },
-                ],
-            },
-        ),
         AdminOp(
             "POST",
             "/v1/admin/crosswalk",
@@ -540,6 +551,39 @@ def test_membership_and_crosswalk_ops_byte_exact(tmp_path):
     flat = json.dumps([dict(op.body) for op in admin.ops])
     for marker in ("U0BOT", "U0GUEST", "U0ULTRA", "U0NOMAIL", "U0GONE", "bot@acme.com", "gone@"):
         assert marker not in flat, marker
+
+
+def test_unknown_canonical_member_confers_nothing_and_slack_never_creates_canonicals(tmp_path):
+    # T1: profile.email is workspace-admin-mutable and re-read every cycle. A
+    # member whose email has NO pre-existing canonical in the registry (eve —
+    # never vouched by gdirectory/entra) must confer nothing: no crosswalk
+    # row, no membership edge, and NO canonical-creation op anywhere (Slack's
+    # word must never mint an identity the admin plane would then trust).
+    eve = _member("U0EVE", "eve@acme.com", display="Eve")
+    transport = _workspace(
+        users=[ALICE, eve],
+        history={C_GEN: [], C_PRIV: []},
+        members={
+            C_GEN: {"ok": True, "members": ["U0ALICE", "U0EVE"]},
+            C_PRIV: {"ok": True, "members": ["U0ALICE"]},
+        },
+    )
+    connector = _connector(transport)
+    admin = CaptureAdminSink()
+    state_file = _seed_state(tmp_path, _mirrored_gen_state())
+    run_once(connector, StaticSlackRegistry(REGISTRY_MAP), AlarmSink(), admin, state_file)
+    assert all(op.path != "/v1/admin/registry/canonical" for op in admin.ops)
+    assert [b["local_id"] for b in admin.bodies("/v1/admin/crosswalk")] == ["U0ALICE"]
+    assert (
+        AdminOp(
+            "POST",
+            "/v1/admin/groups",
+            {"tenant_id": TENANT, "group": GEN_GROUP, "member": "user:alice@acme.com"},
+        )
+        in admin.ops
+    )
+    flat = json.dumps([dict(op.body) for op in admin.ops])
+    assert "U0EVE" not in flat and "eve@" not in flat
 
 
 def test_member_leaving_a_channel_emits_a_tombstoning_delete_edge(tmp_path):
@@ -667,10 +711,15 @@ def test_poll_delivers_thread_documents_byte_exact(tmp_path):
         },
     ]
     state = _saved_state(state_file)
+    # Bookkeeping carries the DELIVERED stamp + content digest per thread (the
+    # L1 guard's replay/regression signal).
     assert state["channels"][C_GEN] == {
         "class": MIRRORED,
         "latest": TS_SOLO,
-        "threads": {TS_ROOT: ISO_REPLY, TS_SOLO: ISO_SOLO},
+        "threads": {
+            TS_ROOT: _entry(ISO_REPLY, GEN_TRANSCRIPT),
+            TS_SOLO: _entry(ISO_SOLO, SOLO_TRANSCRIPT),
+        },
     }
 
 
@@ -749,8 +798,135 @@ def test_thread_reingest_supersedes_same_document_id(tmp_path):
     assert first["document_id"] == second["document_id"] == f"slack:{C_GEN}:{TS_ROOT}"
     assert "kickoff (edited)" in second["content"]
     assert second["visibility"] == [111]
+    # The edit did not add a message, so the recomputed latest-ts stamp equals
+    # the delivered one — the L1 guard advances valid_from to the signal's own
+    # ts so the server supersede (strictly monotonic) actually retires v1.
+    assert first["valid_from"] == ISO_REPLY
+    assert second["valid_from"] == ISO_EDIT
     # The poll mark advanced past the signal row.
     assert _saved_state(state_file)["channels"][C_GEN]["latest"] == TS_EDIT
+
+
+def test_deleting_the_latest_reply_still_supersedes(tmp_path):
+    # THE L1 LEAK: the delivered stamp is the latest thread ts, which is
+    # NON-monotonic — deleting the latest reply REGRESSES it (ISO_REPLY →
+    # ISO_ROOT), while the server retires only rows with valid_from strictly
+    # BELOW the incoming stamp. An honest re-delivery at the regressed stamp
+    # would leave TWO open rows still serving the deleted reply. The guard
+    # must advance valid_from past the bookkept delivered stamp (here: the
+    # message_deleted signal's own ts).
+    signal = {
+        "type": "message",
+        "subtype": "message_deleted",
+        "ts": TS_EDIT,
+        "previous_message": {"ts": TS_REPLY, "thread_ts": TS_ROOT},
+    }
+    transport = _workspace(
+        history={C_GEN: [signal], C_PRIV: []},
+        replies={(C_GEN, TS_ROOT): [THREAD_ROOT]},  # the reply is gone
+    )
+    sink = RetiringSink()
+    state_file = _seed_state(
+        tmp_path, _mirrored_gen_state({TS_ROOT: _entry(ISO_REPLY, GEN_TRANSCRIPT)})
+    )
+    delivered = run_once(
+        _connector(transport), StaticSlackRegistry(REGISTRY_MAP), sink, CaptureAdminSink(), state_file
+    )
+    assert delivered == 1
+    (body,) = sink.requests
+    assert body["content"] == f"[{ISO_ROOT}] Alice: kickoff"  # no deleted text
+    assert body["valid_from"] == ISO_EDIT  # > ISO_REPLY: the old row retires
+    assert _saved_state(state_file)["channels"][C_GEN]["threads"][TS_ROOT] == _entry(
+        ISO_EDIT, f"[{ISO_ROOT}] Alice: kickoff"
+    )
+
+
+def test_editing_the_latest_message_still_supersedes(tmp_path):
+    # Slack edits KEEP the message ts, so the recomputed stamp EQUALS the
+    # delivered one — and the server's ON CONFLICT DO NOTHING (the replay-
+    # idempotency contract) would silently drop the redaction. The guard must
+    # advance valid_from past the bookkept stamp.
+    edited = _msg(TS_SOLO, "U0BOB", "solo note (redacted)")
+    signal = {
+        "type": "message",
+        "subtype": "message_changed",
+        "ts": TS_EDIT,
+        "message": {"ts": TS_SOLO, "text": "solo note (redacted)"},
+    }
+    transport = _workspace(
+        history={C_GEN: [signal], C_PRIV: []},
+        replies={(C_GEN, TS_SOLO): [edited]},
+    )
+    sink = RetiringSink()
+    state_file = _seed_state(
+        tmp_path, _mirrored_gen_state({TS_SOLO: _entry(ISO_SOLO, SOLO_TRANSCRIPT)})
+    )
+    delivered = run_once(
+        _connector(transport), StaticSlackRegistry(REGISTRY_MAP), sink, CaptureAdminSink(), state_file
+    )
+    assert delivered == 1
+    (body,) = sink.requests
+    assert "(redacted)" in body["content"]
+    assert body["valid_from"] == ISO_EDIT  # advanced: the pre-edit row retires
+
+
+def test_unchanged_thread_is_not_redelivered_by_the_reconcile(tmp_path):
+    # The reconcile re-walks every thread; unchanged content (digest match
+    # against the bookkept delivered version) must be CARRIED, not re-sent —
+    # neither index churn nor a false gap-deletion retire.
+    transport = _workspace()
+    sink = RetiringSink()
+    state_file = _seed_state(
+        tmp_path,
+        _mirrored_gen_state(
+            {
+                TS_ROOT: _entry(ISO_REPLY, GEN_TRANSCRIPT),
+                TS_SOLO: _entry(ISO_SOLO, SOLO_TRANSCRIPT),
+            }
+        ),
+    )
+    delivered = run_backfill(
+        _connector(transport), StaticSlackRegistry(REGISTRY_MAP), sink, CaptureAdminSink(), state_file
+    )
+    assert delivered == 0 and sink.requests == []
+    assert sink.retired == []  # carried forward, never mistaken for deleted
+    state = _saved_state(state_file)
+    assert state["channels"][C_GEN]["threads"][TS_ROOT] == _entry(ISO_REPLY, GEN_TRANSCRIPT)
+    assert state["last_reconcile_at"] == NOW_ISO  # still a zero-failure pass
+
+
+def test_replay_of_the_same_delivered_version_stays_idempotent(tmp_path):
+    # At-least-once delivery: the SAME history row surfacing again (a resent
+    # window) must not re-deliver or advance anything — the skip is what lets
+    # the server keep its DO-NOTHING replay contract without ever being asked.
+    def cycle_transport():
+        return _workspace(
+            history={C_GEN: [THREAD_ROOT], C_PRIV: []},
+            replies={(C_GEN, TS_ROOT): [THREAD_ROOT, THREAD_REPLY]},
+        )
+
+    state_file = _seed_state(tmp_path, _mirrored_gen_state())
+    sink1 = RetiringSink()
+    run_once(
+        _connector(cycle_transport()),
+        StaticSlackRegistry(REGISTRY_MAP),
+        sink1,
+        CaptureAdminSink(),
+        state_file,
+    )
+    assert [r["document_id"] for r in sink1.requests] == [f"slack:{C_GEN}:{TS_ROOT}"]
+    before = _saved_state(state_file)["channels"][C_GEN]["threads"]
+    assert before == {TS_ROOT: _entry(ISO_REPLY, GEN_TRANSCRIPT)}
+    sink2 = RetiringSink()
+    delivered = run_once(
+        _connector(cycle_transport()),
+        StaticSlackRegistry(REGISTRY_MAP),
+        sink2,
+        CaptureAdminSink(),
+        state_file,
+    )
+    assert delivered == 0 and sink2.requests == []
+    assert _saved_state(state_file)["channels"][C_GEN]["threads"] == before
 
 
 def test_first_sight_of_a_channel_primes_and_emits_nothing(tmp_path):
@@ -1151,7 +1327,10 @@ def test_backfill_enumerates_threads_and_stamps_the_sla(tmp_path):
     assert state["channels"][C_GEN] == {
         "class": MIRRORED,
         "latest": TS_SOLO,
-        "threads": {TS_ROOT: ISO_REPLY, TS_SOLO: ISO_SOLO},
+        "threads": {
+            TS_ROOT: _entry(ISO_REPLY, GEN_TRANSCRIPT),
+            TS_SOLO: _entry(ISO_SOLO, SOLO_TRANSCRIPT),
+        },
     }
 
 
@@ -1194,6 +1373,68 @@ def test_backfill_with_ingest_failures_does_not_stamp_the_sla(tmp_path):
     state = _saved_state(state_file)
     assert state["last_reconcile_at"] is None  # NOT re-proven; SLA stays unmet
     assert "backfill_incomplete" in sink.alarm_kinds()
+
+
+def test_backfill_crash_after_checkpoint_does_not_over_hide_a_restored_thread(tmp_path):
+    # C2: a restored thread's stale park entry survives guard #1 (the retire
+    # route is down), the crawl DELIVERS the thread and CHECKPOINTS, then
+    # crashes before crawl end. The unpark must have ridden the checkpoint —
+    # otherwise the resumed run's pre-drain replays the stale retraction
+    # against a document the resume (rightly) skips re-delivering, and the
+    # restored thread stays hidden until the next full backfill.
+    doc = f"slack:{C_GEN}:{TS_ROOT}"
+    state_file = _seed_state(tmp_path, _mirrored_gen_state(), last_reconcile_at=None)
+    (tmp_path / "slack_parked_retractions.json").write_text(
+        json.dumps(
+            [
+                {
+                    "channel_id": C_GEN,
+                    "thread_ts": TS_ROOT,
+                    "document_id": doc,
+                    "reason": "removed",
+                    "first_seen": "2023-11-13T00:00:00Z",
+                    "last_seen": "2023-11-13T00:00:00Z",
+                }
+            ],
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    def boom(params):
+        raise RuntimeError("mid-crawl crash")
+
+    transport = _workspace(history={C_GEN: [SOLO_MSG, THREAD_ROOT], C_PRIV: boom})
+    sink = FailingRetireSink()  # guard #1's pre-drain fails: the entry survives it
+    with pytest.raises(RuntimeError, match="mid-crawl crash"):
+        run_backfill(
+            _connector(transport),
+            StaticSlackRegistry(REGISTRY_MAP),
+            sink,
+            CaptureAdminSink(),
+            state_file,
+            flush_every=1,
+        )
+    assert ("deliver", doc) in sink.calls
+    # The delivery's unpark persisted WITH the mid-crawl checkpoint.
+    assert _ledger(tmp_path) == []
+    # Resume with a healthy retire route: C_GEN is checkpointed done (not
+    # re-crawled, so the thread is NOT re-delivered) and — crucially — the
+    # stale retraction is NOT replayed against it.
+    transport2 = _workspace(history={C_PRIV: []}, replies={})
+    sink2 = RetiringSink()
+    run_backfill(
+        _connector(transport2),
+        StaticSlackRegistry(REGISTRY_MAP),
+        sink2,
+        CaptureAdminSink(),
+        state_file,
+    )
+    assert transport2.called("conversations.history", channel=C_GEN) == []
+    assert ("retire", doc) not in sink2.calls
+    assert sink2.requests == []
+    assert _saved_state(state_file)["last_reconcile_at"] == NOW_ISO
 
 
 def test_backfill_resumes_past_channels_already_done(tmp_path):
