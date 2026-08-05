@@ -82,6 +82,7 @@ async fn seeded() -> (PostgresAdapter, TenantId, EpisodeId, FactKey) {
             valid_from: now - Duration::hours(1),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .expect("chunk");

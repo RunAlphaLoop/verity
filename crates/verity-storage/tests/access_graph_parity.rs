@@ -74,6 +74,7 @@ async fn seed_chunk(
         valid_from: Utc::now(),
         provenance: episode,
         acl_provenance: prov,
+        derived_from: vec![],
     }])
     .await
     .unwrap();

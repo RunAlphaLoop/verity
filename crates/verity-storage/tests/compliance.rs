@@ -68,6 +68,7 @@ async fn interaction(
             valid_from: Utc::now(),
             provenance: episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .unwrap();
@@ -534,6 +535,7 @@ async fn entity_erasure_deletes_facts_and_multitag_chunks() {
             valid_from: Utc::now(),
             provenance: other_episode,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .unwrap();

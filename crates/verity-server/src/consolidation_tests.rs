@@ -51,6 +51,7 @@ async fn test_state_cfg(auto_tag: bool, auto_merge: bool) -> Option<(Arc<AppStat
         rebac: None,
         revocations: RevocationPlane::new(300),
         allow_restricted_without_rebac: false,
+        remember_require_lineage: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag,
         knowledge_auto_merge: auto_merge,
@@ -110,6 +111,7 @@ async fn test_state_with_encoder() -> Option<(Arc<AppState>, TenantId)> {
             rebac,
             revocations,
             allow_restricted_without_rebac,
+            remember_require_lineage: false,
             subscribers,
             auto_tag,
             knowledge_auto_merge,
@@ -978,6 +980,7 @@ async fn episode_with_chunk(
             valid_from: Utc::now(),
             provenance: ep,
             acl_provenance: AclProvenance::AdminAssigned,
+            derived_from: vec![],
         }])
         .await
         .expect("chunk");

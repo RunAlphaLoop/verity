@@ -56,6 +56,7 @@ fn embedded_chunk(tenant: TenantId, ep: EpisodeId, doc: &str, seed: f32) -> Chun
         valid_from: Utc::now(),
         provenance: ep,
         acl_provenance: AclProvenance::AdminAssigned,
+        derived_from: vec![],
     }
 }
 

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::types::*;
 
@@ -79,6 +80,24 @@ pub trait StorageAdapter: Send + Sync {
     /// Scoped hybrid recall: filtered ANN and/or BM25, fused. Filters are
     /// pushed into the index — pre-filtering only, never truncate-then-authorize.
     async fn recall(&self, query: RecallQuery) -> Result<Vec<RecallHit>>;
+
+    /// Resolve declared derivation refs (chunk ids and/or episode ids) for an
+    /// input-derived agent write, UNDER the caller's compiled scope — the same
+    /// visibility/confidentiality/entity/current-row predicate `recall`
+    /// enforces, so a caller can only cite lineage it could have read. Each
+    /// returned input carries the FULL visibility array + confidentiality of
+    /// its underlying current row(s); an episode ref spans ALL its current
+    /// chunks (intersection/max folded per input). A ref matching zero
+    /// scope-visible current rows is simply absent from the result — the
+    /// caller must treat that as a refusal (fail closed), never as an
+    /// empty-visibility input.
+    async fn resolve_derivation_inputs(
+        &self,
+        _scope: &Scope,
+        _refs: &[Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        Err(unsupported("resolve_derivation_inputs"))
+    }
 
     /// Append to the activity timeline (SPEC §2, Action records): writes the
     /// L0 episode and the timeline row in one transaction, and indexes the

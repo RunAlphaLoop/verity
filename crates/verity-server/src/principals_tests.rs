@@ -68,6 +68,7 @@ async fn test_state() -> Option<(Arc<AppState>, TenantId)> {
         source_freshness: crate::source_freshness::SourceFreshnessPlane::new(None),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         allow_restricted_without_rebac: false,
+        remember_require_lineage: false,
         subscribers: crate::subscribe::Subscribers::new(crate::subscribe::DEFAULT_MAX_CONNECTIONS),
         auto_tag: false,
         knowledge_auto_merge: true,
@@ -235,6 +236,7 @@ async fn debug_recall_trace_names_visibility_tokens() {
                 valid_from: Utc::now(),
                 provenance: episode,
                 acl_provenance: AclProvenance::Mirrored,
+                derived_from: vec![],
             }])
             .await
             .expect("chunk");

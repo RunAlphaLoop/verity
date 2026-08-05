@@ -473,6 +473,7 @@ pub(crate) async fn deliver(
                 valid_from: write.valid_from,
                 provenance: episode_id,
                 acl_provenance,
+                derived_from: vec![],
             });
         }
     }

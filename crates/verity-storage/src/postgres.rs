@@ -4040,8 +4040,8 @@ impl StorageAdapter for PostgresAdapter {
                 "INSERT INTO chunks (id, tenant_id, source, document_id, seq, content,
                                      content_hash, embedding, visibility, entity_tags,
                                      confidentiality, trust_tier, valid_from, provenance,
-                                     acl_provenance)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                                     acl_provenance, derived_from)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                  ON CONFLICT (tenant_id, source, document_id, seq, valid_from) DO NOTHING",
             )
             .bind(Uuid::now_v7())
@@ -4059,6 +4059,7 @@ impl StorageAdapter for PostgresAdapter {
             .bind(c.valid_from)
             .bind(c.provenance)
             .bind(c.acl_provenance.as_str())
+            .bind(&c.derived_from)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -4099,6 +4100,82 @@ impl StorageAdapter for PostgresAdapter {
                 "recall requires an embedding, text, or both".into(),
             )),
         }
+    }
+
+    /// ONE scope-predicated query resolving declared derivation refs (chunk
+    /// ids OR episode ids) to their current rows' full visibility +
+    /// confidentiality. The predicate is EXACTLY the recall predicate —
+    /// tenant partition, `valid_to IS NULL`, `visibility && $principals`,
+    /// `confidentiality <= $ceiling`, plus the entity fence for entity-bound
+    /// scopes — so lineage can only cite what the writer could recall. Rows a
+    /// scope cannot see are structurally absent (fail closed): the caller sees
+    /// an unresolved ref, never a hint that a hidden row exists.
+    async fn resolve_derivation_inputs(
+        &self,
+        scope: &Scope,
+        refs: &[Uuid],
+    ) -> Result<Vec<DerivationInput>> {
+        // Fail closed in the shared layer, mirroring `recall`.
+        if scope.principals.is_empty() || refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Safe: the predicate string is assembled from constants only; all
+        // caller data goes through binds (same argument as recall_dense).
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT id, provenance, visibility, confidentiality FROM chunks
+             WHERE tenant_id = $1
+               AND valid_to IS NULL
+               AND (id = ANY($2) OR provenance = ANY($2))
+               AND visibility && $3
+               AND confidentiality <= $4
+               {}",
+            entity_scope_predicate(scope, "$5"),
+        )))
+        .bind(scope.tenant_id)
+        .bind(refs)
+        .bind(&scope.principals)
+        .bind(scope.max_confidentiality as i16)
+        .bind(&scope.entity_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // Fold rows per caller ref. A chunk-id ref matches exactly its row; an
+        // episode-id ref matches ALL its current chunks — visibility is the
+        // intersection across them, confidentiality the max, so a multi-chunk
+        // episode is only as visible as its most restricted chunk.
+        let mut inputs = Vec::with_capacity(refs.len());
+        for &reference in refs {
+            let mut episode_id: Option<EpisodeId> = None;
+            let mut visibility: Option<Vec<PrincipalToken>> = None;
+            let mut confidentiality = Confidentiality::Public;
+            for row in &rows {
+                let id: Uuid = row.try_get("id").map_err(db_err)?;
+                let provenance: Uuid = row.try_get("provenance").map_err(db_err)?;
+                if id != reference && provenance != reference {
+                    continue;
+                }
+                let vis: Vec<PrincipalToken> = row.try_get("visibility").map_err(db_err)?;
+                let conf = Confidentiality::from_i16(
+                    row.try_get::<i16, _>("confidentiality").map_err(db_err)?,
+                );
+                episode_id = Some(provenance);
+                confidentiality = confidentiality.max(conf);
+                visibility = Some(match visibility {
+                    None => vis,
+                    Some(acc) => acc.into_iter().filter(|t| vis.contains(t)).collect(),
+                });
+            }
+            if let (Some(episode_id), Some(visibility)) = (episode_id, visibility) {
+                inputs.push(DerivationInput {
+                    reference,
+                    episode_id,
+                    visibility,
+                    confidentiality,
+                });
+            }
+        }
+        Ok(inputs)
     }
 
     async fn record_action(&self, action: ActionWrite) -> Result<bool> {
