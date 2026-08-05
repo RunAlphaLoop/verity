@@ -59,6 +59,24 @@ exposes:
   to under-privileged callers with a 200); change subscriptions not yet wired (poll lane only).
 - **Intercom** — conversations ride the operator-declared teammate-audience floor plus the
   resolved assignee as a provable superset; fail-closed on unassigned.
+- **Zoom (transcripts) — reconstructed, fixture-verified only.** Zoom exposes no per-recording
+  audience, so visibility is *reconstructed* from a 3-value sharing enum plus an
+  operator-anchored token: `none` → the directory-vouched host alone (mirrored),
+  `internally` → the operator-declared `ZOOM_INTERNAL_MAPS_TO` token + host
+  (**admin-assigned** — an operator policy, not a source ACL), `publicly` → quarantined
+  (a passcode does not rescue a public link), and anything unreadable or unrecognized →
+  quarantined. Attendance-derived participant audiences are opt-in and at best
+  **approximated**. There is no access oracle to reconcile against — the mapping is
+  fail-closed and over-hides by design, and it is **live-unvalidated** (fixtures authored
+  from Zoom's API docs; a live run needs a Pro+ seat with cloud recording). Two further
+  live-unverifiable assumptions ride the retraction diff: (1) absence is keyed on the
+  recording's UTC start date landing in the same from/to window Zoom lists it under —
+  Zoom does not document which clock its window filter uses, and a mismatch at a
+  month/midnight edge would over-hide (deliver-then-retire flapping), never leak; needs a
+  live check. (2) The reconcile horizon is `backfill_months` of ~30-day windows —
+  bookkept recordings older than every crawled window (or with unparseable bookkept
+  dates) cannot have their deletion re-proven, so they block the `last_reconcile_at`
+  stamp and alarm `backfill_incomplete` rather than riding silently under it.
 
 Directory sync (nested-group ACL inheritance) is proven end-to-end and fixture-verified for
 both IdPs — Google Workspace against a real workspace, and Microsoft Entra against a real
