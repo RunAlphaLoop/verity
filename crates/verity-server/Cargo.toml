@@ -42,16 +42,37 @@ moka = { workspace = true }
 # Media object-store seam (task 47): S3/MinIO blob tier behind object_store.
 object_store = { workspace = true }
 bytes = "1"
-# Tier-1 file extraction (extract.rs): PDF/PPTX/XLS(X) → text, deterministic,
-# no OCR. Dep choices justified at the workspace root Cargo.toml.
+# Tier-1 file extraction (extract.rs): PDF/PPTX/XLS(X)/DOC(X) text layers,
+# deterministic. Dep choices justified at the workspace root Cargo.toml.
 calamine = { workspace = true }
 zip = { workspace = true }
 cfb = { workspace = true }
 quick-xml = { workspace = true }
 pdf-extract = { workspace = true }
+# OCR tier (ocr.rs): image decode + scanned-PDF page walking are always built
+# (typed failures either way); the ocrs/rten engine itself sits behind the
+# default-ON `ocr` feature so `--no-default-features` can shave its compile
+# cost — extraction then fails typed ("built without the 'ocr' feature").
+image = { workspace = true }
+lopdf = { workspace = true }
+# Bomb-guarded FlateDecode for embedded PDF images: lopdf's own
+# decompressed_content() has no output cap, so ocr.rs inflates manually with
+# flate2 + Read::take. Non-optional — the decode path compiles either way.
+flate2 = { workspace = true }
+ocrs = { workspace = true, optional = true }
+rten = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
 # SSE subscriptions (task 21): poll-loop event streams.
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # Local-folder watching (folder_watch.rs): server-side FS watcher + debounce.
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
+
+[features]
+default = ["ocr"]
+# Local OCR engine (ocrs + rten). ON by default — sovereignty-first, still
+# pure Rust, still zero system deps. Building with --no-default-features
+# drops the engine (and its compile time); scanned-PDF/image extraction then
+# returns the typed "built without the 'ocr' feature" failure instead.
+ocr = ["dep:ocrs", "dep:rten", "dep:ureq"]

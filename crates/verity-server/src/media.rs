@@ -1,12 +1,14 @@
 //! MediaObject + signed URIs (roadmap task 9): blobs live in the `media`
 //! table, addressed by uuid, served ONLY through HMAC-signed, expiring URLs
 //! minted under a scope handle. Text-like media additionally chunks into the
-//! retrieval index under the uploader's scope; PDF / PPTX / XLS(X) go through
-//! the Tier-1 extractor (extract.rs — deterministic, Rust-native, no OCR) and
-//! index the extracted text, with the method + truncation recorded in
-//! provenance and typed extraction failures stored metadata-only, disclosed
-//! in both the response and the episode record. Other binary media is
-//! store-only.
+//! retrieval index under the uploader's scope; PDF / PPTX / XLS(X) / DOC(X) /
+//! PNG / JPEG go through the Tier-1 extractor (extract.rs — Rust-native and
+//! local; scanned PDFs and images ride the best-effort local OCR tier, ocr.rs)
+//! and index the extracted text, with the method + truncation (+ OCR page
+//! accounting for OCRed PDFs) recorded in provenance and typed extraction
+//! failures stored
+//! metadata-only, disclosed in both the response and the episode record. Other
+//! binary media is store-only.
 //!
 //! v0.2 seam, stated honestly: the signed GET enforces signature + expiry
 //! (and the sign step enforces the tenant match), but per-principal media
@@ -287,15 +289,28 @@ pub(crate) async fn ingest_file(
             text: String,
             method: &'static str,
             truncated: bool,
+            ocr_pages: Option<crate::ocr::OcrPages>,
         },
         Refuse(crate::extract::ExtractFailure),
         StoreOnly,
     }
-    let plan = match crate::extract::extract(&bytes, filename.as_deref()) {
+    // Extraction runs on the blocking pool: the OCR paths can take seconds
+    // per page, which must never stall the async runtime.
+    let (outcome, bytes) = {
+        let fname = filename.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = crate::extract::extract(&bytes, fname.as_deref());
+            (outcome, bytes)
+        })
+        .await
+        .map_err(internal)?
+    };
+    let plan = match outcome {
         crate::extract::ExtractOutcome::Extracted(ex) => Plan::Index {
             text: ex.text,
             method: ex.method,
             truncated: ex.truncated,
+            ocr_pages: ex.ocr_pages,
         },
         crate::extract::ExtractOutcome::Failed(f) => Plan::Refuse(f),
         crate::extract::ExtractOutcome::NotHandled => {
@@ -307,6 +322,7 @@ pub(crate) async fn ingest_file(
                     text: s.to_string(),
                     method: "utf-8",
                     truncated: false,
+                    ocr_pages: None,
                 },
                 None => Plan::StoreOnly,
             }
@@ -320,6 +336,7 @@ pub(crate) async fn ingest_file(
             text,
             method,
             truncated,
+            ocr_pages,
         } => {
             let episode_id = state
                 .storage
@@ -331,7 +348,7 @@ pub(crate) async fn ingest_file(
                     payload: serde_json::json!({
                         "media_id": media_id, "filename": filename,
                         "mime": mime, "sha256": sha256, "size_bytes": bytes.len(),
-                        "extraction": { "method": method, "truncated": truncated },
+                        "extraction": crate::extract::receipt_json(method, truncated, ocr_pages),
                     }),
                     content_hash: sha256.clone(),
                     trust_tier: TrustTier::Observation,
@@ -374,10 +391,7 @@ pub(crate) async fn ingest_file(
             // emit after a write. Its absence here meant file content added via
             // `verity-cli add` (POST /v1/files) was never entity-resolved.
             state.resolution.mark_dirty(payload.tenant_id);
-            extraction_receipt = Some(serde_json::json!({
-                "method": method,
-                "truncated": truncated,
-            }));
+            extraction_receipt = Some(crate::extract::receipt_json(method, truncated, ocr_pages));
         }
         Plan::Refuse(failure) => {
             let reason = failure.reason();

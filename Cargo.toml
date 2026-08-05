@@ -71,6 +71,28 @@ cfb = "0.10"
 # lopdf — the part we refuse to reimplement. Known to panic on hostile files;
 # every call is wrapped in catch_unwind (see extract.rs).
 pdf-extract = "0.12"
+# OCR tier (ocr.rs): ocrs + rten — pure-Rust OCR. No tesseract or any system
+# dependency (that would break the clean-VM stranger gate), no cloud OCR.
+# Models (~12 MB total) download once from the ocrs project's canonical bucket
+# into ~/.cache/ocrs — the same fetch-once-then-cache lane as the MiniLM
+# encoder (which uses the hf-hub default cache). rten must track the exact
+# version the ocrs release depends on, or Model types won't line up.
+ocrs = "0.12"
+rten = "0.24"
+# image: PNG/JPEG decode for standalone image OCR and embedded PDF images,
+# plus JPEG *encoding* in test fixtures. Decode-only features, pure Rust.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# lopdf: pinned to the same version pdf-extract already compiles, so walking a
+# scanned PDF's page/image tree reuses the one PDF parser in the tree.
+lopdf = "0.42"
+# flate2: capped FlateDecode inflation for embedded PDF images (ocr.rs). We
+# deliberately do NOT use lopdf's decompressed_content() there — it inflates
+# without any output bound, so a 100 KB stream declaring a 10x10 image can
+# materialize gigabytes (decompression bomb). Already in the tree via zip.
+flate2 = "1"
+# ureq: blocking OCR-model download (extraction is synchronous code); already
+# in the tree transitively via hf-hub.
+ureq = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 schemars = { version = "1", features = ["chrono04"] }
 # Local-folder watching (folder_watch.rs): cross-platform FS events
@@ -78,3 +100,24 @@ schemars = { version = "1", features = ["chrono04"] }
 # write bursts and mid-write partials fire once, after the file is quiescent.
 notify = "6"
 notify-debouncer-full = "0.3"
+
+# OCR inference is numeric hot-loop work; unoptimized rten is ~50x slower,
+# which makes dev-profile scanned-PDF ingestion (and the VERITY_OCR_E2E test)
+# crawl. Optimizing JUST the rten family in dev keeps `cargo build` fast for
+# our own code while making local OCR usable. Release builds are unaffected.
+[profile.dev.package.rten]
+opt-level = 3
+[profile.dev.package.rten-base]
+opt-level = 3
+[profile.dev.package.rten-gemm]
+opt-level = 3
+[profile.dev.package.rten-imageproc]
+opt-level = 3
+[profile.dev.package.rten-simd]
+opt-level = 3
+[profile.dev.package.rten-tensor]
+opt-level = 3
+[profile.dev.package.rten-vecmath]
+opt-level = 3
+[profile.dev.package.ocrs]
+opt-level = 3

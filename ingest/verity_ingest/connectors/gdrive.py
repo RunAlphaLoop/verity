@@ -15,17 +15,20 @@ and only if the ACL is resolvable (ACL-before-content, §5a) — content:
 - Google Docs → ``files.export`` as ``text/plain``
 - ``text/*`` and ``application/json`` → direct download (``alt=media``),
   delivered inline as ``content`` text
-- PDF / PPTX / XLS(X) → direct download (``alt=media``), delivered as raw
-  bytes in ``content_base64`` (+ ``filename``); the SERVER runs the Tier-1
-  extractor (verity-server extract.rs: Rust-native, deterministic, no OCR).
+- PDF / Office formats / PNG / JPEG → direct download (``alt=media``),
+  delivered as raw bytes in ``content_base64`` (+ ``filename``); the SERVER
+  runs the Tier-1 extractor (verity-server extract.rs: Rust-native and local
+  — deterministic text layers, plus best-effort local OCR for scanned PDFs
+  and images, disclosed as ``pdf-ocr``/``image-ocr`` on the receipt).
   This was chosen over posting bytes to ``POST /v1/files`` because /v1/files
   writes under a scope handle whose principals would REPLACE the mirrored
   per-file ACL this connector computed — the whole point of a Tier-A
   connector. Riding the existing documents endpoint keeps one sink, the same
   visibility/entity mapping, and ACL-before-content ordering; the smallest
-  honest change. Typed extraction failures (encrypted PDF, scanned/image PDF
-  with no text layer, parse failure) land METADATA-ONLY server-side with the
-  reason disclosed on the stored record — never silently indexed as empty.
+  honest change. Typed extraction failures (encrypted PDF, scanned PDF where
+  OCR found nothing, OCR engine unavailable, parse failure) land
+  METADATA-ONLY server-side with the reason disclosed on the stored record —
+  never silently indexed as empty.
 - everything else → metadata + ACL only, no content bytes
 
 ACL mapping (fail-closed, §5e.6 / §6b):
@@ -226,9 +229,9 @@ class GDriveDocumentEvent(DocumentEvent):
 
 
 # Binary formats the server's Tier-1 extractor handles (verity-server
-# extract.rs): text-based PDF, PPTX, XLS(X). Deliberately NOT .doc/.docx or
-# legacy .ppt — Google Docs already export as text, and anything else stays
-# honestly metadata-only until a later tier.
+# extract.rs): PDF (text layer, or the local OCR tier for scanned ones),
+# Office formats, and PNG/JPEG images (local OCR). Deliberately NOT legacy
+# .ppt, GIF/TIFF/WebP, etc. — anything else stays honestly metadata-only.
 BINARY_EXTRACTABLE_MIMES = frozenset(
     {
         "application/pdf",
@@ -241,6 +244,11 @@ BINARY_EXTRACTABLE_MIMES = frozenset(
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.ms-excel",
+        # Images: the server's local OCR tier (ocr.rs, ocrs+rten) extracts
+        # printed text best-effort, disclosed as method "image-ocr"; an image
+        # with no recognizable text lands metadata-only with a typed reason.
+        "image/png",
+        "image/jpeg",
     }
 )
 
