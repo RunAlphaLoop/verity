@@ -50,7 +50,7 @@ pub(crate) struct SourceSpec {
 /// Fixed registry, alphabetical-ish by affinity: the zero-credential local
 /// path first, then content, directory, CRM. `folder` is the aggregate of
 /// every `folder:<name>` watch (the server IS that worker, in-process).
-pub(crate) const SOURCES: [SourceSpec; 9] = [
+pub(crate) const SOURCES: [SourceSpec; 10] = [
     SourceSpec {
         source: "folder",
         label: "Local folders",
@@ -94,6 +94,11 @@ pub(crate) const SOURCES: [SourceSpec; 9] = [
     SourceSpec {
         source: "slack",
         label: "Slack",
+        kind: "content",
+    },
+    SourceSpec {
+        source: "zoom",
+        label: "Zoom",
         kind: "content",
     },
 ];
@@ -1896,6 +1901,7 @@ mod tests {
                 ("notion", "content"),
                 ("intercom", "support"),
                 ("slack", "content"),
+                ("zoom", "content"),
             ]
         );
         assert_eq!(source_spec("hubspot").expect("known").label, "HubSpot");
