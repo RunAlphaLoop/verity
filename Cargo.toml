@@ -85,6 +85,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # lopdf: pinned to the same version pdf-extract already compiles, so walking a
 # scanned PDF's page/image tree reuses the one PDF parser in the tree.
 lopdf = "0.42"
+# flate2: capped FlateDecode inflation for embedded PDF images (ocr.rs). We
+# deliberately do NOT use lopdf's decompressed_content() there — it inflates
+# without any output bound, so a 100 KB stream declaring a 10x10 image can
+# materialize gigabytes (decompression bomb). Already in the tree via zip.
+flate2 = "1"
 # ureq: blocking OCR-model download (extraction is synchronous code); already
 # in the tree transitively via hf-hub.
 ureq = "3"

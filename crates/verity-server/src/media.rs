@@ -4,8 +4,9 @@
 //! retrieval index under the uploader's scope; PDF / PPTX / XLS(X) / DOC(X) /
 //! PNG / JPEG go through the Tier-1 extractor (extract.rs — Rust-native and
 //! local; scanned PDFs and images ride the best-effort local OCR tier, ocr.rs)
-//! and index the extracted text, with the method + truncation (+ pages_ocred
-//! for OCRed PDFs) recorded in provenance and typed extraction failures stored
+//! and index the extracted text, with the method + truncation (+ OCR page
+//! accounting for OCRed PDFs) recorded in provenance and typed extraction
+//! failures stored
 //! metadata-only, disclosed in both the response and the episode record. Other
 //! binary media is store-only.
 //!
@@ -288,7 +289,7 @@ pub(crate) async fn ingest_file(
             text: String,
             method: &'static str,
             truncated: bool,
-            pages_ocred: Option<u32>,
+            ocr_pages: Option<crate::ocr::OcrPages>,
         },
         Refuse(crate::extract::ExtractFailure),
         StoreOnly,
@@ -309,7 +310,7 @@ pub(crate) async fn ingest_file(
             text: ex.text,
             method: ex.method,
             truncated: ex.truncated,
-            pages_ocred: ex.pages_ocred,
+            ocr_pages: ex.ocr_pages,
         },
         crate::extract::ExtractOutcome::Failed(f) => Plan::Refuse(f),
         crate::extract::ExtractOutcome::NotHandled => {
@@ -321,7 +322,7 @@ pub(crate) async fn ingest_file(
                     text: s.to_string(),
                     method: "utf-8",
                     truncated: false,
-                    pages_ocred: None,
+                    ocr_pages: None,
                 },
                 None => Plan::StoreOnly,
             }
@@ -335,7 +336,7 @@ pub(crate) async fn ingest_file(
             text,
             method,
             truncated,
-            pages_ocred,
+            ocr_pages,
         } => {
             let episode_id = state
                 .storage
@@ -347,7 +348,7 @@ pub(crate) async fn ingest_file(
                     payload: serde_json::json!({
                         "media_id": media_id, "filename": filename,
                         "mime": mime, "sha256": sha256, "size_bytes": bytes.len(),
-                        "extraction": crate::extract::receipt_json(method, truncated, pages_ocred),
+                        "extraction": crate::extract::receipt_json(method, truncated, ocr_pages),
                     }),
                     content_hash: sha256.clone(),
                     trust_tier: TrustTier::Observation,
@@ -389,7 +390,7 @@ pub(crate) async fn ingest_file(
             // emit after a write. Its absence here meant file content added via
             // `verity-cli add` (POST /v1/files) was never entity-resolved.
             state.resolution.mark_dirty(payload.tenant_id);
-            extraction_receipt = Some(crate::extract::receipt_json(method, truncated, pages_ocred));
+            extraction_receipt = Some(crate::extract::receipt_json(method, truncated, ocr_pages));
         }
         Plan::Refuse(failure) => {
             let reason = failure.reason();

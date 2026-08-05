@@ -55,6 +55,10 @@ pdf-extract = { workspace = true }
 # cost — extraction then fails typed ("built without the 'ocr' feature").
 image = { workspace = true }
 lopdf = { workspace = true }
+# Bomb-guarded FlateDecode for embedded PDF images: lopdf's own
+# decompressed_content() has no output cap, so ocr.rs inflates manually with
+# flate2 + Read::take. Non-optional — the decode path compiles either way.
+flate2 = { workspace = true }
 ocrs = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }

@@ -58,22 +58,26 @@ pub(crate) struct Extraction {
     /// layer.
     pub(crate) method: &'static str,
     pub(crate) truncated: bool,
-    /// For "pdf-ocr" only: how many pages were actually OCRed (engine
-    /// consulted), capped at [`ocr::MAX_OCR_PAGES`] — a partial pass is
-    /// visible on the receipt.
-    pub(crate) pages_ocred: Option<u32>,
+    /// For "pdf-ocr" only: the honest page accounting — pages OCRed (engine
+    /// consulted; capped at [`ocr::MAX_OCR_PAGES`]), total pages in the
+    /// document, and pages skipped because their images use encodings we
+    /// don't implement. A partial pass is visible on the receipt.
+    pub(crate) ocr_pages: Option<ocr::OcrPages>,
 }
 
 /// The disclosed extraction receipt, embedded verbatim in episode payloads
-/// and HTTP responses. ONE builder so no call site forgets `pages_ocred`.
+/// and HTTP responses. ONE builder so no call site forgets the OCR page
+/// accounting.
 pub(crate) fn receipt_json(
     method: &str,
     truncated: bool,
-    pages_ocred: Option<u32>,
+    ocr_pages: Option<ocr::OcrPages>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({ "method": method, "truncated": truncated });
-    if let Some(pages) = pages_ocred {
-        v["pages_ocred"] = pages.into();
+    if let Some(pages) = ocr_pages {
+        v["pages_ocred"] = pages.ocred.into();
+        v["pages_total"] = pages.total.into();
+        v["pages_skipped_unsupported"] = pages.skipped_unsupported.into();
     }
     v
 }
@@ -88,6 +92,13 @@ pub(crate) enum ExtractFailure {
     /// No text layer AND the OCR pass recognized nothing (or found no
     /// decodable raster images at all).
     ScannedPdf,
+    /// No text layer, and every image-bearing page uses an encoding we don't
+    /// implement (CCITT/JBIG2/JPX, exotic colorspaces): OCR never got to
+    /// ATTEMPT recognition. Distinct from [`Self::ScannedPdf`], which means
+    /// OCR ran (or had nothing at all to run on) and found none — conflating
+    /// the two would pass off "we can't read this format" as "there was
+    /// nothing to read".
+    UnsupportedPdfImages,
     PdfParse(String),
     SheetParse(String),
     PptxParse(String),
@@ -114,6 +125,9 @@ impl ExtractFailure {
         match self {
             Self::EncryptedPdf => "encrypted PDF".into(),
             Self::ScannedPdf => "scanned/image PDF — no text layer and OCR found none".into(),
+            Self::UnsupportedPdfImages => {
+                "scanned/image PDF — unsupported image encodings; OCR could not attempt".into()
+            }
             Self::PdfParse(e) => format!("PDF parse failure: {e}"),
             Self::SheetParse(e) => format!("spreadsheet parse failure: {e}"),
             Self::PptxParse(e) => format!("PPTX parse failure: {e}"),
@@ -361,7 +375,7 @@ impl Budget {
             text: self.out,
             method,
             truncated: self.truncated,
-            pages_ocred: None,
+            ocr_pages: None,
         }
     }
 }
@@ -418,7 +432,7 @@ fn extract_sheet(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure>
             text: String::new(), // folded to ExtractFailure::NoText by finish()
             method: "calamine",
             truncated: false,
-            pages_ocred: None,
+            ocr_pages: None,
         });
     }
     Ok(budget.into_extraction("calamine"))
@@ -496,7 +510,7 @@ fn extract_pptx(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure> 
             text: String::new(), // folded to ExtractFailure::NoText by finish()
             method: "pptx-xml",
             truncated: false,
-            pages_ocred: None,
+            ocr_pages: None,
         });
     }
     Ok(budget.into_extraction("pptx-xml"))
@@ -566,7 +580,7 @@ fn extract_docx(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure> 
         text: budget.out,
         method: "docx-xml",
         truncated: budget.truncated,
-        pages_ocred: None,
+        ocr_pages: None,
     })
 }
 
@@ -724,7 +738,7 @@ fn extract_doc(bytes: &[u8], cap: usize) -> Result<Extraction, ExtractFailure> {
         text: budget.out.trim().to_string(),
         method: "doc-piecetable",
         truncated: budget.truncated,
-        pages_ocred: None,
+        ocr_pages: None,
     })
 }
 
@@ -828,7 +842,7 @@ fn ocr_scanned_pdf(
         let pages = ocr::ocr_pdf_pages(bytes, &mut budget, ocr::MAX_OCR_PAGES, ocr)?;
         Ok((budget, pages))
     }));
-    let (budget, pages_ocred) = match outcome {
+    let (budget, pages) = match outcome {
         Ok(Ok(ok)) => ok,
         Ok(Err(ocr::PdfOcrError::Parse(e))) => {
             return Err(ExtractFailure::PdfParse(format!("OCR pass: {e}")))
@@ -841,10 +855,16 @@ fn ocr_scanned_pdf(
         }
     };
     if budget.out.trim().is_empty() {
+        // Honesty split: if OCR never got to attempt a single page because
+        // every image-bearing page uses an encoding we don't implement, say
+        // THAT — "OCR found none" would be a false claim of having looked.
+        if pages.ocred == 0 && pages.skipped_unsupported > 0 {
+            return Err(ExtractFailure::UnsupportedPdfImages);
+        }
         return Err(ExtractFailure::ScannedPdf);
     }
     let mut ex = budget.into_extraction("pdf-ocr");
-    ex.pages_ocred = Some(pages_ocred);
+    ex.ocr_pages = Some(pages);
     Ok(ex)
 }
 
@@ -857,17 +877,30 @@ fn extract_image(
     cap: usize,
     ocr: &dyn OcrBackend,
 ) -> Result<Extraction, ExtractFailure> {
-    let img = ocr::decode_rgb(bytes).map_err(ExtractFailure::ImageParse)?;
-    let text = ocr
-        .recognize_rgb(img.width(), img.height(), img.as_raw())
-        .map_err(ExtractFailure::OcrUnavailable)?;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(ExtractFailure::ImageNoText);
+    // Fenced like the PDF lanes: a decoder or engine panic on a hostile image
+    // must surface as a typed failure, never unwind into the handler (where
+    // it would become a JoinError 500 off the blocking pool).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<Extraction, ExtractFailure> {
+            let img = ocr::decode_rgb(bytes).map_err(ExtractFailure::ImageParse)?;
+            let text = ocr
+                .recognize_rgb(img.width(), img.height(), img.as_raw())
+                .map_err(ExtractFailure::OcrUnavailable)?;
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(ExtractFailure::ImageNoText);
+            }
+            let mut budget = Budget::new(cap);
+            budget.push(text);
+            Ok(budget.into_extraction("image-ocr"))
+        },
+    ));
+    match outcome {
+        Ok(res) => res,
+        Err(_) => Err(ExtractFailure::ImageParse(
+            "image decode/OCR panicked on malformed input (contained)".into(),
+        )),
     }
-    let mut budget = Budget::new(cap);
-    budget.push(text);
-    Ok(budget.into_extraction("image-ocr"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,6 +1227,99 @@ pub(crate) mod fixtures {
         );
         pdf
     }
+
+    /// The hostile-image harness: a one-page PDF embedding a single image
+    /// XObject with EXACTLY the dict entries given (everything but /Length,
+    /// which is derived) over an arbitrary stream body. Lets tests declare
+    /// lying dimensions, decompression bombs, and unsupported filters that no
+    /// honest encoder would produce.
+    pub(crate) fn pdf_with_image_xobject(image_dict: &str, stream: &[u8]) -> Vec<u8> {
+        let content = "q 100 0 0 100 0 0 cm /Im0 Do Q\n";
+        let mut image_object = format!(
+            "<< /Type /XObject /Subtype /Image {image_dict} /Length {} >>\nstream\n",
+            stream.len()
+        )
+        .into_bytes();
+        image_object.extend_from_slice(stream);
+        image_object.extend_from_slice(b"\nendstream");
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R /Resources << /XObject << /Im0 5 0 R >> >> >>"
+                .to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            )
+            .into_bytes(),
+            image_object,
+        ];
+
+        let mut pdf: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(obj);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// zlib-compress bytes (FlateDecode test payloads).
+    pub(crate) fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).expect("zlib write");
+        enc.finish().expect("zlib finish")
+    }
+
+    /// The review's probe, as a fixture: a small FlateDecode stream whose
+    /// dict declares a tiny image but whose payload inflates to ~100 MB.
+    pub(crate) fn flate_bomb_pdf() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let zeros = [0u8; 65536];
+        for _ in 0..1600 {
+            enc.write_all(&zeros).expect("zlib write"); // 1600 * 64 KiB = 100 MiB
+        }
+        let bomb = enc.finish().expect("zlib finish");
+        assert!(bomb.len() < 256 * 1024, "bomb must be small on the wire");
+        pdf_with_image_xobject(
+            "/Width 10 /Height 10 /ColorSpace /DeviceRGB /BitsPerComponent 8 \
+             /Filter /FlateDecode",
+            &bomb,
+        )
+    }
+
+    /// Patch a fixture JPEG's SOF0 header to claim absurd dimensions — the
+    /// bytes still decode as a JPEG *header*, but any pixel decode would try
+    /// to materialize gigapixels.
+    pub(crate) fn jpeg_with_lying_dims(w: u32, h: u32, claim_w: u16, claim_h: u16) -> Vec<u8> {
+        let mut jpeg = jpeg_bytes(w, h);
+        let sof = jpeg
+            .windows(2)
+            .position(|m| m == [0xFF, 0xC0])
+            .expect("baseline fixture JPEG has an SOF0 marker");
+        // SOF0: FF C0 len(2) precision(1) height(2) width(2) …
+        jpeg[sof + 5..sof + 7].copy_from_slice(&claim_h.to_be_bytes());
+        jpeg[sof + 7..sof + 9].copy_from_slice(&claim_w.to_be_bytes());
+        jpeg
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,7 +1560,14 @@ mod tests {
             &FakeOcr("the falcon codeword is zanzibar"),
         ));
         assert_eq!(ex.method, "pdf-ocr");
-        assert_eq!(ex.pages_ocred, Some(2));
+        assert_eq!(
+            ex.ocr_pages,
+            Some(crate::ocr::OcrPages {
+                ocred: 2,
+                total: 2,
+                skipped_unsupported: 0
+            })
+        );
         assert!(!ex.truncated);
         assert!(ex.text.contains("Page 1:"));
         assert!(ex.text.contains("Page 2:"));
@@ -1458,7 +1591,13 @@ mod tests {
             &FakeOcr("line"),
         ));
         assert_eq!(ex.method, "pdf-ocr");
-        assert_eq!(ex.pages_ocred, Some(crate::ocr::MAX_OCR_PAGES as u32));
+        let pages = ex.ocr_pages.expect("pdf-ocr carries page accounting");
+        assert_eq!(pages.ocred, crate::ocr::MAX_OCR_PAGES as u32);
+        assert_eq!(
+            pages.total,
+            crate::ocr::MAX_OCR_PAGES as u32 + 2,
+            "total must show the WHOLE document so the cap is visible"
+        );
         assert!(ex
             .text
             .contains(&format!("Page {}:", crate::ocr::MAX_OCR_PAGES)));
@@ -1517,17 +1656,263 @@ mod tests {
         assert_eq!(f, ExtractFailure::ScannedPdf);
     }
 
+    // ------- hostile embedded images: bombs, lying headers, unsupported -------
+
+    /// Records exactly what bitmaps the engine was shown (pixel-level proof
+    /// for the decode plumbing) and returns fixed text.
+    struct CaptureOcr(std::sync::Mutex<Vec<(u32, u32, Vec<u8>)>>);
+    impl CaptureOcr {
+        fn new() -> Self {
+            Self(std::sync::Mutex::new(Vec::new()))
+        }
+    }
+    impl OcrBackend for CaptureOcr {
+        fn recognize_rgb(&self, w: u32, h: u32, rgb: &[u8]) -> Result<String, String> {
+            self.0.lock().unwrap().push((w, h, rgb.to_vec()));
+            Ok("captured".into())
+        }
+    }
+
     #[test]
-    fn receipt_json_discloses_pages_ocred_only_when_present() {
-        let r = receipt_json("pdf-ocr", false, Some(3));
+    fn extract_pdf_flate_bomb_is_skipped_typed_and_never_reaches_the_engine() {
+        // The review's probe: ~100 KB on the wire, declares 10x10, inflates
+        // to 100 MB. The capped inflate must skip it (typed ScannedPdf, since
+        // nothing else is on the page) without materializing the payload and
+        // without ever consulting the engine.
+        let bytes = fixtures::flate_bomb_pdf();
+        let f = expect_failed(extract_with_ocr(
+            &bytes,
+            Some("bomb.pdf"),
+            MAX_EXTRACT_CHARS,
+            &PanicOcr,
+        ));
+        assert_eq!(f, ExtractFailure::ScannedPdf);
+        // And nothing was OCRed / nothing counted as "unsupported encoding":
+        // the bomb is bad DATA on a supported path, not an unsupported format.
+        let mut budget = Budget::new(MAX_EXTRACT_CHARS);
+        let pages =
+            crate::ocr::ocr_pdf_pages(&bytes, &mut budget, crate::ocr::MAX_OCR_PAGES, &PanicOcr)
+                .expect("walk parses");
+        assert_eq!(
+            pages,
+            crate::ocr::OcrPages {
+                ocred: 0,
+                total: 1,
+                skipped_unsupported: 0
+            }
+        );
+    }
+
+    #[test]
+    fn extract_inflate_capped_bounds_output_memory_at_the_cap() {
+        // Seam-level proof of the memory bound: a stream inflating to 10 MB
+        // against a 1000-byte cap is refused, and the refusal path can never
+        // have held more than cap+1 bytes of inflated output.
+        let payload = fixtures::zlib(&vec![0u8; 10 * 1024 * 1024]);
+        assert_eq!(crate::ocr::inflate_capped(&payload, 1000), None);
+        // At exactly the required cap the same stream inflates fine.
+        let ok = crate::ocr::inflate_capped(&payload, 10 * 1024 * 1024).expect("fits the cap");
+        assert_eq!(ok.len(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn extract_pdf_image_dict_declaring_oversize_dims_is_skipped_pre_decode() {
+        // MAX_OCR_PIXELS in the PDF lane: dict-declared 100k x 100k is
+        // refused before any sample is touched; the page contributes nothing.
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 100000 /Height 100000 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            b"tiny",
+        );
+        let f = expect_failed(extract_with_ocr(
+            &bytes,
+            Some("huge.pdf"),
+            MAX_EXTRACT_CHARS,
+            &PanicOcr,
+        ));
+        assert_eq!(f, ExtractFailure::ScannedPdf);
+    }
+
+    #[test]
+    fn extract_image_lane_rejects_lying_jpeg_dims_before_decode() {
+        // MAX_OCR_PIXELS in the standalone-image lane: the JPEG header claims
+        // 65500 x 65500 (~4.3 gigapixels); the header check must refuse it
+        // BEFORE any pixel decode, engine provably untouched.
+        let bytes = fixtures::jpeg_with_lying_dims(8, 8, 65500, 65500);
+        let f = expect_failed(extract_with_ocr(
+            &bytes,
+            Some("liar.jpg"),
+            MAX_EXTRACT_CHARS,
+            &PanicOcr,
+        ));
+        match f {
+            ExtractFailure::ImageParse(msg) => assert!(
+                msg.contains("refuses images over"),
+                "must be the pre-decode dimension refusal, got: {msg}"
+            ),
+            other => panic!("expected ImageParse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_dct_image_with_lying_header_dims_is_rejected_pre_decode() {
+        // Same lie inside a PDF: the dict claims 8x8 (passes), but the JPEG's
+        // own header claims gigapixels — the header re-check must catch it
+        // before load, and the page then contributes nothing (typed).
+        let jpeg = fixtures::jpeg_with_lying_dims(8, 8, 65500, 65500);
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+            &jpeg,
+        );
+        let f = expect_failed(extract_with_ocr(
+            &bytes,
+            Some("liar.pdf"),
+            MAX_EXTRACT_CHARS,
+            &PanicOcr,
+        ));
+        assert_eq!(f, ExtractFailure::ScannedPdf);
+    }
+
+    #[test]
+    fn extract_pdf_flate_wrapped_dct_image_decodes_and_ocrs() {
+        // [/FlateDecode /DCTDecode]: previously dead (lopdf errors
+        // Unimplemented on DCT); now the flate layer is stripped manually
+        // (capped) and the JPEG rides the normal bomb-checked decode.
+        let jpeg = fixtures::jpeg_bytes(24, 16);
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 24 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8 \
+             /Filter [/FlateDecode /DCTDecode]",
+            &fixtures::zlib(&jpeg),
+        );
+        let ex = expect_extracted(extract_with_ocr(
+            &bytes,
+            Some("wrapped.pdf"),
+            MAX_EXTRACT_CHARS,
+            &FakeOcr("the falcon codeword is zanzibar"),
+        ));
+        assert_eq!(ex.method, "pdf-ocr");
+        assert_eq!(
+            ex.ocr_pages,
+            Some(crate::ocr::OcrPages {
+                ocred: 1,
+                total: 1,
+                skipped_unsupported: 0
+            })
+        );
+        assert!(ex.text.contains("the falcon codeword is zanzibar"));
+    }
+
+    #[test]
+    fn extract_pdf_all_pages_unsupported_encoding_fails_with_the_distinct_reason() {
+        // A CCITT-only scan: OCR never gets to ATTEMPT anything, and saying
+        // "OCR found none" would be a false claim of having looked (C1).
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode",
+            b"not really ccitt data",
+        );
+        let f = expect_failed(extract_with_ocr(
+            &bytes,
+            Some("fax.pdf"),
+            MAX_EXTRACT_CHARS,
+            &PanicOcr,
+        ));
+        assert_eq!(f, ExtractFailure::UnsupportedPdfImages);
+        assert_eq!(
+            f.reason(),
+            "scanned/image PDF — unsupported image encodings; OCR could not attempt"
+        );
+        // The accounting the receipt would carry on a partial success:
+        let mut budget = Budget::new(MAX_EXTRACT_CHARS);
+        let pages =
+            crate::ocr::ocr_pdf_pages(&bytes, &mut budget, crate::ocr::MAX_OCR_PAGES, &PanicOcr)
+                .expect("walk parses");
+        assert_eq!(
+            pages,
+            crate::ocr::OcrPages {
+                ocred: 0,
+                total: 1,
+                skipped_unsupported: 1
+            }
+        );
+    }
+
+    #[test]
+    fn extract_pdf_flate_image_with_png_predictor_reconstructs_exact_pixels() {
+        // The predictor handling lopdf used to apply inside its (uncapped)
+        // inflate, proven preserved on the capped path: Sub- and Up-filtered
+        // rows must reconstruct to the exact original samples.
+        let raw_rows: [[u8; 4]; 2] = [[10, 20, 30, 40], [50, 60, 70, 80]];
+        let filtered = [
+            [1u8, 10, 10, 10, 10], // Sub: first byte raw, then deltas of 10
+            [2u8, 40, 40, 40, 40], // Up: deltas against the row above
+        ]
+        .concat();
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 4 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 \
+             /Filter /FlateDecode \
+             /DecodeParms << /Predictor 15 /Colors 1 /BitsPerComponent 8 /Columns 4 >>",
+            &fixtures::zlib(&filtered),
+        );
+        let capture = CaptureOcr::new();
+        let ex = expect_extracted(extract_with_ocr(
+            &bytes,
+            Some("predicted.pdf"),
+            MAX_EXTRACT_CHARS,
+            &capture,
+        ));
+        assert_eq!(ex.method, "pdf-ocr");
+        let seen = capture.0.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one bitmap must reach the engine");
+        let (w, h, rgb) = &seen[0];
+        assert_eq!((*w, *h), (4, 2));
+        let expected: Vec<u8> = raw_rows.iter().flatten().flat_map(|&g| [g, g, g]).collect();
+        assert_eq!(rgb, &expected, "unfiltered gray samples, replicated to RGB");
+    }
+
+    #[test]
+    fn extract_pdf_plain_flate_rgb_image_still_decodes() {
+        // The legit raw-samples lane must survive the bomb-guard rewrite.
+        let samples: Vec<u8> = (0..2u8 * 2 * 3).map(|i| i * 10).collect();
+        let bytes = fixtures::pdf_with_image_xobject(
+            "/Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode",
+            &fixtures::zlib(&samples),
+        );
+        let capture = CaptureOcr::new();
+        let ex = expect_extracted(extract_with_ocr(
+            &bytes,
+            Some("raw.pdf"),
+            MAX_EXTRACT_CHARS,
+            &capture,
+        ));
+        assert_eq!(ex.method, "pdf-ocr");
+        let seen = capture.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].2, samples);
+    }
+
+    #[test]
+    fn receipt_json_discloses_ocr_page_accounting_only_when_present() {
+        let r = receipt_json(
+            "pdf-ocr",
+            false,
+            Some(crate::ocr::OcrPages {
+                ocred: 3,
+                total: 7,
+                skipped_unsupported: 2,
+            }),
+        );
         assert_eq!(r["method"], "pdf-ocr");
         assert_eq!(r["pages_ocred"], 3);
+        assert_eq!(r["pages_total"], 7);
+        assert_eq!(r["pages_skipped_unsupported"], 2);
         let r = receipt_json("pdf-text", true, None);
         assert_eq!(r["truncated"], true);
-        assert!(
-            r.get("pages_ocred").is_none(),
-            "non-OCR receipts must not carry pages_ocred"
-        );
+        for key in ["pages_ocred", "pages_total", "pages_skipped_unsupported"] {
+            assert!(
+                r.get(key).is_none(),
+                "non-OCR receipts must not carry {key}"
+            );
+        }
     }
 
     #[test]
@@ -1543,7 +1928,7 @@ mod tests {
                 &FakeOcr("renewal quote is 61000"),
             ));
             assert_eq!(ex.method, "image-ocr", "for {name}");
-            assert_eq!(ex.pages_ocred, None);
+            assert_eq!(ex.ocr_pages, None);
             assert!(ex.text.contains("renewal quote is 61000"));
         }
     }
@@ -1621,7 +2006,14 @@ mod tests {
         let pdf = fixtures::scanned_pdf_with_jpegs(&[jpeg.as_slice()]);
         let ex = expect_extracted(extract(&pdf, Some("scan.pdf")));
         assert_eq!(ex.method, "pdf-ocr");
-        assert_eq!(ex.pages_ocred, Some(1));
+        assert_eq!(
+            ex.ocr_pages,
+            Some(crate::ocr::OcrPages {
+                ocred: 1,
+                total: 1,
+                skipped_unsupported: 0
+            })
+        );
         let lower = ex.text.to_lowercase();
         assert!(
             lower.contains("quick brown fox"),

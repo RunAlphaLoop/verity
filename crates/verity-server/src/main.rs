@@ -4273,11 +4273,8 @@ pub(crate) async fn ingest_document(
                     .map_err(internal)?;
             let text = match outcome {
                 extract::ExtractOutcome::Extracted(ex) => {
-                    extraction_receipt = Some(extract::receipt_json(
-                        ex.method,
-                        ex.truncated,
-                        ex.pages_ocred,
-                    ));
+                    extraction_receipt =
+                        Some(extract::receipt_json(ex.method, ex.truncated, ex.ocr_pages));
                     Some(ex.text)
                 }
                 extract::ExtractOutcome::Failed(f) => {
