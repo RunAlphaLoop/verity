@@ -170,7 +170,7 @@ pub async fn slack(ctx: &mut Ctx, print_manifest_only: bool) -> Result<()> {
     println!();
     println!(
         "      {}",
-        ui::cyan("python -m verity_ingest.connectors.slack --visibility 1")
+        ui::cyan("python -m verity_ingest.connectors.slack --backfill")
     );
     println!();
     println!(

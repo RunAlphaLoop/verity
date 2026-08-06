@@ -8,7 +8,9 @@ Enterprises run agents across sales, support, marketing, and ops, but each agent
 adversarial probes** and **0 stale reads** after CDC supersession (`verity-bench srb`; results
 in [docs/benchmark/](docs/benchmark/)). The scope plane is fuzzed in CI, identity resolves
 through SpiceDB, and the ingestion funnel is live (CLI, MCP, minted webhooks, file drop,
-Google Drive/Gmail/HubSpot/Salesforce/Notion/Intercom connectors, Debezium CDC). Latency is
+Debezium CDC, and connectors for Google Drive, Gmail, SharePoint/OneDrive, Slack, Zoom,
+HubSpot, Salesforce, Notion, and Intercom, plus Google Workspace and Microsoft Entra
+directory sync). See [docs/CONNECTORS.md](docs/CONNECTORS.md) for setup per source. Latency is
 honest, not flat — point reads and BM25 stay fast at scale, while dense/hybrid recall rises
 with corpus size, ACL selectivity, and cache state; the full measured curves with stated
 conditions are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). What Verity does **not** do yet is
