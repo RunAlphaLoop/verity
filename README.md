@@ -4,18 +4,13 @@
 
 Enterprises run agents across sales, support, marketing, and ops, but each agent is an island: the context they need lives in CRMs, ticketing systems, docs, and wikis. Verity mirrors those systems of record into a bi-temporal memory store via CDC/webhooks, inherits source ACLs into a Zanzibar-style permission graph, compiles caller scope into every retrieval as a mandatory pre-filter, and serves scoped hybrid recall, exposed MCP-first to any agent framework.
 
-**Status: v0.1.** The load-bearing claim is measured: **0 cross-entity leaks across 1,220
-adversarial probes** and **0 stale reads** after CDC supersession (`verity-bench srb`; results
-in [docs/benchmark/](docs/benchmark/)). The scope plane is fuzzed in CI, identity resolves
-through SpiceDB, and the ingestion funnel is live (CLI, MCP, minted webhooks, file drop,
-Debezium CDC, and connectors for Google Drive, Gmail, SharePoint/OneDrive, Slack, Zoom,
-HubSpot, Salesforce, Notion, and Intercom, plus Google Workspace and Microsoft Entra
-directory sync). See [docs/CONNECTORS.md](docs/CONNECTORS.md) for setup per source. Latency is
-honest, not flat: point reads and BM25 stay fast at scale, while dense/hybrid recall rises
-with corpus size, ACL selectivity, and cache state; the full measured curves with stated
-conditions are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). What Verity does **not** do yet is
-in [HONESTY.md](HONESTY.md). See [SPEC.md](SPEC.md), the build contract, and
-[docs/research/](docs/research/) for the research that produced it.
+**Status: v0.1.** Where things actually stand:
+
+- **The load-bearing claim is measured:** **0 cross-entity leaks across 1,220 adversarial probes** and **0 stale reads** after CDC supersession (`verity-bench srb`; results in [docs/benchmark/](docs/benchmark/)).
+- **Enforcement is real:** the scope plane is fuzzed in CI and identity resolves through SpiceDB.
+- **Ingestion is live:** CLI, MCP, minted webhooks, file drop, Debezium CDC, and connectors for Google Drive, Gmail, SharePoint/OneDrive, Slack, Zoom, HubSpot, Salesforce, Notion, and Intercom, plus Google Workspace and Microsoft Entra directory sync ([docs/CONNECTORS.md](docs/CONNECTORS.md) for setup per source).
+- **Latency is honest, not flat:** point reads and BM25 stay fast at scale, while dense/hybrid recall rises with corpus size, ACL selectivity, and cache state (full measured curves with stated conditions in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+- **The gaps are written down:** what Verity does **not** do yet is in [HONESTY.md](HONESTY.md); the build contract is [SPEC.md](SPEC.md); the research behind it is in [docs/research/](docs/research/).
 
 ## The three claims
 
