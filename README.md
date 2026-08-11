@@ -52,9 +52,10 @@ deploy/                 # docker-compose for the Postgres profile
 
 ## Quickstart (dev)
 
-Run these from the repo checkout. **The first run builds the workspace from source and downloads a small local embedding model, so budget ~15 minutes.** Every run after that starts in seconds.
+**The first run builds the workspace from source and downloads a small local embedding model, so budget ~15 minutes.** Every run after that starts in seconds.
 
 ```sh
+git clone https://github.com/RunAlphaLoop/verity && cd verity        # step zero: get the checkout
 cargo run --release -p verity-cli -- dev                             # compose up + server + tenant + org-wide scope handle
 cargo run --release -p verity-cli -- add ./docs --visibility 1       # ingest a directory (visibility is required, never guessed)
 cargo run --release -p verity-cli -- query "what do we know about pricing?"   # scoped hybrid recall with provenance tags
