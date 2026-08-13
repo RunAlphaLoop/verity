@@ -1948,15 +1948,24 @@ mod tests {
         assert!(none_hits.is_empty(), "empty scope reads nothing");
 
         // Source registered live in Sources & Freshness as folder:<name>.
-        let sources = crate::connectors::list_status_rows(state.pool(), tenant)
-            .await
-            .expect("status");
-        assert!(
-            sources
-                .iter()
-                .any(|s| s["source"] == format!("folder:{folder}")),
-            "the watch registers as a live source"
-        );
+        // The status row is bumped per-file inside the async ingest task, which
+        // can lag chunk visibility, so poll for it (as the recall above does)
+        // rather than assume it lands synchronously with the recalled chunk.
+        let folder_src = format!("folder:{folder}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let registered = loop {
+            let sources = crate::connectors::list_status_rows(state.pool(), tenant)
+                .await
+                .expect("status");
+            if sources.iter().any(|s| s["source"] == folder_src) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        };
+        assert!(registered, "the watch registers as a live source");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
