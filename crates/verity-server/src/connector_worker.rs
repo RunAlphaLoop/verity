@@ -1484,8 +1484,7 @@ mod tests {
             None,
             None,
         )
-        .err()
-        .expect("gmail must fail without subject");
+        .expect_err("gmail must fail without subject");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Blank/whitespace subject counts as absent (matches connector abort).
         assert!(matches!(
@@ -1574,8 +1573,7 @@ mod tests {
             Some(cred),
             None,
         )
-        .err()
-        .expect("no visibility must fail");
+        .expect_err("no visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Empty visibility is treated as absent.
         let err = assemble_spec(
@@ -1588,8 +1586,7 @@ mod tests {
             Some(cred),
             None,
         )
-        .err()
-        .expect("empty visibility must fail");
+        .expect_err("empty visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // No credential-file path → NoConfig.
         let err = assemble_spec(
@@ -1602,8 +1599,7 @@ mod tests {
             None,
             None,
         )
-        .err()
-        .expect("no credential-file must fail");
+        .expect_err("no credential-file must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
     }
 
@@ -1865,8 +1861,7 @@ mod tests {
             Some(cred),
             Some(cursor),
         )
-        .err()
-        .expect("no visibility must fail");
+        .expect_err("no visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // Empty visibility is treated as absent.
         let err = assemble_spec(
@@ -1879,8 +1874,7 @@ mod tests {
             Some(cred),
             Some(cursor),
         )
-        .err()
-        .expect("empty visibility must fail");
+        .expect_err("empty visibility must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
         // No credential-file path → NoConfig.
         let err = assemble_spec(
@@ -1893,8 +1887,7 @@ mod tests {
             None,
             Some(cursor),
         )
-        .err()
-        .expect("no credential-file must fail");
+        .expect_err("no credential-file must fail");
         assert!(matches!(err, SpawnError::NoConfig(_)));
     }
 

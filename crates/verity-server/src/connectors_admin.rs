@@ -2447,8 +2447,7 @@ mod tests {
     fn resolve_both_present_is_ambiguous_409() {
         let cred = stored_path(None);
         let err = resolve_backfill("gdrive", Some(&cred), Some(Path::new("/env/sa.json")))
-            .err()
-            .expect("both present must 409");
+            .expect_err("both present must 409");
         assert!(matches!(err, BackfillReject::Ambiguous(_)));
         assert_eq!(err.status(), StatusCode::CONFLICT);
     }
@@ -2456,8 +2455,7 @@ mod tests {
     #[test]
     fn resolve_neither_present_is_no_credential_422() {
         let err = resolve_backfill("gdrive", None, None)
-            .err()
-            .expect("neither present must 422");
+            .expect_err("neither present must 422");
         assert!(matches!(err, BackfillReject::NoCredential(_)));
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -2466,8 +2464,7 @@ mod tests {
     fn gmail_requires_a_stored_subject() {
         // Path present (env), but gmail has no stored subject → 422.
         let err = resolve_backfill("gmail", None, Some(Path::new("/env/sa.json")))
-            .err()
-            .expect("gmail without subject must 422");
+            .expect_err("gmail without subject must 422");
         assert!(matches!(err, BackfillReject::SubjectMissing(_)));
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
         // A blank stored subject is treated as absent.
@@ -2686,6 +2683,11 @@ mod tests {
         }
     }
 
+    // These assertions deliberately pin relationships between COMPILE-TIME
+    // constants (the sync interval floor and default). clippy sees them as
+    // constant-valued, which is exactly the point: the test exists to fail if
+    // someone changes either constant out from under the handler's floor check.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn interval_floor_is_below_the_default() {
         // The DB floor (60) must be <= the default the toggle applies (300), so
