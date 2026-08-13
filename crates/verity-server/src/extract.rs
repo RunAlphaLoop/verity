@@ -1580,8 +1580,8 @@ mod tests {
     #[test]
     fn scanned_pdf_ocr_honors_the_page_cap() {
         let jpeg = fixtures::jpeg_bytes(8, 8);
-        let pages: Vec<&[u8]> = std::iter::repeat_n(jpeg.as_slice(), crate::ocr::MAX_OCR_PAGES + 2)
-            .collect();
+        let pages: Vec<&[u8]> =
+            std::iter::repeat_n(jpeg.as_slice(), crate::ocr::MAX_OCR_PAGES + 2).collect();
         let bytes = fixtures::scanned_pdf_with_jpegs(&pages);
         let ex = expect_extracted(extract_with_ocr(
             &bytes,

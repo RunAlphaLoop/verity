@@ -2454,8 +2454,7 @@ mod tests {
 
     #[test]
     fn resolve_neither_present_is_no_credential_422() {
-        let err = resolve_backfill("gdrive", None, None)
-            .expect_err("neither present must 422");
+        let err = resolve_backfill("gdrive", None, None).expect_err("neither present must 422");
         assert!(matches!(err, BackfillReject::NoCredential(_)));
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
