@@ -22,29 +22,20 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
-      spicedb:
-        # ReBAC engine (SPEC §7a). Same image + preshared key as
-        # deploy/docker-compose.yml so VERITY_SPICEDB_KEY matches. The v0.1
-        # Rust client speaks the HTTP gateway (8443); SPICEDB_HTTP_ENABLED turns
-        # it on. In-memory datastore (default) — ephemeral is correct for CI;
-        # every soundness test writes its own schema via ensure_schema().
-        # GitHub Actions service containers cannot override the image command,
-        # so serve flags are passed as env: SPICEDB_GRPC_PRESHARED_KEY
-        # (== --grpc-preshared-key), SPICEDB_HTTP_ENABLED (== --http-enabled).
-        image: authzed/spicedb
-        env:
-          SPICEDB_GRPC_PRESHARED_KEY: verity-dev-key
-          SPICEDB_HTTP_ENABLED: "true"
-        ports:
-          - 8443:8443
-          - 50051:50051
-        options: >-
-          --health-cmd "grpc_health_probe -addr=localhost:50051"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
+      # SpiceDB is NOT a service container: GitHub Actions can't override a
+      # service image's command, and the authzed/spicedb image no longer
+      # defaults to `serve` (a `:latest` drift that silently broke this job),
+      # so the env-var approach printed help and the container died at init.
+      # It's started as an explicit `docker run ... serve` step below instead,
+      # mirroring deploy/docker-compose.yml exactly.
     steps:
       - uses: actions/checkout@v4
+      - name: Start SpiceDB (explicit serve; runs during the build below)
+        run: |
+          docker run -d --name spicedb \
+            -p 8443:8443 -p 50051:50051 \
+            authzed/spicedb serve \
+            --grpc-preshared-key verity-dev-key --http-enabled
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -58,6 +49,21 @@ jobs:
       # resolution_precision_gate (pure, ≥0.99 precision / 0.0 false-merge-rate)
       # and resolution_scope_fuzz (DSN; a mis-linked entity surfacing across
       # scope handles fails the build).
+      - name: Wait for SpiceDB HTTP gateway
+        run: |
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST http://localhost:8443/v1/schema/read \
+              -H "authorization: bearer verity-dev-key" \
+              -H "content-type: application/json" -d '{}' || true)
+            # Any HTTP status (200 or a 4xx "no schema written yet") means it is
+            # serving; only 000 (connection refused) means not up yet.
+            if [ -n "$code" ] && [ "$code" != "000" ]; then
+              echo "SpiceDB responding (HTTP $code)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "SpiceDB did not become healthy:"; docker logs spicedb || true; exit 1
       - run: cargo test --workspace
         env:
           VERITY_TEST_DSN: postgres://verity:verity@localhost:5433/verity

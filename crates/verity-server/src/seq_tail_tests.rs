@@ -9,7 +9,7 @@
 //! these are enforcement-soundness tests — a missing database is a
 //! misconfiguration to surface loudly, never a class of test to silently no-op.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use serde_json::json;
 use sqlx::Row;
 
@@ -119,7 +119,10 @@ fn scope(tenant: TenantId) -> Scope {
 #[tokio::test]
 async fn shrink_redelivery_closes_the_stale_tail() {
     let (storage, tenant) = tail_state().await;
-    let t0 = Utc::now() - Duration::seconds(60);
+    // Microsecond resolution: Postgres stores timestamptz at µs, so an
+    // in-memory nanosecond `Utc::now()` (Linux) would not equal its own
+    // read-back and the lineage assertions below would fail by sub-µs digits.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::seconds(60);
     let t1 = t0 + Duration::seconds(30);
     let tag = "account:shrink";
 
@@ -154,7 +157,10 @@ async fn shrink_redelivery_closes_the_stale_tail() {
 #[tokio::test]
 async fn shrink_replay_is_idempotent() {
     let (storage, tenant) = tail_state().await;
-    let t0 = Utc::now() - Duration::seconds(60);
+    // Microsecond resolution: Postgres stores timestamptz at µs, so an
+    // in-memory nanosecond `Utc::now()` (Linux) would not equal its own
+    // read-back and the lineage assertions below would fail by sub-µs digits.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::seconds(60);
     let t1 = t0 + Duration::seconds(30);
     let tag = "account:replay";
 
@@ -180,7 +186,10 @@ async fn shrink_replay_is_idempotent() {
 #[tokio::test]
 async fn tail_close_is_scoped_to_its_document_and_source() {
     let (storage, tenant) = tail_state().await;
-    let t0 = Utc::now() - Duration::seconds(60);
+    // Microsecond resolution: Postgres stores timestamptz at µs, so an
+    // in-memory nanosecond `Utc::now()` (Linux) would not equal its own
+    // read-back and the lineage assertions below would fail by sub-µs digits.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::seconds(60);
     let t1 = t0 + Duration::seconds(30);
 
     // The shrink target, a NEIGHBOR document in the same source, and the SAME
@@ -251,7 +260,10 @@ async fn tail_close_is_scoped_to_its_document_and_source() {
 #[tokio::test]
 async fn growth_redelivery_is_unaffected() {
     let (storage, tenant) = tail_state().await;
-    let t0 = Utc::now() - Duration::seconds(60);
+    // Microsecond resolution: Postgres stores timestamptz at µs, so an
+    // in-memory nanosecond `Utc::now()` (Linux) would not equal its own
+    // read-back and the lineage assertions below would fail by sub-µs digits.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::seconds(60);
     let t1 = t0 + Duration::seconds(30);
     let tag = "account:growth";
 
