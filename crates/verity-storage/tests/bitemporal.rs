@@ -5,7 +5,7 @@
 //! and `recall_fails_closed` is a direct empty-principal fail-closed assertion —
 //! a soundness gate that silently skips is worse than no gate.
 
-use chrono::{Duration, Utc};
+use chrono::{Duration, SubsecRound, Utc};
 use serde_json::json;
 
 use verity_core::adapter::StorageAdapter;
@@ -63,7 +63,9 @@ fn read_scope(tenant: TenantId) -> Scope {
 #[tokio::test]
 async fn supersession_lifecycle() {
     let (adapter, tenant, episode) = test_adapter().await;
-    let t0 = Utc::now() - Duration::minutes(10);
+    // µs resolution: Postgres timestamptz stores µs, so the valid_to equality
+    // checks below must not carry sub-µs digits that never survive the round-trip.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::minutes(10);
     let write = |value: serde_json::Value, at| FactWrite {
         tenant_id: tenant,
         key: key(),

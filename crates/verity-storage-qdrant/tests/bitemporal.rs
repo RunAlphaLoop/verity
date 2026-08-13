@@ -4,7 +4,7 @@
 //! leg), plus a retire_entity case for this profile's chunk-retirement
 //! superset. Requires VERITY_TEST_DSN + VERITY_QDRANT_URL; skips when absent.
 
-use chrono::{Duration, Utc};
+use chrono::{Duration, SubsecRound, Utc};
 use rand::Rng;
 use serde_json::json;
 
@@ -70,7 +70,9 @@ async fn supersession_lifecycle() {
         eprintln!("VERITY_TEST_DSN / VERITY_QDRANT_URL not set; skipping");
         return;
     };
-    let t0 = Utc::now() - Duration::minutes(10);
+    // µs resolution: Postgres timestamptz stores µs, so the valid_to equality
+    // checks below must not carry sub-µs digits that never survive the round-trip.
+    let t0 = Utc::now().trunc_subsecs(6) - Duration::minutes(10);
     let write = |value: serde_json::Value, at| FactWrite {
         tenant_id: tenant,
         key: key(),
