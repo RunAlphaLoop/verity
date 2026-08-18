@@ -1,8 +1,14 @@
 # Verity
 
-**The open-source, permission-aware shared context plane for enterprise AI agents:** always fresh from systems of record, provably scoped, fast enough for the inner loop.
+**Open-source, permission-aware memory for AI agents.** When several people, teams, or customers share one memory store, Verity makes sure each of them can only recall what they're actually allowed to see.
 
-Enterprises run agents across sales, support, marketing, and ops, but each agent is an island: the context they need lives in CRMs, ticketing systems, docs, and wikis. Verity mirrors those systems of record into a bi-temporal memory store via CDC/webhooks, inherits source ACLs into a Zanzibar-style permission graph, compiles caller scope into every retrieval as a mandatory pre-filter, and serves scoped hybrid recall, exposed MCP-first to any agent framework.
+Here's the problem it solves. Give an agent memory over data that has permissions behind it (a CRM, a Google Drive, a wiki) and let a few people or customers share one store, and the memory quietly starts leaking. An agent reads a document it's allowed to see and writes a fact down. Weeks later, someone else's session runs an ordinary search and pulls that fact back, even though they were never allowed to see where it came from. Nobody attacked anything; the memory just forgot who the fact belonged to.
+
+Verity puts the permission check in the retrieval query itself, not in the model. Your identity is compiled into every search as a mandatory filter, so a memory you're not allowed to see is never even a candidate. No model is involved in that decision, and if Verity can't resolve what you're allowed to see, it returns nothing rather than guess.
+
+You don't hand-label any of it, either. Verity reads permissions straight from the source systems: a doc shared with a Google group resolves to that group's members, SharePoint resolves through Entra, Salesforce is checked against its own access API. So the boundary tracks the source instead of drifting out of date, and when a share is revoked or someone leaves a group, the memory stops surfacing for them on the next sync.
+
+If it's just one person's own memory, you probably don't need this; reach for mem0, Zep, or Letta. Verity is for the shared-store case, where the boundary between people is the hard part.
 
 **Status: v0.1.** Where things actually stand:
 
